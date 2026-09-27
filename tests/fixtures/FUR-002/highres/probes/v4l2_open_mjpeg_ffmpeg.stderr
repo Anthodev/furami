@@ -1,0 +1,14 @@
+Input #0, video4linux2,v4l2, from '/dev/video0':
+  Duration: N/A, start: 40106.711126, bitrate: N/A
+  Stream #0:0: Video: mjpeg (Baseline), yuvj422p(pc, bt470bg/unknown/unknown), 2560x1440, 60 fps, 60 tbr, 1000k tbn, start 40106.711126
+Stream mapping:
+  Stream #0:0 -> #0:0 (mjpeg (native) -> wrapped_avframe (native))
+Press [q] to stop, [?] for help
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf62.12.102
+  Stream #0:0: Video: wrapped_avframe, yuvj422p(pc, bt470bg/unknown/unknown, progressive), 2560x1440, q=2-31, 200 kb/s, 60 fps, 60 tbn
+    Metadata:
+      encoder         : Lavc62.28.102 wrapped_avframe
+[out#0/null @ 0x560a1a580840] video:3KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+frame=    8 fps=0.0 q=-0.0 Lsize=N/A time=00:00:00.16 bitrate=N/A speed=0.918x elapsed=0:00:00.18    

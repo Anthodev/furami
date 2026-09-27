@@ -8,6 +8,10 @@
 moc_*
 qrc_*
 
+# Generated Python bytecode from media build and inventory tools.
+__pycache__/
+*.pyc
+
 # Local environment values.
 .env
 

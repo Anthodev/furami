@@ -1,0 +1,98 @@
+{
+  "schema": 1,
+  "container": "docker.io/library/ubuntu@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3",
+  "platform": "linux/amd64",
+  "apt_snapshot": "20260920T000000Z",
+  "apt_closure": {
+    "file": "build-apt-closure.json",
+    "sha256": "b3cd55d3b690fb84f2fc255c8db274f7d2232b1764eebf1b02f1c1c482c918a4",
+    "installed_sha256": "23e8f6bd1b5fdc1762ebd6fa26914a5ee565ba264403eef0096d5b54da6e7e15",
+    "downloaded_debs_sha256": "0cb4dd6f48991ab1b0b4f82a14b8ab8895a115305713ff2748a152496d19cf29"
+  },
+  "source_date_epoch": 1789862400,
+  "sources": {
+    "ca_certificates": {
+      "version": "20260601~24.04.1",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/ca-certificates/ca-certificates_20260601~24.04.1_all.deb",
+      "archive": "ca-certificates.deb",
+      "sha256": "6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50"
+    },
+    "mpv": {
+      "version": "v0.41.0",
+      "client_api": "2.5.0",
+      "build_flags": ["-Djpeg=disabled"],
+      "commit": "41f6a645068483470267271e1d09966ca3b9f413",
+      "url": "https://codeload.github.com/mpv-player/mpv/tar.gz/refs/tags/v0.41.0",
+      "archive": "mpv.tar.gz",
+      "sha256": "ee21092a5ee427353392360929dc64645c54479aefdb5babc5cfbb5fad626209"
+    },
+    "libplacebo": {
+      "version": "v7.360.1",
+      "commit": "cee9b076f2c63104ccfd497fa79c39a867293ec4",
+      "url": "https://codeload.github.com/haasn/libplacebo/tar.gz/refs/tags/v7.360.1",
+      "archive": "libplacebo.tar.gz",
+      "sha256": "d05fdf90bea2f629eaa2d115e909fd356388ac639e54f77b87a018a6d76224bd"
+    },
+    "vulkan_headers": {
+      "version": "libplacebo-v7.360.1-gitlink",
+      "commit": "450bd2232225d6c7728a4108055ac2e37cef6475",
+      "url": "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/450bd2232225d6c7728a4108055ac2e37cef6475",
+      "archive": "vulkan-headers.tar.gz",
+      "sha256": "26df9841c30806a994e2fdf42f7c87bcb1ced9db9a06033469123939fb3fa075"
+    },
+    "ffmpeg": {
+      "version": "8.1.2",
+      "url": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz",
+      "archive": "ffmpeg.tar.xz",
+      "sha256": "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+    },
+    "qt": {
+      "version": "6.11.2",
+      "kit": "linux_gcc_64",
+      "archives": [
+        {
+          "component": "qtbase",
+          "url": "https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_6112/qt6_6112/qt.qt6.6112.linux_gcc_64/6.11.2-0-202608131018qtbase-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+          "archive": "6.11.2-0-202608131018qtbase-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+          "sha256": "0f86f13b161141e77b1d056b54e2b6fc40fb16f243e71123346f9fb35d418027",
+          "upstream_sha1": "95f3758f512cda7804ab8d281b823f8c2369f053"
+        },
+        {
+          "component": "qtdeclarative",
+          "url": "https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_6112/qt6_6112/qt.qt6.6112.linux_gcc_64/6.11.2-0-202608131018qtdeclarative-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+          "archive": "6.11.2-0-202608131018qtdeclarative-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+          "sha256": "5f0ce87c077f749723dbb6e923142adb860c146ecaf93c68197feda5307f22dd",
+          "upstream_sha1": "1e57a2959e550e36ad2d0864048120c4be52226e"
+        },
+        {
+          "component": "qtsvg",
+          "url": "https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_6112/qt6_6112/qt.qt6.6112.linux_gcc_64/6.11.2-0-202608131018qtsvg-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+          "archive": "6.11.2-0-202608131018qtsvg-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+          "sha256": "939fe0e5d49d11d6d3eceea0184219703c25a1f8dc75f45e99071ca244824a0d",
+          "upstream_sha1": "f71a255c3c944b56e7f520ba8a9e226a4e09139e"
+        },
+        {
+          "component": "icu",
+          "url": "https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_6112/qt6_6112/qt.qt6.6112.linux_gcc_64/6.11.2-0-202608131018icu-linux-Rhel8.6-x86_64.7z",
+          "archive": "6.11.2-0-202608131018icu-linux-Rhel8.6-x86_64.7z",
+          "sha256": "111bdae30a66fff6ef65620e95766170fa5a6f425c360ea33b79cb2ec7e2fd86",
+          "upstream_sha1": "1e7c663c60dd5dad04b55ff4ae02b78fac84c1a9"
+        },
+        {
+          "component": "qtshadertools",
+          "url": "https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_6112/qt6_6112/qt.qt6.6112.addons.qtshadertools.linux_gcc_64/6.11.2-0-202608131018qtshadertools-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+          "archive": "6.11.2-0-202608131018qtshadertools-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+          "sha256": "838c80576bed32aeb5ba6eaa9c58a32f1d6e6b9d63c372b40c4fbcfcd1a086f6",
+          "upstream_sha1": "f93cfc1c2fa2b92d8ab0dd7a089d629d172ff6f5"
+        }
+      ]
+    },
+    "cxx_qt": {
+      "version": "0.10.0",
+      "commit": "61562797ba25558a7c7dba8017deca038f3ee9e4",
+      "url": "https://codeload.github.com/KDAB/cxx-qt/tar.gz/refs/tags/v0.10.0",
+      "archive": "cxx-qt.tar.gz",
+      "sha256": "234d79c8cb8c6ace4e5c83babdfabc916551f1260942c2328c43fb9c5de7bdc7"
+    }
+  }
+}

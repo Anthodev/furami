@@ -1,0 +1,149 @@
+● Video  --vid=1  (wrapped_avframe 1280x720 30 fps)
+[vo/gpu-next/vulkan] Initializing GPU context 'x11vk'
+[vo/gpu-next/libplacebo] Initialized libplacebo v7.360.1 (API v360)
+[vo/gpu-next/libplacebo] Spent 21.069 ms enumerating instance extensions
+[vo/gpu-next/libplacebo] Creating vulkan instance with extensions:
+[vo/gpu-next/libplacebo]     VK_KHR_surface
+[vo/gpu-next/libplacebo]     VK_EXT_swapchain_colorspace
+[vo/gpu-next/libplacebo]     VK_KHR_get_surface_capabilities2
+[vo/gpu-next/libplacebo]     VK_KHR_surface_maintenance1
+[vo/gpu-next/libplacebo]     VK_EXT_surface_maintenance1
+[vo/gpu-next/libplacebo]     VK_KHR_portability_enumeration
+[vo/gpu-next/libplacebo]     VK_KHR_surface
+[vo/gpu-next/libplacebo]     VK_KHR_xlib_surface
+[vo/gpu-next/x11] X11 opening display: :0
+[vo/gpu-next/x11] Display 0 (DP-1): [2560, 0, 5120, 1440] @ 279.871796 FPS
+[vo/gpu-next/x11] Display 1 (DP-3): [0, 0, 2560, 1440] @ 164.782285 FPS
+[vo/gpu-next/x11] Display 2 (DP-4): [5120, 0, 7680, 1440] @ 143.868583 FPS
+[vo/gpu-next/x11] Current display FPS: 279.871796
+[vo/gpu-next/x11] The XPresent extension was found.
+[vo/gpu-next/x11] XPresent disabled.
+[vo/gpu-next/libplacebo] Probing for vulkan devices:
+[vo/gpu-next/libplacebo]     GPU 0: AMD Radeon RX 7900 XTX (RADV NAVI31) v1.4.354 (discrete)
+[vo/gpu-next/libplacebo]            uuid: 00:00:00:00:03:00:00:00:00:00:00:00:00:00:00:00
+[vo/gpu-next/libplacebo]     GPU 1: AMD Ryzen 7 7800X3D 8-Core Processor (RADV RAPHAEL_MENDOCINO) v1.4.354 (integrated)
+[vo/gpu-next/libplacebo]            uuid: 00:00:00:00:18:00:00:00:00:00:00:00:00:00:00:00
+[vo/gpu-next/libplacebo]     GPU 2: llvmpipe (LLVM 22.1.8, 256 bits) v1.4.354 (software)
+[vo/gpu-next/libplacebo]            uuid: 6D:65:73:61:32:36:2E:32:2E:33:00:00:00:00:00:00
+[vo/gpu-next/libplacebo] Vulkan device properties:
+[vo/gpu-next/libplacebo]     Device Name: AMD Radeon RX 7900 XTX (RADV NAVI31)
+[vo/gpu-next/libplacebo]     Device ID: 1002:744c
+[vo/gpu-next/libplacebo]     Device UUID: 00:00:00:00:03:00:00:00:00:00:00:00:00:00:00:00
+[vo/gpu-next/libplacebo]     Driver version: 6802003
+[vo/gpu-next/libplacebo]     API version: 1.4.354
+[vo/gpu-next/libplacebo]     Driver ID: VK_DRIVER_ID_MESA_RADV
+[vo/gpu-next/libplacebo]     Driver name: radv
+[vo/gpu-next/libplacebo]     Driver info: Mesa 26.2.3
+[vo/gpu-next/libplacebo]     Conformance version: 1.4.5.3
+[vo/gpu-next/libplacebo]     Driver UUID: 41:4D:44:2D:4D:45:53:41:2D:44:52:56:00:00:00:00
+[vo/gpu-next/libplacebo] Using async transfer (queue 1)
+[vo/gpu-next/libplacebo] Using async compute (queue 1)
+[vo/gpu-next/libplacebo] Creating vulkan device with extensions:
+[vo/gpu-next/libplacebo]     VK_KHR_swapchain
+[vo/gpu-next/libplacebo]     VK_KHR_swapchain
+[vo/gpu-next/libplacebo]     VK_KHR_external_memory_fd
+[vo/gpu-next/libplacebo]     VK_EXT_external_memory_dma_buf
+[vo/gpu-next/libplacebo]     VK_EXT_external_memory_host
+[vo/gpu-next/libplacebo]     VK_KHR_external_semaphore_fd
+[vo/gpu-next/libplacebo]     VK_EXT_pci_bus_info
+[vo/gpu-next/libplacebo]     VK_EXT_hdr_metadata
+[vo/gpu-next/libplacebo]     VK_EXT_image_drm_format_modifier
+[vo/gpu-next/libplacebo]     VK_KHR_swapchain_maintenance1
+[vo/gpu-next/libplacebo]     VK_EXT_swapchain_maintenance1
+[vo/gpu-next/libplacebo]     VK_EXT_descriptor_buffer
+[vo/gpu-next/libplacebo]     VK_EXT_shader_atomic_float
+[vo/gpu-next/libplacebo]     VK_KHR_dynamic_rendering
+[vo/gpu-next/libplacebo]     VK_KHR_video_decode_queue
+[vo/gpu-next/libplacebo]     VK_KHR_video_queue
+[vo/gpu-next/libplacebo]     VK_KHR_zero_initialize_workgroup_memory
+[vo/gpu-next/libplacebo]     VK_EXT_shader_object
+[vo/gpu-next/libplacebo]     VK_KHR_cooperative_matrix
+[vo/gpu-next/libplacebo]     VK_KHR_video_maintenance1
+[vo/gpu-next/libplacebo]     VK_KHR_video_decode_av1
+[vo/gpu-next/libplacebo] Memory heaps supported by device:
+[vo/gpu-next/libplacebo]     0: flags 0x0 size   30G
+[vo/gpu-next/libplacebo]     1: flags 0x1 size   23G
+[vo/gpu-next/libplacebo] Memory summary:     0 used     0 res     0 alloc, efficiency 100.00%, utilization 100.00%, max page: 1535M
+[vo/gpu-next/libplacebo] glslang version: 15.1.0
+[vo/gpu-next/libplacebo] Initialized SPIR-V compiler 'glslang'
+[vo/gpu-next/libplacebo] GPU information:
+[vo/gpu-next/libplacebo]     GLSL version: 450 (vulkan)
+[vo/gpu-next/libplacebo]       max_shmem_size:            65536
+[vo/gpu-next/libplacebo]       max_group_threads:         1024
+[vo/gpu-next/libplacebo]       max_group_size[0]:         1024
+[vo/gpu-next/libplacebo]       max_group_size[1]:         1024
+[vo/gpu-next/libplacebo]       max_group_size[2]:         1024
+[vo/gpu-next/libplacebo]       subgroup_size:             64
+[vo/gpu-next/libplacebo]       min_gather_offset:         -32
+[vo/gpu-next/libplacebo]       max_gather_offset:         31
+[vo/gpu-next/libplacebo]     Limits:
+[vo/gpu-next/libplacebo]       thread_safe:               1
+[vo/gpu-next/libplacebo]       callbacks:                 1
+[vo/gpu-next/libplacebo]       max_buf_size:              33114984448
+[vo/gpu-next/libplacebo]       max_ubo_size:              4294967295
+[vo/gpu-next/libplacebo]       max_ssbo_size:             4294967295
+[vo/gpu-next/libplacebo]       max_vbo_size:              25753026560
+[vo/gpu-next/libplacebo]       max_mapped_size:           33114984448
+[vo/gpu-next/libplacebo]       max_buffer_texels:         536870912
+[vo/gpu-next/libplacebo]       align_host_ptr:            4096
+[vo/gpu-next/libplacebo]       host_cached:               1
+[vo/gpu-next/libplacebo]       max_tex_1d_dim:            16384
+[vo/gpu-next/libplacebo]       max_tex_2d_dim:            16384
+[vo/gpu-next/libplacebo]       max_tex_3d_dim:            8192
+[vo/gpu-next/libplacebo]       blittable_1d_3d:           1
+[vo/gpu-next/libplacebo]       buf_transfer:              1
+[vo/gpu-next/libplacebo]       align_tex_xfer_pitch:      1
+[vo/gpu-next/libplacebo]       align_tex_xfer_offset:     4
+[vo/gpu-next/libplacebo]       max_variable_comps:        0
+[vo/gpu-next/libplacebo]       max_constants:             18446744073709551615
+[vo/gpu-next/libplacebo]       max_pushc_size:            256
+[vo/gpu-next/libplacebo]       align_vertex_stride:       1
+[vo/gpu-next/libplacebo]       max_dispatch[0]:           4294967295
+[vo/gpu-next/libplacebo]       max_dispatch[1]:           65535
+[vo/gpu-next/libplacebo]       max_dispatch[2]:           65535
+[vo/gpu-next/libplacebo]       fragment_queues:           1
+[vo/gpu-next/libplacebo]       compute_queues:            1
+[vo/gpu-next/libplacebo]     External API interop:
+[vo/gpu-next/libplacebo]       UUID: 00:00:00:00:03:00:00:00:00:00:00:00:00:00:00:00
+[vo/gpu-next/libplacebo]       PCI: 0000:03:00:0
+[vo/gpu-next/libplacebo]       buf export caps: 0x9
+[vo/gpu-next/libplacebo]       buf import caps: 0x19
+[vo/gpu-next/libplacebo]       tex export caps: 0x9
+[vo/gpu-next/libplacebo]       tex import caps: 0x19
+[vo/gpu-next/libplacebo]       sync export caps: 0x1
+[vo/gpu-next/libplacebo]       sync import caps: 0x0
+[vo/gpu-next/libplacebo] Available surface configurations:
+[vo/gpu-next/libplacebo]     0: VK_FORMAT_B8G8R8A8_SRGB                  VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+[vo/gpu-next/libplacebo]     1: VK_FORMAT_B8G8R8A8_UNORM                 VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+[vo/gpu-next/libplacebo] Picked surface configuration 1: VK_FORMAT_B8G8R8A8_UNORM + VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+[vo/gpu-next/libplacebo] libplacebo compiled without LittleCMS 2 support!
+[vo/gpu-next] Assuming 279.871796 FPS for display sync.
+VO: [gpu-next] 1280x720 yuv420p
+[vo/gpu-next] reconfig to 1280x720 yuv420p bt.709/bt.709/bt.1886/limited/display CL=mpeg2/4/h264 crop=1280x720+0+0 A=none
+[vo/gpu-next/x11] not waiting for MapNotify
+[vo/gpu-next/x11] Current display FPS: 164.782285
+[vo/gpu-next] Window size: 1280x720 (Borders: l=0 t=0 r=0 b=0)
+[vo/gpu-next] Video source: 1280x720 (1:1)
+[vo/gpu-next] Video display: (0, 0) 1280x720 -> (0, 0) 1280x720
+[vo/gpu-next] Video scale: 1.000000/1.000000
+[vo/gpu-next] OSD borders: l=0 t=0 r=0 b=0
+[vo/gpu-next] Video borders: l=0 t=0 r=0 b=0
+[vo/gpu-next] Assuming 164.782285 FPS for display sync.
+[vo/gpu-next/libplacebo] Spent 52.318 ms translating SPIR-V
+[vo/gpu-next/libplacebo] Spent 28.964 ms translating SPIR-V
+[vo/gpu-next/libplacebo] Dithering to 8 bit depth
+[vo/gpu-next/x11] Current display FPS: 279.871796
+[vo/gpu-next] Window size: 2518x1343 (Borders: l=0 t=0 r=0 b=0)
+[vo/gpu-next] Video source: 1280x720 (1:1)
+[vo/gpu-next] Video display: (0, 0) 1280x720 -> (65, 0) 2387x1343
+[vo/gpu-next] Video scale: 1.864844/1.865278
+[vo/gpu-next] OSD borders: l=65 t=0 r=66 b=0
+[vo/gpu-next] Video borders: l=65 t=0 r=66 b=0
+[vo/gpu-next] Assuming 279.871796 FPS for display sync.
+[vo/gpu-next/libplacebo] Detected fps ratio 0.0000 below threshold 0.0100, disabling interpolation
+[vo/gpu-next/libplacebo] Spent 27.905 ms translating SPIR-V
+[vo/gpu-next/libplacebo] Spent 40.737 ms translating SPIR-V
+[vo/gpu-next/x11] Disabling screensaver.
+[vo/gpu-next/libplacebo] Estimated source FPS: 30.000, display FPS: 30.000
+[vo/gpu-next/x11] Enabling screensaver.
+Exiting... (End of file)

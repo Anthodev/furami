@@ -1,0 +1,13 @@
+Option gpu-context: 'waylandvk' isn't supported.
+Error parsing option gpu-context (option parameter could not be parsed)
+/home/anthodev/.config/mpv/mpv.conf:22: setting option gpu-context='waylandvk' failed.
+Available video outputs:
+  gpu-next         Video output based on libplacebo
+  gpu              Shader-based GPU Renderer
+  x11              X11 (software scaling)
+  libmpv           render API for libmpv
+  null             Null video output
+  image            Write video frames to image files
+  tct              true-color terminals
+  kitty            Kitty terminal graphics protocol
+

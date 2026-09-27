@@ -1,0 +1,705 @@
+{
+  "source_bundle": "qualified-G-common-720p60-v2",
+  "source_manifest_sha256": "1669a5720eb30efe000e9a1514d305cf37c7a3b953bd2576ed38347889b0bb1b",
+  "source_status": "complete",
+  "source_probes": {
+    "planned": 31,
+    "ran": 31,
+    "not_run": 0
+  },
+  "stack": {
+    "identity_file": {
+      "path": "stack_identity.txt",
+      "sha256": "bd2e290c5c094eaf19536dc91251e4304dc6d46c546df640fa4ece96bcb03cee"
+    },
+    "bins": {
+      "mpv": {
+        "path": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2"
+      },
+      "ffmpeg": {
+        "path": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e"
+      },
+      "libmpv": {
+        "path": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/lib/libmpv.so",
+        "sha256": "801c9dcd8e87516249d05a11dc76a1cbc30c3e792d442762c8fe79e73746e85c"
+      }
+    }
+  },
+  "commands": {
+    "mpv_vo_list": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--vo=help"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_vo_list.stdout",
+        "bytes": 596,
+        "sha256": "3c582b1af06d6f61bf11d0d3a8d0a0b3e7135e7e5d0f440357f0417b0bbe3422"
+      },
+      "stderr": {
+        "path": "probes/mpv_vo_list.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "mpv_gpu_context_list": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--gpu-context=help"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_gpu_context_list.stdout",
+        "bytes": 355,
+        "sha256": "8209056ff83bf220276d0d39fb43bf51b01a2d3b6fc6144cbc8e5758619c4a5c"
+      },
+      "stderr": {
+        "path": "probes/mpv_gpu_context_list.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "mpv_vf_list": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--vf=help"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_vf_list.stdout",
+        "bytes": 14400,
+        "sha256": "7020823c767c9e5877888a9f42b1c759ae21c379c1d492a05a9d6c15cdc6becc"
+      },
+      "stderr": {
+        "path": "probes/mpv_vf_list.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "ffmpeg_formats_devices_list": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-formats"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/ffmpeg_formats_devices_list.stdout",
+        "bytes": 16980,
+        "sha256": "0d50b69ee7819aa6806af68a528c0d3bd4bb60a50903abee9617ba470536f8e9"
+      },
+      "stderr": {
+        "path": "probes/ffmpeg_formats_devices_list.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "ffmpeg_pix_fmts_list": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-pix_fmts"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/ffmpeg_pix_fmts_list.stdout",
+        "bytes": 15929,
+        "sha256": "71e2388cc4d5b109470a24524d563363d647b6b6de8706b8fe5a19e2b2eb8240"
+      },
+      "stderr": {
+        "path": "probes/ffmpeg_pix_fmts_list.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "ffmpeg_filters_list": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-filters"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/ffmpeg_filters_list.stdout",
+        "bytes": 34060,
+        "sha256": "34e4e9c79570719218198616bfc1a51131418199eb8846939d1832f202c36388"
+      },
+      "stderr": {
+        "path": "probes/ffmpeg_filters_list.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "ffmpeg_decoders_list": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-decoders"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/ffmpeg_decoders_list.stdout",
+        "bytes": 26467,
+        "sha256": "051ae91db4dba6dc5a08e9eb9551965ec32a5dd3c8c27b1c21f04b477ab1c075"
+      },
+      "stderr": {
+        "path": "probes/ffmpeg_decoders_list.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "mpv_vf_format_param_help": {
+      "argv": [
+        "bash",
+        "-c",
+        "for a in \"--vf=format=help\" \"--vf=format=fmt=help\"; do echo \"===== mpv $a =====\"; \"$1\" --config=no $a 2>&1; echo \"===== rc=$? for $a =====\"; done; exit 0",
+        "bash",
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv"
+      ],
+      "executable": "/usr/bin/bash",
+      "executable_sha256": "379c1bfc53d08815975c647ad7da5d19d8e8a8566ce8097c50231c8b116e5e7b",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_vf_format_param_help.stdout",
+        "bytes": 4730,
+        "sha256": "e2df73e7650ad7344a1b0afb45d03b12f564c97531adadd83d93a67bfa78d824"
+      },
+      "stderr": {
+        "path": "probes/mpv_vf_format_param_help.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "ffmpeg_filter_option_help": {
+      "argv": [
+        "bash",
+        "-c",
+        "for f in eq unsharp hqdn3d bwdif; do echo \"===== ffmpeg -h filter=$f =====\"; \"$1\" -hide_banner -h \"filter=$f\" 2>&1; echo \"===== rc=$? for $f =====\"; done; exit 0",
+        "bash",
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg"
+      ],
+      "executable": "/usr/bin/bash",
+      "executable_sha256": "379c1bfc53d08815975c647ad7da5d19d8e8a8566ce8097c50231c8b116e5e7b",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/ffmpeg_filter_option_help.stdout",
+        "bytes": 5477,
+        "sha256": "71754677df32d4780f7f885ec65607c4d4372251f7a4d95cfb03402fbb5eb86c"
+      },
+      "stderr": {
+        "path": "probes/ffmpeg_filter_option_help.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "mpv_renderer_option_help": {
+      "argv": [
+        "bash",
+        "-c",
+        "for o in scale cscale dscale dither; do echo \"===== mpv --$o=help =====\"; \"$1\" --config=no --$o=help 2>&1; echo \"===== rc=$? for $o =====\"; done; echo \"===== mpv --list-options (renderer rows) =====\"; \"$1\" --config=no --list-options 2>/dev/null | grep -E \"^ --(scale|cscale|dscale|scale-antiring|dither|deband|deband-iterations|deband-grain)( |$)\" ; echo \"===== rc=$? for list-options grep =====\"; exit 0",
+        "bash",
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv"
+      ],
+      "executable": "/usr/bin/bash",
+      "executable_sha256": "379c1bfc53d08815975c647ad7da5d19d8e8a8566ce8097c50231c8b116e5e7b",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_renderer_option_help.stdout",
+        "bytes": 3832,
+        "sha256": "b269236dabca2a2aa339070d830fae1def5af5bd615aece49f57d60f558f61d3"
+      },
+      "stderr": {
+        "path": "probes/mpv_renderer_option_help.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "mpv_render_gpu_next_x11vk": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--config=no",
+        "--msg-level=all=info,vo=v",
+        "--vo=gpu-next",
+        "--gpu-context=x11vk",
+        "--gpu-api=vulkan",
+        "--scale=ewa_lanczossharp",
+        "--cscale=ewa_lanczossharp",
+        "--dscale=mitchell",
+        "--scale-antiring=0.7",
+        "--dither=error-diffusion",
+        "--deband=yes",
+        "--deband-iterations=2",
+        "--deband-grain=16",
+        "--frames=90",
+        "--ao=null",
+        "av://lavfi:testsrc2=size=1280x720:rate=30:d=2"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_render_gpu_next_x11vk.stdout",
+        "bytes": 9055,
+        "sha256": "0441a6351a44cbeba32cda3eec1111f7b58fd6fac98f1b3b06dee3de6ca535c9"
+      },
+      "stderr": {
+        "path": "probes/mpv_render_gpu_next_x11vk.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "mpv_vf_native_format": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--config=no",
+        "--msg-level=all=info,vo=v",
+        "--vo=null",
+        "--ao=null",
+        "--frames=90",
+        "--vf=format=fmt=yuv420p",
+        "av://lavfi:testsrc2=size=320x240:rate=60:d=1"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_vf_native_format.stdout",
+        "bytes": 221,
+        "sha256": "0b24ddfb2e7c4b41d93787873169b7b472b4765298035ccfa7495b1fbe1c0b07"
+      },
+      "stderr": {
+        "path": "probes/mpv_vf_native_format.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "mpv_vf_lavfi_eq": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--config=no",
+        "--msg-level=all=info,vo=v",
+        "--vo=null",
+        "--ao=null",
+        "--frames=90",
+        "--vf=lavfi=[eq=contrast=1.06:saturation=1.04]",
+        "av://lavfi:testsrc2=size=320x240:rate=60:d=1"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_vf_lavfi_eq.stdout",
+        "bytes": 221,
+        "sha256": "0b24ddfb2e7c4b41d93787873169b7b472b4765298035ccfa7495b1fbe1c0b07"
+      },
+      "stderr": {
+        "path": "probes/mpv_vf_lavfi_eq.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "mpv_vf_lavfi_unsharp": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--config=no",
+        "--msg-level=all=info,vo=v",
+        "--vo=null",
+        "--ao=null",
+        "--frames=90",
+        "--vf=lavfi=[unsharp=5:5:0.6]",
+        "av://lavfi:testsrc2=size=320x240:rate=60:d=1"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_vf_lavfi_unsharp.stdout",
+        "bytes": 221,
+        "sha256": "0b24ddfb2e7c4b41d93787873169b7b472b4765298035ccfa7495b1fbe1c0b07"
+      },
+      "stderr": {
+        "path": "probes/mpv_vf_lavfi_unsharp.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "mpv_vf_lavfi_hqdn3d": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--config=no",
+        "--msg-level=all=info,vo=v",
+        "--vo=null",
+        "--ao=null",
+        "--frames=90",
+        "--vf=lavfi=[hqdn3d=1.5:1.5:6:6]",
+        "av://lavfi:testsrc2=size=320x240:rate=60:d=1"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_vf_lavfi_hqdn3d.stdout",
+        "bytes": 221,
+        "sha256": "0b24ddfb2e7c4b41d93787873169b7b472b4765298035ccfa7495b1fbe1c0b07"
+      },
+      "stderr": {
+        "path": "probes/mpv_vf_lavfi_hqdn3d.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "mpv_vf_lavfi_bwdif": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--config=no",
+        "--msg-level=all=info,vo=v",
+        "--vo=null",
+        "--ao=null",
+        "--frames=90",
+        "--vf=lavfi=[tinterlace=mode=interleave_top],lavfi=[bwdif=mode=send_field]",
+        "av://lavfi:testsrc2=size=320x240:rate=60:d=1"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/mpv_vf_lavfi_bwdif.stdout",
+        "bytes": 221,
+        "sha256": "0b24ddfb2e7c4b41d93787873169b7b472b4765298035ccfa7495b1fbe1c0b07"
+      },
+      "stderr": {
+        "path": "probes/mpv_vf_lavfi_bwdif.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "v4l2_list_formats": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-f",
+        "v4l2",
+        "-list_formats",
+        "all",
+        "-i",
+        "/dev/video0"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_list_formats.stdout",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "probes/v4l2_list_formats.stderr",
+        "bytes": 572,
+        "sha256": "841e2f8812bb488c9edbf56bad095ec3c36918b54657f1c8191e445514965b21"
+      }
+    },
+    "v4l2_open_nv12_ffmpeg": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-v",
+        "info",
+        "-f",
+        "v4l2",
+        "-input_format",
+        "nv12",
+        "-video_size",
+        "1280x720",
+        "-framerate",
+        "60",
+        "-i",
+        "/dev/video0",
+        "-frames:v",
+        "8",
+        "-f",
+        "null",
+        "-"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_open_nv12_ffmpeg.stdout",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "probes/v4l2_open_nv12_ffmpeg.stderr",
+        "bytes": 831,
+        "sha256": "a4cb2c51a90b6647062d537be52a1b890860158c848d37b7547fa4afdf70f166"
+      }
+    },
+    "v4l2_open_yuyv_ffmpeg": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-v",
+        "info",
+        "-f",
+        "v4l2",
+        "-input_format",
+        "yuyv422",
+        "-video_size",
+        "1280x720",
+        "-framerate",
+        "60",
+        "-i",
+        "/dev/video0",
+        "-frames:v",
+        "8",
+        "-f",
+        "null",
+        "-"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_open_yuyv_ffmpeg.stdout",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "probes/v4l2_open_yuyv_ffmpeg.stderr",
+        "bytes": 837,
+        "sha256": "cf12c2cd58d50f31a15f786da7a170b0a5e898a6705c9bef8bc5f9dfaac887b2"
+      }
+    },
+    "v4l2_open_mjpeg_ffmpeg": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-v",
+        "info",
+        "-f",
+        "v4l2",
+        "-input_format",
+        "mjpeg",
+        "-video_size",
+        "1280x720",
+        "-framerate",
+        "60",
+        "-i",
+        "/dev/video0",
+        "-frames:v",
+        "8",
+        "-f",
+        "null",
+        "-"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_open_mjpeg_ffmpeg.stdout",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "probes/v4l2_open_mjpeg_ffmpeg.stderr",
+        "bytes": 861,
+        "sha256": "ab8b7c573332a9a14c2af6b78fa80998cc16918bc21f8818068a6ac6d525bd28"
+      }
+    },
+    "v4l2_open_nv12_mpv": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--config=no",
+        "--msg-level=all=info",
+        "--demuxer-lavf-format=v4l2",
+        "--demuxer-lavf-o=input_format=nv12,video_size=1280x720,framerate=60",
+        "--vo=null",
+        "--ao=null",
+        "--frames=30",
+        "av://v4l2:/dev/video0"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_open_nv12_mpv.stdout",
+        "bytes": 246,
+        "sha256": "873c91f6749037891a64a2d433c65906c069c89142913c41d35758e0eb8b4d8f"
+      },
+      "stderr": {
+        "path": "probes/v4l2_open_nv12_mpv.stderr",
+        "bytes": 102,
+        "sha256": "143b5d32d6b95c95ccf65fe8505a1cd84da74b59a557901f95e0aeca714e1060"
+      }
+    },
+    "v4l2_open_yuyv_mpv": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--config=no",
+        "--msg-level=all=info",
+        "--demuxer-lavf-format=v4l2",
+        "--demuxer-lavf-o=input_format=yuyv422,video_size=1280x720,framerate=60",
+        "--vo=null",
+        "--ao=null",
+        "--frames=30",
+        "av://v4l2:/dev/video0"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_open_yuyv_mpv.stdout",
+        "bytes": 249,
+        "sha256": "e2677addf08798f14ab39248f877ae7d89f4088dc73ed0129f2fdeb32cdaa2bb"
+      },
+      "stderr": {
+        "path": "probes/v4l2_open_yuyv_mpv.stderr",
+        "bytes": 102,
+        "sha256": "143b5d32d6b95c95ccf65fe8505a1cd84da74b59a557901f95e0aeca714e1060"
+      }
+    },
+    "pulse_source_capture": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-v",
+        "info",
+        "-f",
+        "pulse",
+        "-i",
+        "alsa_input.usb-GENKI_ShadowCast_3_KT044001-02.analog-stereo",
+        "-t",
+        "3",
+        "-af",
+        "volumedetect",
+        "-f",
+        "null",
+        "-"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/pulse_source_capture.stdout",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "probes/pulse_source_capture.stderr",
+        "bytes": 1576,
+        "sha256": "f8170a51c6c536c905543d81ad2d6aeb850dbf7a2d0a3dd5512245ede445178b"
+      }
+    },
+    "pulse_sink_tone_monitor": {
+      "argv": [
+        "sh",
+        "-c",
+        "\"$1\" -hide_banner -v info -f lavfi -i \"sine=frequency=440:duration=2\" -f pulse -device \"$2\" \"furami-probe-tone\" & tone=$!; sleep 1; \"$1\" -hide_banner -v info -f pulse -i \"$2.monitor\" -t 2 -af volumedetect -f null - 2>&1; echo \"--- monitor volumedetect rc=$? ---\"; kill \"$tone\" 2>/dev/null; wait \"$tone\" 2>/dev/null; echo \"--- tone rc=$? (143 = our TERM) ---\"; exit 0",
+        "sh",
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "alsa_output.usb-Fosi_Audio_Fosi_Audio_K7-00.analog-stereo"
+      ],
+      "executable": "/usr/bin/bash",
+      "executable_sha256": "379c1bfc53d08815975c647ad7da5d19d8e8a8566ce8097c50231c8b116e5e7b",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/pulse_sink_tone_monitor.stdout",
+        "bytes": 1545,
+        "sha256": "13b82a53b2253730f8ba5f39ca78de4f151dec5cf3ec48f65c3864934ff3a4f1"
+      },
+      "stderr": {
+        "path": "probes/pulse_sink_tone_monitor.stderr",
+        "bytes": 704,
+        "sha256": "b1b1cf777a0977f7df9e64dcd1b5fd7e22aa5bd749d03310754f2b2aa6903e58"
+      }
+    },
+    "pulse_direct_source_to_sink": {
+      "argv": [
+        "/home/anthodev/dev/perso/rust/furami/packaging/media/probes/pulse-direct.sh",
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "alsa_input.usb-GENKI_ShadowCast_3_KT044001-02.analog-stereo",
+        "alsa_output.usb-Fosi_Audio_Fosi_Audio_K7-00.analog-stereo"
+      ],
+      "executable": "/home/anthodev/dev/perso/rust/furami/packaging/media/probes/pulse-direct.sh",
+      "executable_sha256": "ddaa12e7d953c4d2c9f0556bd2b199432150d1332b1425dc7de3a9c811149a9b",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/pulse_direct_source_to_sink.stdout",
+        "bytes": 4560,
+        "sha256": "2d8f83ca37ff792df928543698f889c83e06679866cf2b34a9e2e3e437f7189f"
+      },
+      "stderr": {
+        "path": "probes/pulse_direct_source_to_sink.stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  }
+}

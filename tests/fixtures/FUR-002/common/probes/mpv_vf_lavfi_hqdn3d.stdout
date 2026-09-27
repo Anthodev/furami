@@ -1,0 +1,4 @@
+● Video  --vid=1  (wrapped_avframe 320x240 60 fps)
+VO: [null] 320x240 yuv420p
+[vo/null] reconfig to 320x240 yuv420p bt.601/bt.709/bt.1886/limited/display CL=mpeg2/4/h264 crop=320x240+0+0 A=none
+Exiting... (End of file)

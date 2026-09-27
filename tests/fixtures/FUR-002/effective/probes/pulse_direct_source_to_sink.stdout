@@ -1,0 +1,64 @@
+--- relay stream=furami-direct-source-to-sink-1572551 ---
+--- sinks ---
+121	easyeffects_sink	PipeWire	float32le 2ch 48000Hz	RUNNING
+--- sinks rc=0 ---
+--- sink-inputs ---
+Sink Input #4414
+	Sink: 121
+        media.name = "furami-direct-source-to-sink-1572551"
+--- sink-inputs rc=0 ---
+--- pw-link ---
+--- pw-link rc=0 ---
+--- sink monitor ---
+[aist#0:0/pcm_s16le @ 0x55b588f71840] Guessed Channel Layout: stereo
+Input #0, pulse, from 'easyeffects_sink.monitor':
+  Duration: N/A, start: 1790528916.605653, bitrate: 1536 kb/s
+  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s, start 1790528916.605653
+[Parsed_volumedetect_0 @ 0x55b588f72f40] n_samples: 0
+Stream mapping:
+  Stream #0:0 -> #0:0 (pcm_s16le (native) -> pcm_s16le (native))
+Press [q] to stop, [?] for help
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf62.12.102
+  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s
+    Metadata:
+      encoder         : Lavc62.28.102 pcm_s16le
+size=N/A time=00:00:00.54 bitrate=N/A speed= 1.1x elapsed=0:00:00.50    size=N/A time=00:00:01.05 bitrate=N/A speed=1.05x elapsed=0:00:01.00    size=N/A time=00:00:01.55 bitrate=N/A speed=1.03x elapsed=0:00:01.50    [Parsed_volumedetect_0 @ 0x7ff1f4002100] n_samples: 196800
+[Parsed_volumedetect_0 @ 0x7ff1f4002100] mean_volume: -25.0 dB
+[Parsed_volumedetect_0 @ 0x7ff1f4002100] max_volume: -9.6 dB
+[Parsed_volumedetect_0 @ 0x7ff1f4002100] histogram_9db: 5
+[Parsed_volumedetect_0 @ 0x7ff1f4002100] histogram_10db: 42
+[Parsed_volumedetect_0 @ 0x7ff1f4002100] histogram_11db: 113
+[Parsed_volumedetect_0 @ 0x7ff1f4002100] histogram_12db: 316
+[out#0/null @ 0x55b588f71a40] video:0KiB audio:375KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+size=N/A time=00:00:02.00 bitrate=N/A speed=0.979x elapsed=0:00:02.04    
+--- monitor rc=0 ---
+--- relay transcript ---
+[aist#0:0/pcm_s16le @ 0x562d7e468a00] Guessed Channel Layout: stereo
+Input #0, pulse, from 'alsa_input.usb-GENKI_ShadowCast_3_KT044001-02.analog-stereo':
+  Duration: N/A, start: 1790528914.600387, bitrate: 1536 kb/s
+  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s, start 1790528914.600387
+[Parsed_volumedetect_0 @ 0x562d7e46a180] n_samples: 0
+Stream mapping:
+  Stream #0:0 -> #0:0 (pcm_s16le (native) -> pcm_s16le (native))
+Press [q] to stop, [?] for help
+Output #0, pulse, to 'furami-direct-source-to-sink-1572551':
+  Metadata:
+    encoder         : Lavf62.12.102
+  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s
+    Metadata:
+      encoder         : Lavc62.28.102 pcm_s16le
+size=N/A time=00:00:00.54 bitrate=N/A speed= 1.1x elapsed=0:00:00.50    size=N/A time=00:00:01.04 bitrate=N/A speed=1.05x elapsed=0:00:01.00    size=N/A time=00:00:01.54 bitrate=N/A speed=1.03x elapsed=0:00:01.50    size=N/A time=00:00:02.04 bitrate=N/A speed=1.02x elapsed=0:00:02.00    size=N/A time=00:00:02.54 bitrate=N/A speed=1.02x elapsed=0:00:02.50    size=N/A time=00:00:03.04 bitrate=N/A speed=1.02x elapsed=0:00:03.00    size=N/A time=00:00:03.54 bitrate=N/A speed=1.01x elapsed=0:00:03.50    size=N/A time=00:00:04.04 bitrate=N/A speed=1.01x elapsed=0:00:04.00    size=N/A time=00:00:04.54 bitrate=N/A speed=1.01x elapsed=0:00:04.50    size=N/A time=00:00:04.99 bitrate=N/A speed=   1x elapsed=0:00:05.00    size=N/A time=00:00:05.50 bitrate=N/A speed=   1x elapsed=0:00:05.50    size=N/A time=00:00:06.00 bitrate=N/A speed=   1x elapsed=0:00:06.00    size=N/A time=00:00:06.50 bitrate=N/A speed=   1x elapsed=0:00:06.50    size=N/A time=00:00:07.00 bitrate=N/A speed=   1x elapsed=0:00:07.00    size=N/A time=00:00:07.50 bitrate=N/A speed=   1x elapsed=0:00:07.50    [Parsed_volumedetect_0 @ 0x7f79fc002100] n_samples: 772800
+[Parsed_volumedetect_0 @ 0x7f79fc002100] mean_volume: -37.9 dB
+[Parsed_volumedetect_0 @ 0x7f79fc002100] max_volume: -23.6 dB
+[Parsed_volumedetect_0 @ 0x7f79fc002100] histogram_23db: 5
+[Parsed_volumedetect_0 @ 0x7f79fc002100] histogram_24db: 146
+[Parsed_volumedetect_0 @ 0x7f79fc002100] histogram_25db: 539
+[Parsed_volumedetect_0 @ 0x7f79fc002100] histogram_26db: 1269
+[out#0/pulse @ 0x562d7e468c00] video:0KiB audio:1500KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+size=N/A time=00:00:08.00 bitrate=N/A speed=0.994x elapsed=0:00:08.04    
+--- relay rc=0 ---
+--- ffmpeg sha256 ---
+1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e  /home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg
+--- ffmpeg sha256 rc=0 ---

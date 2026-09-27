@@ -1,0 +1,15 @@
+[in#0 @ 0x55b310476740] The driver changed the time per frame from 1/60 to 1/50
+Input #0, video4linux2,v4l2, from '/dev/video0':
+  Duration: N/A, start: 40106.308751, bitrate: 2949120 kb/s
+  Stream #0:0: Video: rawvideo (YUY2 / 0x32595559), yuyv422, 2560x1440, 2949120 kb/s, 50 fps, 50 tbr, 1000k tbn, start 40106.308751
+Stream mapping:
+  Stream #0:0 -> #0:0 (rawvideo (native) -> wrapped_avframe (native))
+Press [q] to stop, [?] for help
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf62.12.102
+  Stream #0:0: Video: wrapped_avframe, yuyv422(progressive), 2560x1440, q=2-31, 200 kb/s, 50 fps, 50 tbn
+    Metadata:
+      encoder         : Lavc62.28.102 wrapped_avframe
+[out#0/null @ 0x55b310479300] video:3KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+frame=    8 fps=0.0 q=-0.0 Lsize=N/A time=00:00:00.18 bitrate=N/A speed=0.993x elapsed=0:00:00.18    

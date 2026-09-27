@@ -1,0 +1,3 @@
+[in#0 @ 0x560627c50440] Error opening input: Device or resource busy
+Error opening input file /dev/video0.
+Error opening input files: Device or resource busy

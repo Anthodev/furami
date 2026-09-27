@@ -1,0 +1,35 @@
+===== mpv --vf=format=help =====
+Options:
+
+ fmt                            Image format (default: no)
+ colormatrix                    Choices: auto bt.601 bt.709 smpte-240m bt.2020-ncl bt.2020-cl bt.2100-pq bt.2100-hlg dolbyvision rgb xyz ycgco ycgco-re ycgco-ro (default: auto)
+ colorlevels                    Choices: auto limited full (default: auto)
+ primaries                      Choices: auto bt.601-525 bt.601-625 bt.709 bt.2020 bt.470m apple adobe prophoto cie1931 dci-p3 display-p3 v-gamut s-gamut ebu3213 film-c aces-ap0 aces-ap1 (default: auto)
+ gamma                          Choices: auto bt.1886 srgb linear gamma1.8 gamma2.0 gamma2.2 gamma2.4 gamma2.6 gamma2.8 prophoto pq hlg v-log s-log1 s-log2 st428 (default: auto)
+ transfer                       alias for gamma
+ sig-peak                       Float (default: 0)
+ light                          Choices: auto display hlg 709-1886 gamma1.2 (default: auto)
+ chroma-location                Choices: unknown uhd mpeg2/4/h264 mpeg1/jpeg top bottom-left bottom (default: unknown)
+ stereo-in                      Choices: no mono sbs2l ab2r ab2l checkr checkl irr irl icr icl arcc sbs2r agmc al ar (default: mono)
+ rotate                         Integer (-1 to 359) (default: -1)
+ alpha                          Choices: auto straight premul none (default: auto)
+ w                              Integer (default: 0)
+ h                              Integer (default: 0)
+ dw                             Integer (default: 0)
+ dh                             Integer (default: 0)
+ dar                            Double (default: 0)
+ convert                        Flag (default: no)
+ dolbyvision                    Flag (default: yes)
+ hdr10plus                      Flag (default: yes)
+ min-luma                       Float (0 to 10000) (default: 0)
+ max-luma                       Float (0 to 10000) (default: 0)
+ max_cll                        Float (0 to 10000) (default: 0)
+ max_fall                       Float (0 to 10000) (default: 0)
+ film-grain                     Flag (default: yes)
+ force-scaler                   Choices: auto sws zimg (default: auto)
+
+Total: 26 options
+===== rc=0 for --vf=format=help =====
+===== mpv --vf=format=fmt=help =====
+Available formats: yuv444p yuv420p gray gray16 uyvy422 nv12 p010 argb bgra abgr rgba bgr24 rgb24 0rgb bgr0 0bgr rgb0 rgba64 rgb565 pal8 vdpau d3d11 dxva2_vld mmal mediacodec cuda yap8 yap16 grayaf32 yuv444pf yuva444pf yuv420pf yuva420pf yuv422pf yuva422pf yuv440pf yuva440pf yuv410pf yuva410pf yuv411pf yuva411pf rgb30 y1 gbrp1 gbrp2 gbrp3 gbrp4 gbrp5 gbrp6 vdpau_output vaapi videotoolbox vulkan drm_prime yuyv422 yuv422p yuv410p yuv411p monow monob yuvj422p uyyvyy411 bgr8 bgr4 bgr4_byte rgb8 rgb4 rgb4_byte nv21 gray16be yuv440p yuvj440p yuva420p rgb48be rgb48 rgb565be rgb555be rgb555 bgr565be bgr565 bgr555be bgr555 yuv420p16 yuv420p16be yuv422p16 yuv422p16be yuv444p16 yuv444p16be rgb444 rgb444be bgr444 bgr444be ya8 bgr48be bgr48 yuv420p9be yuv420p9 yuv420p10be yuv420p10 yuv422p10be yuv422p10 yuv444p9be yuv444p9 yuv444p10be yuv444p10 yuv422p9be yuv422p9 gbrp gbrp9be gbrp9 gbrp10be gbrp10 gbrp16be gbrp16 yuva422p yuva444p yuva420p9be yuva420p9 yuva422p9be yuva422p9 yuva444p9be yuva444p9 yuva420p10be yuva420p10 yuva422p10be yuva422p10 yuva444p10be yuva444p10 yuva420p16be yuva420p16 yuva422p16be yuva422p16 yuva444p16be yuva444p16 xyz12 xyz12be nv16 nv20 nv20be rgba64be bgra64be bgra64 yvyu422 ya16be ya16 gbrap gbrap16be gbrap16 qsv d3d11va_vld yuv420p12be yuv420p12 yuv420p14be yuv420p14 yuv422p12be yuv422p12 yuv422p14be yuv422p14 yuv444p12be yuv444p12 yuv444p14be yuv444p14 gbrp12be gbrp12 gbrp14be gbrp14 yuvj411p bayer_bggr8 bayer_rggb8 bayer_gbrg8 bayer_grbg8 bayer_bggr16 bayer_bggr16be bayer_rggb16 bayer_rggb16be bayer_gbrg16 bayer_gbrg16be bayer_grbg16 bayer_grbg16be yuv440p10 yuv440p10be yuv440p12 yuv440p12be ayuv64 ayuv64be p010be gbrap12be gbrap12 gbrap10be gbrap10 gray12be gray12 gray10be gray10 p016 p016be gray9be gray9 gbrpf32be gbrpf32 gbrapf32be gbrapf32 opencl gray14be gray14 grayf32be grayf32 yuva422p12be yuva422p12 yuva444p12be yuva444p12 nv24 nv42 y210be y210 x2rgb10be x2bgr10 x2bgr10be p210be p210 p410be p410 p216be p216 p416be p416 vuya rgbaf16be rgbaf16 vuyx p012 p012be y212be y212 xv30be xv30 xv36be xv36 rgbf32be rgbf32 rgbaf32be rgbaf32 p212be p212 p412be p412 gbrap14be gbrap14 d3d12 ayuv uyva vyu444 v30xbe v30x rgbf16be rgbf16 rgba128be rgba128 rgb96be rgb96 y216be y216 xv48be xv48 gbrpf16be gbrpf16 gbrapf16be gbrapf16 grayf16be grayf16 amf gray32be gray32 yaf32be yaf32 yaf16be yaf16 gbrap32be gbrap32 yuv444p10msbbe yuv444p10msb yuv444p12msbbe yuv444p12msb gbrp10msbbe gbrp10msb gbrp12msbbe gbrp12msb ohcodec no
+===== rc=0 for --vf=format=fmt=help =====

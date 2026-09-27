@@ -1,0 +1,23 @@
+[aist#0:0/pcm_s16le @ 0x564b5a46f840] Guessed Channel Layout: stereo
+Input #0, pulse, from 'easyeffects_sink.monitor':
+  Duration: N/A, start: 1790528912.417606, bitrate: 1536 kb/s
+  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s, start 1790528912.417606
+[Parsed_volumedetect_0 @ 0x564b5a470f40] n_samples: 0
+Stream mapping:
+  Stream #0:0 -> #0:0 (pcm_s16le (native) -> pcm_s16le (native))
+Press [q] to stop, [?] for help
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf62.12.102
+  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s
+    Metadata:
+      encoder         : Lavc62.28.102 pcm_s16le
+size=N/A time=00:00:00.54 bitrate=N/A speed= 1.1x elapsed=0:00:00.50    size=N/A time=00:00:01.04 bitrate=N/A speed=1.04x elapsed=0:00:01.00    size=N/A time=00:00:01.54 bitrate=N/A speed=1.03x elapsed=0:00:01.50    size=N/A time=00:00:02.00 bitrate=N/A speed=   1x elapsed=0:00:02.00    [Parsed_volumedetect_0 @ 0x7f6438002100] n_samples: 201600
+[Parsed_volumedetect_0 @ 0x7f6438002100] mean_volume: -26.2 dB
+[Parsed_volumedetect_0 @ 0x7f6438002100] max_volume: -12.4 dB
+[Parsed_volumedetect_0 @ 0x7f6438002100] histogram_12db: 32
+[Parsed_volumedetect_0 @ 0x7f6438002100] histogram_13db: 205
+[out#0/null @ 0x564b5a46fa40] video:0KiB audio:377KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+size=N/A time=00:00:02.00 bitrate=N/A speed=0.952x elapsed=0:00:02.10    
+--- monitor volumedetect rc=0 ---
+--- tone rc=0 (143 = our TERM) ---

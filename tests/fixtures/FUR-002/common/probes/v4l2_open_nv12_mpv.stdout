@@ -1,0 +1,5 @@
+● Video  --vid=1  (rawvideo 1280x720 60 fps)
+VO: [null] 1280x720 nv12
+[ffmpeg/demuxer] video4linux2,v4l2: Some buffers are still owned by the caller on close.
+Exiting... (End of file)
+[ffmpeg] ioctl(VIDIOC_QBUF): Inappropriate ioctl for device

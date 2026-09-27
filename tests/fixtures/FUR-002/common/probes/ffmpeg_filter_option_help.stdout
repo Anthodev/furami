@@ -1,0 +1,98 @@
+===== ffmpeg -h filter=eq =====
+Filter eq
+  Adjust brightness, contrast, gamma, and saturation.
+    Inputs:
+       #0: default (video)
+    Outputs:
+       #0: default (video)
+eq AVOptions:
+   contrast          <string>     ..FV.....T. set the contrast adjustment, negative values give a negative image (default "1.0")
+   brightness        <string>     ..FV.....T. set the brightness adjustment (default "0.0")
+   saturation        <string>     ..FV.....T. set the saturation adjustment (default "1.0")
+   gamma             <string>     ..FV.....T. set the initial gamma value (default "1.0")
+   gamma_r           <string>     ..FV.....T. gamma value for red (default "1.0")
+   gamma_g           <string>     ..FV.....T. gamma value for green (default "1.0")
+   gamma_b           <string>     ..FV.....T. gamma value for blue (default "1.0")
+   gamma_weight      <string>     ..FV.....T. set the gamma weight which reduces the effect of gamma on bright areas (default "1.0")
+   eval              <int>        ..FV....... specify when to evaluate expressions (from 0 to 1) (default init)
+     init            0            ..FV....... eval expressions once during initialization
+     frame           1            ..FV....... eval expressions per-frame
+
+This filter has support for timeline through the 'enable' option.
+
+Exiting with exit code 0
+===== rc=0 for eq =====
+===== ffmpeg -h filter=unsharp =====
+Filter unsharp
+  Sharpen or blur the input video.
+    slice threading supported
+    Inputs:
+       #0: default (video)
+    Outputs:
+       #0: default (video)
+unsharp AVOptions:
+   luma_msize_x      <int>        ..FV....... set luma matrix horizontal size (from 3 to 23) (default 5)
+   lx                <int>        ..FV....... set luma matrix horizontal size (from 3 to 23) (default 5)
+   luma_msize_y      <int>        ..FV....... set luma matrix vertical size (from 3 to 23) (default 5)
+   ly                <int>        ..FV....... set luma matrix vertical size (from 3 to 23) (default 5)
+   luma_amount       <float>      ..FV....... set luma effect strength (from -2 to 5) (default 1)
+   la                <float>      ..FV....... set luma effect strength (from -2 to 5) (default 1)
+   chroma_msize_x    <int>        ..FV....... set chroma matrix horizontal size (from 3 to 23) (default 5)
+   cx                <int>        ..FV....... set chroma matrix horizontal size (from 3 to 23) (default 5)
+   chroma_msize_y    <int>        ..FV....... set chroma matrix vertical size (from 3 to 23) (default 5)
+   cy                <int>        ..FV....... set chroma matrix vertical size (from 3 to 23) (default 5)
+   chroma_amount     <float>      ..FV....... set chroma effect strength (from -2 to 5) (default 0)
+   ca                <float>      ..FV....... set chroma effect strength (from -2 to 5) (default 0)
+   alpha_msize_x     <int>        ..FV....... set alpha matrix horizontal size (from 3 to 23) (default 5)
+   ax                <int>        ..FV....... set alpha matrix horizontal size (from 3 to 23) (default 5)
+   alpha_msize_y     <int>        ..FV....... set alpha matrix vertical size (from 3 to 23) (default 5)
+   ay                <int>        ..FV....... set alpha matrix vertical size (from 3 to 23) (default 5)
+   alpha_amount      <float>      ..FV....... set alpha effect strength (from -2 to 5) (default 0)
+   aa                <float>      ..FV....... set alpha effect strength (from -2 to 5) (default 0)
+
+This filter has support for timeline through the 'enable' option.
+
+Exiting with exit code 0
+===== rc=0 for unsharp =====
+===== ffmpeg -h filter=hqdn3d =====
+Filter hqdn3d
+  Apply a High Quality 3D Denoiser.
+    slice threading supported
+    Inputs:
+       #0: default (video)
+    Outputs:
+       #0: default (video)
+hqdn3d AVOptions:
+   luma_spatial      <double>     ..FV.....T. spatial luma strength (from 0 to DBL_MAX) (default 0)
+   chroma_spatial    <double>     ..FV.....T. spatial chroma strength (from 0 to DBL_MAX) (default 0)
+   luma_tmp          <double>     ..FV.....T. temporal luma strength (from 0 to DBL_MAX) (default 0)
+   chroma_tmp        <double>     ..FV.....T. temporal chroma strength (from 0 to DBL_MAX) (default 0)
+
+This filter has support for timeline through the 'enable' option.
+
+Exiting with exit code 0
+===== rc=0 for hqdn3d =====
+===== ffmpeg -h filter=bwdif =====
+Filter bwdif
+  Deinterlace the input image.
+    slice threading supported
+    Inputs:
+       #0: default (video)
+    Outputs:
+       #0: default (video)
+bwdif AVOptions:
+   mode              <int>        ..FV....... specify the interlacing mode (from 0 to 1) (default send_field)
+     send_frame      0            ..FV....... send one frame for each frame
+     send_field      1            ..FV....... send one frame for each field
+   parity            <int>        ..FV....... specify the assumed picture field parity (from -1 to 1) (default auto)
+     tff             0            ..FV....... assume top field first
+     bff             1            ..FV....... assume bottom field first
+     auto            -1           ..FV....... auto detect parity
+   deint             <int>        ..FV....... specify which frames to deinterlace (from 0 to 1) (default all)
+     all             0            ..FV....... deinterlace all frames
+     interlaced      1            ..FV....... only deinterlace frames marked as interlaced
+
+This filter has support for timeline through the 'enable' option.
+
+Exiting with exit code 0
+===== rc=0 for bwdif =====

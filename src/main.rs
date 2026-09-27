@@ -1,11 +1,13 @@
 #[cfg(not(any(cxxqt_qt_version_at_least_6_8, cxxqt_qt_version_at_least_7)))]
 compile_error!("Furami requires Qt 6.8 or newer");
 
+// Keep the library's generated QML registration linked into the executable.
+extern crate furami as _;
+
 mod app;
 mod capture;
 mod diagnostics;
 mod domain;
-mod media;
 mod native_host;
 mod profiles;
 mod settings;

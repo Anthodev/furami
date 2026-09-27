@@ -1,0 +1,145 @@
+===== mpv --scale=help =====
+Valid values for option scale are:
+    bilinear
+    bicubic_fast
+    oversample
+    spline16
+    spline36
+    spline64
+    sinc
+    lanczos
+    ginseng
+    bicubic
+    hermite
+    catmull_rom
+    mitchell
+    robidoux
+    robidouxsharp
+    box
+    nearest
+    triangle
+    gaussian
+    jinc
+    ewa_lanczos
+    ewa_hanning
+    ewa_ginseng
+    ewa_lanczossharp
+    ewa_lanczos4sharpest
+    ewa_lanczossoft
+    haasnsoft
+    ewa_robidoux
+    ewa_robidouxsharp
+    bartlett
+    cosine
+    hanning
+    tukey
+    hamming
+    quadric
+    welch
+    kaiser
+    blackman
+    sphinx
+===== rc=0 for scale =====
+===== mpv --cscale=help =====
+Valid values for option cscale are:
+    (passing nothing)
+    bilinear
+    bicubic_fast
+    oversample
+    spline16
+    spline36
+    spline64
+    sinc
+    lanczos
+    ginseng
+    bicubic
+    hermite
+    catmull_rom
+    mitchell
+    robidoux
+    robidouxsharp
+    box
+    nearest
+    triangle
+    gaussian
+    jinc
+    ewa_lanczos
+    ewa_hanning
+    ewa_ginseng
+    ewa_lanczossharp
+    ewa_lanczos4sharpest
+    ewa_lanczossoft
+    haasnsoft
+    ewa_robidoux
+    ewa_robidouxsharp
+    bartlett
+    cosine
+    hanning
+    tukey
+    hamming
+    quadric
+    welch
+    kaiser
+    blackman
+    sphinx
+===== rc=0 for cscale =====
+===== mpv --dscale=help =====
+Valid values for option dscale are:
+    (passing nothing)
+    bilinear
+    bicubic_fast
+    oversample
+    spline16
+    spline36
+    spline64
+    sinc
+    lanczos
+    ginseng
+    bicubic
+    hermite
+    catmull_rom
+    mitchell
+    robidoux
+    robidouxsharp
+    box
+    nearest
+    triangle
+    gaussian
+    jinc
+    ewa_lanczos
+    ewa_hanning
+    ewa_ginseng
+    ewa_lanczossharp
+    ewa_lanczos4sharpest
+    ewa_lanczossoft
+    haasnsoft
+    ewa_robidoux
+    ewa_robidouxsharp
+    bartlett
+    cosine
+    hanning
+    tukey
+    hamming
+    quadric
+    welch
+    kaiser
+    blackman
+    sphinx
+===== rc=0 for dscale =====
+===== mpv --dither=help =====
+Valid values for option dither are:
+    fruit
+    ordered
+    error-diffusion
+    no
+===== rc=0 for dither =====
+===== mpv --list-options (renderer rows) =====
+ --cscale                         Choices:  bilinear bicubic_fast oversample spline16 spline36 spline64 sinc lanczos ginseng bicubic hermite catmull_rom mitchell robidoux robidouxsharp box nearest triangle gaussian jinc ewa_lanczos ewa_hanning ewa_ginseng ewa_lanczossharp ewa_lanczos4sharpest ewa_lanczossoft haasnsoft ewa_robidoux ewa_robidouxsharp bartlett cosine hanning tukey hamming quadric welch kaiser blackman sphinx (default: )
+ --deband                         Flag (default: no)
+ --deband-grain                   Float (0 to 4096) (default: 32)
+ --deband-iterations              Integer (0 to 16) (default: 1)
+ --dither                         Choices: fruit ordered error-diffusion no (default: fruit)
+ --dscale                         Choices:  bilinear bicubic_fast oversample spline16 spline36 spline64 sinc lanczos ginseng bicubic hermite catmull_rom mitchell robidoux robidouxsharp box nearest triangle gaussian jinc ewa_lanczos ewa_hanning ewa_ginseng ewa_lanczossharp ewa_lanczos4sharpest ewa_lanczossoft haasnsoft ewa_robidoux ewa_robidouxsharp bartlett cosine hanning tukey hamming quadric welch kaiser blackman sphinx (default: hermite)
+ --scale                          Choices: bilinear bicubic_fast oversample spline16 spline36 spline64 sinc lanczos ginseng bicubic hermite catmull_rom mitchell robidoux robidouxsharp box nearest triangle gaussian jinc ewa_lanczos ewa_hanning ewa_ginseng ewa_lanczossharp ewa_lanczos4sharpest ewa_lanczossoft haasnsoft ewa_robidoux ewa_robidouxsharp bartlett cosine hanning tukey hamming quadric welch kaiser blackman sphinx (default: lanczos)
+ --scale-antiring                 Float (0 to 1) (default: 0)
+===== rc=0 for list-options grep =====

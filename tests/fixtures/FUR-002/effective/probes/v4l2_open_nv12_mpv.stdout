@@ -1,0 +1,3 @@
+[lavf] avformat_open_input() failed
+Failed to recognize file format.
+Exiting... (Errors when loading file)

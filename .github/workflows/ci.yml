@@ -24,19 +24,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential \
+            lld \
             libgl1-mesa-dev
 
-      - name: Install Qt 6.8.3 via aqtinstall
+      - name: Read qualified Qt version
+        run: |
+          python3 -c 'import json; print("QT_VERSION=" + json.load(open("packaging/media/stack.lock.json"))["sources"]["qt"]["version"])' >> "$GITHUB_ENV"
+
+      - name: Install pinned Qt via aqtinstall
         run: |
           python3 -m venv "$RUNNER_TEMP/aqt-venv"
           "$RUNNER_TEMP/aqt-venv/bin/pip" install --no-cache-dir aqtinstall==3.3.0
-          "$RUNNER_TEMP/aqt-venv/bin/aqt" install-qt linux desktop 6.8.3 linux_gcc_64 --outputdir "$RUNNER_TEMP/Qt"
+          "$RUNNER_TEMP/aqt-venv/bin/aqt" install-qt linux desktop "$QT_VERSION" linux_gcc_64 --outputdir "$RUNNER_TEMP/Qt" --modules qtshadertools
 
       - name: Export Qt environment
         run: |
-          echo "QMAKE=$RUNNER_TEMP/Qt/6.8.3/gcc_64/bin/qmake" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/Qt/6.8.3/gcc_64/lib" >> "$GITHUB_ENV"
-          echo "$RUNNER_TEMP/Qt/6.8.3/gcc_64/bin" >> "$GITHUB_PATH"
+          echo "QMAKE=$RUNNER_TEMP/Qt/$QT_VERSION/gcc_64/bin/qmake" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/Qt/$QT_VERSION/gcc_64/lib" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/Qt/$QT_VERSION/gcc_64/bin" >> "$GITHUB_PATH"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

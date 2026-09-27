@@ -1,0 +1,21 @@
+[aist#0:0/pcm_s16le @ 0x5555b91c89c0] Guessed Channel Layout: stereo
+Input #0, pulse, from 'alsa_input.usb-GENKI_ShadowCast_3_KT044001-02.analog-stereo':
+  Duration: N/A, start: 1790528908.226837, bitrate: 1536 kb/s
+  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s, start 1790528908.226837
+[Parsed_volumedetect_0 @ 0x5555b91ca0c0] n_samples: 0
+Stream mapping:
+  Stream #0:0 -> #0:0 (pcm_s16le (native) -> pcm_s16le (native))
+Press [q] to stop, [?] for help
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf62.12.102
+  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s
+    Metadata:
+      encoder         : Lavc62.28.102 pcm_s16le
+size=N/A time=00:00:00.54 bitrate=N/A speed= 1.1x elapsed=0:00:00.50    size=N/A time=00:00:01.04 bitrate=N/A speed=1.04x elapsed=0:00:01.00    size=N/A time=00:00:01.54 bitrate=N/A speed=1.03x elapsed=0:00:01.50    size=N/A time=00:00:02.04 bitrate=N/A speed=1.02x elapsed=0:00:02.00    size=N/A time=00:00:02.54 bitrate=N/A speed=1.02x elapsed=0:00:02.50    size=N/A time=00:00:03.00 bitrate=N/A speed=   1x elapsed=0:00:03.00    [Parsed_volumedetect_0 @ 0x7f5c04002100] n_samples: 297600
+[Parsed_volumedetect_0 @ 0x7f5c04002100] mean_volume: -37.5 dB
+[Parsed_volumedetect_0 @ 0x7f5c04002100] max_volume: -26.3 dB
+[Parsed_volumedetect_0 @ 0x7f5c04002100] histogram_26db: 50
+[Parsed_volumedetect_0 @ 0x7f5c04002100] histogram_27db: 408
+[out#0/null @ 0x5555b91c8bc0] video:0KiB audio:564KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+size=N/A time=00:00:03.00 bitrate=N/A speed=0.967x elapsed=0:00:03.10    
