@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - '**'
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Build, test and lint (Avrea Ubuntu 24.04 x86_64)
+    runs-on: avrea-ubuntu-24.04-1-vcpu
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libgl1-mesa-dev
+
+      - name: Install Qt 6.8.3 via aqtinstall
+        run: |
+          python3 -m venv "$RUNNER_TEMP/aqt-venv"
+          "$RUNNER_TEMP/aqt-venv/bin/pip" install --no-cache-dir aqtinstall==3.3.0
+          "$RUNNER_TEMP/aqt-venv/bin/aqt" install-qt linux desktop 6.8.3 linux_gcc_64 --outputdir "$RUNNER_TEMP/Qt"
+
+      - name: Export Qt environment
+        run: |
+          echo "QMAKE=$RUNNER_TEMP/Qt/6.8.3/gcc_64/bin/qmake" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/Qt/6.8.3/gcc_64/lib" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/Qt/6.8.3/gcc_64/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: clippy, rustfmt
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
