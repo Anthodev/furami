@@ -1,32 +1,15 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Rust build output; keep Cargo.lock tracked for this application.
+/target/
 
-# Test binary, built with `go test -c`
-*.test
+# Qt and QML generated files.
+.qmake.stash
+.qmlcache/
+.qmlls.ini
+moc_*
+qrc_*
 
-# Code coverage profiles and other test artifacts
-*.out
-coverage.*
-*.coverprofile
-profile.cov
-
-# Dependency directories (remove the comment below to include it)
-# vendor/
-
-# Go workspace file
-go.work
-go.work.sum
-
-# env file
+# Local environment values.
 .env
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/
