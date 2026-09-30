@@ -1,0 +1,265 @@
+Option gpu-context: 'waylandvk' isn't supported.
+Error parsing option gpu-context (option parameter could not be parsed)
+/home/anthodev/.config/mpv/mpv.conf:22: setting option gpu-context='waylandvk' failed.
+Available video filters:
+  format           force output format
+  lavfi            libavfilter bridge
+  lavfi-bridge     libavfilter bridge (explicit options)
+  sub              Render subtitles
+  gpu              vo_gpu as filter
+
+Available libavfilter filters:
+  astreamselect    Select audio streams
+  addroi           Add region of interest to frame.
+  alphaextract     Extract an alpha channel as a grayscale image component.
+  amplify          Amplify changes between successive video frames.
+  atadenoise       Apply an Adaptive Temporal Averaging Denoiser.
+  avgblur          Apply Average Blur filter.
+  backgroundkey    Turns a static background into transparency.
+  bbox             Compute bounding box for each frame.
+  bench            Benchmark part of a filtergraph.
+  bilateral        Apply Bilateral filter.
+  bitplanenoise    Measure bit plane noise.
+  blackdetect      Detect video intervals that are (almost) black.
+  blackframe       Detect frames that are (almost) black.
+  blockdetect      Blockdetect filter.
+  blurdetect       Blurdetect filter.
+  bm3d             Block-Matching 3D denoiser.
+  boxblur          Blur the input.
+  bwdif            Deinterlace the input image.
+  cas              Contrast Adaptive Sharpen.
+  ccrepack         Repack CEA-708 closed caption metadata
+  chromahold       Turns a certain color range into gray.
+  chromakey        Turns a certain color into transparency. Operates on YUV colors.
+  chromanr         Reduce chrominance noise.
+  chromashift      Shift chroma.
+  ciescope         Video CIE scope.
+  codecview        Visualize information about some codecs.
+  colorbalance     Adjust the color balance.
+  colorchannelmixer Adjust colors by mixing color channels.
+  colorcontrast    Adjust color contrast between RGB components.
+  colorcorrect     Adjust color white balance selectively for blacks and whites.
+  colordetect      Detect video color properties.
+  colorize         Overlay a solid color on the video stream.
+  colorkey         Turns a certain color into transparency. Operates on RGB colors.
+  colorhold        Turns a certain color range into gray. Operates on RGB colors.
+  colorlevels      Adjust the color levels.
+  colormatrix      Convert color matrix.
+  colorspace       Convert between colorspaces.
+  colortemperature Adjust color temperature of video.
+  convolution      Apply convolution filter.
+  copy             Copy the input video unchanged to the output.
+  cover_rect       Find and cover a user specified object.
+  crop             Crop the input video.
+  cropdetect       Auto-detect crop size.
+  cue              Delay filtering to match a cue.
+  curves           Adjust components curves.
+  datascope        Video data analysis.
+  dblur            Apply Directional Blur filter.
+  dctdnoiz         Denoise frames using 2D DCT.
+  deband           Debands video.
+  deblock          Deblock video.
+  decimate         Decimate frames (post field matching filter).
+  dedot            Reduce cross-luminance and cross-color.
+  deflate          Apply deflate effect.
+  deflicker        Remove temporal frame luminance variations.
+  dejudder         Remove judder produced by pullup.
+  delogo           Remove logo from input video.
+  deshake          Stabilize shaky video.
+  despill          Despill video.
+  detelecine       Apply an inverse telecine pattern.
+  dilation         Apply dilation effect.
+  doubleweave      Weave input video fields into double number of frames.
+  drawbox          Draw a colored box on the input video.
+  drawgraph        Draw a graph using input video metadata.
+  drawgrid         Draw a colored grid on the input video.
+  edgedetect       Detect and draw edge.
+  elbg             Apply posterize effect, using the ELBG algorithm.
+  entropy          Measure video frames entropy.
+  epx              Scale the input using EPX algorithm.
+  eq               Adjust brightness, contrast, gamma, and saturation.
+  erosion          Apply erosion effect.
+  estdif           Apply Edge Slope Tracing deinterlace.
+  exposure         Adjust exposure of the video stream.
+  extractplanes    Extract planes as grayscale frames.
+  fade             Fade in/out input video.
+  fftdnoiz         Denoise frames using 3D FFT.
+  fftfilt          Apply arbitrary expressions to pixels in frequency domain.
+  field            Extract a field from the input video.
+  fieldhint        Field matching using hints.
+  fieldmatch       Field matching for inverse telecine.
+  fieldorder       Set the field order.
+  fillborders      Fill borders of the input video.
+  find_rect        Find a user specified object.
+  floodfill        Fill area with same color with another color.
+  format           Convert the input video to one of the specified pixel formats.
+  fps              Force constant framerate.
+  framerate        Upsamples or downsamples progressive source between specified frame rates.
+  framestep        Select one frame every N frames.
+  freezedetect     Detects frozen video input.
+  fspp             Apply Fast Simple Post-processing filter.
+  fsync            Synchronize video frames from external source.
+  gblur            Apply Gaussian Blur filter.
+  geq              Apply generic equation to each pixel.
+  gradfun          Debands video quickly using gradients.
+  graphmonitor     Show various filtergraph stats.
+  grayworld        Adjust white balance using LAB gray world algorithm
+  greyedge         Estimates scene illumination by grey edge assumption.
+  guided           Apply Guided filter.
+  hflip            Horizontally flip the input video.
+  histeq           Apply global color histogram equalization.
+  histogram        Compute and draw a histogram.
+  hqdn3d           Apply a High Quality 3D Denoiser.
+  hqx              Scale the input by 2, 3 or 4 using the hq*x magnification algorithm.
+  hstack           Stack video inputs horizontally.
+  hsvhold          Turns a certain HSV range into gray.
+  hsvkey           Turns a certain HSV range into transparency. Operates on YUV colors.
+  hue              Adjust the hue and saturation of the input video.
+  huesaturation    Apply hue-saturation-intensity adjustments.
+  hwdownload       Download a hardware frame to a normal frame
+  hwmap            Map hardware frames
+  hwupload         Upload a normal frame to a hardware frame
+  idet             Interlace detect Filter.
+  il               Deinterleave or interleave fields.
+  inflate          Apply inflate effect.
+  interlace        Convert progressive video into interlaced.
+  interleave       Temporally interleave video inputs.
+  kerndeint        Apply kernel deinterlacing to the input.
+  kirsch           Apply kirsch operator.
+  lagfun           Slowly update darker pixels.
+  latency          Report video filtering latency.
+  lenscorrection   Rectify the image by correcting for lens distortion.
+  limitdiff        Apply filtering with limiting difference.
+  limiter          Limit pixels components to the specified range.
+  loop             Loop video frames.
+  lumakey          Turns a certain luma into transparency.
+  lut              Compute and apply a lookup table to the RGB/YUV input video.
+  lut1d            Adjust colors using a 1D LUT.
+  lut3d            Adjust colors using a 3D LUT.
+  lutrgb           Compute and apply a lookup table to the RGB input video.
+  lutyuv           Compute and apply a lookup table to the YUV input video.
+  maskfun          Create Mask.
+  mcdeint          Apply motion compensating deinterlacing.
+  median           Apply Median filter.
+  mergeplanes      Merge planes.
+  mestimate        Generate motion vectors.
+  metadata         Manipulate video frame metadata.
+  minterpolate     Frame rate conversion using Motion Interpolation.
+  mix              Mix video inputs.
+  monochrome       Convert video to gray using custom color filter.
+  mpdecimate       Remove near-duplicate frames.
+  negate           Negate input video.
+  nlmeans          Non-local means denoiser.
+  nnedi            Apply neural network edge directed interpolation intra-only deinterlacer.
+  noformat         Force libavfilter not to use any of the specified pixel formats for the input to the next filter.
+  noise            Add noise.
+  normalize        Normalize RGB video.
+  null             Pass the source unchanged to the output.
+  oscilloscope     2D Video Oscilloscope.
+  owdenoise        Denoise using wavelets.
+  pad              Pad the input video.
+  palettegen       Find the optimal palette for a given stream.
+  perms            Set permissions for the output video frame.
+  perspective      Correct the perspective of video.
+  phase            Phase shift fields.
+  photosensitivity Filter out photosensitive epilepsy seizure-inducing flashes.
+  pixdesctest      Test pixel format definitions.
+  pixelize         Pixelize video.
+  pixscope         Pixel data analysis.
+  pp7              Apply Postprocessing 7 filter.
+  premultiply      PreMultiply first stream with first plane of second stream.
+  premultiply_dynamic Premultiply or unpremultiply an image in-place, as needed.
+  prewitt          Apply prewitt operator.
+  pseudocolor      Make pseudocolored video frames.
+  pullup           Pullup from field sequence to frames.
+  qp               Change video quantization parameters.
+  random           Return random frames.
+  readeia608       Read EIA-608 Closed Caption codes from input video and write them to frame metadata.
+  readvitc         Read vertical interval timecode and write it to frame metadata.
+  realtime         Slow down filtering to match realtime.
+  removegrain      Remove grain.
+  removelogo       Remove a TV logo based on a mask image.
+  repeatfields     Hard repeat fields based on MPEG repeat field flag.
+  reverse          Reverse a clip.
+  rgbashift        Shift RGBA.
+  roberts          Apply roberts cross operator.
+  rotate           Rotate the input image.
+  sab              Apply shape adaptive blur.
+  scale            Scale the input video size and/or convert the image format.
+  scdet            Detect video scene change
+  scharr           Apply scharr operator.
+  scroll           Scroll input video.
+  segment          Segment video stream.
+  select           Select video frames to pass in output.
+  selectivecolor   Apply CMYK adjustments to specific color ranges.
+  sendcmd          Send commands to filters.
+  separatefields   Split input video frames into fields.
+  setdar           Set the frame display aspect ratio.
+  setfield         Force field for the output video frame.
+  setparams        Force field, or color property for the output video frame.
+  setpts           Set PTS for the output video frame.
+  setrange         Force color range for the output video frame.
+  setsar           Set the pixel sample aspect ratio.
+  settb            Set timebase for the video output link.
+  shear            Shear transform the input image.
+  showinfo         Show textual information for each video frame.
+  showpalette      Display frame palette.
+  shuffleframes    Shuffle video frames.
+  shufflepixels    Shuffle video pixels.
+  shuffleplanes    Shuffle video planes.
+  sidedata         Manipulate video frame side data.
+  signalstats      Generate statistics from video analysis.
+  signature        Calculate the MPEG-7 video signature
+  siti             Calculate spatial information (SI) and temporal information (TI).
+  smartblur        Blur the input video without impacting the outlines.
+  sobel            Apply sobel operator.
+  split            Pass on the input to N video outputs.
+  spp              Apply a simple post processing filter.
+  stereo3d         Convert video stereoscopic 3D view.
+  streamselect     Select video streams
+  super2xsai       Scale the input by 2x using the Super2xSaI pixel art algorithm.
+  swaprect         Swap 2 rectangular objects in video.
+  swapuv           Swap U and V components.
+  tblend           Blend successive frames.
+  telecine         Apply a telecine pattern.
+  thistogram       Compute and draw a temporal histogram.
+  thumbnail        Select the most representative frame in a given sequence of consecutive frames.
+  tile             Tile several successive frames together.
+  tiltandshift     Generate a tilt-and-shift'd video.
+  tinterlace       Perform temporal field interlacing.
+  tlut2            Compute and apply a lookup table from two successive frames.
+  tmedian          Pick median pixels from successive frames.
+  tmidequalizer    Apply Temporal Midway Equalization.
+  tmix             Mix successive video frames.
+  tonemap          Conversion to/from different dynamic ranges.
+  tpad             Temporarily pad video frames.
+  transpose        Transpose input video.
+  trim             Pick one continuous section from the input, drop the rest.
+  unpremultiply    UnPreMultiply first stream with first plane of second stream.
+  unsharp          Sharpen or blur the input video.
+  untile           Untile a frame into a sequence of frames.
+  uspp             Apply Ultra Simple / Slow Post-processing filter.
+  v360             Convert 360 projection of video.
+  vaguedenoiser    Apply a Wavelet based Denoiser.
+  vectorscope      Video vectorscope.
+  vflip            Flip the input video vertically.
+  vfrdet           Variable frame rate detect filter.
+  vibrance         Boost or alter saturation.
+  vignette         Make or reverse a vignette effect.
+  vmafmotion       Calculate the VMAF Motion score.
+  vstack           Stack video inputs vertically.
+  w3fdif           Apply Martin Weston three field deinterlace.
+  waveform         Video waveform monitor.
+  weave            Weave input video fields into frames.
+  xbr              Scale the input using xBR algorithm.
+  xmedian          Pick median pixels from several video inputs.
+  xstack           Stack video inputs into custom layout.
+  yadif            Deinterlace the input image.
+  yaepblur         Yet another edge preserving blur filter.
+  zoompan          Apply Zoom & Pan effect.
+  concat           Concatenate audio and video streams.
+
+If libavfilter filters clash with builtin mpv filters,
+prefix them with lavfi- to select the libavfilter one.
+
+Get help on individual entries via: --vf=entry=help

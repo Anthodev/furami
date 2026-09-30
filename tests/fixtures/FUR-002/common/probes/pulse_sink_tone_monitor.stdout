@@ -1,0 +1,24 @@
+[aist#0:0/pcm_s16le @ 0x56541a8caa00] Guessed Channel Layout: stereo
+Input #0, pulse, from 'alsa_output.usb-Fosi_Audio_Fosi_Audio_K7-00.analog-stereo.monitor':
+  Duration: N/A, start: 1790528481.656341, bitrate: 1536 kb/s
+  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s, start 1790528481.656341
+[Parsed_volumedetect_0 @ 0x56541a8cc100] n_samples: 0
+Stream mapping:
+  Stream #0:0 -> #0:0 (pcm_s16le (native) -> pcm_s16le (native))
+Press [q] to stop, [?] for help
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf62.12.102
+  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s
+    Metadata:
+      encoder         : Lavc62.28.102 pcm_s16le
+size=N/A time=00:00:00.50 bitrate=N/A speed=   1x elapsed=0:00:00.50    size=N/A time=00:00:01.05 bitrate=N/A speed=1.05x elapsed=0:00:01.00    size=N/A time=00:00:01.55 bitrate=N/A speed=1.03x elapsed=0:00:01.50    [Parsed_volumedetect_0 @ 0x7ff72c002100] n_samples: 196800
+[Parsed_volumedetect_0 @ 0x7ff72c002100] mean_volume: -32.7 dB
+[Parsed_volumedetect_0 @ 0x7ff72c002100] max_volume: -18.6 dB
+[Parsed_volumedetect_0 @ 0x7ff72c002100] histogram_18db: 16
+[Parsed_volumedetect_0 @ 0x7ff72c002100] histogram_19db: 142
+[Parsed_volumedetect_0 @ 0x7ff72c002100] histogram_20db: 301
+[out#0/null @ 0x56541a8cac00] video:0KiB audio:375KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+size=N/A time=00:00:02.00 bitrate=N/A speed=0.977x elapsed=0:00:02.04    
+--- monitor volumedetect rc=0 ---
+--- tone rc=0 (143 = our TERM) ---

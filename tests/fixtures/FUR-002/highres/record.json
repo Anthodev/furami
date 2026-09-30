@@ -1,0 +1,202 @@
+{
+  "source_bundle": "qualified-G-highres-1440p60",
+  "source_manifest_sha256": "969ace52ce1a4c69561217dea8b2bb9579768512010c97085d2ae166fe386d9b",
+  "source_status": "complete",
+  "source_probes": {
+    "planned": 31,
+    "ran": 31,
+    "not_run": 0
+  },
+  "stack": {
+    "identity_file": {
+      "path": "stack_identity.txt",
+      "sha256": "bd2e290c5c094eaf19536dc91251e4304dc6d46c546df640fa4ece96bcb03cee"
+    },
+    "bins": {
+      "mpv": {
+        "path": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2"
+      },
+      "ffmpeg": {
+        "path": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e"
+      },
+      "libmpv": {
+        "path": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/lib/libmpv.so",
+        "sha256": "801c9dcd8e87516249d05a11dc76a1cbc30c3e792d442762c8fe79e73746e85c"
+      }
+    }
+  },
+  "commands": {
+    "v4l2_open_nv12_ffmpeg": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-v",
+        "info",
+        "-f",
+        "v4l2",
+        "-input_format",
+        "nv12",
+        "-video_size",
+        "2560x1440",
+        "-framerate",
+        "60",
+        "-i",
+        "/dev/video0",
+        "-frames:v",
+        "8",
+        "-f",
+        "null",
+        "-"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_open_nv12_ffmpeg.stdout",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "probes/v4l2_open_nv12_ffmpeg.stderr",
+        "bytes": 835,
+        "sha256": "0e00fe43569203b8464387b0b41a550ac95cdc21bfaa077d9dee2d1ff4f88e9b"
+      }
+    },
+    "v4l2_open_yuyv_ffmpeg": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-v",
+        "info",
+        "-f",
+        "v4l2",
+        "-input_format",
+        "yuyv422",
+        "-video_size",
+        "2560x1440",
+        "-framerate",
+        "60",
+        "-i",
+        "/dev/video0",
+        "-frames:v",
+        "8",
+        "-f",
+        "null",
+        "-"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_open_yuyv_ffmpeg.stdout",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "probes/v4l2_open_yuyv_ffmpeg.stderr",
+        "bytes": 921,
+        "sha256": "17bbde2bdbec9834073cb20e036d6b5dc712e88d5aeb37d67e4cc7424f200d9e"
+      }
+    },
+    "v4l2_open_mjpeg_ffmpeg": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+        "-hide_banner",
+        "-v",
+        "info",
+        "-f",
+        "v4l2",
+        "-input_format",
+        "mjpeg",
+        "-video_size",
+        "2560x1440",
+        "-framerate",
+        "60",
+        "-i",
+        "/dev/video0",
+        "-frames:v",
+        "8",
+        "-f",
+        "null",
+        "-"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "executable_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_open_mjpeg_ffmpeg.stdout",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "probes/v4l2_open_mjpeg_ffmpeg.stderr",
+        "bytes": 863,
+        "sha256": "8c890f4be629223d5e62acbd9f0a02f19733097626e2ae515ebdbfa74af739fc"
+      }
+    },
+    "v4l2_open_nv12_mpv": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--config=no",
+        "--msg-level=all=info",
+        "--demuxer-lavf-format=v4l2",
+        "--demuxer-lavf-o=input_format=nv12,video_size=2560x1440,framerate=60",
+        "--vo=null",
+        "--ao=null",
+        "--frames=30",
+        "av://v4l2:/dev/video0"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_open_nv12_mpv.stdout",
+        "bytes": 248,
+        "sha256": "4efb6fc86bd34f38f889b22f378f4fdf93abf999fbc395c7e0b2c770dd28380e"
+      },
+      "stderr": {
+        "path": "probes/v4l2_open_nv12_mpv.stderr",
+        "bytes": 102,
+        "sha256": "143b5d32d6b95c95ccf65fe8505a1cd84da74b59a557901f95e0aeca714e1060"
+      }
+    },
+    "v4l2_open_yuyv_mpv": {
+      "argv": [
+        "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+        "--config=no",
+        "--msg-level=all=info",
+        "--demuxer-lavf-format=v4l2",
+        "--demuxer-lavf-o=input_format=yuyv422,video_size=2560x1440,framerate=60",
+        "--vo=null",
+        "--ao=null",
+        "--frames=30",
+        "av://v4l2:/dev/video0"
+      ],
+      "executable": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "executable_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ran": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "stdout": {
+        "path": "probes/v4l2_open_yuyv_mpv.stdout",
+        "bytes": 251,
+        "sha256": "9d2749fc8e6669a46dc230d60425da41a45f494f3b8a479099c69981f6f9fae2"
+      },
+      "stderr": {
+        "path": "probes/v4l2_open_yuyv_mpv.stderr",
+        "bytes": 1173,
+        "sha256": "a72831ac65fe32b0993d0c3c4ecdfdc156c32b967a8743eda671bf450cfdfb9e"
+      }
+    }
+  }
+}

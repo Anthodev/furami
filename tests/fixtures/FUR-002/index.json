@@ -1,0 +1,222 @@
+{
+  "schema": 1,
+  "description": "Selected unchanged FUR-002 command transcripts. Records preserve source argv, executable identities, run status, and raw stream descriptors. Full 31-probe manifests live only in local docs/evidence/FUR-002.",
+  "bundles": {
+    "common": {
+      "source_bundle": "qualified-G-common-720p60-v2",
+      "source_manifest_sha256": "1669a5720eb30efe000e9a1514d305cf37c7a3b953bd2576ed38347889b0bb1b",
+      "record_sha256": "c9d77b70b9a6c6a98b82d8414762e7fbb98d552837ffcccd24899e0858b9aef7",
+      "source_probe_counts": {
+        "planned": 31,
+        "ran": 31,
+        "not_run": 0
+      },
+      "stack_sha256": "bd2e290c5c094eaf19536dc91251e4304dc6d46c546df640fa4ece96bcb03cee",
+      "mpv_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ffmpeg_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "probes": {
+        "mpv_vo_list": {
+          "stdout_sha256": "3c582b1af06d6f61bf11d0d3a8d0a0b3e7135e7e5d0f440357f0417b0bbe3422",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_gpu_context_list": {
+          "stdout_sha256": "8209056ff83bf220276d0d39fb43bf51b01a2d3b6fc6144cbc8e5758619c4a5c",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_vf_list": {
+          "stdout_sha256": "7020823c767c9e5877888a9f42b1c759ae21c379c1d492a05a9d6c15cdc6becc",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "ffmpeg_formats_devices_list": {
+          "stdout_sha256": "0d50b69ee7819aa6806af68a528c0d3bd4bb60a50903abee9617ba470536f8e9",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "ffmpeg_pix_fmts_list": {
+          "stdout_sha256": "71e2388cc4d5b109470a24524d563363d647b6b6de8706b8fe5a19e2b2eb8240",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "ffmpeg_filters_list": {
+          "stdout_sha256": "34e4e9c79570719218198616bfc1a51131418199eb8846939d1832f202c36388",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "ffmpeg_decoders_list": {
+          "stdout_sha256": "051ae91db4dba6dc5a08e9eb9551965ec32a5dd3c8c27b1c21f04b477ab1c075",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_vf_format_param_help": {
+          "stdout_sha256": "e2df73e7650ad7344a1b0afb45d03b12f564c97531adadd83d93a67bfa78d824",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "ffmpeg_filter_option_help": {
+          "stdout_sha256": "71754677df32d4780f7f885ec65607c4d4372251f7a4d95cfb03402fbb5eb86c",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_renderer_option_help": {
+          "stdout_sha256": "b269236dabca2a2aa339070d830fae1def5af5bd615aece49f57d60f558f61d3",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_render_gpu_next_x11vk": {
+          "stdout_sha256": "0441a6351a44cbeba32cda3eec1111f7b58fd6fac98f1b3b06dee3de6ca535c9",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_vf_native_format": {
+          "stdout_sha256": "0b24ddfb2e7c4b41d93787873169b7b472b4765298035ccfa7495b1fbe1c0b07",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_vf_lavfi_eq": {
+          "stdout_sha256": "0b24ddfb2e7c4b41d93787873169b7b472b4765298035ccfa7495b1fbe1c0b07",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_vf_lavfi_unsharp": {
+          "stdout_sha256": "0b24ddfb2e7c4b41d93787873169b7b472b4765298035ccfa7495b1fbe1c0b07",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_vf_lavfi_hqdn3d": {
+          "stdout_sha256": "0b24ddfb2e7c4b41d93787873169b7b472b4765298035ccfa7495b1fbe1c0b07",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_vf_lavfi_bwdif": {
+          "stdout_sha256": "0b24ddfb2e7c4b41d93787873169b7b472b4765298035ccfa7495b1fbe1c0b07",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "v4l2_list_formats": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "841e2f8812bb488c9edbf56bad095ec3c36918b54657f1c8191e445514965b21"
+        },
+        "v4l2_open_nv12_ffmpeg": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "a4cb2c51a90b6647062d537be52a1b890860158c848d37b7547fa4afdf70f166"
+        },
+        "v4l2_open_yuyv_ffmpeg": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "cf12c2cd58d50f31a15f786da7a170b0a5e898a6705c9bef8bc5f9dfaac887b2"
+        },
+        "v4l2_open_mjpeg_ffmpeg": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "ab8b7c573332a9a14c2af6b78fa80998cc16918bc21f8818068a6ac6d525bd28"
+        },
+        "v4l2_open_nv12_mpv": {
+          "stdout_sha256": "873c91f6749037891a64a2d433c65906c069c89142913c41d35758e0eb8b4d8f",
+          "stderr_sha256": "143b5d32d6b95c95ccf65fe8505a1cd84da74b59a557901f95e0aeca714e1060"
+        },
+        "v4l2_open_yuyv_mpv": {
+          "stdout_sha256": "e2677addf08798f14ab39248f877ae7d89f4088dc73ed0129f2fdeb32cdaa2bb",
+          "stderr_sha256": "143b5d32d6b95c95ccf65fe8505a1cd84da74b59a557901f95e0aeca714e1060"
+        },
+        "pulse_source_capture": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "f8170a51c6c536c905543d81ad2d6aeb850dbf7a2d0a3dd5512245ede445178b"
+        },
+        "pulse_sink_tone_monitor": {
+          "stdout_sha256": "13b82a53b2253730f8ba5f39ca78de4f151dec5cf3ec48f65c3864934ff3a4f1",
+          "stderr_sha256": "b1b1cf777a0977f7df9e64dcd1b5fd7e22aa5bd749d03310754f2b2aa6903e58"
+        },
+        "pulse_direct_source_to_sink": {
+          "stdout_sha256": "2d8f83ca37ff792df928543698f889c83e06679866cf2b34a9e2e3e437f7189f",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "libmpv_sha256": "801c9dcd8e87516249d05a11dc76a1cbc30c3e792d442762c8fe79e73746e85c"
+    },
+    "effective": {
+      "source_bundle": "qualified-G-effective-output",
+      "source_manifest_sha256": "8584de533c1c187fa51d23589bc27eb4397f537f3af3a05c3d855d71260df6d8",
+      "record_sha256": "c32e5d0c275ace31c095fefd95383ffae9fec8fcf124a96d2e70aa6476b816b6",
+      "source_probe_counts": {
+        "planned": 31,
+        "ran": 31,
+        "not_run": 0
+      },
+      "stack_sha256": "bd2e290c5c094eaf19536dc91251e4304dc6d46c546df640fa4ece96bcb03cee",
+      "mpv_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ffmpeg_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "probes": {
+        "mpv_vo_list": {
+          "stdout_sha256": "3c582b1af06d6f61bf11d0d3a8d0a0b3e7135e7e5d0f440357f0417b0bbe3422",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_gpu_context_list": {
+          "stdout_sha256": "8209056ff83bf220276d0d39fb43bf51b01a2d3b6fc6144cbc8e5758619c4a5c",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "mpv_render_gpu_next_x11vk": {
+          "stdout_sha256": "44bf827455a32518e4a713d55a25d039525f00f3f08ef6e951c1f52ebe653424",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "v4l2_open_nv12_ffmpeg": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "f616b56a5b915d874470a26f0d4ee32d8abeb9e4876a4e089b35d31f13bbb711"
+        },
+        "v4l2_open_yuyv_ffmpeg": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "9e4468ba63c4f22c14afd5f1e708b060dff6ea66b16abded6ad992ef0c3e87c4"
+        },
+        "v4l2_open_mjpeg_ffmpeg": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "20b2fbe92aea988f4d4173600ee611255ff25187c92cab89c45ed99055f61687"
+        },
+        "v4l2_open_nv12_mpv": {
+          "stdout_sha256": "970658dcefd16e918b19cf52dffb51d5d989b4ff07c7bb3145e64717820aed92",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "v4l2_open_yuyv_mpv": {
+          "stdout_sha256": "970658dcefd16e918b19cf52dffb51d5d989b4ff07c7bb3145e64717820aed92",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "pulse_source_capture": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "62d90bbf3d92518392cd918a482ce5817b1263b9cadac120677d3f6d86106294"
+        },
+        "pulse_sink_tone_monitor": {
+          "stdout_sha256": "444f2f058ab15c481aeae4e863b3dd622eebe0b4d2beb16fd11c946a5a28671e",
+          "stderr_sha256": "687f88b5b2c13a7458c44f456e86c941db180b557440b75f458b2d71ab36b904"
+        },
+        "pulse_direct_source_to_sink": {
+          "stdout_sha256": "38a564e817b348683d41694830b94840a5683ec9a01825d38369f0eeade71fdd",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "ffmpeg_formats_devices_list": {
+          "stdout_sha256": "0d50b69ee7819aa6806af68a528c0d3bd4bb60a50903abee9617ba470536f8e9",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "libmpv_sha256": "801c9dcd8e87516249d05a11dc76a1cbc30c3e792d442762c8fe79e73746e85c"
+    },
+    "highres": {
+      "source_bundle": "qualified-G-highres-1440p60",
+      "source_manifest_sha256": "969ace52ce1a4c69561217dea8b2bb9579768512010c97085d2ae166fe386d9b",
+      "record_sha256": "0cf9bfa0382d2e014bea061a051b198c16e92a7bbec4a9bbaa67993deef13b3a",
+      "source_probe_counts": {
+        "planned": 31,
+        "ran": 31,
+        "not_run": 0
+      },
+      "stack_sha256": "bd2e290c5c094eaf19536dc91251e4304dc6d46c546df640fa4ece96bcb03cee",
+      "mpv_sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2",
+      "ffmpeg_sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e",
+      "probes": {
+        "v4l2_open_nv12_ffmpeg": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "0e00fe43569203b8464387b0b41a550ac95cdc21bfaa077d9dee2d1ff4f88e9b"
+        },
+        "v4l2_open_yuyv_ffmpeg": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "17bbde2bdbec9834073cb20e036d6b5dc712e88d5aeb37d67e4cc7424f200d9e"
+        },
+        "v4l2_open_mjpeg_ffmpeg": {
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_sha256": "8c890f4be629223d5e62acbd9f0a02f19733097626e2ae515ebdbfa74af739fc"
+        },
+        "v4l2_open_nv12_mpv": {
+          "stdout_sha256": "4efb6fc86bd34f38f889b22f378f4fdf93abf999fbc395c7e0b2c770dd28380e",
+          "stderr_sha256": "143b5d32d6b95c95ccf65fe8505a1cd84da74b59a557901f95e0aeca714e1060"
+        },
+        "v4l2_open_yuyv_mpv": {
+          "stdout_sha256": "9d2749fc8e6669a46dc230d60425da41a45f494f3b8a479099c69981f6f9fae2",
+          "stderr_sha256": "a72831ac65fe32b0993d0c3c4ecdfdc156c32b967a8743eda671bf450cfdfb9e"
+        }
+      },
+      "libmpv_sha256": "801c9dcd8e87516249d05a11dc76a1cbc30c3e792d442762c8fe79e73746e85c"
+    }
+  }
+}

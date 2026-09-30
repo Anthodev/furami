@@ -1,0 +1,9 @@
+Option gpu-context: 'waylandvk' isn't supported.
+Error parsing option gpu-context (option parameter could not be parsed)
+/home/anthodev/.config/mpv/mpv.conf:22: setting option gpu-context='waylandvk' failed.
+Available GPU contexts:
+  auto             Auto detect
+  x11vk            X11/Vulkan
+  x11egl           X11/EGL
+  displayvk        VK_KHR_display
+
