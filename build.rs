@@ -1,6 +1,6 @@
 use std::{path::Path, process::Command};
 
-use cxx_qt_build::{CxxQtBuilder, QmlModule};
+use cxx_qt_build::{CppFile, CxxQtBuilder, MocArguments, QmlModule};
 
 fn tool_output(command: &mut Command, name: &str) -> String {
     let result = command
@@ -58,13 +58,36 @@ fn main() {
             "frozen libmpv pkg-config",
         );
         assert_eq!(actual_api, api, "libmpv client API differs from stack lock");
-        println!(
-            "cargo:rustc-link-search=native={}",
-            prefix.join("lib").display()
-        );
-        println!("cargo:rustc-link-lib=dylib=mpv");
     }
 
-    CxxQtBuilder::new_qml_module(QmlModule::new("dev.antho.furami").qml_file("qml/Main.qml"))
-        .build();
+    let native_flags = tool_output(
+        Command::new("pkg-config").args(["--cflags", "x11", "xcb", "xcb-shape"]),
+        "X11/XCB/XCB-SHAPE development prerequisites",
+    );
+    let builder =
+        CxxQtBuilder::new_qml_module(QmlModule::new("dev.antho.furami").qml_file("qml/Main.qml"))
+            .file("src/ui/bridge.rs")
+            .qt_module("Quick")
+            .cpp_file("src/native_host/host.cpp")
+            .cpp_file(
+                CppFile::from("src/native_host/host.h")
+                    .compile(false)
+                    .moc(true)
+                    .moc_arguments(MocArguments::default().uri("dev.antho.furami")),
+            )
+            .include_dir("src/native_host");
+    // SAFETY: With CXX-Qt pinned to 0.10.0, this closure only appends pkg-config's
+    // native prerequisite flags. It does not replace generated inputs or change
+    // CXX-Qt's compiler language, C++ standard, or ownership configuration.
+    let builder = unsafe {
+        builder.cc_builder(move |compiler| {
+            for flag in native_flags.split_whitespace() {
+                compiler.flag(flag);
+            }
+        })
+    };
+    builder.build();
+    for library in ["X11", "xcb", "xcb-shape"] {
+        println!("cargo:rustc-link-lib={library}");
+    }
 }
