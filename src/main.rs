@@ -19,7 +19,9 @@ enum StartupError {
     InvalidLogFilter(#[source] tracing_subscriber::filter::ParseError),
     #[error("failed to install tracing subscriber: {0}")]
     SubscriberInstallation(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error("missing X11 display: DISPLAY must be nonempty")]
+    #[error(
+        "missing or empty DISPLAY: install/enable XWayland in your Wayland session, or set DISPLAY to a reachable X11 display"
+    )]
     NoDisplay,
     #[error("DISPLAY must be valid UTF-8")]
     InvalidDisplayEnvironment(#[source] std::env::VarError),
