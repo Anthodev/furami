@@ -376,6 +376,19 @@ pub fn query_intervals(
     })
 }
 
+/// Recheck the explicitly selected route immediately before backend handoff.
+/// This read-only descriptor is closed here; it never certifies libmpv's capture.
+pub(crate) fn revalidate_route(
+    identity: &DeviceIdentity,
+    route: &ValidatedRoute<'_>,
+) -> Result<(), CaptureError> {
+    let node = route.node();
+    let file = udev::revalidate_node(&node.syspath, &node.devnode, &node.usb_syspath, identity)?;
+    let constants = ffi::bridge::v4l2_constants();
+    let raw = ffi::bridge::query_cap(file.as_raw_fd());
+    check_fresh_capabilities(node, &raw, &constants)
+}
+
 /// Resolve physical identity first, then prove the tuple on every genuinely
 /// announced route. Missing optional data does not veto a proven route, but
 /// required I/O and malformed-descriptor errors always propagate.
@@ -486,6 +499,66 @@ fn unsupported_rank(reason: UnsupportedReason) -> u8 {
         UnsupportedReason::FourCc => 0,
         UnsupportedReason::FrameSize => 1,
         UnsupportedReason::FrameRate => 2,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn session_fixture(paths: &[&str], mode: CaptureMode) -> CaptureSnapshot {
+    use crate::domain::capture::{
+        DiscreteSize, FormatDescriptor, FourCcCapabilities, FrameIntervalKind, FrameSizeKind,
+        FrameSizes, UsbTopology,
+    };
+    let identity = DeviceIdentity::new(
+        0x32ed,
+        0x3701,
+        UsbTopology::new(
+            "pci-fixture".into(),
+            vec![std::num::NonZeroU8::new(1).unwrap()],
+        )
+        .unwrap(),
+        Some("fixture".into()),
+    )
+    .unwrap();
+    let nodes = paths
+        .iter()
+        .map(|path| CaptureNode {
+            devnode: (*path).into(),
+            syspath: format!("/sys{path}").into(),
+            usb_syspath: "/sys/usb/fixture".into(),
+            driver: "uvcvideo".into(),
+            card_name: "fixture".into(),
+            bus_info: "fixture".into(),
+            raw_capabilities: 0,
+            raw_device_caps: 0,
+            effective_capabilities: 0,
+            capabilities: NodeCapabilities::new(
+                vec![FormatDescriptor {
+                    buffer_type: CaptureBufferType::SinglePlanar,
+                    captured_fourcc: mode.captured_fourcc,
+                    description: "fixture".into(),
+                    flags: 0,
+                }],
+                vec![FourCcCapabilities {
+                    captured_fourcc: mode.captured_fourcc,
+                    sizes: Descriptor::Available(
+                        FrameSizes::new(FrameSizeKind::Discrete(vec![DiscreteSize {
+                            size: mode.size,
+                            intervals: Descriptor::Available(
+                                FrameIntervals::new(FrameIntervalKind::Discrete(vec![
+                                    mode.rate.interval(),
+                                ]))
+                                .unwrap(),
+                            ),
+                        }]))
+                        .unwrap(),
+                    ),
+                }],
+            )
+            .unwrap(),
+        })
+        .collect();
+    CaptureSnapshot {
+        devices: vec![CaptureDevice { identity, nodes }],
     }
 }
 

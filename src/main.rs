@@ -7,6 +7,11 @@ extern crate furami as _;
 mod diagnostics;
 mod profiles;
 mod settings;
+use furami::capture::{
+    input::{CaptureArgumentError, CaptureArguments, CaptureSelection, SelectionError},
+    linux,
+};
+use std::ffi::OsString;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +34,20 @@ enum StartupError {
     InvalidMediaPrefix,
     #[error(transparent)]
     NativeLaunch(#[from] furami::native_host::NativeLaunchError),
+    #[error(transparent)]
+    CaptureArguments(#[from] CaptureArgumentError),
+    #[error("capture startup Prevalidation requested {request}: {source}")]
+    CaptureDiscovery {
+        request: String,
+        #[source]
+        source: linux::CaptureError,
+    },
+    #[error("capture startup Prevalidation requested {request}: {source}")]
+    CaptureSelection {
+        request: String,
+        #[source]
+        source: SelectionError,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -51,6 +70,20 @@ fn initialize_logging() -> Result<(), StartupError> {
 }
 
 fn run() -> Result<(), StartupError> {
+    let capture = parse_capture_args(std::env::args_os().skip(1))?
+        .map(|args| {
+            let snapshot = linux::discover().map_err(|source| StartupError::CaptureDiscovery {
+                request: args.to_string(),
+                source,
+            })?;
+            let selection = CaptureSelection::from_snapshot(&snapshot, &args.node, args.mode)
+                .map_err(|source| StartupError::CaptureSelection {
+                    request: args.to_string(),
+                    source,
+                })?;
+            Ok::<_, StartupError>(selection)
+        })
+        .transpose()?;
     let x11_display = match std::env::var("DISPLAY") {
         Ok(value) if !value.is_empty() => value,
         Ok(_) | Err(std::env::VarError::NotPresent) => return Err(StartupError::NoDisplay),
@@ -67,7 +100,93 @@ fn run() -> Result<(), StartupError> {
         media_prefix = media_prefix.as_str(),
         "starting Qt application"
     );
-    furami::native_host::run_application(&media_prefix, &x11_display)?;
+    furami::native_host::run_application(&media_prefix, &x11_display, capture)?;
     tracing::info!("Qt application exited");
     Ok(())
+}
+
+fn parse_capture_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<Option<CaptureArguments>, StartupError> {
+    Ok(CaptureArguments::parse(args)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn capture_cli_requires_complete_explicit_tuple_and_checked_values() {
+        assert!(parse_capture_args(args(&[])).unwrap().is_none());
+        let parsed = parse_capture_args(args(&[
+            "--capture-node",
+            "/dev/video0",
+            "--capture-fourcc",
+            "NV12",
+            "--capture-size",
+            "2560x1440",
+            "--capture-rate",
+            "60/1",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.node, std::path::Path::new("/dev/video0"));
+        assert_eq!(parsed.mode.rate.numerator(), 60);
+        assert_eq!(parsed.mode.rate.denominator(), 1);
+        assert!(matches!(
+            parse_capture_args(args(&["--capture-node", "/dev/video0"])),
+            Err(StartupError::CaptureArguments(
+                CaptureArgumentError::IncompleteSelection
+            ))
+        ));
+        for value in ["0x1440", "2560x0", "2560x1440x1"] {
+            assert!(
+                parse_capture_args(args(&[
+                    "--capture-node",
+                    "/dev/video0",
+                    "--capture-fourcc",
+                    "NV12",
+                    "--capture-size",
+                    value,
+                    "--capture-rate",
+                    "60/1"
+                ]))
+                .is_err()
+            );
+        }
+        assert!(
+            parse_capture_args(args(&[
+                "--capture-node",
+                "/dev/video0",
+                "--capture-fourcc",
+                "NV12",
+                "--capture-size",
+                "2560x1440",
+                "--capture-rate",
+                "59.94"
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_cli_rejects_duplicates_unknown_flags_and_missing_values() {
+        for values in [
+            vec!["--capture-node"],
+            vec![
+                "--capture-node",
+                "/dev/video0",
+                "--capture-node",
+                "/dev/video2",
+            ],
+            vec!["--proof-source", "testsrc2"],
+        ] {
+            assert!(parse_capture_args(args(&values)).is_err());
+        }
+    }
 }

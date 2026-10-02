@@ -179,11 +179,13 @@ private:
     bool m_poisoned = false;
 };
 
-FuramiBridge::FuramiBridge(rust::Str mediaPrefix)
-    : m_gate(new_gate(mediaPrefix))
+FuramiBridge::FuramiBridge(rust::Box<GateCoordinator> gate)
+    : m_gate(std::move(gate))
 {
     assertGuiThread();
     QQmlEngine::setObjectOwnership(this, QQmlEngine::CppOwnership);
+    m_captureSelected = gate_capture_selected(*m_gate);
+    applyUpdate(gate_poll(*m_gate));
     m_pollTimer.setInterval(16);
     connect(&m_pollTimer, &QTimer::timeout, this, [this] {
         assertGuiThread();
@@ -211,6 +213,7 @@ QString FuramiBridge::phase() const { assertGuiThread(); return m_failed ? QStri
 QString FuramiBridge::diagnostic() const { assertGuiThread(); return m_diagnostic; }
 bool FuramiBridge::paused() const { assertGuiThread(); return m_paused; }
 bool FuramiBridge::ended() const { assertGuiThread(); return m_ended; }
+bool FuramiBridge::captureSelected() const { assertGuiThread(); return m_captureSelected; }
 bool FuramiBridge::textEntryActive() const { assertGuiThread(); return m_textEntryActive; }
 bool FuramiBridge::panelVisible() const { assertGuiThread(); return m_panelVisible; }
 bool FuramiBridge::popupOpen() const { assertGuiThread(); return m_popupOpen; }
@@ -311,16 +314,16 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
     return true;
 }
 
-void FuramiBridge::openProofSource()
+void FuramiBridge::openCapture()
 {
     assertGuiThread();
-    if (m_actualPhase != QStringLiteral("Idle") || m_failed)
+    if (m_actualPhase != QStringLiteral("Idle") || m_failed || !m_captureSelected)
         return;
-    qInfo().noquote() << "input_intent action=OpenProofSource source=panel";
+    qInfo().noquote() << "input_intent action=OpenCapture source=panel";
     applyUpdate(gate_open(*m_gate));
 }
 
-void FuramiBridge::closeProofSession()
+void FuramiBridge::closeCapture()
 {
     assertGuiThread();
     qInfo().noquote() << QStringLiteral("input_intent action=CloseSession source=panel generation=%1 phase=%2")
@@ -331,7 +334,7 @@ void FuramiBridge::closeProofSession()
 void FuramiBridge::openAndCloseDuringOpeningForProof()
 {
     assertGuiThread();
-    if (m_actualPhase != QStringLiteral("Idle") || m_failed)
+    if (m_actualPhase != QStringLiteral("Idle") || m_failed || !m_captureSelected)
         return;
     qInfo().noquote() << "input_intent action=OpenAndCloseDuringOpening source=panel";
     auto update = gate_open(*m_gate);
@@ -755,7 +758,7 @@ void FuramiBridge::logGeometry()
     }
 }
 
-LaunchResult run_qt_application(rust::Str media_prefix, rust::Str display)
+LaunchResult run_qt_application(rust::Box<GateCoordinator> gate, rust::Str display)
 {
     const QByteArray captured(display.data(), static_cast<qsizetype>(display.size()));
     if (captured.isEmpty() || qgetenv("DISPLAY").isEmpty())
@@ -811,7 +814,7 @@ LaunchResult run_qt_application(rust::Str media_prefix, rust::Str display)
 #endif
 
     // Construction order keeps bridge/timer alive until after the QML engine/root dies.
-    FuramiBridge bridge(media_prefix);
+    FuramiBridge bridge(std::move(gate));
     QQmlApplicationEngine engine;
     QObject::connect(&engine, &QObject::destroyed, &application, [] {
         qInfo().noquote() << "qt_engine_destroy";

@@ -65,7 +65,7 @@ ApplicationWindow {
             Label {
                 anchors.centerIn: parent
                 visible: root.bridge.hostWindow === null
-                text: root.bridge.phase === "Idle" ? "Open proof source to start" : root.bridge.phase
+                text: root.bridge.phase === "Idle" ? (root.bridge.captureSelected ? "Open capture to start" : "Select capture mode on command line") : root.bridge.phase
             }
         }
 
@@ -84,30 +84,30 @@ ApplicationWindow {
                 spacing: 8
 
                 Label {
-                    text: "XWayland / Vulkan proof"
+                    text: "Selected capture / Vulkan"
                     font.bold: true
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
                 }
                 Button {
                     objectName: "openProof"
-                    text: "Open proof source"
+                    text: "Open capture"
                     Layout.fillWidth: true
-                    enabled: root.bridge.phase === "Idle"
-                    onClicked: root.bridge.openProofSource()
+                    enabled: root.bridge.phase === "Idle" && root.bridge.captureSelected
+                    onClicked: root.bridge.openCapture()
                 }
                 Button {
                     objectName: "closeProof"
                     text: "Close session"
                     Layout.fillWidth: true
                     enabled: root.bridge.phase !== "Idle" && root.bridge.phase !== "QuitReady"
-                    onClicked: root.bridge.closeProofSession()
+                    onClicked: root.bridge.closeCapture()
                 }
                 Button {
                     objectName: "closeDuringOpenProof"
                     text: "Close during opening"
                     Layout.fillWidth: true
-                    enabled: root.bridge.phase === "Idle"
+                    enabled: root.bridge.phase === "Idle" && root.bridge.captureSelected
                     onClicked: root.bridge.openAndCloseDuringOpeningForProof()
                 }
                 Button {
@@ -118,7 +118,7 @@ ApplicationWindow {
                     onClicked: root.bridge.forceSurfaceLossForProof()
                 }
                 Label {
-                    text: root.bridge.ended ? "Proof source ended. Session stays alive."
+                    text: root.bridge.ended ? "Capture ended. Session stays alive."
                         : root.bridge.paused ? "Playback paused" : "Space pauses / resumes video"
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
@@ -144,14 +144,19 @@ ApplicationWindow {
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
                 }
-                Label {
-                    objectName: "proofDiagnostic"
-                    visible: text.length > 0
-                    text: root.bridge.diagnostic
-                    wrapMode: Text.WrapAnywhere
+                ScrollView {
+                    id: diagnosticScroll
+                    contentWidth: availableWidth
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    verticalAlignment: Text.AlignTop
+                    Layout.minimumHeight: 80
+                    visible: root.bridge.diagnostic.length > 0
+                    Label {
+                        objectName: "proofDiagnostic"
+                        text: root.bridge.diagnostic
+                        width: diagnosticScroll.availableWidth
+                        wrapMode: Text.WrapAnywhere
+                    }
                 }
                 Item {
                     Layout.fillHeight: true

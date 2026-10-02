@@ -4,3 +4,4 @@
 pub mod capabilities;
 pub mod controller;
 mod ffi;
+pub mod session;

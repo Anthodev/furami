@@ -1,5 +1,6 @@
 //! Value-only lifecycle reducer. Native release requires a genuine owner ack.
 
+use crate::capture::input::CaptureSelection;
 #[cfg(test)]
 use crate::media::controller::BackendEvent;
 pub use crate::media::controller::{
@@ -49,6 +50,7 @@ struct GateState {
     quit_requested: bool,
     paused: bool,
     ended: bool,
+    report: String,
 }
 impl GateState {
     fn new(last_generation: u64) -> Self {
@@ -61,6 +63,7 @@ impl GateState {
             quit_requested: false,
             paused: false,
             ended: false,
+            report: String::new(),
         }
     }
     fn phase(&self) -> GatePhase {
@@ -89,7 +92,7 @@ impl GateState {
                 self.failure
                     .as_ref()
                     .map(|e| e.to_string())
-                    .unwrap_or_default()
+                    .unwrap_or_else(|| self.report.clone())
             } else {
                 String::new()
             },
@@ -144,13 +147,26 @@ impl GateState {
         self.update(true, false, false, false)
     }
 
-    fn fail(&mut self, error: MediaError) -> UiUpdate {
-        let changed = self.failure.is_none()
-            || self.token.is_some()
-            || !matches!(self.cleanup, GatePhase::Stopping | GatePhase::Releasing);
-        if self.failure.is_none() {
+    /// Closing handoff/intent rejections are consequences of an owner stop,
+    /// not evidence for its cause. They must yield to a genuine owner/native
+    /// failure, while the first independently observed failure stays latched.
+    fn record_failure(&mut self, error: MediaError) -> bool {
+        let secondary =
+            |error: &MediaError| matches!(error.code, "surface_handoff" | "owner_unavailable");
+        let replace = self
+            .failure
+            .as_ref()
+            .is_none_or(|current| secondary(current) && !secondary(&error));
+        if replace {
             self.failure = Some(error);
         }
+        replace
+    }
+
+    fn fail(&mut self, error: MediaError) -> UiUpdate {
+        let changed = self.record_failure(error)
+            || self.token.is_some()
+            || !matches!(self.cleanup, GatePhase::Stopping | GatePhase::Releasing);
         self.token = None;
         if self.generation.is_some() && self.cleanup != GatePhase::Releasing {
             self.cleanup = GatePhase::Stopping;
@@ -209,8 +225,13 @@ impl GateState {
         let mut changed = self.paused != snapshot.paused || self.ended != snapshot.ended;
         self.paused = snapshot.paused;
         self.ended = snapshot.ended;
+        if let Some(session) = snapshot.session {
+            let report = session.summary();
+            changed |= self.report != report;
+            self.report = report;
+        }
         if snapshot.initialized
-            && snapshot.file_loaded
+            && snapshot.playback_started
             && self.cleanup == GatePhase::Opening
             && self.token.is_some()
         {
@@ -226,10 +247,8 @@ impl GateState {
         {
             return self.unchanged();
         }
-        if let Err(error) = stopped.outcome
-            && self.failure.is_none()
-        {
-            self.failure = Some(error);
+        if let Err(error) = stopped.outcome {
+            self.record_failure(error);
         }
         self.token = None;
         self.cleanup = GatePhase::Releasing;
@@ -257,10 +276,26 @@ pub struct GateCoordinator {
     endpoint: Option<OwnerEndpoint>,
     spawn: Box<dyn FnMut(Generation) -> Result<OwnerEndpoint, MediaError>>,
     pending_update: bool,
+    capture_selected: bool,
 }
 impl GateCoordinator {
-    pub fn new(media_prefix: String) -> Self {
-        Self::with_spawner(move |generation| OwnerEndpoint::spawn(generation, media_prefix.clone()))
+    pub fn new(media_prefix: String, selection: Option<CaptureSelection>) -> Self {
+        let capture_selected = selection.is_some();
+        let report = selection.as_ref().map(|selection| format!("Requested: {}\nOpen capture to start.", selection.requested()))
+            .unwrap_or_else(|| "No capture selected. Start with --capture-node, --capture-fourcc, --capture-size and --capture-rate.".into());
+        let mut coordinator = Self::with_spawner(move |generation| {
+            let selection = selection.clone().ok_or_else(|| {
+                MediaError::new("capture_selection", "no explicit capture selection")
+            })?;
+            OwnerEndpoint::spawn(generation, media_prefix.clone(), selection)
+        });
+        coordinator.capture_selected = capture_selected;
+        coordinator.state.report = report;
+        coordinator.pending_update = true;
+        coordinator
+    }
+    pub(crate) fn capture_selected(&self) -> bool {
+        self.capture_selected
     }
     fn with_spawner(
         spawn: impl FnMut(Generation) -> Result<OwnerEndpoint, MediaError> + 'static,
@@ -270,6 +305,7 @@ impl GateCoordinator {
             endpoint: None,
             spawn: Box::new(spawn),
             pending_update: false,
+            capture_selected: true,
         }
     }
     fn synchronize_stop(&self) {
@@ -281,6 +317,9 @@ impl GateCoordinator {
     }
 
     pub fn open(&mut self) -> UiUpdate {
+        if !self.capture_selected {
+            return self.state.update(true, false, false, false);
+        }
         let update = self.state.open();
         if !update.create_native {
             return update;
@@ -409,6 +448,10 @@ impl GateCoordinator {
     }
     pub fn poll(&mut self) -> UiUpdate {
         let Some(endpoint) = self.endpoint.as_mut() else {
+            if self.pending_update {
+                self.pending_update = false;
+                return self.state.update(true, false, false, false);
+            }
             return self.state.unchanged();
         };
         // Terminal ack must beat any coalesced FileLoaded/Ready snapshot.
@@ -490,6 +533,8 @@ mod tests {
             generation,
             initialized: true,
             file_loaded: ready,
+            playback_started: ready,
+            session: None,
             paused: false,
             ended,
             failure: None,
@@ -551,7 +596,7 @@ mod tests {
         gate.surface_ready(token(g));
         driver.initialized.recv().unwrap();
         driver.submitted.recv().unwrap();
-        driver.send(BackendEvent::FileLoaded);
+        driver.send(BackendEvent::PlaybackRestart);
         driver.send(BackendEvent::EndFile {
             reason: 0,
             error: 0,
@@ -591,7 +636,7 @@ mod tests {
         gate.surface_ready(token(second));
         driver.initialized.recv().unwrap();
         driver.submitted.recv().unwrap();
-        driver.send(BackendEvent::FileLoaded);
+        driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
         assert_eq!(gate.poll().phase, GatePhase::Ready);
         gate.close(second, CloseTarget::Session);
@@ -759,7 +804,7 @@ mod tests {
         gate.surface_ready(token(g));
         driver.initialized.recv().unwrap();
         driver.submitted.recv().unwrap();
-        driver.send(BackendEvent::FileLoaded);
+        driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
         gate.close(g, CloseTarget::Session);
         let update = await_owner(&mut gate);
@@ -802,7 +847,7 @@ mod tests {
         gate.surface_ready(token(g));
         driver.initialized.recv().unwrap();
         driver.submitted.recv().unwrap();
-        driver.send(BackendEvent::FileLoaded);
+        driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
         assert_eq!(gate.poll().phase, GatePhase::Ready);
         for _ in 0..64 {
@@ -844,7 +889,7 @@ mod tests {
             gate.surface_ready(token(g));
             driver.initialized.recv().unwrap();
             driver.submitted.recv().unwrap();
-            driver.send(BackendEvent::FileLoaded);
+            driver.send(BackendEvent::PlaybackRestart);
             driver.fence();
             assert_eq!(gate.poll().phase, GatePhase::Ready);
             if during_stop {
@@ -940,7 +985,7 @@ mod tests {
         gate.surface_ready(token(second));
         driver.initialized.recv().unwrap();
         let (load, _) = driver.submitted.recv().unwrap();
-        driver.send(BackendEvent::FileLoaded);
+        driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
         assert_eq!(gate.poll().phase, GatePhase::Ready);
         for generation in [first, second] {
@@ -1010,5 +1055,226 @@ mod tests {
         host.apply(&update);
         assert_eq!(host.live, Some(g));
         assert!(host.released.is_empty());
+    }
+    #[test]
+    fn file_loaded_headers_never_make_gate_ready_and_no_selection_creates_nothing() {
+        let mut empty = GateCoordinator::new(String::new(), None);
+        let notice = empty.poll();
+        assert_eq!(notice.phase, GatePhase::Idle);
+        assert!(notice.diagnostic.contains("--capture-node"));
+        assert!(!empty.open().create_native);
+        assert!(empty.endpoint.is_none());
+
+        let (mut gate, drivers) = coordinator(Config::default());
+        let generation = gate.open().generation.unwrap();
+        let driver = drivers.recv().unwrap();
+        gate.surface_ready(token(generation));
+        driver.initialized.recv().unwrap();
+        driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::FileLoaded);
+        driver.fence();
+        assert_eq!(gate.poll().phase, GatePhase::Opening);
+        driver.send(BackendEvent::PlaybackRestart);
+        driver.fence();
+        assert_eq!(gate.poll().phase, GatePhase::Ready);
+        gate.close(generation, CloseTarget::Session);
+        assert!(await_owner(&mut gate).release_native);
+        driver.destroyed.recv().unwrap();
+    }
+
+    fn capture_race_coordinator(
+        advertised_rate: u32,
+        hold_shutdown: bool,
+    ) -> (
+        GateCoordinator,
+        mpsc::Receiver<Driver>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        crate::media::session::RequestedFacts,
+    ) {
+        use crate::{
+            capture::linux,
+            domain::capture::{CaptureMode, CapturedFourCc, FrameRate, FrameSize},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let mode = CaptureMode {
+            captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
+            size: FrameSize::new(2560, 1440).unwrap(),
+            rate: FrameRate::new(60, 1).unwrap(),
+        };
+        let initial = linux::session_fixture(&["/dev/video0"], mode);
+        let selection =
+            CaptureSelection::from_snapshot(&initial, std::path::Path::new("/dev/video0"), mode)
+                .unwrap();
+        let requested = selection.requested();
+        let factories = Arc::new(AtomicUsize::new(0));
+        let factory_count = Arc::clone(&factories);
+        let (tx, rx) = mpsc::channel();
+        let gate = GateCoordinator::with_spawner(move |generation| {
+            let (driver, backend) = Driver::pair(Config {
+                hold_shutdown,
+                ..Config::default()
+            });
+            tx.send(driver).unwrap();
+            let selection = selection.clone();
+            let requested = selection.requested();
+            let factory_count = Arc::clone(&factory_count);
+            OwnerEndpoint::spawn_capture_with_backend(
+                generation,
+                requested,
+                move || {
+                    let advertised = CaptureMode {
+                        rate: FrameRate::new(advertised_rate, 1).unwrap(),
+                        ..mode
+                    };
+                    selection
+                        .validate_snapshot(&linux::session_fixture(&["/dev/video0"], advertised))
+                },
+                move |_| {
+                    factory_count.fetch_add(1, Ordering::SeqCst);
+                    backend
+                },
+            )
+        });
+        (gate, rx, factories, requested)
+    }
+
+    #[test]
+    fn authoritative_prevalidation_failure_survives_delayed_surface_handoff_rejection() {
+        use crate::media::session::{Cause, Stage};
+        let (mut gate, drivers, factories, requested) = capture_race_coordinator(30, false);
+        let mut host = FakeHost::default();
+        let opening = gate.open();
+        let generation = opening.generation.unwrap();
+        host.apply(&opening);
+        let driver = drivers.recv().unwrap();
+        gate.endpoint.as_mut().unwrap().wait_for_ack().unwrap();
+        let rejected = gate.surface_ready(token(generation));
+        assert!(rejected.failed && !rejected.release_native);
+        host.apply(&rejected);
+        let release = gate.poll();
+        let error = gate
+            .state
+            .failure
+            .as_ref()
+            .unwrap()
+            .session
+            .as_ref()
+            .unwrap();
+        assert_eq!(error.requested, requested);
+        assert_eq!(
+            (error.stage, error.cause),
+            (Stage::Prevalidation, Cause::RequestedModeRefused)
+        );
+        assert_eq!(release.failure_code, Some("capture_session"));
+        assert!(release.diagnostic.contains("2560x1440"));
+        assert!(release.failed && release.release_native);
+        host.apply(&release);
+        assert_eq!(factories.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(driver.initialized.try_recv().is_err());
+        assert!(driver.submitted.try_recv().is_err());
+        assert!(!gate.poll().release_native);
+        host.apply(&gate.native_released(generation));
+        assert!(!gate.poll().release_native);
+        assert_eq!(host.released, vec![generation]);
+    }
+
+    #[test]
+    fn authoritative_verification_failure_survives_pause_rejection_before_destruction_ack() {
+        use crate::{
+            domain::capture::FrameSize,
+            media::session::{Cause, Observation, ObservedFacts, Source, Stage},
+        };
+        let (mut gate, drivers, factories, requested) = capture_race_coordinator(60, true);
+        let mut host = FakeHost::default();
+        let opening = gate.open();
+        let generation = opening.generation.unwrap();
+        host.apply(&opening);
+        let driver = drivers.recv().unwrap();
+        gate.surface_ready(token(generation));
+        driver.initialized.recv().unwrap();
+        driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::PlaybackRestart);
+        driver.fence();
+        assert_eq!(gate.poll().phase, GatePhase::Ready);
+        driver.set_observed(ObservedFacts {
+            decoded_size: Some(Observation {
+                value: FrameSize::new(1920, 1080).unwrap(),
+                source: Source::MpvDecodedParams,
+            }),
+            ..ObservedFacts::default()
+        });
+        driver.send(BackendEvent::VideoReconfig);
+        driver.shutdown_started.recv().unwrap();
+        assert_eq!(
+            gate.submit(generation, PlaybackIntent::TogglePause),
+            SubmitStatus::Closing
+        );
+        let pending = gate.poll();
+        let failure = gate.poll();
+        // Always release the held owner before assertions can unwind this test.
+        driver.shutdown_release.send(()).unwrap();
+        gate.endpoint.as_mut().unwrap().wait_for_ack().unwrap();
+        let error = gate
+            .state
+            .failure
+            .as_ref()
+            .unwrap()
+            .session
+            .as_ref()
+            .unwrap();
+        assert_eq!(error.requested, requested);
+        assert_eq!(
+            (error.stage, error.cause),
+            (Stage::Verification, Cause::RequestedModeRefused)
+        );
+        assert_eq!(failure.failure_code, Some("capture_session"));
+        assert!(failure.failed && !failure.release_native);
+        assert!(!pending.release_native);
+        assert_eq!(host.live, Some(generation));
+        let release = gate.poll();
+        assert_eq!(release.failure_code, Some("capture_session"));
+        assert!(release.release_native);
+        host.apply(&release);
+        driver.destroyed.recv().unwrap();
+        assert_eq!(factories.load(std::sync::atomic::Ordering::SeqCst), 1);
+        host.apply(&gate.native_released(generation));
+        assert!(!gate.poll().release_native);
+        assert_eq!(host.released, vec![generation]);
+    }
+
+    #[test]
+    fn genuine_surface_loss_supersedes_secondary_pause_rejection_and_survives_owner_ack() {
+        let (mut gate, drivers, _, _) = capture_race_coordinator(60, true);
+        let generation = gate.open().generation.unwrap();
+        let driver = drivers.recv().unwrap();
+        gate.surface_ready(token(generation));
+        driver.initialized.recv().unwrap();
+        driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::PlaybackRestart);
+        driver.fence();
+        assert_eq!(gate.poll().phase, GatePhase::Ready);
+        driver.send(BackendEvent::EndFile {
+            reason: 4,
+            error: -13,
+        });
+        driver.shutdown_started.recv().unwrap();
+        assert_eq!(
+            gate.submit(generation, PlaybackIntent::TogglePause),
+            SubmitStatus::Closing
+        );
+        let loss = gate.surface_lost(generation);
+        driver.shutdown_release.send(()).unwrap();
+        gate.endpoint.as_mut().unwrap().wait_for_ack().unwrap();
+        assert_eq!(loss.failure_code, Some("surface_lost"));
+        assert!(loss.failed && !loss.release_native);
+        let release = gate.poll();
+        assert_eq!(release.failure_code, Some("surface_lost"));
+        assert!(release.failed && release.release_native);
+        driver.destroyed.recv().unwrap();
+        gate.native_released(generation);
+        assert!(!gate.poll().release_native);
     }
 }

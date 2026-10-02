@@ -3,6 +3,9 @@
 use super::controller::{
     BackendCommand, BackendEvent, MediaError, OwnerBackend, RequestId, StopFlag, SurfaceToken,
 };
+use super::session::{Observation, ObservedFacts, Source};
+use crate::capture::input::InputSpec;
+use crate::domain::capture::FrameSize;
 use libloading::Library;
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_ulong, c_void},
@@ -14,7 +17,6 @@ use std::{
 };
 
 const CLIENT_API: c_ulong = 0x0002_0005;
-const PROOF_SOURCE: &CStr = c"av://lavfi:testsrc2=size=1280x720:rate=30:d=60";
 
 #[repr(C)]
 struct MpvEvent {
@@ -254,12 +256,16 @@ impl Drop for Handle {
 pub(crate) struct MpvBackend {
     prefix: String,
     handle: Option<Handle>,
+    input: InputSpec,
+    diagnostics: std::collections::VecDeque<String>,
 }
 impl MpvBackend {
-    pub(crate) fn new(prefix: String) -> Self {
+    pub(crate) fn new(prefix: String, input: InputSpec) -> Self {
         Self {
             prefix,
             handle: None,
+            input,
+            diagnostics: std::collections::VecDeque::new(),
         }
     }
     fn handle(&self) -> Result<&Handle, MediaError> {
@@ -305,13 +311,19 @@ impl OwnerBackend for MpvBackend {
             handle.option(name, value)?;
         }
         check_stop(stop)?;
-        let xid = CString::new(token.xid.get().to_string()).expect("decimal XID contains no NUL");
+        handle.option(c"demuxer-lavf-format", c"v4l2")?;
+        handle.option(c"demuxer-lavf-o", self.input.lavf_options())?;
+        handle.option(c"audio", c"no")?;
+        check_stop(stop)?;
+        let xid = CString::new(token.xid.get().to_string())
+            .map_err(|error| MediaError::new("mpv_xid", error.to_string()))?;
         handle.option(c"wid", &xid)?;
         check_stop(stop)?;
         // SAFETY: Live unique owner handle and static C log-level string. All
         // later log payloads are copied within their wait_event lifetime.
-        let result = unsafe { (handle.functions.request_logs)(handle.raw.as_ptr(), c"v".as_ptr()) };
-        handle.checked(result, "request verbose logs")?;
+        let result =
+            unsafe { (handle.functions.request_logs)(handle.raw.as_ptr(), c"info".as_ptr()) };
+        handle.checked(result, "request info logs")?;
         check_stop(stop)?;
         // SAFETY: All pinned options were set on this owner-thread handle before
         // initialization. Synchronous initialize may block only this owner thread.
@@ -337,13 +349,14 @@ impl OwnerBackend for MpvBackend {
     fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
         let handle = self.handle()?;
         let arguments = match command {
-            BackendCommand::LoadProofSource => {
-                [c"loadfile".as_ptr(), PROOF_SOURCE.as_ptr(), ptr::null()]
+            BackendCommand::LoadInput => {
+                [c"loadfile".as_ptr(), self.input.url().as_ptr(), ptr::null()]
             }
             BackendCommand::TogglePause => [c"cycle".as_ptr(), c"pause".as_ptr(), ptr::null()],
         };
-        // SAFETY: Owner-thread live handle, checked nonzero ID and a terminated
-        // argv of static C strings. mpv copies arguments before returning.
+        // SAFETY: Live owner-thread handle, checked nonzero ID, terminated argv
+        // of separately owned NUL-free strings. mpv copies before returning;
+        // the node never enters the lavf option string.
         let result = unsafe {
             (handle.functions.command_async)(handle.raw.as_ptr(), id.get(), arguments.as_ptr())
         };
@@ -371,6 +384,15 @@ impl OwnerBackend for MpvBackend {
                         CStr::from_ptr(log.text).to_string_lossy().into_owned(),
                     )
                 };
+                if matches!(level.as_str(), "fatal" | "error" | "warn") {
+                    if self.diagnostics.len() == 16 {
+                        self.diagnostics.pop_front();
+                    }
+                    self.diagnostics.push_back(format!(
+                        "{prefix}/{level}: {}",
+                        text.chars().take(2048).collect::<String>()
+                    ));
+                }
                 tracing::info!(
                     mpv_prefix = prefix,
                     mpv_level = level,
@@ -395,11 +417,9 @@ impl OwnerBackend for MpvBackend {
                     error: end.error,
                 })
             }
-            8 => {
-                let vo = handle.property(c"current-vo")?;
-                tracing::info!(current_vo = vo, "mpv_file_loaded");
-                Ok(BackendEvent::FileLoaded)
-            }
+            8 => Ok(BackendEvent::FileLoaded),
+            17 => Ok(BackendEvent::VideoReconfig),
+            21 => Ok(BackendEvent::PlaybackRestart),
             24 => Ok(BackendEvent::QueueOverflow),
             _ => Ok(BackendEvent::Other),
         }
@@ -412,6 +432,59 @@ impl OwnerBackend for MpvBackend {
                 "pause_property",
                 format!("invalid pause property {value:?}"),
             )),
+        }
+    }
+    fn read_observed(&mut self) -> Result<ObservedFacts, MediaError> {
+        let handle = self.handle()?;
+        let width = handle
+            .property(c"video-params/w")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok());
+        let height = handle
+            .property(c"video-params/h")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok());
+        let decoded_size = width
+            .zip(height)
+            .and_then(|(width, height)| FrameSize::new(width, height).ok())
+            .map(|value| Observation {
+                value,
+                source: Source::MpvDecodedParams,
+            });
+        let decoded_pixel_format = handle
+            .property(c"video-params/pixelformat")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| Observation {
+                value,
+                source: Source::MpvDecodedParams,
+            });
+        let nominal_rate = handle
+            .property(c"container-fps")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| Observation {
+                value,
+                source: Source::MpvContainerFps,
+            });
+        Ok(ObservedFacts {
+            decoded_size,
+            decoded_pixel_format,
+            nominal_rate,
+        })
+    }
+    fn diagnostic(&self) -> Option<String> {
+        if self.diagnostics.is_empty() {
+            None
+        } else {
+            Some(
+                self.diagnostics
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
         }
     }
     fn shutdown(&mut self) {

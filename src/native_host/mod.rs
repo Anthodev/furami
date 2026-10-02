@@ -8,8 +8,16 @@ pub struct NativeLaunchError {
     pub diagnostic: String,
 }
 
-pub fn run_application(media_prefix: &str, display: &str) -> Result<(), NativeLaunchError> {
-    let result = crate::ui::bridge::ffi::run_qt_application(media_prefix, display);
+pub fn run_application(
+    media_prefix: &str,
+    display: &str,
+    selection: Option<crate::capture::input::CaptureSelection>,
+) -> Result<(), NativeLaunchError> {
+    let gate = Box::new(crate::app::gate::GateCoordinator::new(
+        media_prefix.to_owned(),
+        selection,
+    ));
+    let result = crate::ui::bridge::ffi::run_qt_application(gate, display);
     if result.exit_code == 0 {
         Ok(())
     } else {

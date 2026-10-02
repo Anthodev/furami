@@ -11,6 +11,9 @@ use std::{
     time::Duration,
 };
 
+use super::session::{ObservedFacts, RequestedFacts, SessionError, SessionFacts};
+use crate::capture::input::{CaptureSelection, InputSpec, SelectionError};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Generation(NonZeroU64);
 impl Generation {
@@ -59,21 +62,33 @@ pub enum SubmitStatus {
 pub struct MediaError {
     pub code: &'static str,
     pub diagnostic: String,
+    #[source]
+    pub session: Option<Box<SessionError>>,
 }
 impl MediaError {
     pub(crate) fn new(code: &'static str, diagnostic: impl Into<String>) -> Self {
         Self {
             code,
             diagnostic: diagnostic.into(),
+            session: None,
+        }
+    }
+    pub(crate) fn from_session(error: SessionError) -> Self {
+        Self {
+            code: "capture_session",
+            diagnostic: error.to_string(),
+            session: Some(Box::new(error)),
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Snapshot {
     pub generation: Generation,
     pub initialized: bool,
     pub file_loaded: bool,
+    pub playback_started: bool,
+    pub session: Option<SessionFacts>,
     pub paused: bool,
     pub ended: bool,
     pub failure: Option<MediaError>,
@@ -141,13 +156,15 @@ impl RequestId {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BackendCommand {
-    LoadProofSource,
+    LoadInput,
     TogglePause,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BackendEvent {
     None,
     FileLoaded,
+    PlaybackRestart,
+    VideoReconfig,
     CommandReply {
         id: u64,
         error: i32,
@@ -166,6 +183,8 @@ pub(crate) trait OwnerBackend {
     fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError>;
     fn next_event(&mut self) -> Result<BackendEvent, MediaError>;
     fn read_pause(&mut self) -> Result<bool, MediaError>;
+    fn read_observed(&mut self) -> Result<ObservedFacts, MediaError>;
+    fn diagnostic(&self) -> Option<String>;
     fn shutdown(&mut self);
 }
 
@@ -188,10 +207,60 @@ impl OwnerEndpoint {
         self.generation
     }
 
-    pub(crate) fn spawn(generation: Generation, prefix: String) -> Result<Self, MediaError> {
-        Self::spawn_with_backend(generation, move || super::ffi::MpvBackend::new(prefix))
+    pub(crate) fn spawn(
+        generation: Generation,
+        prefix: String,
+        selection: CaptureSelection,
+    ) -> Result<Self, MediaError> {
+        let requested = selection.requested();
+        Self::spawn_capture_with_backend(
+            generation,
+            requested,
+            move || selection.revalidate(),
+            move |input| super::ffi::MpvBackend::new(prefix, input),
+        )
     }
 
+    pub(crate) fn spawn_capture_with_backend<P, F, B>(
+        generation: Generation,
+        requested: RequestedFacts,
+        prepare: P,
+        factory: F,
+    ) -> Result<Self, MediaError>
+    where
+        P: FnOnce() -> Result<InputSpec, SelectionError> + Send + 'static,
+        F: FnOnce(InputSpec) -> B + Send + 'static,
+        B: OwnerBackend + 'static,
+    {
+        Self::spawn_task(
+            generation,
+            move |surface, commands, stop, latest, snapshot| {
+                if stop.is_set() {
+                    return stop.outcome();
+                }
+                let input = prepare().map_err(|error| {
+                    MediaError::from_session(SessionError::prevalidation(requested.clone(), error))
+                })?;
+                if stop.is_set() {
+                    return stop.outcome();
+                }
+                let requested = input.requested().clone();
+                tracing::info!(generation = generation.get(), requested = %requested, "capture_requested");
+                run_backend(
+                    factory(input),
+                    surface,
+                    commands,
+                    stop,
+                    latest,
+                    snapshot,
+                    0,
+                    Some(&requested),
+                )
+            },
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn spawn_with_backend<F, B>(
         generation: Generation,
         factory: F,
@@ -203,6 +272,7 @@ impl OwnerEndpoint {
         Self::spawn_with_backend_seed(generation, factory, 0)
     }
 
+    #[cfg(test)]
     fn spawn_with_backend_seed<F, B>(
         generation: Generation,
         factory: F,
@@ -212,6 +282,35 @@ impl OwnerEndpoint {
         F: FnOnce() -> B + Send + 'static,
         B: OwnerBackend + 'static,
     {
+        Self::spawn_task(
+            generation,
+            move |surface, commands, stop, latest, snapshot| {
+                run_backend(
+                    factory(),
+                    surface,
+                    commands,
+                    stop,
+                    latest,
+                    snapshot,
+                    request_seed,
+                    None,
+                )
+            },
+        )
+    }
+
+    fn spawn_task(
+        generation: Generation,
+        task: impl FnOnce(
+            &Receiver<SurfaceToken>,
+            &Receiver<PlaybackIntent>,
+            &StopFlag,
+            &Mutex<Option<Snapshot>>,
+            &mut Snapshot,
+        ) -> Result<(), MediaError>
+        + Send
+        + 'static,
+    ) -> Result<Self, MediaError> {
         let (surface, surface_rx) = mpsc::sync_channel(1);
         let (commands, command_rx) = mpsc::sync_channel(64);
         let (stopped_tx, stopped) = mpsc::sync_channel(1);
@@ -222,34 +321,30 @@ impl OwnerEndpoint {
         let handle = thread::Builder::new()
             .name(format!("furami-mpv-{}", generation.get()))
             .spawn(move || {
-                // The backend is constructed here: B need not, and real B cannot, be Send.
-                let mut backend = BackendLifetime(Some(factory()));
                 let mut snapshot = Snapshot {
                     generation,
                     initialized: false,
                     file_loaded: false,
+                    playback_started: false,
+                    session: None,
                     paused: false,
                     ended: false,
                     failure: None,
                 };
-                let outcome = run_owner(
-                    backend.0.as_mut().expect("live backend"),
+                let outcome = task(
                     &surface_rx,
                     &command_rx,
                     &owner_stop,
                     &owner_latest,
                     &mut snapshot,
-                    request_seed,
                 );
-                if let Err(error) = &outcome {
+                if let Err(error) = &outcome
+                    && snapshot.failure.as_ref() != Some(error)
+                {
                     owner_stop.request(Some(error.clone()));
                     snapshot.failure = Some(error.clone());
                     publish(&owner_latest, &snapshot);
                 }
-                tracing::info!(generation = generation.get(), "owner_destroy_begin");
-                backend.shutdown();
-                tracing::info!(generation = generation.get(), "owner_destroy_complete");
-                // shutdown includes backend drop, callback teardown and ELF resource release.
                 let _ = stopped_tx.send(OwnerStopped {
                     generation,
                     outcome: owner_stop.outcome(),
@@ -426,6 +521,59 @@ fn publish(latest: &Mutex<Option<Snapshot>>, snapshot: &Snapshot) {
     *latest.lock().unwrap_or_else(|p| p.into_inner()) = Some(snapshot.clone());
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_backend<B: OwnerBackend>(
+    backend: B,
+    surface: &Receiver<SurfaceToken>,
+    commands: &Receiver<PlaybackIntent>,
+    stop: &StopFlag,
+    latest: &Mutex<Option<Snapshot>>,
+    snapshot: &mut Snapshot,
+    request_seed: u64,
+    requested: Option<&RequestedFacts>,
+) -> Result<(), MediaError> {
+    let mut backend = BackendLifetime(Some(backend));
+    let outcome = match backend.0.as_mut() {
+        Some(backend) => run_owner(
+            backend,
+            surface,
+            commands,
+            stop,
+            latest,
+            snapshot,
+            request_seed,
+            requested,
+        ),
+        None => Err(MediaError::new("owner_backend", "owner backend absent")),
+    }
+    .map_err(|error| match requested {
+        Some(requested) if error.session.is_none() && error.code != "cancelled" => {
+            MediaError::from_session(SessionError::backend(
+                requested.clone(),
+                error.to_string(),
+                None,
+            ))
+        }
+        _ => error,
+    });
+    if let Err(error) = &outcome {
+        stop.request(Some(error.clone()));
+        snapshot.failure = Some(error.clone());
+        publish(latest, snapshot);
+    }
+    tracing::info!(
+        generation = snapshot.generation.get(),
+        "owner_destroy_begin"
+    );
+    backend.shutdown();
+    tracing::info!(
+        generation = snapshot.generation.get(),
+        "owner_destroy_complete"
+    );
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_owner<B: OwnerBackend>(
     backend: &mut B,
     surface: &Receiver<SurfaceToken>,
@@ -434,6 +582,7 @@ fn run_owner<B: OwnerBackend>(
     latest: &Mutex<Option<Snapshot>>,
     snapshot: &mut Snapshot,
     mut last_request: u64,
+    requested: Option<&RequestedFacts>,
 ) -> Result<(), MediaError> {
     let token = loop {
         if stop.is_set() {
@@ -464,8 +613,8 @@ fn run_owner<B: OwnerBackend>(
     snapshot.initialized = true;
     publish(latest, snapshot);
     let id = RequestId::next(&mut last_request)?;
-    backend.submit(id, BackendCommand::LoadProofSource)?;
-    let mut pending = Some((id, BackendCommand::LoadProofSource));
+    backend.submit(id, BackendCommand::LoadInput)?;
+    let mut pending = Some((id, BackendCommand::LoadInput));
     loop {
         if stop.is_set() {
             return stop.outcome();
@@ -494,7 +643,8 @@ fn run_owner<B: OwnerBackend>(
             if stop.is_set() {
                 return stop.outcome();
             }
-            match backend.next_event()? {
+            let event = backend.next_event()?;
+            match event {
                 BackendEvent::None => {
                     drained = true;
                     break;
@@ -505,6 +655,23 @@ fn run_owner<B: OwnerBackend>(
                     snapshot.file_loaded = true;
                     publish(latest, snapshot);
                 }
+                BackendEvent::PlaybackRestart | BackendEvent::VideoReconfig => {
+                    let started = matches!(event, BackendEvent::PlaybackRestart);
+                    let observed = backend.read_observed()?;
+                    if started || snapshot.playback_started {
+                        if let Some(requested) = requested {
+                            let facts = SessionFacts::verify(requested.clone(), observed)
+                                .map_err(MediaError::from_session)?;
+                            tracing::info!(generation = snapshot.generation.get(),
+                                facts = %serde_json::to_string(&facts).map_err(|error| MediaError::new("capture_metadata", error.to_string()))?,
+                                "capture_observed");
+                            snapshot.session = Some(facts);
+                        }
+                        snapshot.playback_started |= started;
+                        snapshot.paused = backend.read_pause()?;
+                        publish(latest, snapshot);
+                    }
+                }
                 BackendEvent::CommandReply { id, error } => {
                     if let Some((expected, kind)) = pending
                         && expected.get() == id
@@ -512,7 +679,10 @@ fn run_owner<B: OwnerBackend>(
                         if error < 0 {
                             return Err(MediaError::new(
                                 "command_reply",
-                                format!("mpv async command failed: {error}"),
+                                format!(
+                                    "mpv async command failed: {error}; {}",
+                                    backend.diagnostic().unwrap_or_default()
+                                ),
                             ));
                         }
                         pending = None;
@@ -542,7 +712,10 @@ fn run_owner<B: OwnerBackend>(
                     if error < 0 || reason == 4 {
                         return Err(MediaError::new(
                             "playback",
-                            format!("mpv END_FILE reason={reason} error={error}"),
+                            format!(
+                                "mpv END_FILE reason={reason} error={error}; {}",
+                                backend.diagnostic().unwrap_or_default()
+                            ),
                         ));
                     }
                     if reason == 0 {
@@ -580,6 +753,7 @@ pub(crate) mod test_support {
 
     pub(crate) enum Input {
         Event(BackendEvent),
+        Observe(ObservedFacts),
         Fence(Sender<()>),
     }
 
@@ -590,6 +764,7 @@ pub(crate) mod test_support {
         pub destroyed: Receiver<bool>,
         pub initialize_release: Sender<()>,
         pub shutdown_release: Sender<()>,
+        pub shutdown_started: Receiver<()>,
     }
 
     #[derive(Default)]
@@ -610,8 +785,10 @@ pub(crate) mod test_support {
         destroyed: Sender<bool>,
         initialize_release: Receiver<()>,
         shutdown_release: Receiver<()>,
+        shutdown_started: Sender<()>,
         has_handle: bool,
         paused: bool,
+        observed: ObservedFacts,
     }
 
     impl Driver {
@@ -622,6 +799,7 @@ pub(crate) mod test_support {
             let (destroy_tx, destroyed) = mpsc::channel();
             let (initialize_release, init_rx) = mpsc::channel();
             let (shutdown_release, shutdown_rx) = mpsc::channel();
+            let (shutdown_started_tx, shutdown_started) = mpsc::channel();
             (
                 Self {
                     events,
@@ -630,6 +808,7 @@ pub(crate) mod test_support {
                     destroyed,
                     initialize_release,
                     shutdown_release,
+                    shutdown_started,
                 },
                 FakeBackend {
                     config,
@@ -639,14 +818,20 @@ pub(crate) mod test_support {
                     destroyed: destroy_tx,
                     initialize_release: init_rx,
                     shutdown_release: shutdown_rx,
+                    shutdown_started: shutdown_started_tx,
                     has_handle: false,
                     paused: false,
+                    observed: ObservedFacts::default(),
                 },
             )
         }
 
         pub(crate) fn send(&self, event: BackendEvent) {
             self.events.send(Input::Event(event)).unwrap();
+        }
+
+        pub(crate) fn set_observed(&self, observed: ObservedFacts) {
+            self.events.send(Input::Observe(observed)).unwrap();
         }
 
         pub(crate) fn fence(&self) {
@@ -682,6 +867,10 @@ pub(crate) mod test_support {
                     }
                     Ok(event)
                 }
+                Ok(Input::Observe(observed)) => {
+                    self.observed = observed;
+                    Ok(BackendEvent::Other)
+                }
                 Ok(Input::Fence(tx)) => {
                     tx.send(()).unwrap();
                     Ok(BackendEvent::None)
@@ -701,7 +890,15 @@ pub(crate) mod test_support {
             }
         }
 
+        fn read_observed(&mut self) -> Result<ObservedFacts, MediaError> {
+            Ok(self.observed.clone())
+        }
+        fn diagnostic(&self) -> Option<String> {
+            None
+        }
+
         fn shutdown(&mut self) {
+            let _ = self.shutdown_started.send(());
             if self.config.hold_shutdown {
                 self.shutdown_release.recv().unwrap();
             }
@@ -734,7 +931,7 @@ mod tests {
     }
     fn load(driver: &Driver) -> RequestId {
         let (id, command) = driver.submitted.recv().unwrap();
-        assert_eq!(command, BackendCommand::LoadProofSource);
+        assert_eq!(command, BackendCommand::LoadInput);
         id
     }
     fn stop(owner: &mut OwnerEndpoint, driver: &Driver) -> OwnerStopped {
