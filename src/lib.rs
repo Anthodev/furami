@@ -3,6 +3,8 @@
 extern crate cxx_qt_lib as _;
 
 pub mod app;
+pub mod capture;
+pub mod domain;
 pub mod media;
 pub mod native_host;
 pub mod ui;

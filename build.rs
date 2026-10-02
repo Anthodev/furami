@@ -60,6 +60,19 @@ fn main() {
         assert_eq!(actual_api, api, "libmpv client API differs from stack lock");
     }
 
+    cxx_build::bridge("src/capture/linux/ffi.rs")
+        .file("src/capture/linux/v4l2.cpp")
+        .include("src/capture/linux")
+        .std("c++17")
+        .compile("furami_capture_linux");
+    for source in [
+        "src/capture/linux/ffi.rs",
+        "src/capture/linux/v4l2.h",
+        "src/capture/linux/v4l2.cpp",
+    ] {
+        println!("cargo:rerun-if-changed={source}");
+    }
+
     let native_flags = tool_output(
         Command::new("pkg-config").args(["--cflags", "x11", "xcb", "xcb-shape"]),
         "X11/XCB/XCB-SHAPE development prerequisites",
