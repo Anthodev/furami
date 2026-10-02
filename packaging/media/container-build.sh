@@ -74,6 +74,8 @@ export LDFLAGS="-Wl,-rpath,$PREFIX/lib"
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
 export LD_LIBRARY_PATH="$PREFIX/lib"
 export SOURCE_DATE_EPOCH
+JOBS="${FURAMI_BUILD_JOBS:-2}"
+[[ "$JOBS" =~ ^[1-4]$ ]] || { echo 'build jobs must be 1..4' >&2; exit 1; }
 
 record() {
   printf '%q ' "$@" >> /out/build-flags.txt
@@ -98,7 +100,7 @@ record ./configure --prefix="$PREFIX" --enable-shared --disable-static --disable
   --enable-indev=v4l2 --enable-libpulse --enable-indev=pulse \
   --enable-decoder=mjpeg --enable-avfilter --enable-filter=eq \
   --enable-filter=unsharp --enable-filter=hqdn3d --enable-filter=bwdif
-record make -j"$(nproc)"
+record make -j"$JOBS"
 record make install
 cp ffbuild/config.mak /out/ffmpeg-config.mak
 cp config.h /out/ffmpeg-config.h
@@ -112,7 +114,7 @@ record meson setup placebo-build libplacebo --prefix="$PREFIX" --libdir=lib \
   -Dvulkan=enabled -Dglslang=enabled -Dshaderc=disabled -Dopengl=disabled \
   -Dlcms=disabled -Dlibdovi=disabled -Ddovi=disabled -Dxxhash=disabled \
   -Ddemos=false -Dtests=false -Dunwind=disabled
-record meson compile -C placebo-build
+record meson compile -j "$JOBS" -C placebo-build
 record meson install -C placebo-build
 meson introspect placebo-build --buildoptions > /out/libplacebo-buildoptions.json
 require_private_pc libplacebo 7.360.1
@@ -129,7 +131,7 @@ record meson setup mpv-build mpv --prefix="$PREFIX" --libdir=lib \
   --buildtype=release --default-library=shared --wrap-mode=nofallback \
   -Dbuild-date=false -Dgpl=true -Dlibmpv=true -Dlibavdevice=enabled \
   -Dpulse=enabled -Dvulkan=enabled -Dx11=enabled -Dwayland=disabled "$MPV_JPEG_FLAG"
-record meson compile -C mpv-build
+record meson compile -j "$JOBS" -C mpv-build
 record meson install -C mpv-build
 meson introspect mpv-build --buildoptions > /out/mpv-buildoptions.json
 require_private_pc mpv "$MPV_CLIENT_API"

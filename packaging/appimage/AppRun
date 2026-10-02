@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+export FURAMI_MEDIA_PREFIX="$HERE/usr"
+export LD_LIBRARY_PATH="$HERE/usr/lib"
+export QT_PLUGIN_PATH="$HERE/usr/lib/qt6/plugins"
+export QT_QPA_PLATFORM_PLUGIN_PATH="$HERE/usr/lib/qt6/plugins/platforms"
+export QML_IMPORT_PATH="$HERE/usr/qml"
+export QML2_IMPORT_PATH="$HERE/usr/qml"
+unset QT_QPA_PLATFORMTHEME QT_QPA_GENERIC_PLUGINS QT_STYLE_OVERRIDE
+unset QT_QUICK_CONTROLS_CONF QT_QUICK_CONTROLS_FALLBACK_STYLE
+export QT_QUICK_CONTROLS_STYLE=Basic
+export QT_QPA_PLATFORM=xcb
+exec "$HERE/usr/bin/furami" "$@"

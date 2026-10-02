@@ -1,0 +1,163 @@
+{
+  "schema": 1,
+  "rust_version": "1.97.1",
+  "target": "x86_64-unknown-linux-gnu",
+  "media_lock_sha256": "05840c73903c6af3e7c696ab8b73b77f07130345c5847a18fc0f887757ab514b",
+  "toolchain": {
+    "rustc": {
+      "url": "https://static.rust-lang.org/dist/rustc-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "archive": "rustc-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "9819d0a32d56bd339585319c80260e332779f5541fd66838ab7e016d6c814819"
+    },
+    "cargo": {
+      "url": "https://static.rust-lang.org/dist/cargo-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "archive": "cargo-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "e1be5f5ff7f7f80ca506fb65770b759edbdc6d303781ed71c5de8ec8a8394779"
+    },
+    "rust-std": {
+      "url": "https://static.rust-lang.org/dist/rust-std-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "archive": "rust-std-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "1c1e704ae80126b7de34f72ea2825f7fd01736dec20732faed47374b95282fba"
+    },
+    "rust-src": {
+      "url": "https://static.rust-lang.org/dist/rust-src-1.97.1.tar.xz",
+      "archive": "rust-src-1.97.1.tar.xz",
+      "sha256": "e9a1e616d04c6845895c827a178b9227f7c7199f3f4a80af81ab3aff7b80156b"
+    }
+  },
+  "rust_standard_library": {
+    "license_expression": "MIT OR Apache-2.0",
+    "notices": [
+      {
+        "archive": "rust-std-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+        "path": "rust-std-1.97.1-x86_64-unknown-linux-gnu/LICENSE-APACHE",
+        "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+      },
+      {
+        "archive": "rust-std-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+        "path": "rust-std-1.97.1-x86_64-unknown-linux-gnu/LICENSE-MIT",
+        "sha256": "b71bd43a069ca0641a9ecfe585ca7b3c53b5cc1608f8b68321168698e28b5ea1"
+      },
+      {
+        "archive": "rust-std-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+        "path": "rust-std-1.97.1-x86_64-unknown-linux-gnu/COPYRIGHT",
+        "sha256": "172020dbfd5b53a226dfde77616190a48dcff519b0bc0e6deb91a8450782c4af"
+      }
+    ]
+  },
+  "apt_source_index": {
+    "inrelease": {
+      "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/dists/noble-updates/InRelease",
+      "sha256": "aeaf85abd41363b42bf9951020685e0f28971d0626afd28f210919a2b8f89810"
+    },
+    "sources": {
+      "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/dists/noble-updates/main/source/Sources.xz",
+      "sha256": "c876fec71ef809bc2de97df985eca3be12dce1a0699b3928d54a2d1a511bb2d2"
+    }
+  },
+  "direct_object_packages": {
+    "libgcc-13-dev": {
+      "binary_package": {
+        "name": "libgcc-13-dev",
+        "version": "13.3.0-6ubuntu2~24.04.1",
+        "archive": "libgcc-13-dev_13.3.0-6ubuntu2~24.04.1_amd64.deb",
+        "sha256": "cd689db2691edaa10f37329307292796bb599e722e0505c79e14caaa1fe9a93a",
+        "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/gcc-13/libgcc-13-dev_13.3.0-6ubuntu2~24.04.1_amd64.deb"
+      },
+      "source_package": {
+        "name": "gcc-13",
+        "version": "13.3.0-6ubuntu2~24.04.1",
+        "dsc": {
+          "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/gcc-13/gcc-13_13.3.0-6ubuntu2~24.04.1.dsc",
+          "sha256": "86b4012c312ac13e3e092877719a62a5b5dbab082ae7e9680780a25c6a13ddc6"
+        },
+        "files": [
+          {
+            "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/gcc-13/gcc-13_13.3.0.orig.tar.gz",
+            "sha256": "3b85d91bf38d1b858d9d01134f4046b3359731968ed4e6e912d29717a35d1a46"
+          },
+          {
+            "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/gcc-13/gcc-13_13.3.0-6ubuntu2~24.04.1.debian.tar.xz",
+            "sha256": "5523658f272ad6d15a83b6e26d178fbd5cb7709ec7ce2ca52b0c843e19c228e3"
+          }
+        ],
+        "build_config": {
+          "archive": "gcc-13_13.3.0-6ubuntu2~24.04.1.debian.tar.xz",
+          "path": "debian/rules",
+          "sha256": "2e0afdc6303e407f344d2f6724be731ae84b8fd59758f172491c25348432d75a"
+        },
+        "object_sources": {
+          "/usr/lib/gcc/x86_64-linux-gnu/13/crtbeginS.o": "gcc/crtstuff.c",
+          "/usr/lib/gcc/x86_64-linux-gnu/13/crtendS.o": "gcc/crtstuff.c"
+        }
+      },
+      "license_expression": "GPL-3.0-or-later WITH GCC-exception-3.1",
+      "notice": {
+        "archive": "gcc-13-base_13.3.0-6ubuntu2~24.04.1_amd64.deb",
+        "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/gcc-13/gcc-13-base_13.3.0-6ubuntu2~24.04.1_amd64.deb",
+        "archive_sha256": "e859aca26585bb91113a451f1e66bc0e5283cb08797d679aacc1d936ae6dff8e",
+        "path": "usr/share/doc/gcc-13-base/copyright",
+        "sha256": "08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+      },
+      "objects": {
+        "/usr/lib/gcc/x86_64-linux-gnu/13/crtbeginS.o": "667ff5f1edc931d44d1f2bb44d313907aa274bcc207c0beff71a398335f0d29f",
+        "/usr/lib/gcc/x86_64-linux-gnu/13/crtendS.o": "9c8b2caad195193301ef072895dc89bea1d23371d4c19accd821debe27773063"
+      }
+    },
+    "libc6-dev": {
+      "binary_package": {
+        "name": "libc6-dev",
+        "version": "2.39-0ubuntu8.9",
+        "archive": "libc6-dev_2.39-0ubuntu8.9_amd64.deb",
+        "sha256": "e13d5fcc1b2a86f75bca8e0026a8e39f24fe97ca86e92be79991f8697eb1306f",
+        "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/glibc/libc6-dev_2.39-0ubuntu8.9_amd64.deb"
+      },
+      "source_package": {
+        "name": "glibc",
+        "version": "2.39-0ubuntu8.9",
+        "dsc": {
+          "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/glibc/glibc_2.39-0ubuntu8.9.dsc",
+          "sha256": "1b73a89e0910eb3e5920cde639ac7eb606256d8ee809688ff9b5912b67002711"
+        },
+        "files": [
+          {
+            "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/glibc/glibc_2.39.orig.tar.xz",
+            "sha256": "f77bd47cf8170c57365ae7bf86696c118adb3b120d3259c64c502d3dc1e2d926"
+          },
+          {
+            "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/glibc/glibc_2.39.orig.tar.xz.asc",
+            "sha256": "2cce427ef7933c17379f5514e4f0ccf8dffae5bf8c72f0f7e0bf8b8401f34be5"
+          },
+          {
+            "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/glibc/glibc_2.39-0ubuntu8.9.debian.tar.xz",
+            "sha256": "d6114f2302896a3c8612453e1bf1d0e61603e3029ba4a7c246fbb1ab4c48d2b0"
+          }
+        ],
+        "build_config": {
+          "archive": "glibc_2.39-0ubuntu8.9.debian.tar.xz",
+          "path": "debian/rules",
+          "sha256": "b816a9bef95e8ad06f395a54ef52b90132e6947c47d3f0aa8b9b66d297dc74d2"
+        },
+        "object_sources": {
+          "/usr/lib/x86_64-linux-gnu/Scrt1.o": "sysdeps/x86_64/start.S",
+          "/usr/lib/x86_64-linux-gnu/crti.o": "sysdeps/x86_64/crti.S",
+          "/usr/lib/x86_64-linux-gnu/crtn.o": "sysdeps/x86_64/crtn.S"
+        }
+      },
+      "license_expression": "LGPL-2.1-or-later",
+      "license_exception": "GNU C Library startup object source headers grant unlimited permission to link compiled version with other programs and distribute those programs without restriction from use of these files; LGPL restrictions still apply to modification and other distribution.",
+      "notice": {
+        "archive": "libc6-dev_2.39-0ubuntu8.9_amd64.deb",
+        "url": "https://snapshot.ubuntu.com/ubuntu/20260920T000000Z/pool/main/g/glibc/libc6-dev_2.39-0ubuntu8.9_amd64.deb",
+        "archive_sha256": "e13d5fcc1b2a86f75bca8e0026a8e39f24fe97ca86e92be79991f8697eb1306f",
+        "path": "usr/share/doc/libc6-dev/copyright",
+        "sha256": "d3c95b56fa33e28b57860580f0baf4e4f4de2a268a2b80f1d031a5191bade265"
+      },
+      "objects": {
+        "/usr/lib/x86_64-linux-gnu/Scrt1.o": "9438d15c4bac893a0e3aad2c2c86ccbceb59d5872bd07101949f237ee1c92a8b",
+        "/usr/lib/x86_64-linux-gnu/crti.o": "077ccb6c68db1794da3ee262c4a16a3c6f8e902845dd0829110ad4b7065e5aa3",
+        "/usr/lib/x86_64-linux-gnu/crtn.o": "a2266079f95b84ccc2162ebbf279bcd78858a748aa1882e0bdb912316c76a58f"
+      }
+    }
+  }
+}
