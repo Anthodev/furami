@@ -46,6 +46,10 @@ jobs:
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/Qt/$QT_VERSION/gcc_64/lib" >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/Qt/$QT_VERSION/gcc_64/bin" >> "$GITHUB_PATH"
 
+      - name: Isolate Rust toolchain state
+        # Keep toolchains separate from the runner's preinstalled Rust state.
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

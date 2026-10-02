@@ -13,6 +13,7 @@
 - Report missing or unreachable X11 displays with actionable XWayland/session guidance before Qt GUI construction.
 - Stage an executable AppRun and reject non-executable launch entries in the final-image audit.
 - Parse empty Deb822 checksum headers correctly and attribute built-in QML generated metadata through verified vendor backing modules.
+- Isolate CI Rust toolchain state in the job's temporary directory to avoid component conflicts with the runner's preinstalled or partial toolchains.
 
 ### Maintenance
 
