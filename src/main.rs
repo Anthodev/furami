@@ -4,9 +4,7 @@ compile_error!("Furami requires Qt 6.8 or newer");
 // Keep the library's generated QML registration linked into the executable.
 extern crate furami as _;
 
-mod capture;
 mod diagnostics;
-mod domain;
 mod profiles;
 mod settings;
 use tracing_subscriber::EnvFilter;

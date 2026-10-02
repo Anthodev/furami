@@ -7,6 +7,7 @@
 - Package the current generated-video prototype as a Linux x86_64 AppImage with isolated bundled Qt/QML and media libraries, host graphics drivers, checked build inputs, an actual-image linkage manifest and source/relink material inventory.
 - Add manual `workflow_dispatch` AppImage build workflow entry that uploads an Actions artifact only and never publishes, including when dispatched on a tag ref.
 - Add tag-driven AppImage release workflow: stable `vX.Y.Z` tags trigger tag/commit/Cargo-version validation, changelog note extraction, a two-build reproducibility comparison from the frozen media/runtime/app recipes, and a release publication gated on `release-ready.json` source and license clearance.
+- Add read-only Linux UVC discovery with physical USB identities, native V4L2 descriptors, exact rational capture-mode validation and a JSON qualification probe (FUR-006).
 
 ### Fixes
 
