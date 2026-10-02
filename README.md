@@ -10,7 +10,7 @@ Linux capture viewer prototype, built with Rust and Qt.</p>
 </p>
 
 > [!IMPORTANT]
-> Furami is an **early prototype**. Its purpose is low-latency viewing of a game console captured on the same machine, but today it plays only a generated local test video; no capture device input exists yet. It has been exercised on Fedora 44 with KDE Plasma (Wayland/XWayland, AMD RX 7900 XTX), with partial desktop qualification and no broad hardware compatibility claims. Arch and Ubuntu sessions are expected to work under the same prerequisites but were not tested. An unexpected Qt-initiated video-surface loss enters a terminal failure state and permits controlled closure; restarting the application is required. Already-destroyed X11 surfaces and X server loss are not covered.
+> Furami is an **early prototype**. Its purpose is low-latency viewing of a game console captured on the same machine. Playback of a selected UVC capture mode is available through explicit command-line selection; there is no device picker and no audio path. It has been exercised on Fedora 44 with KDE Plasma (Wayland/XWayland, AMD RX 7900 XTX), with partial desktop qualification and no broad hardware compatibility claims. Arch and Ubuntu sessions are expected to work under the same prerequisites but were not tested. An unexpected Qt-initiated video-surface loss enters a terminal failure state and permits controlled closure; restarting the application is required. Already-destroyed X11 surfaces and X server loss are not covered.
 
 ## What it does
 
@@ -19,16 +19,29 @@ Furami is a Linux project for viewing console capture in one window, with playba
 The current prototype provides:
 
 - **One playback window.** Video and controls share one application window.
-- **Collapsible control panel.** Open the test source, close the session, toggle the panel and fullscreen, and view playback state.
+- **Capture playback.** Start the UVC capture mode selected on the command line, from the panel.
+- **Collapsible control panel.** Close the session, toggle the panel and fullscreen, and view playback state.
 - **Fullscreen playback.** Toggle fullscreen from the panel or keyboard.
 - **Keyboard and pointer control.** Playback shortcuts apply when the video has focus; text fields are intended to keep priority while editing.
 
+## Selecting a capture mode
+
+Capture is opt-in on the command line; all four options are required together:
+
+```sh
+./furami --capture-node /dev/video0 --capture-fourcc NV12 --capture-size 2560x1440 --capture-rate 60/1
+```
+
+Without a selection the window opens idle with capture disabled and an instruction to select a mode on the command line. At startup Furami parses the complete checked tuple and resolves the device identity. Each open validates the requested tuple against the device's advertised modes on a fresh route, off the GUI thread, before the media backend is built. An out-of-route tuple is rejected before the backend starts.
+
+What Furami reports is separated into requested facts (what you asked for) and observed facts (what the backend reports, with provenance). The captured FourCC itself stays unverified: mpv exposes the decoded pixel format, which never proves the format the device delivered. The observed frame rate comes from the backend's nominal `container-fps` property, which can be wrong, so a match is labeled approximate rather than certified; a clear mismatch (for example 30 reported against 60 requested) fails the open.
+
 ## Trying it
 
-1. Launch an [AppImage](#appimage) or the [source build](#build-from-source). The window opens in the `Idle` state.
-2. Click **Open proof source** in the panel. The video starts playing.
+1. Launch an [AppImage](#appimage) or the [source build](#build-from-source) with a [capture selection](#selecting-a-capture-mode). The window opens in the `Idle` state.
+2. Click **Open capture** in the panel. The video starts playing.
 3. Use `Space`, `F11`, and the panel buttons while it plays.
-4. When the video ends, the session stays open. Click **Close session**, then **Open proof source** to replay.
+4. When the stream ends, the session stays open. Click **Close session**, then **Open capture** to restart.
 5. Click **Close session** to stop and return to idle, or quit the application normally.
 
 ## AppImage
@@ -62,7 +75,7 @@ Mounted, desktop-entry and extracted playback were exercised on Fedora 44/KDE Pl
 | `F11` | Toggle fullscreen |
 | `Esc` | Leave fullscreen, otherwise hide the control panel |
 | `Tab` / `Shift+Tab` | Move focus between controls |
-| **Open proof source** | Start the generated test video |
+| **Open capture** | Start the selected capture mode (disabled without a command-line selection) |
 | **Close session** | Stop playback and return to idle |
 | **Fullscreen / Leave fullscreen** | Toggle fullscreen from the panel |
 
@@ -70,12 +83,14 @@ Text typed in a panel field is intended to take precedence over playback shortcu
 
 ## Not implemented yet
 
-- **Capture input** — no capture device, console, or network source; only the generated local test video plays.
+- **Device picker** — the capture mode is chosen only on the command line; there is no in-app device or mode browser.
 - **Audio output** — playback is video-only today; no audio path is wired or claimed.
 - **Settings and profiles** — no persisted configuration and no per-game or per-console profiles.
 
 ## Known limitations
 
+- Capture verification is bounded by what the media backend reports. The captured FourCC is never proven; the observed rate is a nominal property, so a reported match is approximate, not a certified cadence. The backend's request options are requests, not assertions, so an internal substitution by the pinned FFmpeg stack cannot be fully excluded; decisive contradictions (decoded size, or a clearly different nominal rate) fail the open.
+- Advertised-but-refused modes fail with the requested tuple named at the stage the backend reports. Busy and permission failures are typed only when the backend evidence (operation and errno) is sufficient; otherwise the raw diagnostic is shown as-is. No alternate mode is attempted and there is no retry loop. A capture failure is terminal: the session cannot return to idle, and restarting the application is required.
 - An unexpected Qt-initiated video-surface loss while playing latches an explicit failure state and keeps the application open. The failed session cannot recover; controlled closure exits with a failure status and restarting the application is required. This does not cover an already-destroyed X11 surface or loss of the X server itself.
 - Tested on Fedora 44 with KDE Plasma (Wayland/XWayland) and an AMD RX 7900 XTX (RADV Vulkan). Minimize/restore, desktop switching, fullscreen toggling and multi-monitor moves passed at 100%, 150% and 200% display scale; the panel popup passed at 100%. Qualification is partial: the input-test driver could not exercise pointer-dependent checks at 150% and 200%, Tab focus at 100% lacked visible confirmation, resizing stayed fixed under the desktop's tiling rules, and a text-entry check triggered pause/resume without populating the field. The cause of that text-entry failure is not isolated. Arch (Hyprland) and Ubuntu LTS (GNOME) sessions are untested.
 - The prototype uses XWayland rather than native Wayland and requires hardware Vulkan rendering.

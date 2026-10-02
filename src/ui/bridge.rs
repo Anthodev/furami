@@ -1,4 +1,4 @@
-//! Scalar-only CXX boundary. C++ retains every Qt object and notification target.
+//! Value-only CXX boundary. C++ retains every Qt object and notification target.
 
 use crate::app::gate::{self, GateCoordinator, Generation, SurfaceToken, X11WindowId};
 
@@ -45,16 +45,16 @@ pub(crate) mod ffi {
         quit: bool,
     }
 
-    // SAFETY: host.h declares this exact scalar-only C++ ABI. The implementation
-    // owns Qt lifetime through event-loop exit and returns only copied values.
+    // SAFETY: host.h declares this exact C++ ABI. The opaque Rust coordinator
+    // carries owned values only; C++ owns Qt lifetime through event-loop exit.
     unsafe extern "C++" {
         include!("host.h");
-        fn run_qt_application(media_prefix: &str, display: &str) -> LaunchResult;
+        fn run_qt_application(gate: Box<GateCoordinator>, display: &str) -> LaunchResult;
     }
 
     extern "Rust" {
         type GateCoordinator;
-        fn new_gate(media_prefix: &str) -> Box<GateCoordinator>;
+        fn gate_capture_selected(gate: &GateCoordinator) -> bool;
         fn gate_open(gate: &mut GateCoordinator) -> UiUpdate;
         fn gate_surface_ready(gate: &mut GateCoordinator, generation: u64, xid: u64) -> UiUpdate;
         fn gate_surface_lost(gate: &mut GateCoordinator, generation: u64) -> UiUpdate;
@@ -96,8 +96,8 @@ impl From<gate::UiUpdate> for ffi::UiUpdate {
     }
 }
 
-fn new_gate(media_prefix: &str) -> Box<GateCoordinator> {
-    Box::new(GateCoordinator::new(media_prefix.to_owned()))
+fn gate_capture_selected(gate: &GateCoordinator) -> bool {
+    gate.capture_selected()
 }
 fn gate_open(gate: &mut GateCoordinator) -> ffi::UiUpdate {
     gate.open().into()

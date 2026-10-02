@@ -33,9 +33,10 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(bool textEntryActive READ textEntryActive WRITE setTextEntryActive NOTIFY textEntryActiveChanged)
     Q_PROPERTY(bool panelVisible READ panelVisible WRITE setPanelVisible NOTIFY panelVisibleChanged)
     Q_PROPERTY(bool popupOpen READ popupOpen WRITE setPopupOpen NOTIFY popupOpenChanged)
+    Q_PROPERTY(bool captureSelected READ captureSelected CONSTANT)
 
 public:
-    explicit FuramiBridge(rust::Str mediaPrefix);
+    explicit FuramiBridge(rust::Box<GateCoordinator> gate);
     ~FuramiBridge() override;
 
     QWindow *hostWindow() const;
@@ -46,6 +47,7 @@ public:
     bool textEntryActive() const;
     bool panelVisible() const;
     bool popupOpen() const;
+    bool captureSelected() const;
     void setTextEntryActive(bool active);
     void setPanelVisible(bool visible);
     void setPopupOpen(bool open);
@@ -54,8 +56,8 @@ public:
     Q_INVOKABLE bool quitAuthorized() const;
     bool failed() const;
 
-    Q_INVOKABLE void openProofSource();
-    Q_INVOKABLE void closeProofSession();
+    Q_INVOKABLE void openCapture();
+    Q_INVOKABLE void closeCapture();
     Q_INVOKABLE void openAndCloseDuringOpeningForProof();
     Q_INVOKABLE void forceSurfaceLossForProof();
     Q_INVOKABLE void requestApplicationClose();
@@ -102,6 +104,7 @@ private:
     std::uint64_t m_lastHostXid = 0;
     std::uint64_t m_closeDuringOpening = 0;
     bool m_failed = false;
+    bool m_captureSelected = false;
     bool m_bootstrapFailed = false;
     bool m_paused = false;
     bool m_ended = false;
@@ -116,7 +119,7 @@ private:
     bool m_insideSurfaceCallback = false;
 };
 
-LaunchResult run_qt_application(rust::Str media_prefix, rust::Str display);
+LaunchResult run_qt_application(rust::Box<GateCoordinator> gate, rust::Str display);
 
 } // namespace furami::bridge
 
