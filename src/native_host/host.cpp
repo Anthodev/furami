@@ -125,7 +125,8 @@ protected:
                 qInfo().noquote() << QStringLiteral("native_surface_about_to_destroy generation=%1 host=%2 authorized=%3")
                     .arg(m_generation).arg(m_previousXid).arg(boolean(m_authorized));
                 if (!m_authorized && !m_poisoned) {
-                    // No winId, reparent, wait, or nested event loop is allowed here.
+                    // No winId, reparent, or nested event loop is allowed here.
+                    // The exceptional owner barrier completes before Qt destroys this parent.
                     m_poisoned = true;
                     if (m_bridge)
                         m_bridge->surfaceLost(m_generation, m_previousXid);
@@ -653,6 +654,17 @@ void FuramiBridge::surfaceLost(std::uint64_t generation, std::uint64_t previousX
         .arg(generation).arg(previousXid).arg(m_rootXid).arg(m_actualPhase);
     m_insideSurfaceCallback = true;
     applyUpdate(gate_surface_lost(*m_gate, generation));
+    qInfo().noquote() << QStringLiteral("native_loss_barrier_begin generation=%1 host=%2")
+        .arg(generation).arg(previousXid);
+    const QString diagnostic = fromRust(gate_wait_for_owner_ack(*m_gate, generation));
+    if (!diagnostic.isEmpty()) {
+        const QByteArray failure = diagnostic.toUtf8();
+        qFatal("native_loss_barrier_failed generation=%llu host=%llu diagnostic=%s",
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long long>(previousXid), failure.constData());
+    }
+    qInfo().noquote() << QStringLiteral("native_loss_barrier_complete generation=%1 host=%2")
+        .arg(generation).arg(previousXid);
     m_insideSurfaceCallback = false;
 }
 
@@ -683,8 +695,10 @@ void FuramiBridge::releaseNative(std::uint64_t generation)
         qInfo().noquote() << QStringLiteral("native_destroy_begin generation=%1 host=%2 root=%3 parent_preserved=%4")
             .arg(generation).arg(m_lastHostXid).arg(m_rootXid)
             .arg(boolean(surviving->parent() == m_root.data()));
-        surviving->hide();
-        surviving->destroy();
+        if (surviving->handle()) {
+            surviving->hide();
+            surviving->destroy();
+        }
     }
     m_host.clear();
     emit hostWindowChanged();

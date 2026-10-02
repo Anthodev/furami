@@ -58,6 +58,7 @@ pub(crate) mod ffi {
         fn gate_open(gate: &mut GateCoordinator) -> UiUpdate;
         fn gate_surface_ready(gate: &mut GateCoordinator, generation: u64, xid: u64) -> UiUpdate;
         fn gate_surface_lost(gate: &mut GateCoordinator, generation: u64) -> UiUpdate;
+        fn gate_wait_for_owner_ack(gate: &mut GateCoordinator, generation: u64) -> String;
         fn gate_pause(gate: &mut GateCoordinator, generation: u64) -> SubmitStatus;
         fn gate_close(gate: &mut GateCoordinator, generation: u64, application: bool) -> UiUpdate;
         fn gate_quit(gate: &mut GateCoordinator) -> UiUpdate;
@@ -114,6 +115,15 @@ fn gate_surface_lost(gate: &mut GateCoordinator, generation: u64) -> ffi::UiUpda
         .map(|g| gate.surface_lost(g))
         .unwrap_or_else(|| gate.unchanged())
         .into()
+}
+fn gate_wait_for_owner_ack(gate: &mut GateCoordinator, generation: u64) -> String {
+    let Some(generation) = Generation::new(generation) else {
+        return "surface_loss_barrier: invalid generation".to_owned();
+    };
+    match gate.wait_for_owner_ack(generation) {
+        Ok(()) => String::new(),
+        Err(error) => error.to_string(),
+    }
 }
 fn gate_pause(gate: &mut GateCoordinator, generation: u64) -> ffi::SubmitStatus {
     let status = Generation::new(generation)
