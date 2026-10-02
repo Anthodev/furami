@@ -1,0 +1,330 @@
+name: AppImage
+
+on:
+  workflow_dispatch:
+    # Builds and uploads an Actions artifact only. Never publishes, even
+    # when dispatched on a tag ref.
+    inputs:
+      verify_reproducibility:
+        description: 'Run the two-build reproducibility comparison (build-twice.py) instead of a single build'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appimage-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ------------------------------------------------------------------
+  # Manual path: artifact only, no publication.
+  # ------------------------------------------------------------------
+  build-manual:
+    if: github.event_name == 'workflow_dispatch'
+    name: Build AppImage artifact (manual, not published)
+    runs-on: avrea-ubuntu-24.04-2-vcpu
+    timeout-minutes: 240
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            lld \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-shape0-dev \
+            python3
+
+      - name: Derive version from Cargo.toml
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ -z "$version" ]; then
+            echo "Could not read version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build AppImage (cold frozen recipes)
+        env:
+          VERIFY_REPRODUCIBILITY: ${{ inputs.verify_reproducibility }}
+        run: |
+          if [ "$VERIFY_REPRODUCIBILITY" = "true" ]; then
+            # Reproducibility comparison includes full checked source
+            # acquisition, matching the tag path.
+            python3 packaging/appimage/build-twice.py \
+              --version "$APP_VERSION" \
+              --output "$RUNNER_TEMP/appimage-out" \
+              --acquire-sources
+          else
+            python3 packaging/appimage/build.py \
+              --version "$APP_VERSION" \
+              --output "$RUNNER_TEMP/appimage-out"
+          fi
+
+      - name: Verify release directory
+        run: |
+          cd "$RUNNER_TEMP/appimage-out/release"
+          test -s "Furami-$APP_VERSION-x86_64.AppImage" || { echo "missing AppImage" >&2; exit 1; }
+          test -s SHA256SUMS || { echo "missing SHA256SUMS" >&2; exit 1; }
+          sha256sum --check --strict SHA256SUMS
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Furami-${{ env.APP_VERSION }}-x86_64-unpublished
+          path: ${{ runner.temp }}/appimage-out/release/
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Tag path: validate before any side effect.
+  # ------------------------------------------------------------------
+  validate-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    name: Validate release tag
+    runs-on: avrea-ubuntu-24.04-2-vcpu
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Extract release notes from tagged changelog
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          python3 scripts/release_notes.py \
+            --tag "$RELEASE_TAG" \
+            --commit "$EVENT_SHA" \
+            --output "$RUNNER_TEMP/release-notes.md"
+
+      - name: Check tag version matches Cargo.toml
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$RELEASE_TAG" != "v$cargo_version" ]; then
+            echo "Tag $RELEASE_TAG does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-notes-${{ github.ref_name }}
+          path: ${{ runner.temp }}/release-notes.md
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Tag path: two-build reproducibility from the frozen recipes.
+  # ------------------------------------------------------------------
+  build-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: validate-release
+    name: Reproducible AppImage build
+    runs-on: avrea-ubuntu-24.04-2-vcpu
+    timeout-minutes: 300
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            lld \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-shape0-dev \
+            python3
+
+      - name: Run two-build reproducibility comparison
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >
+          python3 packaging/appimage/build-twice.py
+          --version "${RELEASE_TAG#v}"
+          --output "$RUNNER_TEMP/appimage-out"
+          --acquire-sources
+
+      - name: Verify release directory
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd "$RUNNER_TEMP/appimage-out/release"
+          test -s "Furami-${RELEASE_TAG#v}-x86_64.AppImage" || { echo "missing AppImage" >&2; exit 1; }
+          test -s SHA256SUMS || { echo "missing SHA256SUMS" >&2; exit 1; }
+          test -s audit.json || { echo "missing audit.json" >&2; exit 1; }
+          test -s NOTICE.txt || { echo "missing NOTICE.txt" >&2; exit 1; }
+          test -s RELINKING.md || { echo "missing RELINKING.md" >&2; exit 1; }
+          sha256sum --check --strict SHA256SUMS
+
+      - name: Summarize failure blockers
+        if: failure()
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo "## Release build failed for $RELEASE_TAG"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Reproducibility comparison (build-twice.py) exited nonzero; see the failing step log for the identical/documented-variance/failure verdict."
+            if [ -d "$RUNNER_TEMP/appimage-out" ]; then
+              echo "- Output tree at failure:"
+              find "$RUNNER_TEMP/appimage-out" -maxdepth 2 -type f | sed 's/^/  - /' || true
+            else
+              echo "- No output tree was produced."
+            fi
+            if [ -f "$RUNNER_TEMP/appimage-out/release/release-ready.json" ]; then
+              echo "- release-ready.json:"
+              cat "$RUNNER_TEMP/appimage-out/release/release-ready.json"
+            else
+              echo "- No release-ready.json was generated (source/license gate did not complete)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-candidate-${{ github.ref_name }}
+          path: ${{ runner.temp }}/appimage-out/release/
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Tag path: sole job with write access.
+  # ------------------------------------------------------------------
+  publish-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [validate-release, build-release]
+    name: Publish GitHub release
+    runs-on: avrea-ubuntu-24.04-2-vcpu
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    environment: release
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-candidate-${{ github.ref_name }}
+          path: candidate
+
+      - name: Download release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-notes-${{ github.ref_name }}
+          path: notes
+
+      - name: Verify remote tag still points at the event commit
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          # The tag may have been force-moved during the multi-hour build.
+          # Resolve the remote tag fresh and require the peeled commit to
+          # equal the commit this run was triggered on. Protected tags are
+          # the residual control against a move after this check.
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          remote_peeled="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          if [ "$remote_peeled" != "$GITHUB_SHA" ]; then
+            echo "Remote tag $RELEASE_TAG now points at $remote_peeled, expected $GITHUB_SHA; refusing to publish" >&2
+            exit 1
+          fi
+
+      - name: Verify artifact checksums and source clearance before publication
+        working-directory: candidate
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          test -s "Furami-${RELEASE_TAG#v}-x86_64.AppImage" || { echo "missing AppImage" >&2; exit 1; }
+          test -s release-ready.json || { echo "missing release-ready.json" >&2; exit 1; }
+          sha256sum --check --strict SHA256SUMS
+          python3 - <<'PYEOF'
+          import json, sys
+
+          with open("release-ready.json", encoding="utf-8") as handle:
+              report = json.load(handle)
+          if report.get("ready") is not True:
+              print("release-ready.json is not ready=true; refusing to publish", file=sys.stderr)
+              print(json.dumps(report.get("missing", report), indent=2), file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+
+      # `gh release create` fails when the release already exists; this is
+      # intentional. Dispatch never reaches this job, and a rerun must not
+      # delete/move the release or its tag to succeed.
+      # Uploads every file in the verified candidate directory (image,
+      # SHA256SUMS, manifest/audit/notice/source/relink assets, including
+      # split source-materials-*.tar parts when used), so the asset set
+      # always matches SHA256SUMS instead of a hardcoded name list.
+      - name: Create GitHub release
+        working-directory: candidate
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$RELEASE_TAG"
+          --repo "$GITHUB_REPOSITORY"
+          --title "$RELEASE_TAG"
+          --notes-file "$GITHUB_WORKSPACE/notes/release-notes.md"
+          --verify-tag
+          ./*
+
+      - name: Verify published notes match tagged section
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          published="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)"
+          if ! diff -u <(printf '%s\n' "$published") "$GITHUB_WORKSPACE/notes/release-notes.md"; then
+            echo "Published notes do not match the tagged CHANGELOG section" >&2
+            exit 1
+          fi
+
+      - name: Summarize failure blockers
+        if: failure()
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo "## Release publication failed for $RELEASE_TAG"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Failure occurred after validation and the reproducible build; see the failing step log."
+            echo "- Downloaded candidate contents:"
+            find candidate -maxdepth 1 -type f -printf '  - %f (%s bytes)\n' 2>/dev/null || echo "  - candidate directory missing (artifact download failed)"
+            if [ -f candidate/release-ready.json ]; then
+              echo "- release-ready.json:"
+              cat candidate/release-ready.json
+            else
+              echo "- candidate/release-ready.json missing: source/license clearance gate did not run or the artifact is incomplete."
+            fi
+            if [ -f candidate/SHA256SUMS ]; then
+              echo "- Recorded checksums:"
+              cat candidate/SHA256SUMS
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

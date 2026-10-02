@@ -1,0 +1,1345 @@
+{
+  "apk_indexes": {
+    "community": {
+      "sha256": "a365093890fb40798ed350ade350d0596dcacb28f549202e8770184adc3910f5",
+      "url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/community/x86_64/APKINDEX.tar.gz"
+    },
+    "main": {
+      "sha256": "13cc793aea16f8f23ae5e7465f9a74965136939417d3d59d3566f3c73a78b54f",
+      "url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz"
+    }
+  },
+  "apk_packages": {
+    "abuild": {
+      "aports_commit": "8fb34bb4a9520f9a6a3d1b1316907307c93fe333",
+      "archive": "abuild-3.14.1-r4.apk",
+      "index_checksum": "Q1pNSTj+JeAWW0FixE1EcBHduo3Zg=",
+      "license": "GPL-2.0-only",
+      "repository": "main",
+      "sha256": "728bec6c2fce11e0c293255c8c46865290168a92220bc51538137d9dad295232",
+      "version": "3.14.1-r4"
+    },
+    "abuild-meson": {
+      "aports_commit": "bd2a8e0fc4db67c9e50e2de14e98e57dcc615297",
+      "archive": "abuild-meson-1.6.1-r0.apk",
+      "index_checksum": "Q1CL2wkH2KpUCl46gZAizojSoQQwQ=",
+      "license": "Apache-2.0",
+      "repository": "main",
+      "sha256": "be9af1fe3be40e28b0bfb90b37fb0a6f4d3c0ada601c2f4e45e399ba04c5e197",
+      "version": "1.6.1-r0"
+    },
+    "abuild-sudo": {
+      "aports_commit": "8fb34bb4a9520f9a6a3d1b1316907307c93fe333",
+      "archive": "abuild-sudo-3.14.1-r4.apk",
+      "index_checksum": "Q1neeXMZqbTTF8xGobf7TVWGbavHg=",
+      "license": "GPL-2.0-only",
+      "repository": "main",
+      "sha256": "cdb78ea5a1b34eeb2f8dcf9d79debe24885f50623587d7d66944c68ed5b3c67f",
+      "version": "3.14.1-r4"
+    },
+    "acl-libs": {
+      "aports_commit": "0824e5bc4c0d1fb9aac2f133a4c0a92f1f0bb5b4",
+      "archive": "acl-libs-2.3.2-r1.apk",
+      "index_checksum": "Q1IBUByzGUNXBEPusHOgbkPSXtKGU=",
+      "license": "LGPL-2.1-or-later AND GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "97aa6d629b26a4329757aa82629ce283710e78b0edc4ac26117246bac037591d",
+      "version": "2.3.2-r1"
+    },
+    "agetty": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "agetty-2.40.4-r1.apk",
+      "index_checksum": "Q1damqNbUS1PSaeSwfdh9gsCRJRgM=",
+      "license": "Public-Domain",
+      "repository": "main",
+      "sha256": "644c341a2fa09ef849f414dedba34e097252d7319921b6c6b140a3385ebe09b1",
+      "version": "2.40.4-r1"
+    },
+    "alpine-sdk": {
+      "aports_commit": "dea35b27002e3c31bef0aa0f724e9fae6230b6f3",
+      "archive": "alpine-sdk-1.1-r0.apk",
+      "index_checksum": "Q1fpCHnlSrOGeLOhtifoqzvjNSdGQ=",
+      "license": "GPL-2.0-only",
+      "repository": "main",
+      "sha256": "fc6dd4a51ecdb67cadb8f12b207db366c6a94a479d7ea6c62b2939b1be14414a",
+      "version": "1.1-r0"
+    },
+    "autoconf": {
+      "aports_commit": "bd3ab572ca03265baf7e78b71b241dcc59eb2e63",
+      "archive": "autoconf-2.72-r0.apk",
+      "index_checksum": "Q1gMFXgU2h7bLBluGQksG74+jjO1o=",
+      "license": "GPL-3.0-or-later WITH Autoconf-exception-3.0",
+      "repository": "main",
+      "sha256": "e5933488956c39b18fbfdd9aa9e23d111ccf1cb0dece612860f289e387447f9d",
+      "version": "2.72-r0"
+    },
+    "automake": {
+      "aports_commit": "2ac544c8b36b9f9595785604691c9de112459a45",
+      "archive": "automake-1.17-r0.apk",
+      "index_checksum": "Q1VCPXkpdwP0PXSZ1KwiBqZF4cffU=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "d16119b95e8ba0194bc788265f20778522a2147289952fefd0794e6ee8f40ba0",
+      "version": "1.17-r0"
+    },
+    "bash": {
+      "aports_commit": "dfdce3cefb431614e410ac9bc3665d33ea45020c",
+      "archive": "bash-5.2.37-r0.apk",
+      "index_checksum": "Q1dK1ny/LSCI6wZLdON3p+XFqF2Ps=",
+      "license": "GPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "0d58acbe43dd345a274a74e333f78af583b612229fc003dfb9fdee5dfc9149ff",
+      "version": "5.2.37-r0"
+    },
+    "binutils": {
+      "aports_commit": "f8c4bbdba1f690f506696c3dfeaf8311411789ac",
+      "archive": "binutils-2.43.1-r3.apk",
+      "index_checksum": "Q1dwtpJUSvGfMG/na3ifMtVgiyJuk=",
+      "license": "GPL-2.0-or-later AND LGPL-2.1-or-later AND BSD-3-Clause",
+      "repository": "main",
+      "sha256": "eb1ae53b03b13c8e1ba7a97c23b7b64ef27c71080b9da5a21e7365188f48d361",
+      "version": "2.43.1-r3"
+    },
+    "blkid": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "blkid-2.40.4-r1.apk",
+      "index_checksum": "Q1TfQMrUxKrF3awZ6CX7+wMnlB9DM=",
+      "license": "LGPL-1.0-only",
+      "repository": "main",
+      "sha256": "61adea9884109b9eb710ab3431ce3cc10ea272e2bd01ccee8fb7b4f1c47f9a70",
+      "version": "2.40.4-r1"
+    },
+    "brotli-libs": {
+      "aports_commit": "bdeb5ac39445d803f7d97bb9b3cf9171d9a35f52",
+      "archive": "brotli-libs-1.1.0-r2.apk",
+      "index_checksum": "Q1cPdzkZ5y416Nm7w2SSIXinZW86E=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "0d12b35f0e00657c0bb0630f658b7e3ecf1eaf9a4a3fcd36d07bcd8d6ea26b41",
+      "version": "1.1.0-r2"
+    },
+    "build-base": {
+      "aports_commit": "2d1f9f414de2521837a7a9c7068217b76e3452ca",
+      "archive": "build-base-0.5-r3.apk",
+      "index_checksum": "Q1Lx4uIARVjL2Ygc+V4SCZZsS1Ejs=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "4749180b35754cb803b643db52e5bb2fefe0ce65411ca12fdf94d8e32302a7e7",
+      "version": "0.5-r3"
+    },
+    "c-ares": {
+      "aports_commit": "40d4af1c03fd0a11bcd6dd687181b78c5cf6c4c9",
+      "archive": "c-ares-1.34.8-r0.apk",
+      "index_checksum": "Q1i/MCBTFIkzlz9/ShX4BwMbm47YQ=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "1c184e0bccdab868e155c3c242c743b5861d785d982860d8a84ead0f4b06530c",
+      "version": "1.34.8-r0"
+    },
+    "cfdisk": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "cfdisk-2.40.4-r1.apk",
+      "index_checksum": "Q1g9hQ0a2beR/ScpPPSP9gxm43tks=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "ae2aa178fa1043463608b153e215224c6c6b81f0acc5054b5b526182e6e00dc5",
+      "version": "2.40.4-r1"
+    },
+    "clang19": {
+      "aports_commit": "d231442d24a4fc805346691521933c7cc3c20fa1",
+      "archive": "clang19-19.1.4-r0.apk",
+      "index_checksum": "Q1cuArTVmMwFCfn/txrsC9/OAFOQM=",
+      "license": "Apache-2.0 WITH LLVM-exception",
+      "repository": "main",
+      "sha256": "9c3c3761e5f06bcf857ffa6b42a097ceefe782a349283d766e895f1898a4c322",
+      "version": "19.1.4-r0"
+    },
+    "clang19-headers": {
+      "aports_commit": "d231442d24a4fc805346691521933c7cc3c20fa1",
+      "archive": "clang19-headers-19.1.4-r0.apk",
+      "index_checksum": "Q15ST8aSpZU4/ePlF2HPvwxkTk5wI=",
+      "license": "Apache-2.0 WITH LLVM-exception",
+      "repository": "main",
+      "sha256": "6686a5ced76e53e4a6ac150833b2590545a884122c86c3abe2c3a7ed529b514b",
+      "version": "19.1.4-r0"
+    },
+    "clang19-libs": {
+      "aports_commit": "d231442d24a4fc805346691521933c7cc3c20fa1",
+      "archive": "clang19-libs-19.1.4-r0.apk",
+      "index_checksum": "Q1T1LJDCkHO48G9VzILkLzSHlV0UY=",
+      "license": "Apache-2.0 WITH LLVM-exception",
+      "repository": "main",
+      "sha256": "946d59e7476d738921e6cb32806cfbf7043a405d324e665a6c2902221fe67193",
+      "version": "19.1.4-r0"
+    },
+    "dmesg": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "dmesg-2.40.4-r1.apk",
+      "index_checksum": "Q1vQY/Y2BxLzU6MtJXFTf2Di8GeW4=",
+      "license": "GPL-3.0-or-later AND GPL-2.0-or-later AND GPL-2.0-only AND GPL-1.0-only AND LGPL-2.1-or-later AND BSD-1-Clause AND BSD-3-Clause AND BSD-4-Clause-UC AND MIT AND Public-Domain",
+      "repository": "main",
+      "sha256": "1e72ae0eb1564a32758527883b3abcdfe42acef9790c2323b8180a51b3caf696",
+      "version": "2.40.4-r1"
+    },
+    "eudev-dev": {
+      "aports_commit": "7ce7590c3a49bb6ea5996296c51250178e1c4e2f",
+      "archive": "eudev-dev-3.2.14-r5.apk",
+      "index_checksum": "Q1lOnCAPxvunvtav6ifTKvXZNr1bM=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "e2af9b55124fc6b27d88615998716681aa9c307d40d98ad25465f062641a19c4",
+      "version": "3.2.14-r5"
+    },
+    "eudev-libs": {
+      "aports_commit": "7ce7590c3a49bb6ea5996296c51250178e1c4e2f",
+      "archive": "eudev-libs-3.2.14-r5.apk",
+      "index_checksum": "Q1Q2GMFFWTE0d+m0riUhbFXS1alNQ=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "c916b361b6485bcef80f8631ad4b507f9a761495f609359aa94bd3ddfd123a58",
+      "version": "3.2.14-r5"
+    },
+    "fakeroot": {
+      "aports_commit": "ec075722826069fe262f9688bb80fa1ba61e60f6",
+      "archive": "fakeroot-1.37.1.1-r0.apk",
+      "index_checksum": "Q1zWxu98Zozz6L4YxCHWRxeg54TB8=",
+      "license": "GPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "f392b61e8365bf88ff6835b67f390d3fb6236e35aed0c34955f00f4d47d98de7",
+      "version": "1.37.1.1-r0"
+    },
+    "file": {
+      "aports_commit": "e89c62d847f7369b16ae24657d91b8d20c564ca4",
+      "archive": "file-5.46-r2.apk",
+      "index_checksum": "Q1qKhdBrNljXzABnwQuiVsz/bGDbY=",
+      "license": "BSD-2-Clause",
+      "repository": "main",
+      "sha256": "72e5c72162439b067ad3e5060e27754eb7bad287db5d6978aef217d36aa1a9c6",
+      "version": "5.46-r2"
+    },
+    "findmnt": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "findmnt-2.40.4-r1.apk",
+      "index_checksum": "Q1MW0wtfwC5o0BfQ4MhXtF0JnNnTk=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "2e06a4959e18b748eb1915ca3b693a67bbf10af0f152b2a4d403d85338c92f83",
+      "version": "2.40.4-r1"
+    },
+    "flock": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "flock-2.40.4-r1.apk",
+      "index_checksum": "Q1zMvigkwaWdgupFeAQ5j/X5O9eNw=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "2e2e84d7e710129086a1da43353618af44f596e754cbf67905a1dc8f9b973525",
+      "version": "2.40.4-r1"
+    },
+    "fortify-headers": {
+      "aports_commit": "175895ac5c1d9d62add7fe3c5a7f39548b8fd715",
+      "archive": "fortify-headers-1.1-r5.apk",
+      "index_checksum": "Q1ZQ4tt9ayRHYd6mkuyRnZ/kLBKxQ=",
+      "license": "0BSD",
+      "repository": "main",
+      "sha256": "133599cbec77b30b58cef7e6e78c65568c205efbac373565b4fdda6c3ac13649",
+      "version": "1.1-r5"
+    },
+    "fstrim": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "fstrim-2.40.4-r1.apk",
+      "index_checksum": "Q1/oqIZd5g+s6+ywNJvZ7G04U0Fsk=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "76dbaea40a08027c7fa56a749c3430aa06beffb5cde651b5cf55226eaaf8b407",
+      "version": "2.40.4-r1"
+    },
+    "g++": {
+      "aports_commit": "1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f",
+      "archive": "g++-14.2.0-r4.apk",
+      "index_checksum": "Q1wuXFYVY/eNNALoZeyIR8ZfV1LMQ=",
+      "license": "GPL-2.0-or-later AND LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "49e912e85f0b7cbc26e812f4f92d5d86c7e6e4d8de4e20c980d6ac148ed8cc57",
+      "version": "14.2.0-r4"
+    },
+    "gcc": {
+      "aports_commit": "1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f",
+      "archive": "gcc-14.2.0-r4.apk",
+      "index_checksum": "Q1so4Nwbpz4Vh1odkv4QnWrBBtaLE=",
+      "license": "GPL-2.0-or-later AND LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "6727367ddd0c58203ac4e9b96a30d371e92da64c4b0f7b1b2afbd512c80a61be",
+      "version": "14.2.0-r4"
+    },
+    "gdbm": {
+      "aports_commit": "cf76e1b436494c60e0c188400007dbf78bbff5f0",
+      "archive": "gdbm-1.24-r0.apk",
+      "index_checksum": "Q1BodqT+jaXKHlkw2qCKr5BinDUHQ=",
+      "license": "GPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "261f792e3bd65c0c1859417e324643a49e8a804ddb92ed197b58e7f6606af090",
+      "version": "1.24-r0"
+    },
+    "gettext": {
+      "aports_commit": "c49ded5d54b708768165f7a99589464cd5c5eeee",
+      "archive": "gettext-0.22.5-r0.apk",
+      "index_checksum": "Q1Y2CLBFHMbOAQ/ndPxeZzqnS4GBc=",
+      "license": "GPL-3.0-or-later AND LGPL-2.1-or-later AND MIT",
+      "repository": "main",
+      "sha256": "7b6cb8e3133087485e0e77250df482e934f48df6a81879da85ad284f0263cd42",
+      "version": "0.22.5-r0"
+    },
+    "gettext-asprintf": {
+      "aports_commit": "c49ded5d54b708768165f7a99589464cd5c5eeee",
+      "archive": "gettext-asprintf-0.22.5-r0.apk",
+      "index_checksum": "Q1aem8l5xTUwQ4GDJltkRg36YBp2Q=",
+      "license": "LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "eaecbc22afff72a41d4eb9ae589f54d43cb0ee1d098e257d5793c5852b60236f",
+      "version": "0.22.5-r0"
+    },
+    "gettext-dev": {
+      "aports_commit": "c49ded5d54b708768165f7a99589464cd5c5eeee",
+      "archive": "gettext-dev-0.22.5-r0.apk",
+      "index_checksum": "Q1QIxO01F6Pzj0gwoh853NSeUqE2c=",
+      "license": "GPL-3.0-or-later AND LGPL-2.1-or-later AND MIT",
+      "repository": "main",
+      "sha256": "fa47d9753904569a8b275a353e2241eea0c75dc04fb1d5a7aefdd15bd89a3145",
+      "version": "0.22.5-r0"
+    },
+    "gettext-envsubst": {
+      "aports_commit": "c49ded5d54b708768165f7a99589464cd5c5eeee",
+      "archive": "gettext-envsubst-0.22.5-r0.apk",
+      "index_checksum": "Q1SPWhbg+j7CzNF4vEWU1w+zpjswU=",
+      "license": "GPL-3.0-or-later AND LGPL-2.1-or-later AND MIT",
+      "repository": "main",
+      "sha256": "03405a85c2982bf1c6cb859e9522337fa16ed83213fa8ca8418043b870a41124",
+      "version": "0.22.5-r0"
+    },
+    "gettext-libs": {
+      "aports_commit": "c49ded5d54b708768165f7a99589464cd5c5eeee",
+      "archive": "gettext-libs-0.22.5-r0.apk",
+      "index_checksum": "Q1RZuKON7Ktz7oPCVW5f2iTDr8kDs=",
+      "license": "GPL-3.0-or-later AND LGPL-2.1-or-later AND MIT",
+      "repository": "main",
+      "sha256": "6c9d36dfe07d310c7939d948dd156d12cfffc292a84e9fad032383af8b5b3b99",
+      "version": "0.22.5-r0"
+    },
+    "git": {
+      "aports_commit": "ca82c367c9e522b81bfa0dcbe39e0fd5eff1b1b5",
+      "archive": "git-2.47.3-r0.apk",
+      "index_checksum": "Q1aGo2wwmVUXK5U5L1uKuCtY92Ges=",
+      "license": "GPL-2.0-only",
+      "repository": "main",
+      "sha256": "1d3696aaf8b7afdbd3fff8cf0954145ff79a9763a602aaa93d249482ef4114bc",
+      "version": "2.47.3-r0"
+    },
+    "git-init-template": {
+      "aports_commit": "ca82c367c9e522b81bfa0dcbe39e0fd5eff1b1b5",
+      "archive": "git-init-template-2.47.3-r0.apk",
+      "index_checksum": "Q1GosB0iOx2j2WpHlN2ffn65S3ODk=",
+      "license": "GPL-2.0-only",
+      "repository": "main",
+      "sha256": "451af5557bab28a0afaf1718543c13285d8d6588a22cbd022deb47d03e78355a",
+      "version": "2.47.3-r0"
+    },
+    "git-perl": {
+      "aports_commit": "ca82c367c9e522b81bfa0dcbe39e0fd5eff1b1b5",
+      "archive": "git-perl-2.47.3-r0.apk",
+      "index_checksum": "Q1cP8aFhnjSpNY4HRsJJ5PlFCdrF0=",
+      "license": "GPL-2.0-only",
+      "repository": "main",
+      "sha256": "7080a4cd4b0a8daa5ffda6403e7892c630f4c865409fc262cdd17d879e6e5fce",
+      "version": "2.47.3-r0"
+    },
+    "gmp": {
+      "aports_commit": "b324434270c040f53644c8698889c6e07206e790",
+      "archive": "gmp-6.3.0-r2.apk",
+      "index_checksum": "Q1peLNExDRKreT6ggMey7xSqxySkU=",
+      "license": "LGPL-3.0-or-later OR GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "4b2790276c2a652883302a4f43712f18a666bfa50edccd95b71ae5d5b9520591",
+      "version": "6.3.0-r2"
+    },
+    "hexdump": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "hexdump-2.40.4-r1.apk",
+      "index_checksum": "Q1e1X2L+sNlMJBaYPoVFPVXummK+Q=",
+      "license": "BSD-4-Clause-UC",
+      "repository": "main",
+      "sha256": "3a800a76197d33f8a8fb01b8fc89e2fe74612e85eb1c72ca367ffde59af0e365",
+      "version": "2.40.4-r1"
+    },
+    "isl26": {
+      "aports_commit": "84a227baf001b6e0208e3352b294e4d7a40e93de",
+      "archive": "isl26-0.26-r1.apk",
+      "index_checksum": "Q1Wu3xZK0+lETSx8v9NkIBHpLeNA0=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "fad45095620e08c1410260cfef6723cc318dc9e554821cced49d263a9d1b4064",
+      "version": "0.26-r1"
+    },
+    "jansson": {
+      "aports_commit": "98f1223d0dbb22dbfe0bede7a7f1a0fef68e0b15",
+      "archive": "jansson-2.14-r4.apk",
+      "index_checksum": "Q1h78JfzJAQ5pgElJkmWgDKzr5nBw=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "ccfcfbe5940220c2224c1d5b4ee282994ebf1419af6455041fa850413e58632d",
+      "version": "2.14-r4"
+    },
+    "libatomic": {
+      "aports_commit": "1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f",
+      "archive": "libatomic-14.2.0-r4.apk",
+      "index_checksum": "Q1m17PeNlXT2p+VZPv5vLQtypYJx0=",
+      "license": "GPL-2.0-or-later AND LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "888fc0cd460a584258cbec9a9d5cdea31060a23f18cdc9c75ff0fb9d35ff7fc5",
+      "version": "14.2.0-r4"
+    },
+    "libblkid": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "libblkid-2.40.4-r1.apk",
+      "index_checksum": "Q1EGl2YW9WCq94kdDf3XcQkWbLAxg=",
+      "license": "LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "74dbd807a8e2a7e88bbdbd0a30329c467e7d6512c03644e373ef12d14d28e817",
+      "version": "2.40.4-r1"
+    },
+    "libbz2": {
+      "aports_commit": "33283848034c9885d984c8e8697c645c57324938",
+      "archive": "libbz2-1.0.8-r6.apk",
+      "index_checksum": "Q1VPiLUY6S45YW9Vv/IeDDwe7EREY=",
+      "license": "bzip2-1.0.6",
+      "repository": "main",
+      "sha256": "9d8305edec09baad972ed5ec904ab2a111a38f306e71332113799d170c1fe4fe",
+      "version": "1.0.8-r6"
+    },
+    "libcap-getcap": {
+      "aports_commit": "b9cb172a928158ce3cedb488f4edaba270c7d728",
+      "archive": "libcap-getcap-2.78-r0.apk",
+      "index_checksum": "Q18Vy1WWmwy7kS35hXWse7K0ejHeA=",
+      "license": "BSD-3-Clause OR GPL-2.0-only",
+      "repository": "main",
+      "sha256": "c7d1be9c5677e2043bb0bc14a1c473cde038cb207152d4eb3463b1d852fe25cf",
+      "version": "2.78-r0"
+    },
+    "libcap-ng": {
+      "aports_commit": "eca5824ffb9bd4158a839862d2e760724bf38b37",
+      "archive": "libcap-ng-0.8.5-r0.apk",
+      "index_checksum": "Q1/8UnRdv6nFHrZvhMDb4/u6Ac2Iw=",
+      "license": "GPL-2.0-or-later AND LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "bb4657a4e80169d855e227cc81eb88658f1e61e42dfb4946867e591ba593fb6d",
+      "version": "0.8.5-r0"
+    },
+    "libcap2": {
+      "aports_commit": "b9cb172a928158ce3cedb488f4edaba270c7d728",
+      "archive": "libcap2-2.78-r0.apk",
+      "index_checksum": "Q1SDUMX/HrDmUvmgGdTVpwSUbYrI4=",
+      "license": "BSD-3-Clause OR GPL-2.0-only",
+      "repository": "main",
+      "sha256": "a2160f94232206985c3656fe4108bb7b25cf56cfda83b8488791b225cc6e7ed1",
+      "version": "2.78-r0"
+    },
+    "libcurl": {
+      "aports_commit": "2c79595339118c69c0809dbff53ad71c90beba48",
+      "archive": "libcurl-8.14.1-r2.apk",
+      "index_checksum": "Q1wT0MZpiQqpTZtXuOLjE+8n11Cx8=",
+      "license": "curl",
+      "repository": "main",
+      "sha256": "e6f76cb875242f30d5e174ef228a698b73e718217f82f7cc749a6c190672d992",
+      "version": "8.14.1-r2"
+    },
+    "libdw": {
+      "aports_commit": "73946d6789300358ecf5ef75975de57cef4df125",
+      "archive": "libdw-0.191-r0.apk",
+      "index_checksum": "Q1iacmGLu7hCBptfYuXfTltgOP0nI=",
+      "license": "GPL-3.0-or-later AND ( GPL-2.0-or-later OR LGPL-3.0-or-later )",
+      "repository": "main",
+      "sha256": "b4b27d2de2b4af924db0c5b8a785e7c8e7667b64981238e8f14a7980c9b16c6a",
+      "version": "0.191-r0"
+    },
+    "libeconf": {
+      "aports_commit": "1e0aa723fba50417893fe5f6cf72f76d044b8192",
+      "archive": "libeconf-0.6.3-r0.apk",
+      "index_checksum": "Q1zQWT57o+Gd9HOuOlTCOA6lKUE2U=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "9bcd1c0d8fafa5532a0fe3c76a24dbbe06ef05d2f2c106c55074552251b446f0",
+      "version": "0.6.3-r0"
+    },
+    "libelf": {
+      "aports_commit": "73946d6789300358ecf5ef75975de57cef4df125",
+      "archive": "libelf-0.191-r0.apk",
+      "index_checksum": "Q1Y9Q8CaY2r66SX1F1TodAEWztGjM=",
+      "license": "GPL-3.0-or-later AND ( GPL-2.0-or-later OR LGPL-3.0-or-later )",
+      "repository": "main",
+      "sha256": "6f98ef2df0544da22d910bc93fdb8eb50654ac822dd9d25f3a39ba8acde6c649",
+      "version": "0.191-r0"
+    },
+    "libexpat": {
+      "aports_commit": "d46a3884017c3c180ea5fa36585135b4da608fcb",
+      "archive": "libexpat-2.8.4-r0.apk",
+      "index_checksum": "Q1ehFjl6MLN4tyIWmqStb2gbil6g8=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "065af3b201fbfd91f2d747c1f7a3fea39f1bff9bf664c911ed94ac86fd4b0c56",
+      "version": "2.8.4-r0"
+    },
+    "libfdisk": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "libfdisk-2.40.4-r1.apk",
+      "index_checksum": "Q1N7iF6IoDw96LCf2EFWp5Yrh6wUU=",
+      "license": "LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "1fc90183036cebfae712b86da274ec42f553463870383939c555b268670f3baf",
+      "version": "2.40.4-r1"
+    },
+    "libffi": {
+      "aports_commit": "22c7b41f717ec56d69c0cc0a183703326fa47414",
+      "archive": "libffi-3.4.7-r0.apk",
+      "index_checksum": "Q1Hh8NLW8YoG9I07NNC73b/nx34jo=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "819e95a9b0dd12dddb72d7151964855518d83d61dc6b7c9b619dd17233160097",
+      "version": "3.4.7-r0"
+    },
+    "libgcc": {
+      "aports_commit": "1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f",
+      "archive": "libgcc-14.2.0-r4.apk",
+      "index_checksum": "Q1uHWWmqc39Tzyj4tdULsmbXk6VmQ=",
+      "license": "GPL-2.0-or-later AND LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "8675867db77b5af11b88fd19186450333202d94cccd84a76a066dccd5b6e8cf1",
+      "version": "14.2.0-r4"
+    },
+    "libgomp": {
+      "aports_commit": "1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f",
+      "archive": "libgomp-14.2.0-r4.apk",
+      "index_checksum": "Q1tEL+HQq8U1/PZZFOON6dw/LAvsM=",
+      "license": "GPL-2.0-or-later AND LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "86720fd442c4e48964d169769ad904fe3fc895b728767a9f2f79f2fb86bd3acb",
+      "version": "14.2.0-r4"
+    },
+    "libidn2": {
+      "aports_commit": "1cdcdd0eccbee1f60078417a7aaf83f92f6e6754",
+      "archive": "libidn2-2.3.7-r0.apk",
+      "index_checksum": "Q1rjtkE0rSpjcYJp2sKCa8UUo0ReI=",
+      "license": "GPL-2.0-or-later OR LGPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "3625d1123662203440cd25c09325c7d7891809ec68ad420ba7d8dd0173a737a6",
+      "version": "2.3.7-r0"
+    },
+    "libintl": {
+      "aports_commit": "c49ded5d54b708768165f7a99589464cd5c5eeee",
+      "archive": "libintl-0.22.5-r0.apk",
+      "index_checksum": "Q1w/GDpV9zgBiQMDY0VAzxyEUwzBc=",
+      "license": "LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "ac62447a8dc879dc52c6b42af7a604d8b5fbf2aab9338ca40e15bab8f93810f7",
+      "version": "0.22.5-r0"
+    },
+    "liblastlog2": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "liblastlog2-2.40.4-r1.apk",
+      "index_checksum": "Q1JD+GnKIzvsQOh0MXc4+5eBuejow=",
+      "license": "BSD-2-Clause",
+      "repository": "main",
+      "sha256": "529a81beab2a056e6c0d1634bafef3b37ca1a9d9c73045421e6d7df4539faefa",
+      "version": "2.40.4-r1"
+    },
+    "libltdl": {
+      "aports_commit": "33283848034c9885d984c8e8697c645c57324938",
+      "archive": "libltdl-2.4.7-r3.apk",
+      "index_checksum": "Q1ypKGcQGpByGrYHEA4AVVkXzvyIo=",
+      "license": "LGPL-2.0-or-later AND GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "2613d2169354172f645178eccbb026ba9c0c6814a43db4acafa316093a2feef5",
+      "version": "2.4.7-r3"
+    },
+    "libmagic": {
+      "aports_commit": "e89c62d847f7369b16ae24657d91b8d20c564ca4",
+      "archive": "libmagic-5.46-r2.apk",
+      "index_checksum": "Q1xKxJr3SpOe1gFcsV0U7bUxmOzn4=",
+      "license": "BSD-2-Clause",
+      "repository": "main",
+      "sha256": "43422ba328180757224cfb7f3d23d48e42c6b6b0e873a55189c5fc4dc3100620",
+      "version": "5.46-r2"
+    },
+    "libmount": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "libmount-2.40.4-r1.apk",
+      "index_checksum": "Q1xSrDYUpSipvOTMT2GSIC8WS0Xbk=",
+      "license": "LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "1d9cdb82cedc15d7211e59db2c3f48b325a30e0f306773ba165e0ff8a8fa0d56",
+      "version": "2.40.4-r1"
+    },
+    "libncursesw": {
+      "aports_commit": "2cf24c798675a7f7deb2603c350d4adc7b59c8bb",
+      "archive": "libncursesw-6.5_p20241006-r3.apk",
+      "index_checksum": "Q1H0oLVnmQp1aZ3pkqqR2nW62RSlc=",
+      "license": "X11",
+      "repository": "main",
+      "sha256": "3919cf673e841d91865213799ccfd5f77a48f5f9f5402723167470295ee32a49",
+      "version": "6.5_p20241006-r3"
+    },
+    "libpanelw": {
+      "aports_commit": "2cf24c798675a7f7deb2603c350d4adc7b59c8bb",
+      "archive": "libpanelw-6.5_p20241006-r3.apk",
+      "index_checksum": "Q1t5KLdR1ILT7hku8csPS43huqCyA=",
+      "license": "X11",
+      "repository": "main",
+      "sha256": "f89752780981d11707e7eee3ca7b5a7f52e91e60ee28bd9e1815c7da05741c4a",
+      "version": "6.5_p20241006-r3"
+    },
+    "libpsl": {
+      "aports_commit": "398a5aee3025ec8a4d0d761e448dc86ac777fa09",
+      "archive": "libpsl-0.21.5-r3.apk",
+      "index_checksum": "Q1nSGpzyDRZepo6vx1ZqXaFs6eq/w=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "693c1743c6204b9307a539a20d048060350531e50dad4059bdd04feaf4acdc58",
+      "version": "0.21.5-r3"
+    },
+    "libsmartcols": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "libsmartcols-2.40.4-r1.apk",
+      "index_checksum": "Q17fGCoCWpsppbrLnom/qNWXIQnH8=",
+      "license": "LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "985aa9d49b9b64c50ad3ff396690a79f851c919c4f95dd6a5e878bc2d6249ba4",
+      "version": "2.40.4-r1"
+    },
+    "libstdc++": {
+      "aports_commit": "1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f",
+      "archive": "libstdc++-14.2.0-r4.apk",
+      "index_checksum": "Q1OjH10Hhk6gsyOjxtdjrmB57xyR8=",
+      "license": "GPL-2.0-or-later AND LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "5899f66390aba2ac908f0912fc62a49775830f523fa38fab406c1761821dfb07",
+      "version": "14.2.0-r4"
+    },
+    "libstdc++-dev": {
+      "aports_commit": "1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f",
+      "archive": "libstdc++-dev-14.2.0-r4.apk",
+      "index_checksum": "Q1i7rNn8WORMYTwGD3LvbxyMuMjtM=",
+      "license": "GPL-2.0-or-later AND LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "8a2c14b49e5b3d75ec32d6f62966df8b1abad200ab9479172805ddc0f221e1df",
+      "version": "14.2.0-r4"
+    },
+    "libtool": {
+      "aports_commit": "33283848034c9885d984c8e8697c645c57324938",
+      "archive": "libtool-2.4.7-r3.apk",
+      "index_checksum": "Q1NMtkOgEBJQ8kMDLVPmE+1XcnEy0=",
+      "license": "LGPL-2.0-or-later AND GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "9e604c47eadffa8bfe99a956150792c8d82a1d61a76c6fa6154b8b78fdb4a204",
+      "version": "2.4.7-r3"
+    },
+    "libunistring": {
+      "aports_commit": "c4c67852adc5bc15e278054876bc3c70c321948e",
+      "archive": "libunistring-1.2-r0.apk",
+      "index_checksum": "Q1earAgh704U/GzqrPv3wqdwqAz3g=",
+      "license": "GPL-2.0-or-later OR LGPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "81be06ee6cab58c1b44dd72cd10036457c031a0186a4f915befebb22989b9802",
+      "version": "1.2-r0"
+    },
+    "libuuid": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "libuuid-2.40.4-r1.apk",
+      "index_checksum": "Q1jV5/voHzGogvIsAOunMtz0Wn6Qw=",
+      "license": "BSD-3-Clause",
+      "repository": "main",
+      "sha256": "67dd6b9a714841008389bfa5cb4e42fd0539cd873eaf904481babee49eb11454",
+      "version": "2.40.4-r1"
+    },
+    "libxml2": {
+      "aports_commit": "f77d9e58e5dcbf8b6cc3090c8198d09614581c9b",
+      "archive": "libxml2-2.13.9-r1.apk",
+      "index_checksum": "Q1Za3HxZwubuCpYylF0+OqAttzzZ0=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "8a99b85bf26a698934ca901b66a7aa9a117ed20139cb019086215ea32ec87d2f",
+      "version": "2.13.9-r1"
+    },
+    "linux-headers": {
+      "aports_commit": "ff05649790da27954fc672698b30aa984b772c01",
+      "archive": "linux-headers-6.6-r1.apk",
+      "index_checksum": "Q1e8kNQdS7TOZZXDqKzI0XWFsPkGU=",
+      "license": "GPL-2.0-only",
+      "repository": "main",
+      "sha256": "775cfa57ca5475d6dd87527a9889f6934e1dda11331060b7aee761d54a7c9949",
+      "version": "6.6-r1"
+    },
+    "linux-pam": {
+      "aports_commit": "390b824324986cc9f4a8cca5e13d9c09b8e88855",
+      "archive": "linux-pam-1.6.1-r1.apk",
+      "index_checksum": "Q1yAV3rbo1m3CAgRFazYbDF9FdpvU=",
+      "license": "BSD-3-Clause",
+      "repository": "main",
+      "sha256": "d686045d741b1dec29fbb4ba637236f56fefa029b18a11ef258fa894ae550962",
+      "version": "1.6.1-r1"
+    },
+    "llvm19-libs": {
+      "aports_commit": "14cbf9f66aa84dae688360611937caac603f397b",
+      "archive": "llvm19-libs-19.1.4-r1.apk",
+      "index_checksum": "Q11ki+0qIuWS0pxFad8VRDaTFut60=",
+      "license": "Apache-2.0",
+      "repository": "main",
+      "sha256": "5cca50343cc5dcbfed31cd2208602272f95f6acee33ba109751060383a5ce031",
+      "version": "19.1.4-r1"
+    },
+    "llvm19-linker-tools": {
+      "aports_commit": "14cbf9f66aa84dae688360611937caac603f397b",
+      "archive": "llvm19-linker-tools-19.1.4-r1.apk",
+      "index_checksum": "Q1AMBcOeR8F2a0wIV2oKVjqLzgWCA=",
+      "license": "Apache-2.0",
+      "repository": "main",
+      "sha256": "baf97d77747f60da0d0aa557161426da96af87f543b7cdffa6bbe95b2c74ad97",
+      "version": "19.1.4-r1"
+    },
+    "logger": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "logger-2.40.4-r1.apk",
+      "index_checksum": "Q1tlkOWGGMeW66FL/3mN8p37eICek=",
+      "license": "BSD-4-Clause-UC",
+      "repository": "main",
+      "sha256": "f592f07e330ca361cd100a4b5a7d8ba1ee34f8a49afc7100dee0bd48a38b576f",
+      "version": "2.40.4-r1"
+    },
+    "losetup": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "losetup-2.40.4-r1.apk",
+      "index_checksum": "Q1yhd5kwiOrk548Sf9qy5hKqIl/cg=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "0b55da3f14bd96bd6c1777d48e706c8816e7608d8db32e9af7ad83ae6cd5a69d",
+      "version": "2.40.4-r1"
+    },
+    "lsblk": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "lsblk-2.40.4-r1.apk",
+      "index_checksum": "Q11FswS4aTB8jwoeBSIpXVp2Qi+vs=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "ba826b1f5a390221d64bba6887ab2cb51128a5654cbaf47c9f5922a78166dcde",
+      "version": "2.40.4-r1"
+    },
+    "lscpu": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "lscpu-2.40.4-r1.apk",
+      "index_checksum": "Q1xQPOJAl5zNMw+9s1KCuOy+Ep5/U=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "1cd130928ab589266b9967836a6914472b91b78223d2938709344e76568f223d",
+      "version": "2.40.4-r1"
+    },
+    "lzip": {
+      "aports_commit": "69d685ccfa67285422d5e908a1627f5566fdb1ba",
+      "archive": "lzip-1.24.1-r1.apk",
+      "index_checksum": "Q1S0BA3IUeKEcMnQJfz+RBwlFIwLw=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "872b9758faaa44021d13a2ff6989b6946f72b6dd8be7458f4de2c7180bb82b39",
+      "version": "1.24.1-r1"
+    },
+    "m4": {
+      "aports_commit": "84a227baf001b6e0208e3352b294e4d7a40e93de",
+      "archive": "m4-1.4.19-r3.apk",
+      "index_checksum": "Q1EQhK4lFlygROJBS38R5KZXzY+28=",
+      "license": "GPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "d2ffe67c64e12601536a488d1dff3202c5ccb00ea81a6be0bf9530048406aba3",
+      "version": "1.4.19-r3"
+    },
+    "make": {
+      "aports_commit": "2360b6d78eeafe5b88b6409a4c94dc591339d40c",
+      "archive": "make-4.4.1-r2.apk",
+      "index_checksum": "Q1Ac4ZqP48IWuUQKuNfcSa+s37pPQ=",
+      "license": "GPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "a61bf1442fa3cdee6ea7188e28673dba7b36bf2f469ccaa6b119cb95c3338b43",
+      "version": "4.4.1-r2"
+    },
+    "mcookie": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "mcookie-2.40.4-r1.apk",
+      "index_checksum": "Q1Wa8l+HZFC9WxbHRS+tjFermmYiw=",
+      "license": "Public-Domain",
+      "repository": "main",
+      "sha256": "810a0f661f8d9f93d398a249f579a2ed736a6e2020de0a32c5af1611455e1136",
+      "version": "2.40.4-r1"
+    },
+    "meson": {
+      "aports_commit": "bd2a8e0fc4db67c9e50e2de14e98e57dcc615297",
+      "archive": "meson-1.6.1-r0.apk",
+      "index_checksum": "Q1QNb+zsSEKIsoQGLVwW+4420xm2I=",
+      "license": "Apache-2.0",
+      "repository": "main",
+      "sha256": "47fa573cb2d211689be8368e4a65e7c2cfa34de02ddcebf5b241e0d6799e3167",
+      "version": "1.6.1-r0"
+    },
+    "meson-pyc": {
+      "aports_commit": "bd2a8e0fc4db67c9e50e2de14e98e57dcc615297",
+      "archive": "meson-pyc-1.6.1-r0.apk",
+      "index_checksum": "Q1dOlOm2GpGlVYQ26XolkYiictieE=",
+      "license": "Apache-2.0",
+      "repository": "main",
+      "sha256": "de3040ebdfcb9aea5414015a25f7e6f8d69f99c6b4761c7121cb2772902ebd9f",
+      "version": "1.6.1-r0"
+    },
+    "mimalloc2": {
+      "aports_commit": "5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39",
+      "archive": "mimalloc2-2.1.7-r0.apk",
+      "index_checksum": "Q1OMcwgj4CD/2qdUlsWJoZWJU6Xg8=",
+      "license": "MIT",
+      "repository": "community",
+      "sha256": "fb91cf2044e28fd2e6786efa2953d3e371bf949879688da88268db2085099858",
+      "version": "2.1.7-r0"
+    },
+    "mimalloc2-debug": {
+      "aports_commit": "5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39",
+      "archive": "mimalloc2-debug-2.1.7-r0.apk",
+      "index_checksum": "Q11ZddoAvA+87zHVrheP2/6+E9zy8=",
+      "license": "MIT",
+      "repository": "community",
+      "sha256": "7a565661d54e925ecc04ca874a9d666b5dd63677063a527d9adabb023ca36e2d",
+      "version": "2.1.7-r0"
+    },
+    "mimalloc2-dev": {
+      "aports_commit": "5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39",
+      "archive": "mimalloc2-dev-2.1.7-r0.apk",
+      "index_checksum": "Q1tteTPfVH5KM45YzPm956A7axM7A=",
+      "license": "MIT",
+      "repository": "community",
+      "sha256": "9b140b549613492ad23a8c0749c17e38d9ad737d7b22b7927e035b03f8c4ac3f",
+      "version": "2.1.7-r0"
+    },
+    "mimalloc2-insecure": {
+      "aports_commit": "5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39",
+      "archive": "mimalloc2-insecure-2.1.7-r0.apk",
+      "index_checksum": "Q1uYRH32HhBbCYQBEDHWLNrKkaNuk=",
+      "license": "MIT",
+      "repository": "community",
+      "sha256": "078b69f8cd6734b49e23da7f92538639bc7f651e0eb5bf6a7023e3af1548a72d",
+      "version": "2.1.7-r0"
+    },
+    "mount": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "mount-2.40.4-r1.apk",
+      "index_checksum": "Q1kK6Y4enSt7mTPS7LBhH9Nk8NCpc=",
+      "license": "GPL-3.0-or-later AND GPL-2.0-or-later AND GPL-2.0-only AND GPL-1.0-only AND LGPL-2.1-or-later AND BSD-1-Clause AND BSD-3-Clause AND BSD-4-Clause-UC AND MIT AND Public-Domain",
+      "repository": "main",
+      "sha256": "e3dbbf85418cec42b3471a880511ccf0da2704035c26f551261386bda0dc7e3b",
+      "version": "2.40.4-r1"
+    },
+    "mpc1": {
+      "aports_commit": "84a227baf001b6e0208e3352b294e4d7a40e93de",
+      "archive": "mpc1-1.3.1-r1.apk",
+      "index_checksum": "Q1KijTG4TMJnymzTpIMJrkgMuJ0YE=",
+      "license": "LGPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "a63431b3ae86d2b376d7b3a48bf3ead220983cf1d172b3339cfc899dbfdc6d2a",
+      "version": "1.3.1-r1"
+    },
+    "mpdecimal": {
+      "aports_commit": "2eb73f6cb661fb3582606482331ad083155f18e8",
+      "archive": "mpdecimal-4.0.0-r0.apk",
+      "index_checksum": "Q1EjZSAyIRwjpJ4d3llh52j2u6c4w=",
+      "license": "BSD-2-Clause",
+      "repository": "main",
+      "sha256": "022349ca371423bf80d45e7f8bd11fa1f8e115d103b8bd8674c8f8dfdcc48286",
+      "version": "4.0.0-r0"
+    },
+    "mpfr4": {
+      "aports_commit": "f0981ab6660cc878d98f8dab150cbcf62206b2db",
+      "archive": "mpfr4-4.2.1-r0.apk",
+      "index_checksum": "Q15BTpgB84V7c/Cd4CHLuiC5eHrow=",
+      "license": "LGPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "2493390b05fcaed445ca4fdbf3508422cd9a0af5b7051c6a63a832a65b549ff2",
+      "version": "4.2.1-r0"
+    },
+    "musl-dev": {
+      "aports_commit": "21cafa1183cf7501d3f1744994d221c038436e45",
+      "archive": "musl-dev-1.2.5-r11.apk",
+      "index_checksum": "Q1wUlCOIuDUtbMTXswEWsLET42K2o=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "d3b5ab01046a92b9a168b790f516606e320f015cbd4deeb584c5e115a02124ba",
+      "version": "1.2.5-r11"
+    },
+    "musl-fts": {
+      "aports_commit": "6e686b44f1f50828d099f6968aec968874f43499",
+      "archive": "musl-fts-1.2.7-r6.apk",
+      "index_checksum": "Q1CL/HwdLDDJyZA/eB0ZOuay6qhJg=",
+      "license": "BSD-3-Clause",
+      "repository": "main",
+      "sha256": "ecbb61bb93a733041275dbe2404c6267d9d826064c8b62538471313bfc974037",
+      "version": "1.2.7-r6"
+    },
+    "ncurses-terminfo-base": {
+      "aports_commit": "2cf24c798675a7f7deb2603c350d4adc7b59c8bb",
+      "archive": "ncurses-terminfo-base-6.5_p20241006-r3.apk",
+      "index_checksum": "Q1oryCojXnFyYF8GmjbDcflVvJ2Pw=",
+      "license": "X11",
+      "repository": "main",
+      "sha256": "46402464710d165a8fed4b843b3a20d9950e1e9a20923c3869241014bf6b2f51",
+      "version": "6.5_p20241006-r3"
+    },
+    "nghttp2-libs": {
+      "aports_commit": "f5865f848b702c52c657060adbe80706265984ec",
+      "archive": "nghttp2-libs-1.69.0-r0.apk",
+      "index_checksum": "Q1ihMzkXIPyy/289ITUia9W261EYY=",
+      "license": "MIT",
+      "repository": "main",
+      "sha256": "341724304e3b4bb5ae0ec9021f55da2ef27a19b78ef7873d1a865bdf72dbef0c",
+      "version": "1.69.0-r0"
+    },
+    "openssl": {
+      "aports_commit": "9b59567ddd9ca9722deeedb5145506726b5c9389",
+      "archive": "openssl-3.3.7-r1.apk",
+      "index_checksum": "Q1LZq+pPqCx4TR0SS64He3QMjfnz4=",
+      "license": "Apache-2.0",
+      "repository": "main",
+      "sha256": "675d3335229af672b7a710292973bdf6169f262529442059ca6880f31b863b7e",
+      "version": "3.3.7-r1"
+    },
+    "partx": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "partx-2.40.4-r1.apk",
+      "index_checksum": "Q1T9EF5GX+og1L5XZyUH6dT+Qbu1c=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "abf4199b2e8d2f429e1b09ba458fda81f7ac88a7e1a60f2275334652af89a703",
+      "version": "2.40.4-r1"
+    },
+    "patch": {
+      "aports_commit": "fc95c59998285564fbcb0bfb2443898c62e10171",
+      "archive": "patch-2.7.6-r10.apk",
+      "index_checksum": "Q1kOzsC/F8auswDWihwDKt+8LnN60=",
+      "license": "GPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "c0c7b135ac7e08379bde9bd7ac89661dd70d83c924c7455b6f20d91997cb5595",
+      "version": "2.7.6-r10"
+    },
+    "pcre2": {
+      "aports_commit": "0826e91f0c743946bdc6ffa51fe90479bf4a83da",
+      "archive": "pcre2-10.43-r0.apk",
+      "index_checksum": "Q1rH4mM74meQT5DSqFDqQ9OTWDsWA=",
+      "license": "BSD-3-Clause",
+      "repository": "main",
+      "sha256": "2054948a7bc4c7c74c2236274b514697d30b309c5f68021d7104b30ce6a489c3",
+      "version": "10.43-r0"
+    },
+    "perl": {
+      "aports_commit": "f6a32c48ff721cf171c26edfd2337c5d733c6ac8",
+      "archive": "perl-5.40.4-r0.apk",
+      "index_checksum": "Q1RM1xrcM6ZVeZg9VQlyRlo4NWx2M=",
+      "license": "Artistic-1.0-Perl OR GPL-1.0-or-later",
+      "repository": "main",
+      "sha256": "25d29d18dea18b4e8ccc681643d7eec9b154e4ad2ed76cd039052e13804a7fca",
+      "version": "5.40.4-r0"
+    },
+    "perl-error": {
+      "aports_commit": "1325c9bb2fdb0ed63d3776b3fd8151fbb8cb49f4",
+      "archive": "perl-error-0.17029-r2.apk",
+      "index_checksum": "Q1SyWqzHp8IWN8ZS6TdT43z3Kofyo=",
+      "license": "GPL-1.0-or-later OR Artistic-1.0-Perl",
+      "repository": "main",
+      "sha256": "9b3d3f90da61c646959f4f0d00c3a00b8adb4c9740ccd32d016bf1b8ce57a9ac",
+      "version": "0.17029-r2"
+    },
+    "perl-git": {
+      "aports_commit": "ca82c367c9e522b81bfa0dcbe39e0fd5eff1b1b5",
+      "archive": "perl-git-2.47.3-r0.apk",
+      "index_checksum": "Q1q5mg4+w98qloJrCdXQr6augYvHo=",
+      "license": "GPL-2.0-only",
+      "repository": "main",
+      "sha256": "3856fd0f5f4c7e6279abfe849fd2da83013efcae0e8778dce1a9991fbffdfba0",
+      "version": "2.47.3-r0"
+    },
+    "pkgconf": {
+      "aports_commit": "30b8a2129aa575809ad80dfdf4124e3fb9e7e427",
+      "archive": "pkgconf-2.3.0-r0.apk",
+      "index_checksum": "Q1z/Qxme0yHfCcIEu+qma4bhJfczY=",
+      "license": "ISC",
+      "repository": "main",
+      "sha256": "df410a0e485d40a2bd0bf9b36d1e26f7577c5fe60e25b99906a7d63a426e0d29",
+      "version": "2.3.0-r0"
+    },
+    "pyc": {
+      "aports_commit": "1d63fc4da0e6ddeed22906b0e483e3a519810551",
+      "archive": "pyc-3.12.14-r0.apk",
+      "index_checksum": "Q1Fp3IOQHmZeDiMHt4wW/9Svo6A0A=",
+      "license": "PSF-2.0",
+      "repository": "main",
+      "sha256": "a8dfd1599ca1a75e51bc02b8dadd56390c4bca4e42bdb63a37f4bdebab7835e4",
+      "version": "3.12.14-r0"
+    },
+    "python3": {
+      "aports_commit": "1d63fc4da0e6ddeed22906b0e483e3a519810551",
+      "archive": "python3-3.12.14-r0.apk",
+      "index_checksum": "Q1sk88rATKvlHmDVgO5m1waoheOyc=",
+      "license": "PSF-2.0",
+      "repository": "main",
+      "sha256": "fd3c107796c723259caa3ccf9c684875a77f2e57fa19a631e2d755c3cf21b0d4",
+      "version": "3.12.14-r0"
+    },
+    "python3-pyc": {
+      "aports_commit": "1d63fc4da0e6ddeed22906b0e483e3a519810551",
+      "archive": "python3-pyc-3.12.14-r0.apk",
+      "index_checksum": "Q1f0ifTIVV79Uk3w+C8AZQeNaszUw=",
+      "license": "PSF-2.0",
+      "repository": "main",
+      "sha256": "1f058f0cd678f8d7865dc9492b106f6103a6afe435ff303eea7de36c2c0738ef",
+      "version": "3.12.14-r0"
+    },
+    "python3-pycache-pyc0": {
+      "aports_commit": "1d63fc4da0e6ddeed22906b0e483e3a519810551",
+      "archive": "python3-pycache-pyc0-3.12.14-r0.apk",
+      "index_checksum": "Q15vRJRxiFmGDNdYSoktrwWL7vAx0=",
+      "license": "PSF-2.0",
+      "repository": "main",
+      "sha256": "2e8f919ef24ca2320ce13f86b0d1184d17d30b4d8e114671ea96b1822cda8d81",
+      "version": "3.12.14-r0"
+    },
+    "readline": {
+      "aports_commit": "7dff18068fb2ef6694db4f7bdc447755187e74ab",
+      "archive": "readline-8.2.13-r0.apk",
+      "index_checksum": "Q1uZ5Cdm0tN6qLaYINqggKtQwooVA=",
+      "license": "GPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "fa4ff2347886f5516d021b9064a00259b29fc6e2608eac5588a339de244acf12",
+      "version": "8.2.13-r0"
+    },
+    "runuser": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "runuser-2.40.4-r1.apk",
+      "index_checksum": "Q1WRVMa2Oj5B1k/c5Wu987Cop+2kY=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "20aea01d19ebe7fe402b82d9c7270e91af1930740bf2f1e4addc4fe73e6c39c9",
+      "version": "2.40.4-r1"
+    },
+    "samurai": {
+      "aports_commit": "df5dd307a5e1e9193d389378b85a154de4996016",
+      "archive": "samurai-1.2-r6.apk",
+      "index_checksum": "Q1H7hZxq8K7uHJddKAaVq/fPxSlpc=",
+      "license": "Apache-2.0",
+      "repository": "main",
+      "sha256": "c8ea6ea3303c60dae5254afef6217e8e426f80d2bce8b6c62a7101925ededdc6",
+      "version": "1.2-r6"
+    },
+    "setarch": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "setarch-2.40.4-r1.apk",
+      "index_checksum": "Q1GzDSaP55BmltUH7twg+P1pjhrwQ=",
+      "license": "GPL-3.0-or-later AND GPL-2.0-or-later AND GPL-2.0-only AND GPL-1.0-only AND LGPL-2.1-or-later AND BSD-1-Clause AND BSD-3-Clause AND BSD-4-Clause-UC AND MIT AND Public-Domain",
+      "repository": "main",
+      "sha256": "d94bd703d7fa9608d3baee0ee3f91da99e550a09db14e554f38db2a3c22cdc8f",
+      "version": "2.40.4-r1"
+    },
+    "setpriv": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "setpriv-2.40.4-r1.apk",
+      "index_checksum": "Q1zBaaiJGnE63x9pFNxi+xHTNs61o=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "6da14d12af36b37aabe2aeebd399e59fb94077faa45b457bb29ad8029e259f64",
+      "version": "2.40.4-r1"
+    },
+    "sfdisk": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "sfdisk-2.40.4-r1.apk",
+      "index_checksum": "Q1vBiZ1TA1FEhASjy5lEjEnFsTX/w=",
+      "license": "GPL-1.0-or-later",
+      "repository": "main",
+      "sha256": "5824a64980a2524f126188562a72197df730dfdb583fe3b2b87e3a40dac19208",
+      "version": "2.40.4-r1"
+    },
+    "skalibs-libs": {
+      "aports_commit": "75d88451d8c525124c5126a05c1a33d98b3940fe",
+      "archive": "skalibs-libs-2.14.3.0-r0.apk",
+      "index_checksum": "Q1xfNy4eSU7ewiZe/WGzOZvggyPLQ=",
+      "license": "ISC",
+      "repository": "main",
+      "sha256": "10c8ca82df402bcf01dd1ac00277ee105a6e7528ab182a0dde4a15a20e32ce97",
+      "version": "2.14.3.0-r0"
+    },
+    "sqlite-libs": {
+      "aports_commit": "ee0eac4d746e3a414cacb3186b3577ccc4342c07",
+      "archive": "sqlite-libs-3.48.0-r4.apk",
+      "index_checksum": "Q1ITVrt8QSREoQMXhw8Q1grW653Lo=",
+      "license": "blessing",
+      "repository": "main",
+      "sha256": "56b55029cce8d43a67f5076e07c96b68b80b26dc412b205b7f0b5c63704ab234",
+      "version": "3.48.0-r4"
+    },
+    "strace": {
+      "aports_commit": "46fa29cec1bf548f42ad6bd52ffd57e9ba84a5c2",
+      "archive": "strace-6.12-r0.apk",
+      "index_checksum": "Q19IIftuMEmXeAt4IfapTOsHbhilA=",
+      "license": "BSD-3-Clause",
+      "repository": "main",
+      "sha256": "0354cf3cb023525fade2ddaad1d94cee8b21211f86754981577e3c4207ecf706",
+      "version": "6.12-r0"
+    },
+    "tar": {
+      "aports_commit": "847ff38eb449c4700ec5f6b32f5c2a08933f3027",
+      "archive": "tar-1.35-r2.apk",
+      "index_checksum": "Q1x6EKz9eol/PJ03YUkuhlM/w03iQ=",
+      "license": "GPL-3.0-or-later",
+      "repository": "main",
+      "sha256": "9013cb0ec7a6acf84698a462e0ec903b634da1dbeb5a7b4f613aa9b639a737c6",
+      "version": "1.35-r2"
+    },
+    "umount": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "umount-2.40.4-r1.apk",
+      "index_checksum": "Q1IX+0c2YjJWn80K+pDASaUKHEPaE=",
+      "license": "GPL-3.0-or-later AND GPL-2.0-or-later AND GPL-2.0-only AND GPL-1.0-only AND LGPL-2.1-or-later AND BSD-1-Clause AND BSD-3-Clause AND BSD-4-Clause-UC AND MIT AND Public-Domain",
+      "repository": "main",
+      "sha256": "e0180aad6fb56151b0030b2375c9ee54788a4808f93eabe25563879a95720118",
+      "version": "2.40.4-r1"
+    },
+    "util-linux": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "util-linux-2.40.4-r1.apk",
+      "index_checksum": "Q1V31QXlHWHC7u1BGkmNUQT2xkvjw=",
+      "license": "GPL-3.0-or-later AND GPL-2.0-or-later AND GPL-2.0-only AND GPL-1.0-only AND LGPL-2.1-or-later AND BSD-1-Clause AND BSD-3-Clause AND BSD-4-Clause-UC AND MIT AND Public-Domain",
+      "repository": "main",
+      "sha256": "780b714d13a198f604a553b7382827da0f427f04dd3c5534abb997c5371a9003",
+      "version": "2.40.4-r1"
+    },
+    "util-linux-misc": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "util-linux-misc-2.40.4-r1.apk",
+      "index_checksum": "Q1IA809oVjFwdFvApUILoyxYpD6Oc=",
+      "license": "GPL-3.0-or-later AND GPL-2.0-or-later AND GPL-2.0-only AND GPL-1.0-only AND LGPL-2.1-or-later AND BSD-1-Clause AND BSD-3-Clause AND BSD-4-Clause-UC AND MIT AND Public-Domain",
+      "repository": "main",
+      "sha256": "fd319e364622f7e350c14822226b40e40f89dcbbfae526e0e6f9ec17282fd187",
+      "version": "2.40.4-r1"
+    },
+    "utmps-libs": {
+      "aports_commit": "ea7aa65df4a6d38d6f3386f712d8e1d518e934c9",
+      "archive": "utmps-libs-0.1.2.3-r2.apk",
+      "index_checksum": "Q1I0kIqac6oWyTeao1LlDoHluMsuo=",
+      "license": "ISC",
+      "repository": "main",
+      "sha256": "17b33292e4b080eef9798e73575a6d96c24bc97ad38d78ba4732a9c75096975d",
+      "version": "0.1.2.3-r2"
+    },
+    "uuidgen": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "uuidgen-2.40.4-r1.apk",
+      "index_checksum": "Q1WlkTQYGu/8rc5uKLIUEZntDL7AE=",
+      "license": "GPL-1.0-only",
+      "repository": "main",
+      "sha256": "55d3bfae0bd18c6c18fd1f41fd3be8f98b514d33e5c1e62e3bbc843355a9090e",
+      "version": "2.40.4-r1"
+    },
+    "wipefs": {
+      "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
+      "archive": "wipefs-2.40.4-r1.apk",
+      "index_checksum": "Q1W0OemskW+YlOvU1WQraJCiPLuVE=",
+      "license": "GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "3f9ac3baeb5de63b02099445c2315b33b6f48569c4d8d2efb194c9f4970c3b46",
+      "version": "2.40.4-r1"
+    },
+    "xz": {
+      "aports_commit": "703710896c49375655df7c22d0a523aa02544f2c",
+      "archive": "xz-5.8.4-r0.apk",
+      "index_checksum": "Q1j/LlBob6VwAzoMHmfaUjXhCcQCA=",
+      "license": "GPL-2.0-or-later AND 0BSD AND Public-Domain AND LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "f58a7606d22f3afb0aed68e4829cf18ea0bc96ea0ba6451fd685ea2a69f29fca",
+      "version": "5.8.4-r0"
+    },
+    "xz-libs": {
+      "aports_commit": "703710896c49375655df7c22d0a523aa02544f2c",
+      "archive": "xz-libs-5.8.4-r0.apk",
+      "index_checksum": "Q1njRMHlmJy1dN2V+LZbj8/p4+9Wg=",
+      "license": "GPL-2.0-or-later AND 0BSD AND Public-Domain AND LGPL-2.1-or-later",
+      "repository": "main",
+      "sha256": "6f5303a049a23f68659205eda4840865370340905e0481ba5266c19e2f49b585",
+      "version": "5.8.4-r0"
+    },
+    "zlib-dev": {
+      "aports_commit": "2b38f55109add14f4f99a974c2fdf421b6b9e9e9",
+      "archive": "zlib-dev-1.3.2-r0.apk",
+      "index_checksum": "Q1ctbTKg6sZ0YPT/xVpX9I1ABISAY=",
+      "license": "Zlib",
+      "repository": "main",
+      "sha256": "3569be1b98225e97a2cff5c1377553c26d2e643873186ea20117fa094a698447",
+      "version": "1.3.2-r0"
+    },
+    "zlib-static": {
+      "aports_commit": "2b38f55109add14f4f99a974c2fdf421b6b9e9e9",
+      "archive": "zlib-static-1.3.2-r0.apk",
+      "index_checksum": "Q1yBU32V5wlfDrLgECda4RCU55GRU=",
+      "license": "Zlib",
+      "repository": "main",
+      "sha256": "25ddc9ad82e822afda4cb90cf1081e7530f38ec2c8d53dcc2898f08dae82cb88",
+      "version": "1.3.2-r0"
+    },
+    "zstd": {
+      "aports_commit": "5c2ddf18f193dafdd25ae7391d96c7e30766eecd",
+      "archive": "zstd-1.5.6-r2.apk",
+      "index_checksum": "Q1CrtFHXkndy0dPEjM2O6menbvK94=",
+      "license": "BSD-3-Clause OR GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "0b6c7723b35c2d3333f2dd1a18c73c2efbd220933b0eda2757bb5892e268c404",
+      "version": "1.5.6-r2"
+    },
+    "zstd-dev": {
+      "aports_commit": "5c2ddf18f193dafdd25ae7391d96c7e30766eecd",
+      "archive": "zstd-dev-1.5.6-r2.apk",
+      "index_checksum": "Q1rFIsReY/qGWELG205BrQIe+lD80=",
+      "license": "BSD-3-Clause OR GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "a96d7dc92a56d916fa0b0643e11aac8fbfa28dc417fb86aa669f8cbea3c9dbea",
+      "version": "1.5.6-r2"
+    },
+    "zstd-libs": {
+      "aports_commit": "5c2ddf18f193dafdd25ae7391d96c7e30766eecd",
+      "archive": "zstd-libs-1.5.6-r2.apk",
+      "index_checksum": "Q1l09OQ4pRN3DHjihtrlUgP8OGBNs=",
+      "license": "BSD-3-Clause OR GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "45a06bfc107f44502b7e0503fcd5c8d2d2e6cff255134ed959275eb99caf9979",
+      "version": "1.5.6-r2"
+    },
+    "zstd-static": {
+      "aports_commit": "5c2ddf18f193dafdd25ae7391d96c7e30766eecd",
+      "archive": "zstd-static-1.5.6-r2.apk",
+      "index_checksum": "Q1h5ZLGD2jIdpIW72NH5qqSGXyZoU=",
+      "license": "BSD-3-Clause OR GPL-2.0-or-later",
+      "repository": "main",
+      "sha256": "c82da00816b8dfec70f91d0f1d979aa9558bf5c4e1a15ab354f05c6dba5e7ca1",
+      "version": "1.5.6-r2"
+    }
+  },
+  "base_apk_db_sha256": "51e4082dd0e0e68bf80e5176550c963a7724dfa689469ae431e3f95d1c309ed8",
+  "base_packages": {
+    "alpine-baselayout": "3.6.8-r1",
+    "alpine-baselayout-data": "3.6.8-r1",
+    "alpine-keys": "2.5-r0",
+    "alpine-release": "3.21.8-r0",
+    "apk-tools": "2.14.6-r3",
+    "busybox": "1.37.0-r14",
+    "busybox-binsh": "1.37.0-r14",
+    "ca-certificates-bundle": "20260909-r0",
+    "libcrypto3": "3.3.7-r1",
+    "libssl3": "3.3.7-r1",
+    "musl": "1.2.5-r11",
+    "musl-utils": "1.2.5-r11",
+    "scanelf": "1.3.8-r1",
+    "ssl_client": "1.37.0-r14",
+    "zlib": "1.3.2-r0"
+  },
+  "container": "docker.io/library/alpine@sha256:3c81aa9a3d770b316568f4499e30461a5cd3fbd7180bd89e28e34894c7845832",
+  "direct_apk": [
+    "bash",
+    "alpine-sdk",
+    "util-linux",
+    "strace",
+    "file",
+    "autoconf",
+    "automake",
+    "libtool",
+    "xz",
+    "eudev-dev",
+    "gettext-dev",
+    "linux-headers",
+    "meson",
+    "zstd-dev",
+    "zstd-static",
+    "zlib-dev",
+    "zlib-static",
+    "clang",
+    "musl-dev",
+    "mimalloc-dev"
+  ],
+  "notices": {
+    "gcc-gpl3": {
+      "archive": "gcc.COPYING3",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/releases/gcc-14.2.0/COPYING3",
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+    },
+    "gcc-runtime-exception": {
+      "archive": "gcc.COPYING.RUNTIME",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/releases/gcc-14.2.0/COPYING.RUNTIME",
+      "sha256": "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74"
+    },
+    "llvm": {
+      "archive": "llvm.LICENSE",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-19.1.4/llvm/LICENSE.TXT",
+      "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+    },
+    "mimalloc": {
+      "archive": "mimalloc.LICENSE",
+      "url": "https://raw.githubusercontent.com/microsoft/mimalloc/v2.1.7/LICENSE",
+      "sha256": "19c99805e7a44a34b297a75d1edea9985e300066dfc024d5c99d4236d4573b5d"
+    },
+    "musl": {
+      "archive": "musl.COPYRIGHT",
+      "url": "https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5",
+      "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+    },
+    "zlib": {
+      "archive": "zlib.LICENSE",
+      "url": "https://raw.githubusercontent.com/madler/zlib/v1.3.2/LICENSE",
+      "sha256": "e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2"
+    },
+    "zstd": {
+      "archive": "zstd.LICENSE",
+      "url": "https://raw.githubusercontent.com/facebook/zstd/v1.5.6/LICENSE",
+      "sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
+    }
+  },
+  "platform": "linux/amd64",
+  "repository_base_url": "https://dl-cdn.alpinelinux.org/alpine/v3.21",
+  "schema": 1,
+  "linked_source_closure": {
+    "file": "alpine-source.lock.json",
+    "sha256": "8a37946ce569fe1ec03123925af343b468115075bd039c98060ce97c38b1cf5c"
+  },
+  "source_date_epoch": 1782256868,
+  "sources": {
+    "libfuse": {
+      "archive": "fuse-3.15.0.tar.xz",
+      "sha256": "70589cfd5e1cff7ccd6ac91c86c01be340b227285c5e200baa284e401eea2ca0",
+      "spdx": "LGPL-2.1-only",
+      "url": "https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz",
+      "version": "3.15.0"
+    },
+    "libfuse_patch": {
+      "archive": "mount.c.diff",
+      "sha256": "1c7fd9e26717545a476b226b083a9f9d05676c180edbd71a04bbd8a73599dc44",
+      "spdx": "LGPL-2.1-only",
+      "url": "https://raw.githubusercontent.com/AppImage/type2-runtime/75849dce7cc37e4319b633df1f116ca895c71a12/patches/libfuse/mount.c.diff",
+      "version": "75849dce7cc37e4319b633df1f116ca895c71a12"
+    },
+    "squashfuse": {
+      "archive": "squashfuse-0.5.2.tar.gz",
+      "sha256": "db0238c5981dabbd80ee09ae15387f390091668ca060a7bc38047912491443d3",
+      "spdx": "BSD-2-Clause",
+      "url": "https://codeload.github.com/vasi/squashfuse/tar.gz/refs/tags/0.5.2",
+      "version": "0.5.2"
+    },
+    "type2_runtime": {
+      "archive": "type2-runtime.tar.gz",
+      "sha256": "b7af4960da4b90364e935a3281d04fad6560da4813c012414fa2f738291ad443",
+      "spdx": "MIT",
+      "url": "https://codeload.github.com/AppImage/type2-runtime/tar.gz/75849dce7cc37e4319b633df1f116ca895c71a12",
+      "version": "75849dce7cc37e4319b633df1f116ca895c71a12"
+    }
+  }
+}

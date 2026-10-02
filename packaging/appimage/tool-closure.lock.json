@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "media_lock_sha256": "05840c73903c6af3e7c696ab8b73b77f07130345c5847a18fc0f887757ab514b",
+  "container": "docker.io/library/ubuntu@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3",
+  "apt_snapshot": "20260920T000000Z",
+  "scope": "stage-only build tools; not included in AppDir or AppImage",
+  "packages": {
+    "file": {
+      "version": "1:5.45-3build1",
+      "architecture": "amd64",
+      "deb_filename": "file_1%3a5.45-3build1_amd64.deb",
+      "deb_sha256": "17dae1d6e803d0304e318f451c8abf62cbd5bb2a0068300cdeea77c62075b895",
+      "files_sha256": {"/usr/bin/file": "6741f44dde8e51309325c8bcf88ee16bc1e022985d584415680484c11ee89e0d"},
+      "copyright_sha256": "17c4359a008b198cf2012a6b2437c06d2d7f26bba2789aa3697d4e001eae40cf"
+    },
+    "libmagic1t64": {
+      "version": "1:5.45-3build1",
+      "architecture": "amd64",
+      "deb_filename": "libmagic1t64_1%3a5.45-3build1_amd64.deb",
+      "deb_sha256": "fc2319f342c437e044ccf854e0c95bd472a7eb0b9363e1f76ad1524ab04df68e",
+      "files_sha256": {"/usr/lib/x86_64-linux-gnu/libmagic.so.1.0.0": "2f4745657a648f09add1aee122891f9be1c24bae93d29e734da9386544fedb71"},
+      "copyright_sha256": "17c4359a008b198cf2012a6b2437c06d2d7f26bba2789aa3697d4e001eae40cf"
+    },
+    "libmagic-mgc": {
+      "version": "1:5.45-3build1",
+      "architecture": "amd64",
+      "deb_filename": "libmagic-mgc_1%3a5.45-3build1_amd64.deb",
+      "deb_sha256": "f0ed0e314a63ae1b7e5403d7e43a26c6e0c0ee69e9a305babcf9c6775607377a",
+      "files_sha256": {"/usr/share/file/magic.mgc": "72a25195a2623fe160e926bf20952b6b74b29d6c91e0174a5fa062f02beee1aa"},
+      "copyright_sha256": "17c4359a008b198cf2012a6b2437c06d2d7f26bba2789aa3697d4e001eae40cf"
+    }
+  },
+  "bundled_appimagetool_executables": {
+    "appimagetool": "350c9ddabe2faebb3c40df0ea1c232184a2b78f16131e136523c702c629a20cf",
+    "mksquashfs": "fb1a12ea173beb6b0c6698c74f10e9a853c1a224f15c17f91dee35ccb428931f",
+    "desktop-file-validate": "bcd046c4e4cfff7792f9b3d51ded52a5d4e6fbe2eb4f5e97911ac6d7b7f81592",
+    "zsyncmake": "4fa6642a3bca4d1ba038b3eeadc249ab5fabc252a9973bdb86321544f9f7e098"
+  },
+  "license_source": "Debian copyright in each verified binary .deb; mixed BSD-2-Clause-alike / public-domain / BSD-style notices; build-only, not redistributed"
+}

@@ -1,0 +1,423 @@
+{
+  "linked_sources": {
+    "gcc-startup": {
+      "apkbuild": {
+        "sha256": "392e19a434cd12e8eb6d3ef2b941fdc6a170d4e2e4f74d6014125fe0852660cb",
+        "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/APKBUILD"
+      },
+      "aports_commit": "1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f",
+      "aports_inputs": [
+        {
+          "file": "0001-posix_memalign.patch",
+          "sha256": "e4abd0642017dbab30be8f575117b82f2a2d8affbb8e468ef3f321d8cc524976",
+          "sha512": "1ecffba1b07d60e1b4422302b032bbea918b674c8e12b30aa6965b544d700ce86b61e9f7b8d402c6caf59257f491a394dd0912f0948565d6eae9335ee54f3b35",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0001-posix_memalign.patch"
+        },
+        {
+          "file": "0002-gcc-poison-system-directories.patch",
+          "sha256": "43d027c0a99365901e68f684cb9f705ef363cde6de7b818fa23ddf208943461b",
+          "sha512": "1d102a7b17683909dde4d8591dd889149299e77a2b2003cdc0635dc816666be940e41ae534b469485391a9bed183cd5cd337f130e4e1ecb62cb9ad86c4a081db",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0002-gcc-poison-system-directories.patch"
+        },
+        {
+          "file": "0003-specs-turn-on-Wl-z-now-by-default.patch",
+          "sha256": "aaad89287bcde018ad5d5b108bafe53b0034fd6356fd23b85c106801123ce88b",
+          "sha512": "3f24bb6a50d3c45b71ea05590e32fe3e69b91377ab185352891d5035c76ed193117c6d0b314a4c364bcf136b9a9dd5c926d6c7c30ab436976c121ebfea8d3ddd",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0003-specs-turn-on-Wl-z-now-by-default.patch"
+        },
+        {
+          "file": "0004-Turn-on-D_FORTIFY_SOURCE-2-by-default-for-C-C-ObjC-O.patch",
+          "sha256": "de0d50d51cd9c2e2f9eca26e0e9091934124f30fdaa415bb6adb5079d687ea21",
+          "sha512": "17a2993027d3ddf8595952ebcae425695ddc7b1cf73b384d2e55fddecb9cbf3f6482860a502ff69b14075e12badf27300fd3039f3a9005e851fd8d121d258c2b",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0004-Turn-on-D_FORTIFY_SOURCE-2-by-default-for-C-C-ObjC-O.patch"
+        },
+        {
+          "file": "0005-On-linux-targets-pass-as-needed-by-default-to-the-li.patch",
+          "sha256": "4bb964a92ca1571dc32e53553e4f652a51003fd0cb8031c070acef08c5f14030",
+          "sha512": "444550e55491ff89fe8cbbb4b73d017c9c147cdce1ad5c0561fe7d6ab3834515a814c7676c408cfeec18e1aaace27b3c26a2ffe4a75042285df5124976c38672",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0005-On-linux-targets-pass-as-needed-by-default-to-the-li.patch"
+        },
+        {
+          "file": "0006-Enable-Wformat-and-Wformat-security-by-default.patch",
+          "sha256": "0d5d62c8b68dbb70eebc9bf6e16f125856ce0587da7dc837d5a7db2644bbdde0",
+          "sha512": "5a5f57e4e45745bb4d9d63d7d410fe9dd56ce12dbd70c376dd45015909307faf02391e75368e4e7404591614a874cee41b20652cf27be234765d6db97ceb4e7e",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0006-Enable-Wformat-and-Wformat-security-by-default.patch"
+        },
+        {
+          "file": "0007-Enable-Wtrampolines-by-default.patch",
+          "sha256": "2b6db1110bf5e00654e182b3d44255bbce4cc87781709ff62cc72e813b149384",
+          "sha512": "3a2b22388398a93dae7787e794cd580b9c577326f286241e086120c1fcfdd9228c2e00407088ebb163fb1acc21722c199071343551c989a958dc3c845b15132d",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0007-Enable-Wtrampolines-by-default.patch"
+        },
+        {
+          "file": "0008-Disable-ssp-on-nostdlib-nodefaultlibs-and-ffreestand.patch",
+          "sha256": "50451f9b34149c772581b3eb25f9879986121502a1bbb611c038cb386b51d5d9",
+          "sha512": "7535de1c552544e3a51cbb00b5e08ac59edbf3bdcfce2a63b9f319fada3f3676f47e3a00c75d91bcefd14500555ea0844f18c130ff46b20f416ea76071e5af39",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0008-Disable-ssp-on-nostdlib-nodefaultlibs-and-ffreestand.patch"
+        },
+        {
+          "file": "0009-Ensure-that-msgfmt-doesn-t-encounter-problems-during.patch",
+          "sha256": "1279982303b39d76a6c7ebfe8ff2cbda1b7b4120f8e25917805bf0ec48f44614",
+          "sha512": "93d03afd83dee5f7129c36a7b81fa8fd323476507e2f53a4fbe40a026037e7dfafa23591145d7af5848d9a322d212497947a0f58ef828734552e6a6dabd00cfa",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0009-Ensure-that-msgfmt-doesn-t-encounter-problems-during.patch"
+        },
+        {
+          "file": "0010-Don-t-declare-asprintf-if-defined-as-a-macro.patch",
+          "sha256": "698b54c0b0c61777cebc2b81651c822df1d39d28919ce7e0e7d68aba309f6aa9",
+          "sha512": "da9eaf2f0ddbec5ee14dc26053936587e6c76fbf16846db804a18cf4d318579426ebcc566aed02daf8e34f60c08b61f5d3959305886dca9bbcdc84db057258d9",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0010-Don-t-declare-asprintf-if-defined-as-a-macro.patch"
+        },
+        {
+          "file": "0011-libiberty-copy-PIC-objects-during-build-process.patch",
+          "sha256": "c515c30970dd344e6f3d79d672200216fba3536269346ea7cc8113b7b93bb236",
+          "sha512": "35b9aafe7eee8138cb7aad7164a8f77c15ccdce26843cee78b5871ef91d76cad22ed0871b20f51c4b89b71afd9cfe4ba4227086e158c466558513708fe7d2a1a",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0011-libiberty-copy-PIC-objects-during-build-process.patch"
+        },
+        {
+          "file": "0012-libgcc_s.patch",
+          "sha256": "eaf9dbc66c80b63249d6783d71526002538cc9687aace059733c54cc7d41475b",
+          "sha512": "9d43f844fad0ac6e1c35a2b6f461f9278ae09e468f2c9ae8adc43accbe6934994aa10d3a433644d1393a4a76e3caed69e3191db7f3c0c24b4e7a0a0a0cbac3f1",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0012-libgcc_s.patch"
+        },
+        {
+          "file": "0013-nopie.patch",
+          "sha256": "e456cb56c8ad5943883706b112507f64e0a673ab2f01f57ba62bf49b1ab4c7db",
+          "sha512": "91dde3079c1400c124ab5604597f5857185d075809649603aa3641a4581b34029bfcbd4281a5bd925d1c5e6e3b1f5f3322efda34345c6930652d685a6c9525f4",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0013-nopie.patch"
+        },
+        {
+          "file": "0014-ada-fix-shared-linking.patch",
+          "sha256": "40c67dc4e22a86929d2afbf9a4d02e82530e0d417321287dc2b710572cf8487e",
+          "sha512": "0b50ad15115192699efa9fda3d4fb1c2fa95da06d7880ba34615b40c19a8256e1fe364da39f5c70dc22fbccf21db2de5900932afef68948722eeb25e435262f8",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0014-ada-fix-shared-linking.patch"
+        },
+        {
+          "file": "0015-build-fix-CXXFLAGS_FOR_BUILD-passing.patch",
+          "sha256": "2a723323bef815010a0a606fcdeb6c1c758b3caad4bd8682490b1e3108ce0a6f",
+          "sha512": "00097c7106625ccf02149a757366f434c48f2abe824bb8b4bf067d29308889cb6039a5e5b2d3bd2683617693b47707d549252c56eea6bc3cdc2450a8d14f46a7",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0015-build-fix-CXXFLAGS_FOR_BUILD-passing.patch"
+        },
+        {
+          "file": "0016-add-fortify-headers-paths.patch",
+          "sha256": "84303a2e23f2821b42d5aff199a32e7a1e9aee551b7b79c8b2eeb52e0a0602a3",
+          "sha512": "7f0bc42b93a389b614054e700b851abfbc53db391aa10cbdf6990d41396b293af78980bb39f1cf0967184d3fbf3d46ac7c7f096717b8f193ea34cbf7f37d7e91",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0016-add-fortify-headers-paths.patch"
+        },
+        {
+          "file": "0017-Alpine-musl-package-provides-libssp_nonshared.a.-We-.patch",
+          "sha256": "cb434c7ce1fc7d7f4686ba20be20fbba940f0d752d64c84cbb435a7279a3dec2",
+          "sha512": "0841acbce81250f8cb140a75ff62958dfcab3bed792822baf1fe4193dd62633648343f4b66df886c12338eed88a98e591b968131416460f9f0274046019bb8ef",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0017-Alpine-musl-package-provides-libssp_nonshared.a.-We-.patch"
+        },
+        {
+          "file": "0018-DP-Use-push-state-pop-state-for-gold-as-well-when-li.patch",
+          "sha256": "bb85ab16bb18918b4c83c21ce40c9596bdadebf16cd3973d25a9f210b5c05942",
+          "sha512": "589d538bdf692559e475e53c79869734dede0eb15228cab9ca901c9db81b0e78a0e532b20dfb05ca584ea19ff4bedd83e139ddca912a26b446c5eb6905180536",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0018-DP-Use-push-state-pop-state-for-gold-as-well-when-li.patch"
+        },
+        {
+          "file": "0019-aarch64-disable-multilib-support.patch",
+          "sha256": "9aa8cbb2c87e815526dfbf844b59a65abe84cb07d706d34d4dc43bdeaf2b7dd0",
+          "sha512": "2213e07bab6f5d8d3d39c732f5385f46cc8f0c84e35054139fdaf13051252d7bf11f647f54aa8456b532166b008fff0656d8f41278e34ba868dd6fe427427a3a",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0019-aarch64-disable-multilib-support.patch"
+        },
+        {
+          "file": "0020-s390x-disable-multilib-support.patch",
+          "sha256": "4d6a7af9247cb25117f3d35db2a3006afe5ef7e448e0f31722f3451b714a5256",
+          "sha512": "a9567947471c3ba8a547a79c55e183974554bf823d9a97a165c966d7b3caad8789980e096e3b78452ece5de062bd9bb006af464bbf0c5a35b689eac3ee21e5c5",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0020-s390x-disable-multilib-support.patch"
+        },
+        {
+          "file": "0021-ppc64-le-disable-multilib-support.patch",
+          "sha256": "1956a82758b92fa67769f6b7f18019ee2bc37b7d78e8a93c6a51f91970594de9",
+          "sha512": "f382eb5f7c2c60c5a23fac587c9629a3059d7be0898e97a1feaf9b9cbe1ef4693cc1177eb29333e8b7944fa17487478e73958be45d5782ccb9ef501961fb9a96",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0021-ppc64-le-disable-multilib-support.patch"
+        },
+        {
+          "file": "0022-x86_64-disable-multilib-support.patch",
+          "sha256": "3a24fc520091e713f7427a2bc141a3240fd9d37ed61fdb7489860894a146eb54",
+          "sha512": "44ab86feb8e41e7c2b2e27accdf46194c9b80ee6a39543303dc04824f669d9fad182aabd40c9c7f6c265cf9bb71be830c257be115dc9d701d54eca3aa9ef174e",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0022-x86_64-disable-multilib-support.patch"
+        },
+        {
+          "file": "0023-riscv-disable-multilib-support.patch",
+          "sha256": "bbc0117b9cde1c865560ab1688a3e4a667f0c72f7a6f658248dd3a47859379bb",
+          "sha512": "abf845792433a21fed5dd06167b9f6cf5e8f8026a409acce93824e466c5148e192bf5f404a271931fe4b65283499329bf67bb01019f2f3e02501f20619404e6c",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0023-riscv-disable-multilib-support.patch"
+        },
+        {
+          "file": "0024-always-build-libgcc_eh.a.patch",
+          "sha256": "0be247abeff911e64038fefeedcf6a45768596392f94faf09591dd04fe80e95b",
+          "sha512": "ab88a2f63e3545bbc36537aa9a86f2c6c35e41bbf702d6e13743a405cdac4f901eed5737189b780da96647fea9f5d863fdc76373f25a00064106dcb5514d6d87",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0024-always-build-libgcc_eh.a.patch"
+        },
+        {
+          "file": "0025-ada-libgnarl-compatibility-for-musl.patch",
+          "sha256": "303a7429d2346697677183195150ac3a216753b1c55ec05999bbe85f6c1e8795",
+          "sha512": "8fdbe0c8bf4ca60f458a33e59027de03d15ac91933fe46d8ca62119346d20b9bc2447c0bf22bceb63d0cf8613ab61512d9197f4e6c2224af473b63ef9f254295",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0025-ada-libgnarl-compatibility-for-musl.patch"
+        },
+        {
+          "file": "0026-ada-musl-support-fixes.patch",
+          "sha256": "c7149e3265991c3ae5832db9eaac22b0f1d07a9b359ab2316a23cc48552500be",
+          "sha512": "684bf2db12aa45e8db7a895ab0f227b4e4351f611b4fcc6e1745d7ad94d31b3554f39d8cf9e2203520b3c6ee35cf309b417d4a842e7a8cd55a2b2accb23f2f24",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0026-ada-musl-support-fixes.patch"
+        },
+        {
+          "file": "0027-configure-Add-enable-autolink-libatomic-use-in-LINK_.patch",
+          "sha256": "7753b1843137d6f2f8c9a750c18b6df48b966544f4aee05f2b55a8ec22e2623b",
+          "sha512": "3f9a406d7d2ce34951215ffbcadb49a45e55ad5c24ab9097c0e5e92383e43b876872ccd2a7e7def2833ab204975ee5733f8bcf90934db9fa9c4f6f56c62081f6",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0027-configure-Add-enable-autolink-libatomic-use-in-LINK_.patch"
+        },
+        {
+          "file": "0028-configure-fix-detection-of-atomic-builtins-in-libato.patch",
+          "sha256": "5c1c56db71278695f79d8944ecdc0f821340f9ef7d03a8915b3f0ce85a2ffde5",
+          "sha512": "720a4001f9a1fa4122e456077ecff8d3eb8af7c83d0a81f9da6a6cca05b23664206a82a349e34482c48bfe40e99aa5f21567613d0913f6a24f282bc84a994496",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0028-configure-fix-detection-of-atomic-builtins-in-libato.patch"
+        },
+        {
+          "file": "0029-libstdc-do-not-throw-exceptions-for-non-C-locales-on.patch",
+          "sha256": "e6c0064c7e5efcb1175ceed4d254b0c0af37fb9480e000f7bc1b638dca2265a9",
+          "sha512": "2044c23b23726965c0a6fd39f616cc464badd650947cb40495eeabd906a3af629878c1d28b403b8eb46b30a1a0ba39083023290d62f0c99ccf070063226e3f8f",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0029-libstdc-do-not-throw-exceptions-for-non-C-locales-on.patch"
+        },
+        {
+          "file": "0030-gdc-unconditionally-link-libgphobos-against-libucont.patch",
+          "sha256": "53ad635f7f07b72c925bc318ffec7ae3af30e2c7018c421c62b9829672bbd466",
+          "sha512": "58e8415612e1042329ad114471852c19f6bf15bf3bfd7cd81ceeafa75778bcc28410a01071a7c8cbf12b8f549acd85723215772813deedb8f266e28b9e01a353",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0030-gdc-unconditionally-link-libgphobos-against-libucont.patch"
+        },
+        {
+          "file": "0031-druntime-link-against-libucontext-on-all-platforms.patch",
+          "sha256": "5ea55661dc3ec7503a6896088274e772055d01f10499b0d8ed83a5f2314ca02c",
+          "sha512": "d47b559075f40d526235f47b91da1d0cf6bfe6c5b7311bbfe08af9dd6e8f27e6c7cd82e3b2d529aab0536246fc56e2d42c089b22cacb0e7f09ca4a9d07556994",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0031-druntime-link-against-libucontext-on-all-platforms.patch"
+        },
+        {
+          "file": "0032-libgnat-time_t-is-always-64-bit-on-musl-libc.patch",
+          "sha256": "5523da5ff59a2a1fa5812c96da6049f87f48c563300adcd50ae4a1f81a4e4b16",
+          "sha512": "b325035cb7122d79c6b42ca6d3fc9e02319ed2f7cddb0639dff25d2798d2ce63812cd623462cdf95e21c9ffbf2412193f8b9fc89a4c36fa5a6a041661ac7399d",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0032-libgnat-time_t-is-always-64-bit-on-musl-libc.patch"
+        },
+        {
+          "file": "0033-libphobos-do-not-use-LFS64-symbols.patch",
+          "sha256": "eda5e03520d68e22d385081c1be92cd98a99752ecb3b692072d0ab911bc2fc69",
+          "sha512": "c474f34e6f9a4239d486a65141a133dbe8ce91427d502a57a9fd6eb403478a2b5715ba74f24c1cc0761e16eec77ba2c1ca921fb7d7bc1e040fc3703fc9559e75",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0033-libphobos-do-not-use-LFS64-symbols.patch"
+        },
+        {
+          "file": "0034-libgo-fix-lfs64-use.patch",
+          "sha256": "84b5e6687713fd3535df478a32c640f3baaa6a5be546d4badd1b7b3d6d20ce49",
+          "sha512": "c4482ffc36e7894b2140800159f4cbc9a3e9011e43a69b69f4fa92d5a11e2ee645c7e21df4423dd1e0636e8890849a5719647bfbdf84f951d638f8f488cb718c",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0034-libgo-fix-lfs64-use.patch"
+        },
+        {
+          "file": "0035-loongarch-disable-multilib-support.patch",
+          "sha256": "0c4990e30cbea690ca32a5ea6a437221237cbdb03fbe37c7bc2cf49f41471c1e",
+          "sha512": "65df1d489e8d07a811f39e27fd29e3b2b4164fbc2c5fdc16a5142886d94a96e3fb28ccf4f20dd297ba6540ef8ea1ac3eb65a4279494639bf2f0f8376a3896cc3",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0035-loongarch-disable-multilib-support.patch"
+        },
+        {
+          "file": "0036-libphobos-add-riscv64-and-loongarch64-support.patch",
+          "sha256": "d24568a2bf6fe757f4edb339f90159665e6479a420d49a323a003a5d2c0c2d1a",
+          "sha512": "06f64544fd8bc4b6c8b06410c5198aa8fb4e82c232afc0cad83b2c69ac5d39399968206defa78297222700cd18e7fd7e8244afa76d343406a01f657c86306453",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0036-libphobos-add-riscv64-and-loongarch64-support.patch"
+        },
+        {
+          "file": "fix-arm64.patch",
+          "sha256": "7b1bcc80f0d50ae8a247018af3413ecfa1f684955b43a08279a80b14bc522968",
+          "sha512": "00319c9770362520e8e93bd03fda1769dfa3622eba77d620e11d8af45a38e6d804a5e924046ae388e1cfaea605696e89c343fca507aaaa5edd58d80744fff14f",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/fix-arm64.patch"
+        },
+        {
+          "file": "ppc64le-quadmath.patch",
+          "sha256": "5962083479c79e63d01330f54bf3a9a8807faba063de1446d38c0efc5c19e406",
+          "sha512": "815265826742400f86336f0c2d3e4edc37398dbc6505ee81107c0103c13ac0f406cff851438d2323033c6c6d0c0323765ee15b975eab8d1dd465f9e988168fb9",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/ppc64le-quadmath.patch"
+        },
+        {
+          "file": "riscv64-improve-build-time.patch",
+          "sha256": "2e391dc1c5c68f9ca07e89948d3088a2065e2ae12b2fc8c11f21bb1c1fd66300",
+          "sha512": "ea55e0fa6813fc95c4ca2e87f059182edc54dc61515ebb92bf6eb31dbbd176d0fe81edcc7ea28d32f84ca37e8d48a544623d3d9bc94aa41ffc0859326a616aa2",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/riscv64-improve-build-time.patch"
+        }
+      ],
+      "binary_apk": "gcc",
+      "binary_sha256": "6727367ddd0c58203ac4e9b96a30d371e92da64c4b0f7b1b2afbd512c80a61be",
+      "upstream_source": {
+        "file": "gcc-14.2.0.tar.xz",
+        "sha256": "a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9",
+        "sha512": "932bdef0cda94bacedf452ab17f103c0cb511ff2cec55e9112fc0328cbf1d803b42595728ea7b200e0a057c03e85626f937012e49a7515bc5dd256b2bf4bc396",
+        "url": "https://gcc.gnu.org/pub/gcc/releases/gcc-14.2.0/gcc-14.2.0.tar.xz"
+      },
+      "version": "14.2.0-r4"
+    },
+    "mimalloc": {
+      "apkbuild": {
+        "sha256": "bb2618381e98ef508b41697d9177b7d1fef6f61bf38543aa055b9e0002c3c54b",
+        "url": "https://raw.githubusercontent.com/alpinelinux/aports/5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39/community/mimalloc2/APKBUILD"
+      },
+      "aports_commit": "5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39",
+      "aports_inputs": [
+        {
+          "file": "cmake-add-insecure-suffix.patch",
+          "sha256": "bbf09f82b9a187399f33f6cc4136bd088f475d769f385aa1f08d0850473b04ae",
+          "sha512": "99a7777e310f4a585e482ad9dc44fce62e88b65f4f8f51545c9e6b1fd8a17583614cc853e65dade9dd083936de90c3a6f23aa52eb84697020f2a44868e6d4c93",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39/community/mimalloc2/cmake-add-insecure-suffix.patch"
+        }
+      ],
+      "binary_apk": "mimalloc2-dev",
+      "binary_sha256": "9b140b549613492ad23a8c0749c17e38d9ad737d7b22b7927e035b03f8c4ac3f",
+      "upstream_source": {
+        "file": "mimalloc-2.1.7.tar.gz",
+        "sha256": "0eed39319f139afde8515010ff59baf24de9e47ea316a315398e8027d198202d",
+        "sha512": "4e30976758015c76a146acc1bfc8501e2e5c61b81db77d253de0d58a8edef987669243f232210667b32ef8da3a33286642acb56ba526fd24c4ba925b44403730",
+        "url": "https://codeload.github.com/microsoft/mimalloc/tar.gz/refs/tags/v2.1.7"
+      },
+      "version": "2.1.7-r0"
+    },
+    "musl": {
+      "apkbuild": {
+        "sha256": "366ce96968b1923e4df867b24b434cac635f3013723231107feb0217d7430bb2",
+        "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/APKBUILD"
+      },
+      "aports_commit": "21cafa1183cf7501d3f1744994d221c038436e45",
+      "aports_inputs": [
+        {
+          "file": "handle-aux-at_base.patch",
+          "sha256": "2a65e03b94217063d72fe998e5fb2e25cd01716078a3ba1b0ab574ab205111e6",
+          "sha512": "a76f79b801497ad994746cf82bb6eaf86f9e1ae646e6819fbae8532a7f4eee53a96ac1d4e789ec8f66aea2a68027b0597f7a579b3369e01258da8accfce41370",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/handle-aux-at_base.patch"
+        },
+        {
+          "file": "isatty-glibc-align.patch",
+          "sha256": "1321d542b40921a4c248bb2d15dbd03fcbbf008c8725eb2043d3cab62faeba48",
+          "sha512": "4fe4309d9e5eb12f3aaf9dac300c7bf1a9e104d9b0e7754353314f4b6507de68d8d5bf0ac45164d7e2ab4d71728b5ef8b302f8ee7a6b548f54e022218031e2cf",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/isatty-glibc-align.patch"
+        },
+        {
+          "file": "ldso-fix-non-functional-fix-to-early-dynamic-PAGE_SI.patch",
+          "sha256": "7f5806124d4a89536e53a07bfe95fcd0a8f1b7a27fc0dfc89c78c724dea1c924",
+          "sha512": "1b85079c706b017106ecbf4afbc65b4a2171297a673035645e4c3ddb7e2aae0549b04932df83778323b7329ae8d32160a89e0c1b2534c278708c61b1f40a1ed8",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/ldso-fix-non-functional-fix-to-early-dynamic-PAGE_SI.patch"
+        },
+        {
+          "file": "loongarch64-Add-lsx-and-lasx-vector-structure-defini.patch",
+          "sha256": "28efacd507c01b89e1725ed33723f3f9fdfe6cb83eb78ffea1e2acb7fda8a52c",
+          "sha512": "b4d95231944fd236827a62343bbce74b20a56739e2b8937bda69bfc7b53f2ce5bd709459ee61615bd10d2839f43311eced9344ee8185701fd38ec0de0d43c6ae",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/loongarch64-Add-lsx-and-lasx-vector-structure-defini.patch"
+        },
+        {
+          "file": "loongarch64-add-TLSDESC-support.patch",
+          "sha256": "1efb4604e0b28b84e10faf37d17bad448510e73f6a3db89c8be47d38b9e85138",
+          "sha512": "363d0cbfe11f024b120b6d54e909c038cd5b37f1f195048ddb29591191a1288ff50842ccd14e0cab80359e5b46c0e02d2b5af3016bd1507c1d269e590690a3fe",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/loongarch64-add-TLSDESC-support.patch"
+        },
+        {
+          "file": "loongarch64-add-fpu-and-simd-context-to-signal.h.patch",
+          "sha256": "d73f85a90fe52930dd8b5d16cb7f3369a994918c0e41ae3c3dc9a25df4b45099",
+          "sha512": "b0f93f8868caf15d436ebe81088f4914cac3e21cc5b86cb0d5f40092edc6e29909188a14cde0c69ab86b51631aa34a4b8136a515f2a1b53c424c8b251c5ea689",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/loongarch64-add-fpu-and-simd-context-to-signal.h.patch"
+        },
+        {
+          "file": "loongarch64-add-bits-hwcap.h.patch",
+          "sha256": "8849080b49dff046b1f29db24e54ffe6262b5884078091994db77efdafca2505",
+          "sha512": "70003d89e31b1c83274d1e850f86d8a54f30c1d5e22f769ae229d30d2bbdc095dbf4c262fb55079aaf8bfdf9a213f9468150b50c000b6596b051729a0d25f913",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/loongarch64-add-bits-hwcap.h.patch"
+        },
+        {
+          "file": "CVE-2025-26519.patch",
+          "sha256": "ab382da2bb5e1cc32d8904be28fb13f8ad3ce813967bd4bf7f5b1c6baee33e17",
+          "sha512": "7a6a9836d2de91afc1115868e68f347bd2365fa48188e65938cfa654ae9bafdbb3a56bf12d3185a96800a85198378c8dbf9c25d977ca0e318220529fa4458123",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/CVE-2025-26519.patch"
+        },
+        {
+          "file": "iconv-gb18030-fix.patch",
+          "sha256": "1d0be2e72b9d5bd16546b923aa8af861d271322f01644716a81823bec4065c99",
+          "sha512": "f7849abeab0e4eab992a80464afa07b9c8aae5cee76040523b9dbc0931435f28ea8f5792b8a4a0cd6d608ac2f37e3225e89afcb3171a0a6df44450ed57cee83b",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/iconv-gb18030-fix.patch"
+        },
+        {
+          "file": "CVE-2026-40200.patch",
+          "sha256": "1ee29f64f9ca8e8ad7c349779d661ff6b52126a27575d3586981357a52c406fb",
+          "sha512": "a64ab7688d1a85e560b5687783df482d2467a79a74400da5a1601382847d6b4e6a79b7529a8dc80c46ddda8dc2a812f2261557fc8ee98dc3bdf7322761bd6d9c",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/CVE-2026-40200.patch"
+        },
+        {
+          "file": "ldconfig",
+          "sha256": "b4a2c06db38742e8c42c3c9838b285a7d8cdac6c091ff3df5ff9a15f1e41b9c7",
+          "sha512": "8d3a2d5315fc56fee7da9abb8b89bb38c6046c33d154c10d168fb35bfde6b0cf9f13042a3bceee34daf091bc409d699223735dcf19f382eeee1f6be34154f26f",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/ldconfig"
+        },
+        {
+          "file": "__stack_chk_fail_local.c",
+          "sha256": "299a7d75a09de3e2e11e7fb4acc3182e4a14e868093d2f30938fce9bfcff13da",
+          "sha512": "062bb49fa54839010acd4af113e20f7263dde1c8a2ca359b5fb2661ef9ed9d84a0f7c3bc10c25dcfa10bb3c5a4874588dff636ac43d5dbb3d748d75400756d0b",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/__stack_chk_fail_local.c"
+        },
+        {
+          "file": "getconf.c",
+          "sha256": "d87d0cbb3690ae2c5d8cc218349fd8278b93855dd625deaf7ae50e320aad247c",
+          "sha512": "0d80f37b34a35e3d14b012257c50862dfeb9d2c81139ea2dfa101d981d093b009b9fa450ba27a708ac59377a48626971dfc58e20a3799084a65777a0c32cbc7d",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/getconf.c"
+        },
+        {
+          "file": "getent.c",
+          "sha256": "b25f32d306d542246e9358ef65cd67c12b3e3a77656bc467853d3b0c76b5fbbd",
+          "sha512": "27fa820dc847b1e4a89a45ab7c7ffb8b6436b6b7f1089004b12561d939b227617797d5fc81696658da3f07daab6cc71ea171eb6afb6f5082336b57e2d0ac8463",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/getent.c"
+        },
+        {
+          "file": "iconv.c",
+          "sha256": "f79a2930a2e5bb0624321589edf8b889d1e9b603e01e6b7ae214616605b3fdd7",
+          "sha512": "9d42d66fb1facce2b85dad919be5be819ee290bd26ca2db00982b2f8e055a0196290a008711cbe2b18ec9eee8d2270e3b3a4692c5a1b807013baa5c2b70a2bbf",
+          "url": "https://raw.githubusercontent.com/alpinelinux/aports/21cafa1183cf7501d3f1744994d221c038436e45/main/musl/iconv.c"
+        }
+      ],
+      "binary_apk": "musl-dev",
+      "binary_sha256": "d3b5ab01046a92b9a168b790f516606e320f015cbd4deeb584c5e115a02124ba",
+      "upstream_source": {
+        "file": "musl-1.2.5.tar.gz",
+        "sha256": "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+        "sha512": "7bb7f7833923cd69c7a1a9b8a5f1784bfd5289663eb6061dcd43d583e45987df8a68a1be05d75cc1c88a3f5b610653d1a70f4a9cff4d8f7fd41ae73ee058c17c",
+        "url": "https://musl.libc.org/releases/musl-1.2.5.tar.gz"
+      },
+      "version": "1.2.5-r11"
+    },
+    "zlib": {
+      "apkbuild": {
+        "sha256": "e9ad3aa7ecf048f4bfa26b946275bee347f75254385320e90eecd3fd6651bcf4",
+        "url": "https://raw.githubusercontent.com/alpinelinux/aports/2b38f55109add14f4f99a974c2fdf421b6b9e9e9/main/zlib/APKBUILD"
+      },
+      "aports_commit": "2b38f55109add14f4f99a974c2fdf421b6b9e9e9",
+      "aports_inputs": [],
+      "binary_apk": "zlib-static",
+      "binary_sha256": "25ddc9ad82e822afda4cb90cf1081e7530f38ec2c8d53dcc2898f08dae82cb88",
+      "upstream_source": {
+        "file": "zlib-1.3.2.tar.gz",
+        "sha256": "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16",
+        "sha512": "70963771ea5d763614278a69b474f09b7d237ef8f53b675a10fe31d9923aeef601504b35d7ebd1b1e7f347e9ebb048e6b3b47fffdf137e7bdc7e8d5eb4ec4692",
+        "url": "https://zlib.net/fossils/zlib-1.3.2.tar.gz"
+      },
+      "version": "1.3.2-r0"
+    },
+    "zstd": {
+      "apkbuild": {
+        "sha256": "7344ccab938fb86eb3eb437f1caa11c99ceca58c475b31458d3ab04cce2e2388",
+        "url": "https://raw.githubusercontent.com/alpinelinux/aports/5c2ddf18f193dafdd25ae7391d96c7e30766eecd/main/zstd/APKBUILD"
+      },
+      "aports_commit": "5c2ddf18f193dafdd25ae7391d96c7e30766eecd",
+      "aports_inputs": [],
+      "binary_apk": "zstd-static",
+      "binary_sha256": "c82da00816b8dfec70f91d0f1d979aa9558bf5c4e1a15ab354f05c6dba5e7ca1",
+      "upstream_source": {
+        "file": "zstd-1.5.6.tar.gz",
+        "sha256": "30f35f71c1203369dc979ecde0400ffea93c27391bfd2ac5a9715d2173d92ff7",
+        "sha512": "ca12dffd86618ca008e1ecc79056c1129cb4e61668bf13a3cd5b2fa5c93bc9c92c80f64c1870c68b9c20009d9b3a834eac70db72242d5106125a1c53cccf8de8",
+        "url": "https://codeload.github.com/facebook/zstd/tar.gz/refs/tags/v1.5.6"
+      },
+      "version": "1.5.6-r2"
+    }
+  },
+  "schema": 1
+}

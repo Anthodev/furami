@@ -162,6 +162,7 @@ def build(output, cache):
                "--env", f"APT_CLOSURE_SHA256={lock['apt_closure']['sha256']}",
                "--env", f"APT_INSTALLED_SHA256={lock['apt_closure']['installed_sha256']}",
                "--env", f"APT_DEBS_SHA256={lock['apt_closure']['downloaded_debs_sha256']}",
+               "--env", f"FURAMI_BUILD_JOBS={os.environ.get('FURAMI_BUILD_JOBS', '2')}",
                lock["container"], "bash", "packaging/media/container-build.sh"]
     with (output / "build.log").open("w") as transcript:
         result = subprocess.run(command, stdout=transcript, stderr=subprocess.STDOUT, check=False)

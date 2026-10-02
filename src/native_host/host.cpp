@@ -767,6 +767,11 @@ LaunchResult run_qt_application(rust::Str media_prefix, rust::Str display)
     if (!XInitThreads())
         return launchFailure(QStringLiteral("XInitThreads failed before Qt initialization"));
 
+    if (Display *probe = XOpenDisplay(captured.constData()); probe == nullptr)
+        return launchFailure(QStringLiteral("DISPLAY '%1' is unreachable: install/enable XWayland in your Wayland session, or point DISPLAY at a reachable X11 display").arg(QString::fromUtf8(captured)));
+    else
+        XCloseDisplay(probe);
+
     int argc = 1;
     char program[] = "furami";
     char *argv[] = {program, nullptr};

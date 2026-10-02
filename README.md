@@ -25,11 +25,34 @@ The current prototype provides:
 
 ## Trying it
 
-1. Launch the application (see [Build from source](#build-from-source)). The window opens in the `Idle` state.
+1. Launch an [AppImage](#appimage) or the [source build](#build-from-source). The window opens in the `Idle` state.
 2. Click **Open proof source** in the panel. The video starts playing.
 3. Use `Space`, `F11`, and the panel buttons while it plays.
 4. When the video ends, the session stays open. Click **Close session**, then **Open proof source** to replay.
 5. Click **Close session** to stop and return to idle, or quit the application normally.
+
+## AppImage
+
+The [AppImage recipe](packaging/appimage/README.md) produces one portable Linux x86_64 artifact with bundled Qt/QML and the frozen media libraries. A published release is not available from this change, and the package's source/license completeness gate is not yet cleared.
+
+From the directory containing a built artifact:
+
+```sh
+sha256sum --check SHA256SUMS
+chmod +x Furami-0.1.0-x86_64.AppImage
+./Furami-0.1.0-x86_64.AppImage
+```
+
+No `FURAMI_MEDIA_PREFIX` is needed for an AppImage. On Wayland, the host must provide XWayland and a usable `DISPLAY`; Vulkan and graphics drivers also come from the host. See [portability requirements and tested status](packaging/appimage/PORTABILITY.md). File-manager double-click behavior depends on the desktop's executable-file association; menu integration is optional.
+
+To run without mounting the image:
+
+```sh
+./Furami-0.1.0-x86_64.AppImage --appimage-extract
+./squashfs-root/AppRun
+```
+
+Mounted, desktop-entry and extracted playback were exercised on Fedora 44/KDE Plasma Wayland with an AMD RX 7900 XTX. Extraction was tested on this FUSE-capable host, not on a separate FUSE-less system. Arch/Hyprland and Ubuntu/GNOME compatibility is researched but untested.
 
 ## Controls
 

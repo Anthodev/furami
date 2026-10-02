@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Furami
+Comment=Low-latency capture viewer
+Exec=AppRun
+Icon=furami
+Terminal=false
+Categories=AudioVideo;Video;
