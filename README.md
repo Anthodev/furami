@@ -10,7 +10,7 @@ Linux capture viewer prototype, built with Rust and Qt.</p>
 </p>
 
 > [!IMPORTANT]
-> Furami is an **early prototype**. Its purpose is low-latency viewing of a game console captured on the same machine, but today it plays only a generated local test video; no capture device input exists yet. It was verified on one desktop (Wayland/XWayland with an AMD RX 7900 XTX) and makes no broad hardware compatibility claims. A known defect can close the application instead of recovering, so it is not yet reliable enough for daily use.
+> Furami is an **early prototype**. Its purpose is low-latency viewing of a game console captured on the same machine, but today it plays only a generated local test video; no capture device input exists yet. It has been exercised on Fedora 44 with KDE Plasma (Wayland/XWayland, AMD RX 7900 XTX), with partial desktop qualification and no broad hardware compatibility claims. Arch and Ubuntu sessions are expected to work under the same prerequisites but were not tested. An unexpected Qt-initiated video-surface loss enters a terminal failure state and permits controlled closure; restarting the application is required. Already-destroyed X11 surfaces and X server loss are not covered.
 
 ## What it does
 
@@ -21,7 +21,7 @@ The current prototype provides:
 - **One playback window.** Video and controls share one application window.
 - **Collapsible control panel.** Open the test source, close the session, toggle the panel and fullscreen, and view playback state.
 - **Fullscreen playback.** Toggle fullscreen from the panel or keyboard.
-- **Keyboard and pointer control.** Playback shortcuts apply when the video has focus; text fields keep priority while editing.
+- **Keyboard and pointer control.** Playback shortcuts apply when the video has focus; text fields are intended to keep priority while editing.
 
 ## Trying it
 
@@ -43,7 +43,7 @@ The current prototype provides:
 | **Close session** | Stop playback and return to idle |
 | **Fullscreen / Leave fullscreen** | Toggle fullscreen from the panel |
 
-Text typed in a panel field takes precedence over playback shortcuts until focus leaves the field.
+Text typed in a panel field is intended to take precedence over playback shortcuts until focus leaves the field. The Fedora text-entry check did not qualify this behavior (see limitations).
 
 ## Not implemented yet
 
@@ -53,8 +53,8 @@ Text typed in a panel field takes precedence over playback shortcuts until focus
 
 ## Known limitations
 
-- If the video display is lost while playing, the application can close instead of recovering. Restarting it is the only remedy.
-- Verified only on Wayland/XWayland with an AMD RX 7900 XTX (RADV Vulkan). Other GPUs, compositors, and X11-only sessions are untested.
+- An unexpected Qt-initiated video-surface loss while playing latches an explicit failure state and keeps the application open. The failed session cannot recover; controlled closure exits with a failure status and restarting the application is required. This does not cover an already-destroyed X11 surface or loss of the X server itself.
+- Tested on Fedora 44 with KDE Plasma (Wayland/XWayland) and an AMD RX 7900 XTX (RADV Vulkan). Minimize/restore, desktop switching, fullscreen toggling and multi-monitor moves passed at 100%, 150% and 200% display scale; the panel popup passed at 100%. Qualification is partial: the input-test driver could not exercise pointer-dependent checks at 150% and 200%, Tab focus at 100% lacked visible confirmation, resizing stayed fixed under the desktop's tiling rules, and a text-entry check triggered pause/resume without populating the field. The cause of that text-entry failure is not isolated. Arch (Hyprland) and Ubuntu LTS (GNOME) sessions are untested.
 - The prototype uses XWayland rather than native Wayland and requires hardware Vulkan rendering.
 
 ## Build from source

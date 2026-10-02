@@ -330,6 +330,24 @@ impl GateCoordinator {
         update
     }
 
+    /// Wait inside Qt's pre-destruction callback; leave the ack and release for poll.
+    pub(crate) fn wait_for_owner_ack(&mut self, generation: Generation) -> Result<(), MediaError> {
+        match self.endpoint.as_mut() {
+            Some(endpoint)
+                if self.state.matches(generation)
+                    && endpoint.generation() == generation
+                    && self.state.failure.is_some()
+                    && self.state.cleanup == GatePhase::Stopping =>
+            {
+                endpoint.wait_for_ack()
+            }
+            _ => Err(MediaError::new(
+                "surface_loss_barrier",
+                "surface-loss barrier requires the active failed generation and a live owner endpoint",
+            )),
+        }
+    }
+
     pub fn submit(&mut self, generation: Generation, intent: PlaybackIntent) -> SubmitStatus {
         if !self.state.matches(generation) {
             return SubmitStatus::StaleGeneration;
@@ -496,7 +514,7 @@ mod tests {
         (gate, rx)
     }
     fn await_owner(gate: &mut GateCoordinator) -> UiUpdate {
-        gate.endpoint.as_mut().unwrap().wait_for_ack();
+        gate.endpoint.as_mut().unwrap().wait_for_ack().unwrap();
         gate.poll()
     }
 
@@ -808,5 +826,189 @@ mod tests {
         driver.shutdown_release.send(()).unwrap();
         assert!(await_owner(&mut gate).release_native);
         driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn surface_loss_barrier_revokes_during_held_shutdown_and_only_poll_releases() {
+        for during_stop in [false, true] {
+            let (mut gate, drivers) = coordinator(Config {
+                creates_handle: true,
+                hold_shutdown: true,
+                ..Config::default()
+            });
+            let mut host = FakeHost::default();
+            let opening = gate.open();
+            let g = opening.generation.unwrap();
+            host.apply(&opening);
+            let driver = drivers.recv().unwrap();
+            gate.surface_ready(token(g));
+            driver.initialized.recv().unwrap();
+            driver.submitted.recv().unwrap();
+            driver.send(BackendEvent::FileLoaded);
+            driver.fence();
+            assert_eq!(gate.poll().phase, GatePhase::Ready);
+            if during_stop {
+                host.apply(&gate.close(g, CloseTarget::Session));
+            }
+
+            let loss = gate.surface_lost(g);
+            assert!(loss.changed && loss.failed);
+            assert_eq!(loss.phase, GatePhase::Failed);
+            assert_eq!(loss.failure_code, Some("surface_lost"));
+            assert!(!loss.release_native && !loss.quit);
+            host.apply(&loss);
+            assert!(gate.state.token.is_none());
+            assert_eq!(gate.state.cleanup, GatePhase::Stopping);
+            assert_eq!(
+                gate.submit(g, PlaybackIntent::TogglePause),
+                SubmitStatus::Closing
+            );
+            assert_eq!(
+                gate.endpoint.as_ref().unwrap().attach(token(g)),
+                SubmitStatus::Closing
+            );
+            assert!(!gate.surface_ready(token(g)).changed);
+            assert!(!gate.state.owner_snapshot(snapshot(g, true, false)).changed);
+
+            let stale = Generation::new(g.get() + 1).unwrap();
+            assert_eq!(
+                gate.wait_for_owner_ack(stale).unwrap_err(),
+                MediaError::new(
+                    "surface_loss_barrier",
+                    "surface-loss barrier requires the active failed generation and a live owner endpoint",
+                )
+            );
+            let pending = gate.poll();
+            assert!(pending.failed && !pending.release_native);
+            assert_eq!(pending.phase, GatePhase::Failed);
+            assert!(
+                gate.endpoint
+                    .as_mut()
+                    .unwrap()
+                    .take_stopped()
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(driver.destroyed.try_recv().is_err());
+            assert_eq!(host.live, Some(g));
+            assert!(host.released.is_empty());
+
+            driver.shutdown_release.send(()).unwrap();
+            gate.wait_for_owner_ack(g).unwrap();
+            assert!(driver.destroyed.try_recv().unwrap());
+            gate.wait_for_owner_ack(g).unwrap();
+            assert_eq!(gate.state.cleanup, GatePhase::Stopping);
+            assert_eq!(gate.unchanged().phase, GatePhase::Failed);
+            assert!(gate.state.token.is_none());
+            assert_eq!(host.live, Some(g));
+            assert!(host.released.is_empty());
+
+            let release = gate.poll();
+            assert!(release.changed && release.failed && release.release_native);
+            assert_eq!(release.phase, GatePhase::Releasing);
+            assert_eq!(release.failure_code, Some("surface_lost"));
+            host.apply(&release);
+            assert_eq!(host.released, vec![g]);
+            let duplicate = gate.poll();
+            assert!(!duplicate.changed && !duplicate.release_native);
+            host.apply(&duplicate);
+            assert_eq!(host.released, vec![g]);
+            assert_eq!(gate.native_released(g).phase, GatePhase::Failed);
+            assert!(!gate.open().create_native);
+        }
+    }
+
+    #[test]
+    fn surface_loss_barrier_rejects_pre_stop_and_stale_generation_without_mutation() {
+        let (mut gate, drivers) = coordinator(Config::default());
+        let invalid = MediaError::new(
+            "surface_loss_barrier",
+            "surface-loss barrier requires the active failed generation and a live owner endpoint",
+        );
+        let first = gate.open().generation.unwrap();
+        let first_driver = drivers.recv().unwrap();
+        gate.close(first, CloseTarget::Session);
+        assert!(await_owner(&mut gate).release_native);
+        first_driver.destroyed.recv().unwrap();
+        assert_eq!(gate.native_released(first).phase, GatePhase::Idle);
+        assert_eq!(gate.wait_for_owner_ack(first).unwrap_err(), invalid);
+        assert_eq!(gate.unchanged().phase, GatePhase::Idle);
+
+        let second = gate.open().generation.unwrap();
+        assert!(second.get() > first.get());
+        let driver = drivers.recv().unwrap();
+        gate.surface_ready(token(second));
+        driver.initialized.recv().unwrap();
+        let (load, _) = driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::FileLoaded);
+        driver.fence();
+        assert_eq!(gate.poll().phase, GatePhase::Ready);
+        for generation in [first, second] {
+            assert_eq!(gate.wait_for_owner_ack(generation).unwrap_err(), invalid);
+            assert_eq!(gate.state.generation, Some(second));
+            assert_eq!(gate.state.token, Some(token(second)));
+            assert_eq!(gate.state.cleanup, GatePhase::Ready);
+            assert!(gate.state.failure.is_none());
+            assert!(!gate.poll().changed);
+        }
+        assert_eq!(
+            gate.submit(second, PlaybackIntent::TogglePause),
+            SubmitStatus::Accepted
+        );
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        assert_eq!(
+            driver.submitted.recv().unwrap().1,
+            crate::media::controller::BackendCommand::TogglePause
+        );
+        gate.close(second, CloseTarget::Session);
+        assert_eq!(gate.wait_for_owner_ack(second).unwrap_err(), invalid);
+        assert_eq!(gate.state.cleanup, GatePhase::Stopping);
+        assert!(gate.state.failure.is_none());
+        assert!(await_owner(&mut gate).release_native);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn surface_loss_barrier_disconnected_owner_cannot_release_native() {
+        let mut gate = GateCoordinator::with_spawner(|generation| {
+            OwnerEndpoint::spawn_with_backend(
+                generation,
+                || -> crate::media::controller::test_support::FakeBackend {
+                    panic!("injected owner factory panic");
+                },
+            )
+        });
+        let mut host = FakeHost::default();
+        let opening = gate.open();
+        let g = opening.generation.unwrap();
+        host.apply(&opening);
+        let loss = gate.surface_lost(g);
+        assert!(loss.failed && !loss.release_native);
+        host.apply(&loss);
+        let expected = MediaError::new(
+            "owner_disconnect",
+            "owner exited without destruction completion acknowledgment",
+        );
+        assert_eq!(gate.wait_for_owner_ack(g).unwrap_err(), expected);
+        assert_eq!(gate.wait_for_owner_ack(g).unwrap_err(), expected);
+        assert_eq!(gate.state.cleanup, GatePhase::Stopping);
+        assert!(
+            gate.endpoint
+                .as_mut()
+                .unwrap()
+                .take_stopped()
+                .unwrap()
+                .is_none()
+        );
+        let update = gate.poll();
+        assert!(update.failed && !update.release_native && !update.quit);
+        assert_eq!(update.phase, GatePhase::Failed);
+        assert_eq!(update.failure_code, Some("surface_lost"));
+        host.apply(&update);
+        assert_eq!(host.live, Some(g));
+        assert!(host.released.is_empty());
     }
 }

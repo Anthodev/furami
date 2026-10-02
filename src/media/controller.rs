@@ -184,6 +184,10 @@ pub(crate) struct OwnerEndpoint {
     ack_disconnected: bool,
 }
 impl OwnerEndpoint {
+    pub(crate) fn generation(&self) -> Generation {
+        self.generation
+    }
+
     pub(crate) fn spawn(generation: Generation, prefix: String) -> Result<Self, MediaError> {
         Self::spawn_with_backend(generation, move || super::ffi::MpvBackend::new(prefix))
     }
@@ -369,11 +373,24 @@ impl OwnerEndpoint {
         self.latest.try_lock().ok().and_then(|mut slot| slot.take())
     }
 
-    #[cfg(test)]
-    pub(crate) fn wait_for_ack(&mut self) {
-        if !self.ack_received && self.buffered_ack.is_none() {
-            self.buffered_ack = Some(self.stopped.recv().expect("genuine owner ack"));
+    /// Buffer the destruction acknowledgment without consuming it for the GUI reducer.
+    pub(crate) fn wait_for_ack(&mut self) -> Result<(), MediaError> {
+        if self.ack_received || self.buffered_ack.is_some() {
+            return Ok(());
         }
+        if !self.ack_disconnected {
+            match self.stopped.recv() {
+                Ok(ack) => {
+                    self.buffered_ack = Some(ack);
+                    return Ok(());
+                }
+                Err(_) => self.ack_disconnected = true,
+            }
+        }
+        Err(MediaError::new(
+            "owner_disconnect",
+            "owner exited without destruction completion acknowledgment",
+        ))
     }
 }
 impl Drop for OwnerEndpoint {
@@ -722,7 +739,7 @@ mod tests {
     }
     fn stop(owner: &mut OwnerEndpoint, driver: &Driver) -> OwnerStopped {
         owner.stop(generation(), None);
-        owner.wait_for_ack();
+        owner.wait_for_ack().unwrap();
         assert!(driver.destroyed.recv().is_ok());
         owner.take_stopped().unwrap().unwrap()
     }
@@ -741,7 +758,7 @@ mod tests {
             owner.submit(generation(), PlaybackIntent::TogglePause),
             SubmitStatus::CapacityExceeded
         );
-        owner.wait_for_ack();
+        owner.wait_for_ack().unwrap();
         assert!(owner.take_stopped().unwrap().unwrap().outcome.is_err());
         driver.destroyed.recv().unwrap();
         assert!(driver.submitted.try_recv().is_err());
@@ -795,7 +812,7 @@ mod tests {
             assert!(owner.take_stopped().unwrap().is_none());
             assert!(driver.submitted.try_recv().is_err());
             driver.shutdown_release.send(()).unwrap();
-            owner.wait_for_ack();
+            owner.wait_for_ack().unwrap();
             assert_eq!(driver.destroyed.recv().unwrap(), handle);
             assert!(owner.take_stopped().unwrap().unwrap().outcome.is_err());
             assert!(driver.destroyed.try_recv().is_err());
@@ -810,7 +827,7 @@ mod tests {
         });
         owner.stop(generation(), None);
         driver.initialize_release.send(()).unwrap();
-        owner.wait_for_ack();
+        owner.wait_for_ack().unwrap();
         assert!(owner.take_stopped().unwrap().unwrap().outcome.is_ok());
         assert!(driver.submitted.try_recv().is_err());
         driver.destroyed.recv().unwrap();
@@ -822,7 +839,7 @@ mod tests {
             submission_error: Some(MediaError::new("submission", "negative async result")),
             ..Config::default()
         });
-        owner.wait_for_ack();
+        owner.wait_for_ack().unwrap();
         assert!(owner.take_stopped().unwrap().unwrap().outcome.is_err());
         assert!(driver.submitted.try_recv().is_err());
         driver.destroyed.recv().unwrap();
@@ -837,7 +854,7 @@ mod tests {
             id: initial.get(),
             error: -13,
         });
-        owner.wait_for_ack();
+        owner.wait_for_ack().unwrap();
         assert!(owner.take_stopped().unwrap().unwrap().outcome.is_err());
         driver.destroyed.recv().unwrap();
         assert!(driver.submitted.try_recv().is_err());
@@ -853,7 +870,7 @@ mod tests {
                 driver.fence();
             }
             driver.send(BackendEvent::QueueOverflow);
-            owner.wait_for_ack();
+            owner.wait_for_ack().unwrap();
             assert_eq!(
                 owner
                     .take_stopped()
@@ -896,7 +913,7 @@ mod tests {
                 .unwrap();
         owner.attach(token());
         driver.initialized.recv().unwrap();
-        owner.wait_for_ack();
+        owner.wait_for_ack().unwrap();
         assert_eq!(
             owner
                 .take_stopped()
@@ -933,7 +950,7 @@ mod tests {
                     error: 0,
                 });
             }
-            owner.wait_for_ack();
+            owner.wait_for_ack().unwrap();
             assert_eq!(
                 owner
                     .take_stopped()
@@ -963,7 +980,7 @@ mod tests {
         let snapshot = owner.take_snapshot().unwrap();
         assert!(snapshot.file_loaded && snapshot.ended);
         owner.stop(generation(), None);
-        owner.wait_for_ack();
+        owner.wait_for_ack().unwrap();
         assert!(owner.take_stopped().unwrap().unwrap().outcome.is_ok());
         driver.destroyed.recv().unwrap();
     }
@@ -1010,7 +1027,7 @@ mod tests {
             driver.send(event);
             assert!(owner.take_stopped().unwrap().is_none());
             driver.shutdown_release.send(()).unwrap();
-            owner.wait_for_ack();
+            owner.wait_for_ack().unwrap();
             assert!(owner.take_stopped().unwrap().unwrap().outcome.is_err());
             driver.destroyed.recv().unwrap();
         }
@@ -1032,7 +1049,7 @@ mod tests {
             SubmitStatus::Accepted
         );
         driver.shutdown_release.send(()).unwrap();
-        owner.wait_for_ack();
+        owner.wait_for_ack().unwrap();
         assert_eq!(
             owner
                 .take_stopped()
@@ -1059,5 +1076,75 @@ mod tests {
         assert_eq!(owner.take_stopped().unwrap_err().code, "owner_disconnect");
         assert!(!owner.ack_received);
         assert!(owner.take_stopped().unwrap().is_none());
+    }
+
+    #[test]
+    fn surface_loss_barrier_waits_for_destruction_and_preserves_single_consumption() {
+        let (mut owner, driver) = start(Config {
+            creates_handle: true,
+            hold_shutdown: true,
+            ..Config::default()
+        });
+        load(&driver);
+        owner.stop(
+            generation(),
+            Some(MediaError::new("surface_lost", "lost while stopping")),
+        );
+        assert!(owner.take_stopped().unwrap().is_none());
+        assert!(driver.destroyed.try_recv().is_err());
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel::<Result<(), MediaError>>();
+        let destroyed = driver.destroyed;
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = owner.wait_for_ack();
+            let destruction = destroyed.try_recv();
+            completed_tx.send(result).unwrap();
+            (owner, destruction)
+        });
+        started_rx.recv().unwrap();
+        let while_held = completed_rx.recv_timeout(Duration::from_millis(50));
+        // Release before assertions so a failed negative check cannot strand the owner.
+        driver.shutdown_release.send(()).unwrap();
+        let completion = completed_rx.recv().unwrap();
+        let (mut owner, destruction) = waiter.join().unwrap();
+        assert_eq!(while_held, Err(mpsc::RecvTimeoutError::Timeout));
+        completion.unwrap();
+        assert!(destruction.unwrap());
+
+        owner.wait_for_ack().unwrap();
+        owner.wait_for_ack().unwrap();
+        let stopped = owner.take_stopped().unwrap().unwrap();
+        assert_eq!(stopped.generation, generation());
+        assert_eq!(stopped.outcome.unwrap_err().code, "surface_lost");
+        owner.wait_for_ack().unwrap();
+        assert!(owner.take_stopped().unwrap().is_none());
+    }
+
+    #[test]
+    fn surface_loss_barrier_owner_disconnect_returns_error_without_fabricated_ack() {
+        for disconnect_already_observed in [false, true] {
+            let mut owner = OwnerEndpoint::spawn_with_backend(
+                generation(),
+                || -> super::test_support::FakeBackend {
+                    panic!("injected owner factory panic");
+                },
+            )
+            .unwrap();
+            if disconnect_already_observed {
+                assert!(owner.stopped.recv().is_err());
+                assert_eq!(owner.take_stopped().unwrap_err().code, "owner_disconnect");
+            }
+            let expected = MediaError::new(
+                "owner_disconnect",
+                "owner exited without destruction completion acknowledgment",
+            );
+            assert_eq!(owner.wait_for_ack().unwrap_err(), expected);
+            assert_eq!(owner.wait_for_ack().unwrap_err(), expected);
+            assert!(!owner.ack_received);
+            assert!(owner.buffered_ack.is_none());
+            assert!(owner.take_stopped().unwrap().is_none());
+        }
     }
 }
