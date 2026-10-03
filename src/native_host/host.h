@@ -18,7 +18,7 @@
 
 namespace furami::bridge {
 
-struct GateCoordinator;
+struct RuntimeCoordinator;
 struct LaunchResult;
 struct UiUpdate;
 class HostWindow;
@@ -37,6 +37,7 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(bool panelVisible READ panelVisible WRITE setPanelVisible NOTIFY panelVisibleChanged)
     Q_PROPERTY(bool popupOpen READ popupOpen WRITE setPopupOpen NOTIFY popupOpenChanged)
     Q_PROPERTY(bool captureSelected READ captureSelected CONSTANT)
+    Q_PROPERTY(bool canOpen READ canOpen NOTIFY stateChanged)
     Q_PROPERTY(bool canRestart READ canRestart NOTIFY stateChanged)
     Q_PROPERTY(QString restartGeneration READ restartGeneration NOTIFY stateChanged)
     Q_PROPERTY(QString audioStatus READ audioStatus NOTIFY stateChanged)
@@ -45,7 +46,7 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(bool audioEnabled READ audioEnabled NOTIFY stateChanged)
 
 public:
-    explicit FuramiBridge(rust::Box<GateCoordinator> gate);
+    explicit FuramiBridge(rust::Box<RuntimeCoordinator> gate);
     ~FuramiBridge() override;
 
     QWindow *hostWindow() const;
@@ -57,6 +58,7 @@ public:
     bool panelVisible() const;
     bool popupOpen() const;
     bool captureSelected() const;
+    bool canOpen() const;
     bool canRestart() const;
     QString restartGeneration() const;
     QString audioStatus() const;
@@ -108,7 +110,7 @@ private:
     void logGeometry();
     void readQualificationInput();
 
-    rust::Box<GateCoordinator> m_gate;
+    rust::Box<RuntimeCoordinator> m_gate;
     QTimer m_pollTimer;
     QPointer<HostWindow> m_host;
     QPointer<QSocketNotifier> m_qualificationInput;
@@ -123,6 +125,7 @@ private:
     std::uint64_t m_generation = 0;
     std::uint64_t m_restartGeneration = 0;
     bool m_canRestart = false;
+    bool m_canOpen = false;
     QString m_audioStatus = QStringLiteral("Disabled");
     QString m_audioDiagnostic;
     QString m_audioSource;
@@ -131,6 +134,7 @@ private:
     std::uint64_t m_rootXid = 0;
     std::uint64_t m_lastHostXid = 0;
     std::uint64_t m_closeDuringOpening = 0;
+    bool m_closeOnNextOpening = false;
     bool m_failed = false;
     bool m_captureSelected = false;
     bool m_bootstrapFailed = false;
@@ -147,7 +151,7 @@ private:
     bool m_insideSurfaceCallback = false;
 };
 
-LaunchResult run_qt_application(rust::Box<GateCoordinator> gate, rust::Str display, bool qualificationStdin);
+LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, bool qualificationStdin);
 
 } // namespace furami::bridge
 

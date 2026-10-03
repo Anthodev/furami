@@ -400,6 +400,21 @@ pub fn validate<'a>(
     validate_with_query(snapshot, request, query_intervals)
 }
 
+/// Internal seam: identical validation with an injected exact-size interval
+/// query, so range-descriptor fixtures never touch real `/dev` nodes.
+pub(crate) fn validate_with_injected_query<'a>(
+    snapshot: &'a CaptureSnapshot,
+    request: &ModeRequest,
+    query: impl FnMut(
+        &CaptureDevice,
+        &CaptureNode,
+        CapturedFourCc,
+        FrameSize,
+    ) -> Result<ExactSizeIntervals, CaptureError>,
+) -> Result<ValidatedCapture<'a>, CaptureError> {
+    validate_with_query(snapshot, request, query)
+}
+
 fn validate_with_query<'a>(
     snapshot: &'a CaptureSnapshot,
     request: &ModeRequest,
@@ -560,6 +575,83 @@ pub(crate) fn session_fixture(paths: &[&str], mode: CaptureMode) -> CaptureSnaps
         .collect();
     CaptureSnapshot {
         devices: vec![CaptureDevice { identity, nodes }],
+    }
+}
+
+/// Range-descriptor fixture: same identity, but sizes are announced as a
+/// Stepwise range containing the requested size, so proving the tuple needs an
+/// exact interval query (injected via validate_with_injected_query in tests).
+#[cfg(test)]
+pub(crate) fn session_range_fixture(paths: &[&str], mode: CaptureMode) -> CaptureSnapshot {
+    use crate::domain::capture::{
+        FormatDescriptor, FourCcCapabilities, FrameSizeKind, FrameSizes, UsbTopology,
+    };
+    let identity = DeviceIdentity::new(
+        0x32ed,
+        0x3701,
+        UsbTopology::new(
+            "pci-fixture".into(),
+            vec![std::num::NonZeroU8::new(1).unwrap()],
+        )
+        .unwrap(),
+        Some("fixture".into()),
+    )
+    .unwrap();
+    let nodes = paths
+        .iter()
+        .map(|path| CaptureNode {
+            devnode: (*path).into(),
+            syspath: format!("/sys{path}").into(),
+            usb_syspath: "/sys/usb/fixture".into(),
+            driver: "uvcvideo".into(),
+            card_name: "fixture".into(),
+            bus_info: "fixture".into(),
+            raw_capabilities: 0,
+            raw_device_caps: 0,
+            effective_capabilities: 0,
+            capabilities: NodeCapabilities::new(
+                vec![FormatDescriptor {
+                    buffer_type: CaptureBufferType::SinglePlanar,
+                    captured_fourcc: mode.captured_fourcc,
+                    description: "fixture".into(),
+                    flags: 0,
+                }],
+                vec![FourCcCapabilities {
+                    captured_fourcc: mode.captured_fourcc,
+                    sizes: Descriptor::Available(
+                        FrameSizes::new(FrameSizeKind::Stepwise {
+                            min: FrameSize::new(640, 360).unwrap(),
+                            max: FrameSize::new(3840, 2160).unwrap(),
+                            step_width: std::num::NonZeroU32::new(2).unwrap(),
+                            step_height: std::num::NonZeroU32::new(2).unwrap(),
+                        })
+                        .unwrap(),
+                    ),
+                }],
+            )
+            .unwrap(),
+        })
+        .collect();
+    CaptureSnapshot {
+        devices: vec![CaptureDevice { identity, nodes }],
+    }
+}
+
+/// Deterministic exact-interval answer for range fixtures: announces exactly
+/// the requested rate for the requested tuple, without any `/dev` access.
+#[cfg(test)]
+pub(crate) fn fixture_exact_intervals(
+    fourcc: CapturedFourCc,
+    size: FrameSize,
+    rate: crate::domain::capture::FrameRate,
+) -> ExactSizeIntervals {
+    use crate::domain::capture::{FrameIntervalKind, FrameIntervals};
+    ExactSizeIntervals {
+        captured_fourcc: fourcc,
+        size,
+        intervals: crate::domain::capture::Descriptor::Available(
+            FrameIntervals::new(FrameIntervalKind::Discrete(vec![rate.interval()])).unwrap(),
+        ),
     }
 }
 

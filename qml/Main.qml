@@ -93,7 +93,7 @@ ApplicationWindow {
                     objectName: "openProof"
                     text: "Open capture"
                     Layout.fillWidth: true
-                    enabled: root.bridge.phase === "Idle" && root.bridge.captureSelected
+                    enabled: root.bridge.canOpen
                     onClicked: root.bridge.openCapture()
                 }
                 Button {
@@ -107,14 +107,15 @@ ApplicationWindow {
                     objectName: "closeProof"
                     text: "Close session"
                     Layout.fillWidth: true
-                    enabled: root.bridge.phase !== "Idle" && root.bridge.phase !== "QuitReady"
+                    enabled: root.bridge.captureSelected && root.bridge.phase !== "QuitReady"
+                        && (root.bridge.phase !== "Idle" || !root.bridge.canOpen)
                     onClicked: root.bridge.closeCapture()
                 }
                 Button {
                     objectName: "closeDuringOpenProof"
                     text: "Close during opening"
                     Layout.fillWidth: true
-                    enabled: root.bridge.phase === "Idle" && root.bridge.captureSelected
+                    enabled: root.bridge.canOpen
                     onClicked: root.bridge.openAndCloseDuringOpeningForProof()
                 }
                 Button {
@@ -125,7 +126,7 @@ ApplicationWindow {
                     onClicked: root.bridge.forceSurfaceLossForProof()
                 }
                 Label {
-                    text: root.bridge.ended ? "Capture ended. Session stays alive."
+                    text: root.bridge.ended ? "Capture ended. Reopen after cleanup."
                         : root.bridge.paused ? "Playback paused" : "Space pauses / resumes video"
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true

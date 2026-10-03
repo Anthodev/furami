@@ -2,6 +2,7 @@
 //! `container-fps` is a possibly inaccurate nominal report, not measured cadence.
 
 pub use crate::capture::input::RequestedFacts;
+use crate::domain::failure::{BackendEvidence, BackendOperation, Cause, Stage};
 use crate::{capture::input::SelectionError, domain::capture::FrameSize};
 use serde::Serialize;
 
@@ -40,39 +41,6 @@ pub struct SessionFacts {
     pub requested: RequestedFacts,
     pub observed: ObservedFacts,
     pub verification: Verification,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub enum Stage {
-    Prevalidation,
-    InputConstruction,
-    Open,
-    Negotiation,
-    StreamStart,
-    Verification,
-    Unknown,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub enum Cause {
-    RequestedModeRefused,
-    Busy,
-    Permission,
-    Generic,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub enum BackendOperation {
-    OpenDevice,
-    SetFormat,
-    SetFrameRate,
-    StartStreaming,
-    Unknown,
-}
-/// Only populate from structured backend operation/errno reports. Never parse
-/// numbers or wording out of mpv's text logs; standard libmpv supplies no such proof.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct BackendEvidence {
-    pub operation: BackendOperation,
-    pub errno: i32,
 }
 
 #[derive(Clone, Debug, Serialize, thiserror::Error)]
@@ -378,10 +346,13 @@ mod tests {
         driver.submitted.recv().unwrap();
         (owner, driver)
     }
-    fn close(owner: &mut OwnerEndpoint, driver: &Driver) {
-        owner.stop(owner.generation(), None);
+    fn close(owner: &mut OwnerEndpoint, driver: &Driver, generation: u64) {
+        let generation = Generation::new(generation).unwrap();
+        assert_eq!(owner.stop(generation, None), SubmitStatus::Accepted);
         owner.wait_for_ack().unwrap();
-        owner.take_stopped().unwrap().unwrap().outcome.unwrap();
+        let stopped = owner.take_stopped().unwrap().unwrap();
+        assert_eq!(stopped.generation, generation);
+        stopped.outcome.unwrap();
         driver.destroyed.recv().unwrap();
     }
 
@@ -539,7 +510,7 @@ mod tests {
         first_driver.send(BackendEvent::PlaybackRestart);
         first_driver.fence();
         let first_facts = first.take_snapshot().unwrap().session.unwrap();
-        close(&mut first, &first_driver);
+        close(&mut first, &first_driver, 1);
         let (mut second, second_driver) = start(2);
         second_driver.set_observed(observed(2560, Some(59.94)));
         second_driver.send(BackendEvent::PlaybackRestart);
@@ -554,7 +525,7 @@ mod tests {
             ),
             SubmitStatus::StaleGeneration
         );
-        close(&mut second, &second_driver);
+        close(&mut second, &second_driver, 2);
     }
 
     #[test]
@@ -567,8 +538,9 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let gui_thread = std::thread::current().id();
         let (driver, backend) = Driver::pair(Config::default());
+        let generation = Generation::new(1).unwrap();
         let mut owner = OwnerEndpoint::spawn_capture_with_backend(
-            Generation::new(1).unwrap(),
+            generation,
             requested,
             move || {
                 entered_tx.send(std::thread::current().id()).unwrap();
@@ -582,7 +554,7 @@ mod tests {
         )
         .unwrap();
         assert_ne!(entered_rx.recv().unwrap(), gui_thread);
-        assert_eq!(owner.stop(owner.generation(), None), SubmitStatus::Accepted);
+        assert_eq!(owner.stop(generation, None), SubmitStatus::Accepted);
         release_tx.send(()).unwrap();
         owner.wait_for_ack().unwrap();
         owner.take_stopped().unwrap().unwrap().outcome.unwrap();

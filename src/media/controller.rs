@@ -12,7 +12,9 @@ use std::{
 };
 
 use super::session::{ObservedFacts, RequestedFacts, SessionError, SessionFacts};
-use crate::capture::input::{CaptureSelection, InputSpec, SelectionError};
+#[cfg(test)]
+use crate::capture::input::InputSpec;
+use crate::capture::input::{CaptureSelection, SelectionError};
 use crate::domain::capture::{AudioError, AudioSelection, PlaybackGain};
 
 #[derive(Clone, Debug)]
@@ -252,24 +254,87 @@ pub(crate) struct OwnerEndpoint {
     ack_disconnected: bool,
 }
 impl OwnerEndpoint {
-    pub(crate) fn generation(&self) -> Generation {
-        self.generation
-    }
-
     pub(crate) fn spawn(
         generation: Generation,
         prefix: String,
         config: SessionConfig,
     ) -> Result<Self, MediaError> {
         let requested = config.video.requested();
-        Self::spawn_capture_with_backend(
+        let settings = crate::domain::state::DraftSettings {
+            video: crate::domain::capture::ModeRequest {
+                identity: requested.identity.clone(),
+                mode: requested.mode,
+            },
+            audio: config.audio.clone(),
+        };
+        Self::spawn_task(
             generation,
-            requested,
-            move || config.video.revalidate(),
-            move |input| super::ffi::MpvBackend::new(prefix, input, config.audio, config.gain),
+            move |surface, commands, stop, latest, snapshot| {
+                if stop.is_set() {
+                    return stop.outcome();
+                }
+                // Resolve physical identity again after incumbent cleanup. Prepared
+                // paths are never rollback/reconnect targets and may have renumbered.
+                let fresh = crate::capture::linux::discover().map_err(|error| {
+                    MediaError::from_session(SessionError::prevalidation(
+                        requested.clone(),
+                        SelectionError::Capture(error),
+                    ))
+                })?;
+                let audio = if settings.audio.enabled() {
+                    crate::capture::audio::discover().map_err(|error| {
+                        MediaError::from_session(SessionError {
+                            stage: crate::domain::failure::Stage::Prevalidation,
+                            cause: crate::domain::failure::Cause::Generic,
+                            requested: requested.clone(),
+                            diagnostic: error.to_string(),
+                            evidence: None,
+                            source: None,
+                        })
+                    })?
+                } else {
+                    Vec::new()
+                };
+                let prepared = crate::capture::validate_prepared(settings, &fresh, &audio)
+                    .map_err(|failure| {
+                        MediaError::from_session(SessionError {
+                            stage: failure.stage,
+                            cause: failure.cause,
+                            requested: requested.clone(),
+                            diagnostic: failure.diagnostic,
+                            evidence: failure.evidence,
+                            source: None,
+                        })
+                    })?;
+                if stop.is_set() {
+                    return stop.outcome();
+                }
+                let input = prepared.selection().revalidate().map_err(|error| {
+                    MediaError::from_session(SessionError::prevalidation(
+                        prepared.selection().requested(),
+                        error,
+                    ))
+                })?;
+                if stop.is_set() {
+                    return stop.outcome();
+                }
+                let requested = input.requested().clone();
+                tracing::info!(generation = generation.get(), requested = %requested, "capture_requested");
+                run_backend(
+                    super::ffi::MpvBackend::new(prefix, input, config.audio, config.gain),
+                    surface,
+                    commands,
+                    stop,
+                    latest,
+                    snapshot,
+                    0,
+                    Some(&requested),
+                )
+            },
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_capture_with_backend<P, F, B>(
         generation: Generation,
         requested: RequestedFacts,
@@ -319,6 +384,36 @@ impl OwnerEndpoint {
         B: OwnerBackend + 'static,
     {
         Self::spawn_with_backend_seed(generation, factory, 0)
+    }
+
+    /// Lifecycle tests inject an already-prepared request. Unlike capture
+    /// prevalidation tests, their fake backend lifetime exists even when stop
+    /// wins before publication; shutdown must still precede the genuine ack.
+    #[cfg(test)]
+    pub(crate) fn spawn_with_backend_requested<F, B>(
+        generation: Generation,
+        requested: RequestedFacts,
+        factory: F,
+    ) -> Result<Self, MediaError>
+    where
+        F: FnOnce() -> B + Send + 'static,
+        B: OwnerBackend + 'static,
+    {
+        Self::spawn_task(
+            generation,
+            move |surface, commands, stop, latest, snapshot| {
+                run_backend(
+                    factory(),
+                    surface,
+                    commands,
+                    stop,
+                    latest,
+                    snapshot,
+                    0,
+                    Some(&requested),
+                )
+            },
+        )
     }
 
     #[cfg(test)]
@@ -418,6 +513,16 @@ impl OwnerEndpoint {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn rewrite_buffered_ack_generation(&mut self, generation: Generation) -> bool {
+        if let Some(ack) = &mut self.buffered_ack {
+            ack.generation = generation;
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn attach(&self, token: SurfaceToken) -> SubmitStatus {
         if token.generation != self.generation {
             return SubmitStatus::StaleGeneration;
@@ -479,10 +584,6 @@ impl OwnerEndpoint {
                 SubmitStatus::Closing
             }
         }
-    }
-
-    pub(crate) fn set_gain(&self, generation: Generation, gain: PlaybackGain) -> SubmitStatus {
-        self.submit(generation, PlaybackIntent::SetGain(gain))
     }
 
     pub(crate) fn stop(&self, generation: Generation, error: Option<MediaError>) -> SubmitStatus {
@@ -1507,7 +1608,10 @@ mod audio_tests {
         driver.initialized.recv().unwrap();
         driver.submitted.recv().unwrap();
         assert_eq!(
-            owner.set_gain(Generation::new(2).unwrap(), PlaybackGain::default()),
+            owner.submit(
+                Generation::new(2).unwrap(),
+                PlaybackIntent::SetGain(PlaybackGain::default())
+            ),
             SubmitStatus::StaleGeneration
         );
         assert!(!owner.stop_flag.audio_cancel().load(Ordering::Acquire));

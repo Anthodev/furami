@@ -2,3 +2,5 @@
 //! Allowed dependencies: Pure types and validation; no Qt, no mpv pointers.
 
 pub mod capture;
+pub mod failure;
+pub mod state;
