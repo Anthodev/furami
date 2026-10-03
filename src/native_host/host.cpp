@@ -11,6 +11,7 @@
 #include <QQmlApplicationEngine>
 #include <QQmlEngine>
 #include <QThread>
+#include <QSocketNotifier>
 #include <QVariant>
 #include <QtGui/qguiapplication_platform.h>
 
@@ -19,9 +20,13 @@
 #include <xcb/xcb.h>
 
 #include <clocale>
+#include <cerrno>
 #include <cstdlib>
 #include <limits>
 #include <utility>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 // Xlib event constants otherwise collide with scoped Qt event names.
 #undef KeyPress
@@ -199,6 +204,12 @@ FuramiBridge::~FuramiBridge()
 {
     assertGuiThread();
     m_pollTimer.stop();
+    if (m_qualificationInput) {
+        m_qualificationInput->setEnabled(false);
+        delete m_qualificationInput.data();
+    }
+    if (m_stdinFlags != -1 && ::fcntl(STDIN_FILENO, F_SETFL, m_stdinFlags) == -1)
+        qWarning() << "qualification_stdin_restore_failed errno=" << errno;
     Q_ASSERT(m_nativeGeneration == 0);
 }
 
@@ -214,6 +225,12 @@ QString FuramiBridge::diagnostic() const { assertGuiThread(); return m_diagnosti
 bool FuramiBridge::paused() const { assertGuiThread(); return m_paused; }
 bool FuramiBridge::ended() const { assertGuiThread(); return m_ended; }
 bool FuramiBridge::captureSelected() const { assertGuiThread(); return m_captureSelected; }
+bool FuramiBridge::canRestart() const { assertGuiThread(); return m_canRestart; }
+QString FuramiBridge::restartGeneration() const { assertGuiThread(); return QString::number(m_restartGeneration); }
+QString FuramiBridge::audioStatus() const { assertGuiThread(); return m_audioStatus; }
+QString FuramiBridge::audioDiagnostic() const { assertGuiThread(); return m_audioDiagnostic; }
+QString FuramiBridge::audioSource() const { assertGuiThread(); return m_audioSource; }
+bool FuramiBridge::audioEnabled() const { assertGuiThread(); return m_audioEnabled; }
 bool FuramiBridge::textEntryActive() const { assertGuiThread(); return m_textEntryActive; }
 bool FuramiBridge::panelVisible() const { assertGuiThread(); return m_panelVisible; }
 bool FuramiBridge::popupOpen() const { assertGuiThread(); return m_popupOpen; }
@@ -314,6 +331,63 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
     return true;
 }
 
+bool FuramiBridge::enableQualificationInput(QString &diagnostic)
+{
+    assertGuiThread();
+    const int flags = ::fcntl(STDIN_FILENO, F_GETFL);
+    if (flags == -1 || ::fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) == -1) {
+        diagnostic = QStringLiteral("cannot make opt-in qualification stdin nonblocking: errno %1").arg(errno);
+        return false;
+    }
+    m_stdinFlags = flags;
+    m_qualificationLine.reserve(256);
+    m_qualificationInput = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read, this);
+    connect(m_qualificationInput.data(), &QSocketNotifier::activated, this,
+        [this](QSocketDescriptor, QSocketNotifier::Type) { readQualificationInput(); });
+    qInfo().noquote() << "qualification_stdin_enabled grammar=open|restart|enable|disable|volume|mute|close|quit generation=required initial_open=0";
+    return true;
+}
+
+void FuramiBridge::readQualificationInput()
+{
+    assertGuiThread();
+    char bytes[512];
+    const auto count = ::read(STDIN_FILENO, bytes, sizeof(bytes));
+    if (count == -1 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        return;
+    if (count <= 0) {
+        m_qualificationInput->setEnabled(false);
+        if (count == -1)
+            qWarning() << "qualification_stdin_read_failed errno=" << errno;
+        else
+            qInfo() << "qualification_stdin_eof";
+        m_qualificationLine.clear();
+        return;
+    }
+    // One bounded read per callback. Oversize lines are discarded whole, not
+    // interpreted as command fragments. No inventory event submits controls.
+    for (ssize_t index = 0; index < count; ++index) {
+        const char byte = bytes[index];
+        if (byte == '\n') {
+            if (!m_dropQualificationLine && !m_qualificationLine.isEmpty()) {
+                const auto command = QString::fromUtf8(m_qualificationLine).toUtf8();
+                qInfo().noquote() << "qualification_command" << QString::fromUtf8(command);
+                applyUpdate(gate_qualification_command(*m_gate, asRust(command)));
+            }
+            m_qualificationLine.clear();
+            m_dropQualificationLine = false;
+        } else if (!m_dropQualificationLine) {
+            if (m_qualificationLine.size() == 256) {
+                m_dropQualificationLine = true;
+                m_qualificationLine.clear();
+                qWarning() << "qualification_command_rejected reason=line_exceeds_256_bytes";
+            } else {
+                m_qualificationLine.append(byte);
+            }
+        }
+    }
+}
+
 void FuramiBridge::openCapture()
 {
     assertGuiThread();
@@ -321,6 +395,18 @@ void FuramiBridge::openCapture()
         return;
     qInfo().noquote() << "input_intent action=OpenCapture source=panel";
     applyUpdate(gate_open(*m_gate));
+}
+
+void FuramiBridge::restartCapture(const QString &expectedGeneration)
+{
+    assertGuiThread();
+    bool valid = false;
+    const auto generation = expectedGeneration.toULongLong(&valid);
+    if (!valid || !generation)
+        return;
+    qInfo().noquote() << QStringLiteral("input_intent action=RestartCapture source=panel generation=%1 current_attempt=%2 can_restart=%3")
+        .arg(generation).arg(m_restartGeneration).arg(boolean(m_canRestart));
+    applyUpdate(gate_restart(*m_gate, generation));
 }
 
 void FuramiBridge::closeCapture()
@@ -500,8 +586,16 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     assertGuiThread();
     if (!update.changed)
         return;
+    if (update.restart_generation != m_restartGeneration && !m_bootstrapFailed)
+        m_nativeDiagnostic.clear();
     m_actualPhase = phaseName(update.phase);
     m_generation = update.generation;
+    m_restartGeneration = update.restart_generation;
+    m_canRestart = update.can_restart && !m_bootstrapFailed;
+    m_audioStatus = fromRust(update.audio_status);
+    m_audioDiagnostic = fromRust(update.audio_diagnostic);
+    m_audioSource = fromRust(update.audio_source);
+    m_audioEnabled = update.audio_enabled;
     m_failed = update.failed || m_bootstrapFailed;
     m_paused = update.paused;
     m_ended = update.ended;
@@ -510,9 +604,11 @@ void FuramiBridge::applyUpdate(UiUpdate update)
         m_diagnostic = m_diagnostic.isEmpty() ? m_nativeDiagnostic
             : m_nativeDiagnostic + QStringLiteral("; ") + m_diagnostic;
     }
-    qInfo().noquote() << QStringLiteral("ui_phase phase=%1 visible_phase=%2 generation=%3 failed=%4 paused=%5 ended=%6 diagnostic=%7")
+    qInfo().noquote() << QStringLiteral("ui_phase phase=%1 visible_phase=%2 generation=%3 failed=%4 paused=%5 ended=%6 restart_generation=%7 can_restart=%8 audio_status=%9 audio_enabled=%10 audio_source=%11 audio_diagnostic=%12 diagnostic=%13")
         .arg(m_actualPhase, phase()).arg(m_generation).arg(boolean(m_failed))
-        .arg(boolean(m_paused)).arg(boolean(m_ended)).arg(m_diagnostic);
+        .arg(boolean(m_paused)).arg(boolean(m_ended))
+        .arg(m_restartGeneration).arg(boolean(m_canRestart)).arg(m_audioStatus)
+        .arg(boolean(m_audioEnabled)).arg(m_audioSource, m_audioDiagnostic, m_diagnostic);
     emit stateChanged();
     scheduleGeometryLog();
     // The reducer emits effects in this order. Native effects never invent an ack.
@@ -743,7 +839,7 @@ void FuramiBridge::logGeometry()
     qInfo().noquote() << QStringLiteral("qt_geometry root=%1 generation=%2 root_width=%3 root_height=%4 video_x=%5 video_y=%6 video_width=%7 video_height=%8 panel=%9 dpr=%10")
         .arg(m_rootXid).arg(m_generation).arg(m_root->width()).arg(m_root->height())
         .arg(video.x()).arg(video.y()).arg(video.width()).arg(video.height()).arg(boolean(m_panelVisible)).arg(dpr);
-    const char *names[] = {"openProof", "closeProof", "closeDuringOpenProof", "forceSurfaceLossProof",
+    const char *names[] = {"openProof", "restartCapture", "closeProof", "closeDuringOpenProof", "forceSurfaceLossProof",
                           "proofText", "togglePanelProof", "fullscreenProof", "popupOpenProof",
                           "closePopupProof", "videoContainer", "proofPanel"};
     for (const auto *name : names) {
@@ -758,7 +854,7 @@ void FuramiBridge::logGeometry()
     }
 }
 
-LaunchResult run_qt_application(rust::Box<GateCoordinator> gate, rust::Str display)
+LaunchResult run_qt_application(rust::Box<GateCoordinator> gate, rust::Str display, bool qualificationStdin)
 {
     const QByteArray captured(display.data(), static_cast<qsizetype>(display.size()));
     if (captured.isEmpty() || qgetenv("DISPLAY").isEmpty())
@@ -840,6 +936,8 @@ LaunchResult run_qt_application(rust::Box<GateCoordinator> gate, rust::Str displ
         return launchFailure(rootDiagnostic.isEmpty() ? QStringLiteral("QML root creation is missing or still pending") : rootDiagnostic);
     auto *container = root->findChild<QQuickItem *>(QStringLiteral("videoContainer"));
     if (!bridge.bindRoot(root, container, rootDiagnostic))
+        return launchFailure(rootDiagnostic);
+    if (qualificationStdin && !bridge.enableQualificationInput(rootDiagnostic))
         return launchFailure(rootDiagnostic);
     int exitCode = application.exec();
     if (!bridge.quitAuthorized()) {

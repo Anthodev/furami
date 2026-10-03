@@ -13,6 +13,32 @@ use std::{
 
 use super::session::{ObservedFacts, RequestedFacts, SessionError, SessionFacts};
 use crate::capture::input::{CaptureSelection, InputSpec, SelectionError};
+use crate::domain::capture::{AudioError, AudioSelection, PlaybackGain};
+
+#[derive(Clone, Debug)]
+pub struct SessionConfig {
+    pub video: CaptureSelection,
+    pub audio: AudioSelection,
+    pub gain: PlaybackGain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AudioStatus {
+    Disabled,
+    Opening,
+    Active,
+    RestartRequired(AudioError),
+}
+impl AudioStatus {
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Disabled => "Disabled".into(),
+            Self::Opening => "Opening selected audio source".into(),
+            Self::Active => "Selected audio track active".into(),
+            Self::RestartRequired(diagnostic) => format!("Capture restart required: {diagnostic}"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Generation(NonZeroU64);
@@ -47,6 +73,7 @@ pub struct SurfaceToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaybackIntent {
     TogglePause,
+    SetGain(PlaybackGain),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmitStatus {
@@ -92,6 +119,7 @@ pub(crate) struct Snapshot {
     pub paused: bool,
     pub ended: bool,
     pub failure: Option<MediaError>,
+    pub audio: AudioStatus,
 }
 #[derive(Debug)]
 pub(crate) struct OwnerStopped {
@@ -104,18 +132,25 @@ pub(crate) struct OwnerStopped {
 pub(crate) struct StopFlag {
     state: AtomicU8,
     reason: Mutex<Option<MediaError>>,
+    audio_cancel: Arc<AtomicBool>,
 }
 impl StopFlag {
     fn new() -> Self {
         Self {
             state: AtomicU8::new(0),
             reason: Mutex::new(None),
+            audio_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
     pub(crate) fn is_set(&self) -> bool {
         self.state.load(Ordering::Acquire) != 0
     }
+    pub(crate) fn audio_cancel(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.audio_cancel)
+    }
     fn request(&self, error: Option<MediaError>) {
+        // Independent Pulse worker observes this level without waiting for mpv,
+        // its command queue, or even an Opening command reply.
         let level = if error.is_some() { 2 } else { 1 };
         if let Some(error) = error
             && let Ok(mut reason) = self.reason.try_lock()
@@ -124,6 +159,7 @@ impl StopFlag {
             *reason = Some(error);
         }
         self.state.fetch_max(level, Ordering::Release);
+        self.audio_cancel.store(true, Ordering::Release);
     }
     fn outcome(&self) -> Result<(), MediaError> {
         if self.state.load(Ordering::Acquire) == 2 {
@@ -148,6 +184,7 @@ impl RequestId {
     fn next(last: &mut u64) -> Result<Self, MediaError> {
         *last = last
             .checked_add(1)
+            .filter(|next| *next < (1 << 63))
             .ok_or_else(|| MediaError::new("request_exhausted", "mpv request ID exhausted"))?;
         Ok(Self(
             NonZeroU64::new(*last).expect("checked increment is nonzero"),
@@ -158,8 +195,9 @@ impl RequestId {
 pub(crate) enum BackendCommand {
     LoadInput,
     TogglePause,
+    SetGain(PlaybackGain),
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BackendEvent {
     None,
     FileLoaded,
@@ -177,15 +215,26 @@ pub(crate) enum BackendEvent {
     QueueOverflow,
     /// A copied log or an irrelevant event still counts toward the drain limit.
     Other,
+    PauseObserved(bool),
+    Observed {
+        started: bool,
+        facts: ObservedFacts,
+    },
+    AudioStatus(AudioStatus),
 }
 pub(crate) trait OwnerBackend {
     fn initialize(&mut self, token: SurfaceToken, stop: &StopFlag) -> Result<(), MediaError>;
     fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError>;
     fn next_event(&mut self) -> Result<BackendEvent, MediaError>;
-    fn read_pause(&mut self) -> Result<bool, MediaError>;
-    fn read_observed(&mut self) -> Result<ObservedFacts, MediaError>;
+    /// `None` means an asynchronous fresh read is pending. No owner-blocking
+    /// property read is allowed once external audio can be opening or active.
+    fn refresh_pause(&mut self) -> Result<Option<bool>, MediaError>;
+    fn refresh_observed(&mut self, started: bool) -> Result<Option<ObservedFacts>, MediaError>;
     fn diagnostic(&self) -> Option<String>;
-    fn shutdown(&mut self);
+    fn audio_status(&self) -> AudioStatus {
+        AudioStatus::Disabled
+    }
+    fn shutdown(&mut self) -> Result<(), MediaError>;
 }
 
 /// The endpoint contains Rust values only. Dropping it requests stop, never joins.
@@ -210,14 +259,14 @@ impl OwnerEndpoint {
     pub(crate) fn spawn(
         generation: Generation,
         prefix: String,
-        selection: CaptureSelection,
+        config: SessionConfig,
     ) -> Result<Self, MediaError> {
-        let requested = selection.requested();
+        let requested = config.video.requested();
         Self::spawn_capture_with_backend(
             generation,
             requested,
-            move || selection.revalidate(),
-            move |input| super::ffi::MpvBackend::new(prefix, input),
+            move || config.video.revalidate(),
+            move |input| super::ffi::MpvBackend::new(prefix, input, config.audio, config.gain),
         )
     }
 
@@ -330,6 +379,7 @@ impl OwnerEndpoint {
                     paused: false,
                     ended: false,
                     failure: None,
+                    audio: AudioStatus::Disabled,
                 };
                 let outcome = task(
                     &surface_rx,
@@ -431,6 +481,10 @@ impl OwnerEndpoint {
         }
     }
 
+    pub(crate) fn set_gain(&self, generation: Generation, gain: PlaybackGain) -> SubmitStatus {
+        self.submit(generation, PlaybackIntent::SetGain(gain))
+    }
+
     pub(crate) fn stop(&self, generation: Generation, error: Option<MediaError>) -> SubmitStatus {
         if generation != self.generation {
             return SubmitStatus::StaleGeneration;
@@ -504,16 +558,19 @@ impl Drop for OwnerEndpoint {
 
 struct BackendLifetime<B: OwnerBackend>(Option<B>);
 impl<B: OwnerBackend> BackendLifetime<B> {
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> Result<(), MediaError> {
         if let Some(mut backend) = self.0.take() {
-            backend.shutdown();
+            let outcome = backend.shutdown();
             drop(backend);
+            outcome
+        } else {
+            Ok(())
         }
     }
 }
 impl<B: OwnerBackend> Drop for BackendLifetime<B> {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -533,7 +590,7 @@ fn run_backend<B: OwnerBackend>(
     requested: Option<&RequestedFacts>,
 ) -> Result<(), MediaError> {
     let mut backend = BackendLifetime(Some(backend));
-    let outcome = match backend.0.as_mut() {
+    let mut outcome = match backend.0.as_mut() {
         Some(backend) => run_owner(
             backend,
             surface,
@@ -565,7 +622,14 @@ fn run_backend<B: OwnerBackend>(
         generation = snapshot.generation.get(),
         "owner_destroy_begin"
     );
-    backend.shutdown();
+    if let Err(error) = backend.shutdown() {
+        stop.request(Some(error.clone()));
+        if outcome.is_ok() {
+            snapshot.failure = Some(error.clone());
+            publish(latest, snapshot);
+            outcome = Err(error);
+        }
+    }
     tracing::info!(
         generation = snapshot.generation.get(),
         "owner_destroy_complete"
@@ -611,6 +675,7 @@ fn run_owner<B: OwnerBackend>(
         return stop.outcome();
     }
     snapshot.initialized = true;
+    snapshot.audio = backend.audio_status();
     publish(latest, snapshot);
     let id = RequestId::next(&mut last_request)?;
     backend.submit(id, BackendCommand::LoadInput)?;
@@ -630,6 +695,11 @@ fn run_owner<B: OwnerBackend>(
                     pending = Some((id, BackendCommand::TogglePause));
                 }
                 Err(TryRecvError::Empty) => {}
+                Ok(PlaybackIntent::SetGain(gain)) => {
+                    let id = RequestId::next(&mut last_request)?;
+                    backend.submit(id, BackendCommand::SetGain(gain))?;
+                    pending = Some((id, BackendCommand::SetGain(gain)));
+                }
                 Err(TryRecvError::Disconnected) => {
                     return Err(MediaError::new(
                         "command_disconnect",
@@ -651,24 +721,34 @@ fn run_owner<B: OwnerBackend>(
                 }
                 BackendEvent::Other => {}
                 BackendEvent::FileLoaded => {
-                    snapshot.paused = backend.read_pause()?;
+                    if let Some(paused) = backend.refresh_pause()? {
+                        snapshot.paused = paused;
+                    }
                     snapshot.file_loaded = true;
                     publish(latest, snapshot);
                 }
                 BackendEvent::PlaybackRestart | BackendEvent::VideoReconfig => {
                     let started = matches!(event, BackendEvent::PlaybackRestart);
-                    let observed = backend.read_observed()?;
-                    if started || snapshot.playback_started {
-                        if let Some(requested) = requested {
-                            let facts = SessionFacts::verify(requested.clone(), observed)
-                                .map_err(MediaError::from_session)?;
-                            tracing::info!(generation = snapshot.generation.get(),
-                                facts = %serde_json::to_string(&facts).map_err(|error| MediaError::new("capture_metadata", error.to_string()))?,
-                                "capture_observed");
-                            snapshot.session = Some(facts);
+                    if let Some(observed) = backend.refresh_observed(started)? {
+                        apply_observed(snapshot, requested, started, observed)?;
+                        if let Some(paused) = backend.refresh_pause()? {
+                            snapshot.paused = paused;
                         }
-                        snapshot.playback_started |= started;
-                        snapshot.paused = backend.read_pause()?;
+                        publish(latest, snapshot);
+                    }
+                }
+                BackendEvent::Observed { started, facts } => {
+                    apply_observed(snapshot, requested, started, facts)?;
+                    publish(latest, snapshot);
+                }
+                BackendEvent::PauseObserved(paused) => {
+                    snapshot.paused = paused;
+                    publish(latest, snapshot);
+                }
+                BackendEvent::AudioStatus(status) => {
+                    // Source loss remains latched until explicit whole-session restart.
+                    if !matches!(snapshot.audio, AudioStatus::RestartRequired(_)) {
+                        snapshot.audio = status;
                         publish(latest, snapshot);
                     }
                 }
@@ -687,7 +767,9 @@ fn run_owner<B: OwnerBackend>(
                         }
                         pending = None;
                         if kind == BackendCommand::TogglePause {
-                            snapshot.paused = backend.read_pause()?;
+                            if let Some(paused) = backend.refresh_pause()? {
+                                snapshot.paused = paused;
+                            }
                             tracing::info!(
                                 generation = snapshot.generation.get(),
                                 paused = snapshot.paused,
@@ -746,6 +828,26 @@ fn run_owner<B: OwnerBackend>(
     }
 }
 
+fn apply_observed(
+    snapshot: &mut Snapshot,
+    requested: Option<&RequestedFacts>,
+    started: bool,
+    observed: ObservedFacts,
+) -> Result<(), MediaError> {
+    if started || snapshot.playback_started {
+        if let Some(requested) = requested {
+            let facts = SessionFacts::verify(requested.clone(), observed)
+                .map_err(MediaError::from_session)?;
+            tracing::info!(generation = snapshot.generation.get(),
+                facts = %serde_json::to_string(&facts).map_err(|error| MediaError::new("capture_metadata", error.to_string()))?,
+                "capture_observed");
+            snapshot.session = Some(facts);
+        }
+        snapshot.playback_started |= started;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -765,6 +867,8 @@ pub(crate) mod test_support {
         pub initialize_release: Sender<()>,
         pub shutdown_release: Sender<()>,
         pub shutdown_started: Receiver<()>,
+        pub quiesce_started: Receiver<()>,
+        pub quiesce_release: Sender<()>,
     }
 
     #[derive(Default)]
@@ -775,6 +879,7 @@ pub(crate) mod test_support {
         pub hold_initialize: bool,
         pub hold_shutdown: bool,
         pub creates_handle: bool,
+        pub hold_quiesce: bool,
     }
 
     pub(crate) struct FakeBackend {
@@ -786,6 +891,8 @@ pub(crate) mod test_support {
         initialize_release: Receiver<()>,
         shutdown_release: Receiver<()>,
         shutdown_started: Sender<()>,
+        quiesce_started: Sender<()>,
+        quiesce_release: Receiver<()>,
         has_handle: bool,
         paused: bool,
         observed: ObservedFacts,
@@ -800,6 +907,8 @@ pub(crate) mod test_support {
             let (initialize_release, init_rx) = mpsc::channel();
             let (shutdown_release, shutdown_rx) = mpsc::channel();
             let (shutdown_started_tx, shutdown_started) = mpsc::channel();
+            let (quiesce_tx, quiesce_started) = mpsc::channel();
+            let (quiesce_release, quiesce_rx) = mpsc::channel();
             (
                 Self {
                     events,
@@ -809,6 +918,8 @@ pub(crate) mod test_support {
                     initialize_release,
                     shutdown_release,
                     shutdown_started,
+                    quiesce_started,
+                    quiesce_release,
                 },
                 FakeBackend {
                     config,
@@ -819,6 +930,8 @@ pub(crate) mod test_support {
                     initialize_release: init_rx,
                     shutdown_release: shutdown_rx,
                     shutdown_started: shutdown_started_tx,
+                    quiesce_started: quiesce_tx,
+                    quiesce_release: quiesce_rx,
                     has_handle: false,
                     paused: false,
                     observed: ObservedFacts::default(),
@@ -882,28 +995,36 @@ pub(crate) mod test_support {
             }
         }
 
-        fn read_pause(&mut self) -> Result<bool, MediaError> {
+        fn refresh_pause(&mut self) -> Result<Option<bool>, MediaError> {
             if self.config.pause_error {
                 Err(MediaError::new("pause_property", "invalid pause property"))
             } else {
-                Ok(self.paused)
+                Ok(Some(self.paused))
             }
         }
 
-        fn read_observed(&mut self) -> Result<ObservedFacts, MediaError> {
-            Ok(self.observed.clone())
+        fn refresh_observed(
+            &mut self,
+            _started: bool,
+        ) -> Result<Option<ObservedFacts>, MediaError> {
+            Ok(Some(self.observed.clone()))
         }
         fn diagnostic(&self) -> Option<String> {
             None
         }
 
-        fn shutdown(&mut self) {
+        fn shutdown(&mut self) -> Result<(), MediaError> {
             let _ = self.shutdown_started.send(());
             if self.config.hold_shutdown {
                 self.shutdown_release.recv().unwrap();
             }
             self.destroyed.send(self.has_handle).unwrap();
             self.has_handle = false;
+            if self.config.hold_quiesce {
+                self.quiesce_started.send(()).unwrap();
+                self.quiesce_release.recv().unwrap();
+            }
+            Ok(())
         }
     }
 }
@@ -1343,5 +1464,120 @@ mod tests {
             assert!(owner.buffered_ack.is_none());
             assert!(owner.take_stopped().unwrap().is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::test_support::{Config, Driver};
+    use super::*;
+
+    #[test]
+    fn stop_sets_independent_audio_latch_during_blocked_initialization() {
+        let generation = Generation::new(1).unwrap();
+        let (driver, backend) = Driver::pair(Config {
+            hold_initialize: true,
+            ..Config::default()
+        });
+        let mut owner = OwnerEndpoint::spawn_with_backend(generation, move || backend).unwrap();
+        let latch = owner.stop_flag.audio_cancel();
+        owner.attach(SurfaceToken {
+            generation,
+            xid: X11WindowId::new(47).unwrap(),
+        });
+        driver.initialized.recv().unwrap();
+        assert!(!latch.load(Ordering::Acquire));
+        owner.stop(generation, None);
+        assert!(latch.load(Ordering::Acquire));
+        driver.initialize_release.send(()).unwrap();
+        owner.wait_for_ack().unwrap();
+        assert!(owner.take_stopped().unwrap().unwrap().outcome.is_ok());
+        assert!(driver.submitted.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_gain_does_not_dispatch_or_cancel_current_generation() {
+        let generation = Generation::new(1).unwrap();
+        let (driver, backend) = Driver::pair(Config::default());
+        let mut owner = OwnerEndpoint::spawn_with_backend(generation, move || backend).unwrap();
+        owner.attach(SurfaceToken {
+            generation,
+            xid: X11WindowId::new(47).unwrap(),
+        });
+        driver.initialized.recv().unwrap();
+        driver.submitted.recv().unwrap();
+        assert_eq!(
+            owner.set_gain(Generation::new(2).unwrap(), PlaybackGain::default()),
+            SubmitStatus::StaleGeneration
+        );
+        assert!(!owner.stop_flag.audio_cancel().load(Ordering::Acquire));
+        assert!(driver.submitted.try_recv().is_err());
+        owner.stop(generation, None);
+        owner.wait_for_ack().unwrap();
+    }
+
+    #[test]
+    fn destruction_ack_waits_for_audio_worker_quiescence_after_native_destroy() {
+        let generation = Generation::new(1).unwrap();
+        let (driver, backend) = Driver::pair(Config {
+            creates_handle: true,
+            hold_quiesce: true,
+            ..Config::default()
+        });
+        let mut owner = OwnerEndpoint::spawn_with_backend(generation, move || backend).unwrap();
+        owner.attach(SurfaceToken {
+            generation,
+            xid: X11WindowId::new(47).unwrap(),
+        });
+        driver.initialized.recv().unwrap();
+        driver.submitted.recv().unwrap();
+        owner.stop(generation, None);
+        assert!(driver.destroyed.recv().unwrap());
+        driver.quiesce_started.recv().unwrap();
+        assert!(owner.take_stopped().unwrap().is_none());
+        driver.quiesce_release.send(()).unwrap();
+        owner.wait_for_ack().unwrap();
+        assert!(owner.take_stopped().unwrap().unwrap().outcome.is_ok());
+    }
+
+    #[test]
+    fn source_failure_stays_explicit_despite_late_active_then_native_failure_is_terminal() {
+        let generation = Generation::new(1).unwrap();
+        let (driver, backend) = Driver::pair(Config::default());
+        let mut owner = OwnerEndpoint::spawn_with_backend(generation, move || backend).unwrap();
+        owner.attach(SurfaceToken {
+            generation,
+            xid: X11WindowId::new(47).unwrap(),
+        });
+        driver.initialized.recv().unwrap();
+        driver.submitted.recv().unwrap();
+        let failure = AudioError::SourceMissing {
+            name: "exact-selected-source".into(),
+        };
+        driver.send(BackendEvent::AudioStatus(AudioStatus::RestartRequired(
+            failure.clone(),
+        )));
+        driver.send(BackendEvent::AudioStatus(AudioStatus::Active));
+        driver.send(BackendEvent::FileLoaded);
+        driver.fence();
+        let snapshot = owner.take_snapshot().unwrap();
+        assert!(snapshot.file_loaded);
+        assert_eq!(snapshot.audio, AudioStatus::RestartRequired(failure));
+        assert!(snapshot.failure.is_none());
+        driver.send(BackendEvent::EndFile {
+            reason: 4,
+            error: -13,
+        });
+        owner.wait_for_ack().unwrap();
+        assert_eq!(
+            owner
+                .take_stopped()
+                .unwrap()
+                .unwrap()
+                .outcome
+                .unwrap_err()
+                .code,
+            "playback"
+        );
     }
 }

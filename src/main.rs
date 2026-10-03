@@ -7,9 +7,14 @@ extern crate furami as _;
 mod diagnostics;
 mod profiles;
 mod settings;
-use furami::capture::{
-    input::{CaptureArgumentError, CaptureArguments, CaptureSelection, SelectionError},
-    linux,
+use furami::{
+    capture::{
+        audio,
+        input::{CaptureArgumentError, CaptureArguments, CaptureSelection, SelectionError},
+        linux,
+    },
+    domain::capture::{AudioError, AudioSelection, AudioSourceIdentity, PlaybackGain},
+    media::controller::SessionConfig,
 };
 use std::ffi::OsString;
 use tracing_subscriber::EnvFilter;
@@ -48,6 +53,8 @@ enum StartupError {
         #[source]
         source: SelectionError,
     },
+    #[error(transparent)]
+    Audio(#[from] AudioError),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -69,8 +76,110 @@ fn initialize_logging() -> Result<(), StartupError> {
         .map_err(StartupError::SubscriberInstallation)
 }
 
+#[derive(Debug)]
+struct StartupArguments {
+    video: Option<CaptureArguments>,
+    audio_source: Option<String>,
+    audio_off: bool,
+    list_audio_sources: bool,
+    qualification_stdin: bool,
+}
+
+impl StartupArguments {
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, StartupError> {
+        let mut args = args.into_iter();
+        let mut video_args = Vec::new();
+        let mut audio_source = None;
+        let (mut audio_off, mut list_audio_sources, mut qualification_stdin) =
+            (false, false, false);
+        while let Some(flag) = args.next() {
+            let text = flag.to_str().ok_or_else(|| {
+                CaptureArgumentError::InvalidArgument("flag must be UTF-8".into())
+            })?;
+            match text {
+                "--capture-audio-source" => {
+                    if audio_source.is_some() {
+                        return Err(CaptureArgumentError::InvalidArgument(
+                            "duplicate --capture-audio-source".into(),
+                        )
+                        .into());
+                    }
+                    let name = args
+                        .next()
+                        .and_then(|value| value.into_string().ok())
+                        .filter(|value| !value.starts_with("--"))
+                        .ok_or_else(|| {
+                            CaptureArgumentError::InvalidArgument(
+                                "missing UTF-8 value for --capture-audio-source".into(),
+                            )
+                        })?;
+                    // Validate names before discovery. Special default aliases never
+                    // enter a selection, including the disabled retained-source mode.
+                    AudioSourceIdentity::new(name.clone(), Vec::new())?;
+                    audio_source = Some(name);
+                }
+                "--capture-audio-off" | "--list-audio-sources" | "--qualification-stdin" => {
+                    let slot = match text {
+                        "--capture-audio-off" => &mut audio_off,
+                        "--list-audio-sources" => &mut list_audio_sources,
+                        _ => &mut qualification_stdin,
+                    };
+                    if *slot {
+                        return Err(CaptureArgumentError::InvalidArgument(format!(
+                            "duplicate {text}"
+                        ))
+                        .into());
+                    }
+                    *slot = true;
+                }
+                "--capture-node" | "--capture-fourcc" | "--capture-size" | "--capture-rate" => {
+                    let value = args.next().ok_or_else(|| {
+                        CaptureArgumentError::InvalidArgument(format!("missing value for {text}"))
+                    })?;
+                    video_args.push(flag);
+                    video_args.push(value);
+                }
+                _ => {
+                    return Err(CaptureArgumentError::InvalidArgument(format!(
+                        "unknown option {text:?}"
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(Self {
+            video: CaptureArguments::parse(video_args)?,
+            audio_off: audio_off || audio_source.is_none(),
+            audio_source,
+            list_audio_sources,
+            qualification_stdin,
+        })
+    }
+}
+
 fn run() -> Result<(), StartupError> {
-    let capture = parse_capture_args(std::env::args_os().skip(1))?
+    let arguments = StartupArguments::parse(std::env::args_os().skip(1))?;
+    if arguments.list_audio_sources {
+        for source in audio::discover()? {
+            println!("{}\t{}", source.identity.name(), source.description);
+        }
+        return Ok(());
+    }
+    let audio = match arguments.audio_source.as_deref() {
+        Some(name) => {
+            let source = audio::select(&audio::discover()?, name)?;
+            if arguments.audio_off {
+                AudioSelection::Disabled {
+                    retained: Some(source),
+                }
+            } else {
+                AudioSelection::Enabled { source }
+            }
+        }
+        None => AudioSelection::default(),
+    };
+    let capture = arguments
+        .video
         .map(|args| {
             let snapshot = linux::discover().map_err(|source| StartupError::CaptureDiscovery {
                 request: args.to_string(),
@@ -81,7 +190,11 @@ fn run() -> Result<(), StartupError> {
                     request: args.to_string(),
                     source,
                 })?;
-            Ok::<_, StartupError>(selection)
+            Ok::<_, StartupError>(SessionConfig {
+                video: selection,
+                audio,
+                gain: PlaybackGain::default(),
+            })
         })
         .transpose()?;
     let x11_display = match std::env::var("DISPLAY") {
@@ -100,15 +213,14 @@ fn run() -> Result<(), StartupError> {
         media_prefix = media_prefix.as_str(),
         "starting Qt application"
     );
-    furami::native_host::run_application(&media_prefix, &x11_display, capture)?;
+    furami::native_host::run_application(
+        &media_prefix,
+        &x11_display,
+        capture,
+        arguments.qualification_stdin,
+    )?;
     tracing::info!("Qt application exited");
     Ok(())
-}
-
-fn parse_capture_args(
-    args: impl IntoIterator<Item = OsString>,
-) -> Result<Option<CaptureArguments>, StartupError> {
-    Ok(CaptureArguments::parse(args)?)
 }
 
 #[cfg(test)]
@@ -122,8 +234,8 @@ mod tests {
 
     #[test]
     fn capture_cli_requires_complete_explicit_tuple_and_checked_values() {
-        assert!(parse_capture_args(args(&[])).unwrap().is_none());
-        let parsed = parse_capture_args(args(&[
+        assert!(StartupArguments::parse(args(&[])).unwrap().video.is_none());
+        let parsed = StartupArguments::parse(args(&[
             "--capture-node",
             "/dev/video0",
             "--capture-fourcc",
@@ -134,19 +246,20 @@ mod tests {
             "60/1",
         ]))
         .unwrap()
+        .video
         .unwrap();
         assert_eq!(parsed.node, std::path::Path::new("/dev/video0"));
         assert_eq!(parsed.mode.rate.numerator(), 60);
         assert_eq!(parsed.mode.rate.denominator(), 1);
         assert!(matches!(
-            parse_capture_args(args(&["--capture-node", "/dev/video0"])),
+            StartupArguments::parse(args(&["--capture-node", "/dev/video0"])),
             Err(StartupError::CaptureArguments(
                 CaptureArgumentError::IncompleteSelection
             ))
         ));
         for value in ["0x1440", "2560x0", "2560x1440x1"] {
             assert!(
-                parse_capture_args(args(&[
+                StartupArguments::parse(args(&[
                     "--capture-node",
                     "/dev/video0",
                     "--capture-fourcc",
@@ -160,7 +273,7 @@ mod tests {
             );
         }
         assert!(
-            parse_capture_args(args(&[
+            StartupArguments::parse(args(&[
                 "--capture-node",
                 "/dev/video0",
                 "--capture-fourcc",
@@ -186,7 +299,56 @@ mod tests {
             ],
             vec!["--proof-source", "testsrc2"],
         ] {
-            assert!(parse_capture_args(args(&values)).is_err());
+            assert!(StartupArguments::parse(args(&values)).is_err());
+        }
+    }
+
+    #[test]
+    fn audio_cli_is_explicit_and_can_start_disabled_with_retained_source() {
+        let defaults = StartupArguments::parse(args(&[])).unwrap();
+        assert!(defaults.audio_source.is_none() && defaults.audio_off);
+        assert!(!defaults.list_audio_sources && !defaults.qualification_stdin);
+        let enabled =
+            StartupArguments::parse(args(&["--capture-audio-source", "exact.usb.source"])).unwrap();
+        assert_eq!(enabled.audio_source.as_deref(), Some("exact.usb.source"));
+        assert!(!enabled.audio_off);
+        let disabled = StartupArguments::parse(args(&[
+            "--capture-audio-source",
+            "exact.usb.source",
+            "--capture-audio-off",
+            "--qualification-stdin",
+        ]))
+        .unwrap();
+        assert_eq!(disabled.audio_source.as_deref(), Some("exact.usb.source"));
+        assert!(disabled.audio_off && disabled.qualification_stdin);
+        assert!(
+            StartupArguments::parse(args(&["--list-audio-sources"]))
+                .unwrap()
+                .list_audio_sources
+        );
+    }
+
+    #[test]
+    fn audio_cli_rejects_duplicate_flags_aliases_and_missing_values() {
+        for values in [
+            vec!["--capture-audio-source"],
+            vec!["--capture-audio-source", ""],
+            vec!["--capture-audio-source", "@DEFAULT_SOURCE@"],
+            vec![
+                "--capture-audio-source",
+                "exact",
+                "--capture-audio-source",
+                "other",
+            ],
+            vec!["--capture-audio-off", "--capture-audio-off"],
+            vec!["--qualification-stdin", "--qualification-stdin"],
+            vec!["--list-audio-sources", "--list-audio-sources"],
+            vec!["--capture-audio-source", "--capture-audio-off"],
+        ] {
+            assert!(
+                StartupArguments::parse(args(&values)).is_err(),
+                "{values:?}"
+            );
         }
     }
 }

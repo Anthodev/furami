@@ -1,5 +1,5 @@
-//! Pure capture-domain model: USB identity, kernel rationals, native descriptors,
-//! exact tuple validation and identity resolution.
+//! Pure capture-domain model: USB identity, native video tuples and explicit
+//! audio source identity, selection and playback gain.
 //!
 //! Allowed dependencies: `std`, `serde` (Serialize only), `thiserror`. No Qt, no
 //! native pointers, no node paths, no Linux access. Fraction arithmetic is exact
@@ -36,6 +36,144 @@ pub enum IdentityError {
     SeriallessDuplicates { candidates: usize },
     #[error("{candidates} devices report the requested serial")]
     DuplicateSerial { candidates: usize },
+}
+
+/// Owned Pulse failures. Silence and a suspended source are not failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
+pub enum AudioError {
+    #[error("audio service unavailable: {0}")]
+    Unavailable(String),
+    #[error("invalid audio selection: {0}")]
+    InvalidSelection(String),
+    #[error("selected audio source `{name}` is unavailable")]
+    SourceMissing { name: String },
+    #[error("selected audio source `{name}` changed identity")]
+    SourceChanged { name: String },
+    #[error("owned audio recording transport lost: {detail}")]
+    RecordingLost { detail: String },
+    #[error("ambiguous audio ownership: {0}")]
+    Ambiguous(String),
+    #[error("audio opening cancelled")]
+    Cancelled,
+    #[error("audio cancellation failed: {0}")]
+    Control(String),
+    #[error("audio backend {operation} failed (code {code:?}): {detail}")]
+    Backend {
+        operation: String,
+        code: Option<i32>,
+        detail: String,
+    },
+}
+
+/// Exact source name plus stable properties observed when selected. Server
+/// indices, ALSA card numbers, running/suspended state and mixer values are not
+/// identity. Missing previously observed properties fail revalidation closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AudioSourceIdentity {
+    name: String,
+    stable_properties: Vec<(String, String)>,
+}
+
+impl AudioSourceIdentity {
+    pub fn new(
+        name: String,
+        mut stable_properties: Vec<(String, String)>,
+    ) -> Result<Self, AudioError> {
+        if name.trim().is_empty() || name.contains('\0') || name.starts_with('@') {
+            return Err(AudioError::InvalidSelection(
+                "explicit source name required".into(),
+            ));
+        }
+        stable_properties.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if stable_properties.iter().any(|(key, value)| {
+            key.is_empty() || value.is_empty() || key.contains('\0') || value.contains('\0')
+        }) || stable_properties
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0)
+        {
+            return Err(AudioError::InvalidSelection(
+                "invalid stable source properties".into(),
+            ));
+        }
+        Ok(Self {
+            name,
+            stable_properties,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn compatible_with(&self, observed: &Self) -> bool {
+        self.name == observed.name
+            && self.stable_properties.iter().all(|property| {
+                observed
+                    .stable_properties
+                    .binary_search_by(|other| other.0.cmp(&property.0))
+                    .is_ok_and(|index| observed.stable_properties[index].1 == property.1)
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum AudioSelection {
+    Disabled {
+        retained: Option<AudioSourceIdentity>,
+    },
+    Enabled {
+        source: AudioSourceIdentity,
+    },
+}
+
+impl Default for AudioSelection {
+    fn default() -> Self {
+        Self::Disabled { retained: None }
+    }
+}
+
+impl AudioSelection {
+    /// Includes the retained disabled selection, never an implicit default.
+    pub fn source(&self) -> Option<&AudioSourceIdentity> {
+        match self {
+            Self::Disabled { retained } => retained.as_ref(),
+            Self::Enabled { source } => Some(source),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+}
+
+/// Playback-only gain; never applied to the capture-source mixer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PlaybackGain {
+    pub volume_percent: u8,
+    pub muted: bool,
+}
+
+impl Default for PlaybackGain {
+    fn default() -> Self {
+        Self {
+            volume_percent: 100,
+            muted: false,
+        }
+    }
+}
+
+impl PlaybackGain {
+    pub fn new(volume_percent: u8, muted: bool) -> Result<Self, AudioError> {
+        if volume_percent > 100 {
+            return Err(AudioError::InvalidSelection(
+                "playback volume must be 0..=100".into(),
+            ));
+        }
+        Ok(Self {
+            volume_percent,
+            muted,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -780,6 +918,72 @@ pub fn resolve_identity<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_identity_ignores_new_properties_but_never_drops_known_identity() {
+        let selected = AudioSourceIdentity::new(
+            "capture".into(),
+            vec![("device.serial".into(), "serial".into())],
+        )
+        .unwrap();
+        let enriched = AudioSourceIdentity::new(
+            "capture".into(),
+            vec![
+                ("device.serial".into(), "serial".into()),
+                ("device.bus".into(), "usb".into()),
+            ],
+        )
+        .unwrap();
+        assert!(selected.compatible_with(&enriched));
+        assert!(
+            !selected.compatible_with(&AudioSourceIdentity::new("capture".into(), vec![]).unwrap())
+        );
+        assert!(
+            !selected.compatible_with(
+                &AudioSourceIdentity::new(
+                    "capture".into(),
+                    vec![("device.serial".into(), "other".into())],
+                )
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn audio_identity_rejects_default_aliases_nul_and_duplicate_keys() {
+        for name in ["", "@DEFAULT_SOURCE@", "@DEFAULT_MONITOR@", "bad\0name"] {
+            assert!(AudioSourceIdentity::new(name.into(), vec![]).is_err());
+        }
+        assert!(
+            AudioSourceIdentity::new(
+                "capture".into(),
+                vec![
+                    ("device.serial".into(), "a".into()),
+                    ("device.serial".into(), "b".into())
+                ],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn disabled_audio_retains_selection_without_enabling_capture() {
+        let source = AudioSourceIdentity::new("capture".into(), vec![]).unwrap();
+        let selection = AudioSelection::Disabled {
+            retained: Some(source.clone()),
+        };
+        assert!(!selection.enabled());
+        assert_eq!(selection.source(), Some(&source));
+        assert_eq!(AudioSelection::default().source(), None);
+    }
+
+    #[test]
+    fn playback_gain_rejects_amplification_and_preserves_muting() {
+        assert!(PlaybackGain::new(101, false).is_err());
+        assert_eq!(PlaybackGain::new(0, true).unwrap().volume_percent, 0);
+        assert!(PlaybackGain::new(75, true).unwrap().muted);
+        assert_eq!(PlaybackGain::default().volume_percent, 100);
+    }
 
     const NV12: CapturedFourCc = CapturedFourCc::from_bytes(*b"NV12");
     const YUYV: CapturedFourCc = CapturedFourCc::from_bytes(*b"YUYV");

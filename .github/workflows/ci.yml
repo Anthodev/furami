@@ -27,6 +27,7 @@ jobs:
             lld \
             libgl1-mesa-dev \
             libx11-dev \
+            libpulse0 \
             libxcb1-dev \
             libxcb-shape0-dev
 
