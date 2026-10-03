@@ -11,13 +11,14 @@ pub struct NativeLaunchError {
 pub fn run_application(
     media_prefix: &str,
     display: &str,
-    selection: Option<crate::capture::input::CaptureSelection>,
+    config: Option<crate::media::controller::SessionConfig>,
+    qualification_stdin: bool,
 ) -> Result<(), NativeLaunchError> {
     let gate = Box::new(crate::app::gate::GateCoordinator::new(
         media_prefix.to_owned(),
-        selection,
+        config,
     ));
-    let result = crate::ui::bridge::ffi::run_qt_application(gate, display);
+    let result = crate::ui::bridge::ffi::run_qt_application(gate, display, qualification_stdin);
     if result.exit_code == 0 {
         Ok(())
     } else {

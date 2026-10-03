@@ -1,4 +1,4 @@
-//! Read-only Linux USB UVC capability discovery.
+//! Linux USB UVC discovery and private libpulse recording control.
 //!
 //! Node classification uses `device_caps` when QUERYCAP reports DEVICE_CAPS,
 //! otherwise its global `capabilities`. VIDEO_CAPTURE and VIDEO_CAPTURE_MPLANE
@@ -25,6 +25,7 @@ use crate::domain::capture::{
 };
 
 mod ffi;
+pub(crate) mod pulse;
 mod udev;
 mod v4l2;
 

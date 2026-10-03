@@ -36,6 +36,12 @@ pub(crate) mod ffi {
         changed: bool,
         phase: GatePhase,
         generation: u64,
+        restart_generation: u64,
+        can_restart: bool,
+        audio_status: String,
+        audio_diagnostic: String,
+        audio_source: String,
+        audio_enabled: bool,
         failed: bool,
         diagnostic: String,
         paused: bool,
@@ -49,13 +55,19 @@ pub(crate) mod ffi {
     // carries owned values only; C++ owns Qt lifetime through event-loop exit.
     unsafe extern "C++" {
         include!("host.h");
-        fn run_qt_application(gate: Box<GateCoordinator>, display: &str) -> LaunchResult;
+        fn run_qt_application(
+            gate: Box<GateCoordinator>,
+            display: &str,
+            qualification_stdin: bool,
+        ) -> LaunchResult;
     }
 
     extern "Rust" {
         type GateCoordinator;
         fn gate_capture_selected(gate: &GateCoordinator) -> bool;
         fn gate_open(gate: &mut GateCoordinator) -> UiUpdate;
+        fn gate_restart(gate: &mut GateCoordinator, generation: u64) -> UiUpdate;
+        fn gate_qualification_command(gate: &mut GateCoordinator, line: &str) -> UiUpdate;
         fn gate_surface_ready(gate: &mut GateCoordinator, generation: u64, xid: u64) -> UiUpdate;
         fn gate_surface_lost(gate: &mut GateCoordinator, generation: u64) -> UiUpdate;
         fn gate_wait_for_owner_ack(gate: &mut GateCoordinator, generation: u64) -> String;
@@ -85,6 +97,16 @@ impl From<gate::UiUpdate> for ffi::UiUpdate {
             changed: update.changed,
             phase,
             generation: update.generation.map(Generation::get).unwrap_or(0),
+            restart_generation: update.restart_generation.map(Generation::get).unwrap_or(0),
+            can_restart: update.can_restart,
+            audio_status: if update.changed {
+                update.audio_status.to_owned()
+            } else {
+                String::new()
+            },
+            audio_source: update.audio_source,
+            audio_enabled: update.audio_enabled,
+            audio_diagnostic: update.audio_diagnostic,
             failed: update.failed,
             diagnostic: update.diagnostic,
             paused: update.paused,
@@ -101,6 +123,15 @@ fn gate_capture_selected(gate: &GateCoordinator) -> bool {
 }
 fn gate_open(gate: &mut GateCoordinator) -> ffi::UiUpdate {
     gate.open().into()
+}
+fn gate_restart(gate: &mut GateCoordinator, generation: u64) -> ffi::UiUpdate {
+    Generation::new(generation)
+        .map(|generation| gate.restart(generation))
+        .unwrap_or_else(|| gate.unchanged())
+        .into()
+}
+fn gate_qualification_command(gate: &mut GateCoordinator, line: &str) -> ffi::UiUpdate {
+    gate.qualification_command(line).into()
 }
 fn gate_surface_ready(gate: &mut GateCoordinator, generation: u64, xid: u64) -> ffi::UiUpdate {
     match (Generation::new(generation), X11WindowId::new(xid)) {

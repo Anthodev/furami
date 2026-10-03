@@ -3,9 +3,12 @@
 
 #include "rust/cxx.h"
 
+#include <QByteArray>
+
 #include <QPointer>
 #include <QQuickItem>
 #include <QQuickWindow>
+#include <QSocketNotifier>
 #include <QString>
 #include <QTimer>
 #include <QWindow>
@@ -34,6 +37,12 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(bool panelVisible READ panelVisible WRITE setPanelVisible NOTIFY panelVisibleChanged)
     Q_PROPERTY(bool popupOpen READ popupOpen WRITE setPopupOpen NOTIFY popupOpenChanged)
     Q_PROPERTY(bool captureSelected READ captureSelected CONSTANT)
+    Q_PROPERTY(bool canRestart READ canRestart NOTIFY stateChanged)
+    Q_PROPERTY(QString restartGeneration READ restartGeneration NOTIFY stateChanged)
+    Q_PROPERTY(QString audioStatus READ audioStatus NOTIFY stateChanged)
+    Q_PROPERTY(QString audioDiagnostic READ audioDiagnostic NOTIFY stateChanged)
+    Q_PROPERTY(QString audioSource READ audioSource NOTIFY stateChanged)
+    Q_PROPERTY(bool audioEnabled READ audioEnabled NOTIFY stateChanged)
 
 public:
     explicit FuramiBridge(rust::Box<GateCoordinator> gate);
@@ -48,15 +57,23 @@ public:
     bool panelVisible() const;
     bool popupOpen() const;
     bool captureSelected() const;
+    bool canRestart() const;
+    QString restartGeneration() const;
+    QString audioStatus() const;
+    QString audioDiagnostic() const;
+    QString audioSource() const;
+    bool audioEnabled() const;
     void setTextEntryActive(bool active);
     void setPanelVisible(bool visible);
     void setPopupOpen(bool open);
 
     bool bindRoot(QQuickWindow *root, QQuickItem *container, QString &diagnostic);
+    bool enableQualificationInput(QString &diagnostic);
     Q_INVOKABLE bool quitAuthorized() const;
     bool failed() const;
 
     Q_INVOKABLE void openCapture();
+    Q_INVOKABLE void restartCapture(const QString &expectedGeneration);
     Q_INVOKABLE void closeCapture();
     Q_INVOKABLE void openAndCloseDuringOpeningForProof();
     Q_INVOKABLE void forceSurfaceLossForProof();
@@ -89,16 +106,27 @@ private:
     void failNative(std::uint64_t generation, const QString &diagnostic);
     void scheduleGeometryLog();
     void logGeometry();
+    void readQualificationInput();
 
     rust::Box<GateCoordinator> m_gate;
     QTimer m_pollTimer;
     QPointer<HostWindow> m_host;
+    QPointer<QSocketNotifier> m_qualificationInput;
+    QByteArray m_qualificationLine;
+    int m_stdinFlags = -1;
+    bool m_dropQualificationLine = false;
     QPointer<QQuickWindow> m_root;
     QPointer<QQuickItem> m_container;
     QString m_actualPhase = QStringLiteral("Idle");
     QString m_diagnostic;
     QString m_nativeDiagnostic;
     std::uint64_t m_generation = 0;
+    std::uint64_t m_restartGeneration = 0;
+    bool m_canRestart = false;
+    QString m_audioStatus = QStringLiteral("Disabled");
+    QString m_audioDiagnostic;
+    QString m_audioSource;
+    bool m_audioEnabled = false;
     std::uint64_t m_nativeGeneration = 0;
     std::uint64_t m_rootXid = 0;
     std::uint64_t m_lastHostXid = 0;
@@ -119,7 +147,7 @@ private:
     bool m_insideSurfaceCallback = false;
 };
 
-LaunchResult run_qt_application(rust::Box<GateCoordinator> gate, rust::Str display);
+LaunchResult run_qt_application(rust::Box<GateCoordinator> gate, rust::Str display, bool qualificationStdin);
 
 } // namespace furami::bridge
 

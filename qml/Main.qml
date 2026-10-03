@@ -97,6 +97,13 @@ ApplicationWindow {
                     onClicked: root.bridge.openCapture()
                 }
                 Button {
+                    objectName: "restartCapture"
+                    text: "Restart capture"
+                    Layout.fillWidth: true
+                    enabled: root.bridge.canRestart
+                    onClicked: root.bridge.restartCapture(root.bridge.restartGeneration)
+                }
+                Button {
                     objectName: "closeProof"
                     text: "Close session"
                     Layout.fillWidth: true
@@ -122,6 +129,15 @@ ApplicationWindow {
                         : root.bridge.paused ? "Playback paused" : "Space pauses / resumes video"
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
+                }
+                Label {
+                    text: "Audio: " + root.bridge.audioStatus
+                        + (root.bridge.audioSource.length > 0 ? "\n" + root.bridge.audioSource : "")
+                        + (!root.bridge.audioEnabled && root.bridge.audioSource.length > 0 ? "\nSelected source retained" : "")
+                        + (root.bridge.audioDiagnostic.length > 0 ? "\n" + root.bridge.audioDiagnostic : "")
+                    wrapMode: Text.WrapAnywhere
+                    Layout.fillWidth: true
+                    Accessible.name: "Capture audio status"
                 }
                 TextField {
                     id: proofText
