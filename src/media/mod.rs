@@ -4,4 +4,5 @@
 pub mod capabilities;
 pub mod controller;
 mod ffi;
+pub(crate) mod gate;
 pub mod session;

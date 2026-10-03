@@ -1,0 +1,947 @@
+//! Qt-thread composition: product coordinator plus capture/media adapters.
+
+use crate::{
+    app::{
+        apply::ApplyCoordinator,
+        control::{self, Command, ExpectedCleanup, ExpectedState},
+        gate::GatePhase,
+        ports::{ImmediateIntent, SubmitStatus},
+    },
+    capture::CaptureValidator,
+    domain::{
+        capture::{AudioSelection, AudioSourceIdentity, PlaybackGain},
+        state::{
+            AttemptId, CleanupStatus, CommandRejection, DraftRevision, DraftSettings, StateIdentity,
+        },
+    },
+    media::{
+        controller::{AudioStatus, SurfaceToken},
+        gate::GateRunner,
+    },
+};
+
+type Engine = ApplyCoordinator<CaptureValidator, GateRunner>;
+
+pub(crate) struct UiUpdate {
+    pub changed: bool,
+    pub phase: GatePhase,
+    pub generation: u64,
+    pub restart_generation: u64,
+    pub can_open: bool,
+    pub can_restart: bool,
+    pub audio_status: String,
+    pub audio_source: String,
+    pub audio_enabled: bool,
+    pub audio_diagnostic: String,
+    pub failed: bool,
+    pub diagnostic: String,
+    pub paused: bool,
+    pub ended: bool,
+    pub create_native: bool,
+    pub release_native: bool,
+    pub quit: bool,
+}
+
+pub(crate) struct RuntimeCoordinator {
+    engine: Option<Engine>,
+    sources: Vec<AudioSourceIdentity>,
+    dirty: bool,
+    last_state: Option<(StateIdentity, DraftRevision, PlaybackGain)>,
+    command_error: String,
+    quit_empty: bool,
+}
+impl RuntimeCoordinator {
+    pub(crate) fn new(
+        prefix: String,
+        settings: Option<DraftSettings>,
+        gain: PlaybackGain,
+        sources: Vec<AudioSourceIdentity>,
+    ) -> Self {
+        Self {
+            engine: settings.map(|settings| {
+                ApplyCoordinator::new(
+                    settings,
+                    gain,
+                    CaptureValidator::new(),
+                    GateRunner::new(prefix),
+                )
+            }),
+            sources,
+            dirty: true,
+            last_state: None,
+            command_error: String::new(),
+            quit_empty: false,
+        }
+    }
+    pub(crate) fn capture_selected(&self) -> bool {
+        self.engine.is_some()
+    }
+    fn rejection(&mut self, error: impl std::fmt::Display) {
+        self.command_error = error.to_string();
+        self.dirty = true;
+        tracing::warn!(error = %self.command_error, "qualification_command_rejected");
+    }
+    pub(crate) fn open(&mut self) -> UiUpdate {
+        if let Some(engine) = &mut self.engine {
+            let result = if engine.model().can_reconnect() {
+                engine.reconnect(engine.model().state_identity())
+            } else {
+                engine.apply(
+                    engine.model().state_identity(),
+                    engine.model().draft().revision,
+                )
+            };
+            if let Err(error) = result {
+                self.rejection(error);
+            } else {
+                self.command_error.clear();
+                self.dirty = true;
+            }
+        }
+        self.poll()
+    }
+    pub(crate) fn restart(&mut self, expected_attempt: u64) -> UiUpdate {
+        if let Some(engine) = &mut self.engine {
+            let current = engine
+                .model()
+                .state_identity()
+                .attempt()
+                .map(AttemptId::get)
+                .unwrap_or(0);
+            if current != expected_attempt {
+                self.rejection(CommandRejection::StaleState);
+            } else {
+                let result = engine.restart(engine.model().state_identity());
+                if let Err(error) = result {
+                    self.rejection(error);
+                } else {
+                    self.command_error.clear();
+                    self.dirty = true;
+                }
+            }
+        }
+        self.poll()
+    }
+    pub(crate) fn close(&mut self, expected_attempt: u64) -> UiUpdate {
+        if let Some(engine) = &mut self.engine {
+            let current = engine
+                .model()
+                .state_identity()
+                .attempt()
+                .map(AttemptId::get)
+                .unwrap_or(0);
+            if current != expected_attempt {
+                self.rejection(CommandRejection::StaleState);
+            } else {
+                let result = engine.close(engine.model().state_identity());
+                if let Err(error) = result {
+                    self.rejection(error);
+                } else {
+                    self.command_error.clear();
+                    self.dirty = true;
+                }
+            }
+        }
+        self.poll()
+    }
+    pub(crate) fn quit(&mut self) -> UiUpdate {
+        if let Some(engine) = &mut self.engine {
+            engine.quit();
+        } else {
+            self.quit_empty = true;
+        }
+        self.dirty = true;
+        self.poll()
+    }
+    pub(crate) fn surface_ready(&mut self, token: SurfaceToken) -> UiUpdate {
+        if let Some(engine) = &mut self.engine {
+            engine.runner_mut().surface_ready(token);
+        }
+        self.poll()
+    }
+    pub(crate) fn surface_lost(&mut self, attempt: AttemptId) -> UiUpdate {
+        if let Some(engine) = &mut self.engine {
+            engine.runner_mut().surface_lost(attempt);
+        }
+        self.poll()
+    }
+    pub(crate) fn wait_for_owner_ack(&mut self, attempt: AttemptId) -> String {
+        match &mut self.engine {
+            Some(engine) => engine
+                .runner_mut()
+                .wait_for_owner_ack(attempt)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default(),
+            None => "surface_loss_barrier: no capture engine".into(),
+        }
+    }
+    pub(crate) fn native_released(&mut self, attempt: AttemptId) -> UiUpdate {
+        if let Some(engine) = &mut self.engine {
+            engine.runner_mut().native_released(attempt);
+        }
+        self.poll()
+    }
+    pub(crate) fn pause(&mut self, attempt: AttemptId) -> SubmitStatus {
+        self.engine
+            .as_mut()
+            .map(|engine| engine.submit_immediate(attempt, ImmediateIntent::TogglePause))
+            .unwrap_or(SubmitStatus::NotReady)
+    }
+    fn checked_state(
+        engine: &Engine,
+        expected: ExpectedState,
+    ) -> Result<StateIdentity, CommandRejection> {
+        let identity = engine.model().state_identity();
+        let cleanup = match engine.model().cleanup() {
+            CleanupStatus::Complete => ExpectedCleanup::Complete,
+            CleanupStatus::Draining => ExpectedCleanup::Draining,
+            CleanupStatus::Blocked { .. } => ExpectedCleanup::Blocked,
+        };
+        if engine.model().phase() != expected.phase
+            || identity.operation().map(|id| id.get()).unwrap_or(0) != expected.apply
+            || identity.attempt().map(AttemptId::get).unwrap_or(0) != expected.attempt
+            || cleanup != expected.cleanup
+        {
+            Err(CommandRejection::StaleState)
+        } else {
+            Ok(identity)
+        }
+    }
+    pub(crate) fn qualification_command(&mut self, line: &str) -> UiUpdate {
+        let command = match control::parse(line) {
+            Ok(command) => command,
+            Err(error) => {
+                self.rejection(error);
+                return self.poll();
+            }
+        };
+        if command == Command::Snapshot {
+            self.dirty = true;
+            return self.poll();
+        }
+        let Some(engine) = &mut self.engine else {
+            self.rejection("no explicit startup capture selection");
+            return self.poll();
+        };
+        let result: Result<(), String> = (|| {
+            match command {
+                Command::Video(revision, mode) => {
+                    let mut settings = engine.model().draft().settings.clone();
+                    settings.video.mode = mode;
+                    engine
+                        .edit_draft(revision, settings)
+                        .map_err(|error| error.to_string())?;
+                }
+                Command::Identity(revision, identity) => {
+                    let mut settings = engine.model().draft().settings.clone();
+                    settings.video.identity = identity;
+                    engine
+                        .edit_draft(revision, settings)
+                        .map_err(|error| error.to_string())?;
+                }
+                Command::Audio(revision, enabled) => {
+                    let mut settings = engine.model().draft().settings.clone();
+                    let source = settings.audio.source().cloned();
+                    settings.audio = if enabled {
+                        AudioSelection::Enabled {
+                            source: source
+                                .ok_or("enabling audio requires explicitly retained source")?,
+                        }
+                    } else {
+                        AudioSelection::Disabled { retained: source }
+                    };
+                    engine
+                        .edit_draft(revision, settings)
+                        .map_err(|error| error.to_string())?;
+                }
+                Command::Source(revision, name) => {
+                    let mut matches = self.sources.iter().filter(|source| source.name() == name);
+                    let source = matches
+                        .next()
+                        .ok_or("source absent from enumerated startup audio catalog")?
+                        .clone();
+                    if matches.next().is_some() {
+                        return Err("source ambiguous in enumerated startup audio catalog".into());
+                    }
+                    let mut settings = engine.model().draft().settings.clone();
+                    settings.audio = if settings.audio.enabled() {
+                        AudioSelection::Enabled { source }
+                    } else {
+                        AudioSelection::Disabled {
+                            retained: Some(source),
+                        }
+                    };
+                    engine
+                        .edit_draft(revision, settings)
+                        .map_err(|error| error.to_string())?;
+                }
+                Command::Apply(expected, revision) => {
+                    let state =
+                        Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
+                    engine
+                        .apply(state, revision)
+                        .map_err(|error| error.to_string())?;
+                }
+                Command::Restart(expected) => {
+                    let state =
+                        Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
+                    engine.restart(state).map_err(|error| error.to_string())?;
+                }
+                Command::Reconnect(expected) => {
+                    let state =
+                        Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
+                    engine.reconnect(state).map_err(|error| error.to_string())?;
+                }
+                Command::Close(expected) => {
+                    let state =
+                        Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
+                    engine.close(state).map_err(|error| error.to_string())?;
+                }
+                Command::Quit(expected) => {
+                    Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
+                    engine.quit();
+                }
+                Command::Volume(attempt, percent) => {
+                    let gain = PlaybackGain::new(percent, engine.gain().muted)
+                        .map_err(|error| error.to_string())?;
+                    let status = engine.submit_immediate(attempt, ImmediateIntent::SetGain(gain));
+                    tracing::info!(attempt_id = attempt.get(), ?status, "qualification_volume");
+                    if status != SubmitStatus::Accepted {
+                        return Err(format!("volume submission {status:?}"));
+                    }
+                }
+                Command::Mute(attempt, muted) => {
+                    let gain = PlaybackGain {
+                        muted,
+                        ..engine.gain()
+                    };
+                    let status = engine.submit_immediate(attempt, ImmediateIntent::SetGain(gain));
+                    tracing::info!(attempt_id = attempt.get(), ?status, "qualification_mute");
+                    if status != SubmitStatus::Accepted {
+                        return Err(format!("mute submission {status:?}"));
+                    }
+                }
+                Command::Snapshot => {}
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.command_error.clear();
+                self.dirty = true;
+            }
+            Err(error) => self.rejection(error),
+        }
+        self.poll()
+    }
+    pub(crate) fn poll(&mut self) -> UiUpdate {
+        let Some(engine) = &mut self.engine else {
+            let changed = std::mem::take(&mut self.dirty);
+            return UiUpdate {
+                changed,
+                phase: if self.quit_empty {
+                    GatePhase::QuitReady
+                } else {
+                    GatePhase::Idle
+                },
+                generation: 0,
+                restart_generation: 0,
+                can_open: false,
+                can_restart: false,
+                audio_status: if changed {
+                    "Disabled".into()
+                } else {
+                    String::new()
+                },
+                audio_source: String::new(),
+                audio_enabled: false,
+                audio_diagnostic: String::new(),
+                failed: false,
+                diagnostic: if changed {
+                    if self.command_error.is_empty() {
+                        "No capture selected. Start with --capture-node, --capture-fourcc, --capture-size and --capture-rate.".into()
+                    } else {
+                        self.command_error.clone()
+                    }
+                } else {
+                    String::new()
+                },
+                paused: false,
+                ended: false,
+                create_native: false,
+                release_native: false,
+                quit: self.quit_empty,
+            };
+        };
+        engine.poll();
+        let native = engine.runner_mut().take_native_update();
+        let identity = engine.model().state_identity();
+        let stamp = (identity, engine.model().draft().revision, engine.gain());
+        let changed =
+            std::mem::take(&mut self.dirty) || native.changed || self.last_state != Some(stamp);
+        self.last_state = Some(stamp);
+        let owned_audio = engine.runner_mut().requested_audio().map(|audio| {
+            let source = if changed {
+                audio
+                    .source()
+                    .map(|source| source.name().to_owned())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (source, audio.enabled())
+        });
+        let model = engine.model();
+        let (source, audio_enabled) = owned_audio.unwrap_or_else(|| {
+            let draft_audio = &model.draft().settings.audio;
+            let source = if changed {
+                draft_audio
+                    .source()
+                    .map(|source| source.name().to_owned())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (source, draft_audio.enabled())
+        });
+        let can_open = model.can_apply() || model.can_reconnect();
+        let can_restart = model.can_restart() || model.can_reconnect();
+        let restart_generation = identity.attempt().map(AttemptId::get).unwrap_or(0);
+        let quit = model.shutdown_ready();
+        let mut diagnostic = String::new();
+        if changed {
+            if let Some(rejection) = model.validation_rejection() {
+                diagnostic.push_str(&rejection.failure.to_string());
+            }
+            if let Some(failures) = model.failures() {
+                for failure in failures
+                    .incumbent
+                    .iter()
+                    .chain(failures.candidate.iter())
+                    .chain(failures.restore.iter())
+                    .chain(failures.cleanup.iter())
+                {
+                    if !diagnostic.is_empty() {
+                        diagnostic.push('\n');
+                    }
+                    diagnostic.push_str(&failure.to_string());
+                }
+            }
+            if !self.command_error.is_empty() {
+                if !diagnostic.is_empty() {
+                    diagnostic.push('\n');
+                }
+                diagnostic.push_str(&self.command_error);
+            }
+            log_snapshot(engine);
+        }
+        let phase = if quit {
+            GatePhase::QuitReady
+        } else if native.phase == GatePhase::Ready && engine.model().active().is_none() {
+            GatePhase::Opening
+        } else {
+            native.phase
+        };
+        if changed
+            && diagnostic.is_empty()
+            && let Some(fatal) = engine.runner_mut().fatal_native_failure()
+        {
+            diagnostic = fatal.to_string();
+        }
+        if changed && diagnostic.is_empty() {
+            diagnostic = if engine.runner_mut().report.is_empty() {
+                format!(
+                    "Requested: {:?}\nAudio requested: {audio_enabled}\nOpen capture to apply draft.",
+                    engine.model().draft().settings.video
+                )
+            } else {
+                engine.runner_mut().report.clone()
+            };
+        }
+        let runner = engine.runner_mut();
+        UiUpdate {
+            changed,
+            phase,
+            generation: native.attempt.map(AttemptId::get).unwrap_or(0),
+            restart_generation,
+            can_open,
+            can_restart,
+            audio_status: if changed {
+                match &runner.audio {
+                    AudioStatus::Disabled => "Disabled",
+                    AudioStatus::Opening => "Opening",
+                    AudioStatus::Active => "Active",
+                    AudioStatus::RestartRequired(_) => "RestartRequired",
+                }
+                .into()
+            } else {
+                String::new()
+            },
+            audio_source: if changed { source } else { String::new() },
+            audio_enabled,
+            audio_diagnostic: if changed {
+                match &runner.audio {
+                    AudioStatus::RestartRequired(error) => error.to_string(),
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            },
+            failed: phase == GatePhase::Failed || runner.fatal_native_failure().is_some(),
+            diagnostic,
+            paused: runner.paused,
+            ended: runner.ended,
+            create_native: native.create_native,
+            release_native: native.release_native,
+            quit,
+        }
+    }
+    pub(crate) fn unchanged(&mut self) -> UiUpdate {
+        self.poll()
+    }
+}
+
+fn log_snapshot(engine: &Engine) {
+    let model = engine.model();
+    let identity = model.state_identity();
+    let snapshot = serde_json::json!({
+        "phase": model.phase(), "apply_id": identity.operation().map(|id| id.get()), "attempt_id": identity.attempt().map(AttemptId::get),
+        "cleanup": match model.cleanup() { CleanupStatus::Complete => "Complete", CleanupStatus::Draining => "Draining", CleanupStatus::Blocked { .. } => "Blocked" },
+        "draft_revision": model.draft().revision.get(), "draft": model.draft().settings,
+        "last_valid": model.last_valid().map(|settings| settings.settings()),
+        "active_attempt": model.active().map(|active| active.attempt().get()), "active_settings": model.active().map(|active| active.applied().settings()),
+        "failures": model.failures(), "validation_rejection": model.validation_rejection().map(|rejection| serde_json::json!({"request": rejection.request, "failure": rejection.failure})),
+        "gain": engine.gain(), "can_apply": model.can_apply(), "can_restart": model.can_restart(), "can_reconnect": model.can_reconnect(), "shutdown_ready": model.shutdown_ready(),
+    });
+    tracing::info!(snapshot = %snapshot, "apply_runtime");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        capture::{PreparedCapture, apply::fixture_prepared, linux::session_fixture},
+        domain::{
+            capture::{CaptureMode, CapturedFourCc, FrameRate, FrameSize},
+            failure::ApplyFailure,
+            state::{ProductPhase, ValidationRequest},
+        },
+        media::controller::{
+            BackendEvent, Generation, OwnerEndpoint, X11WindowId,
+            test_support::{Config, Driver},
+        },
+    };
+    use std::sync::mpsc;
+
+    fn settings() -> DraftSettings {
+        let mode = CaptureMode {
+            captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
+            size: FrameSize::new(1280, 720).unwrap(),
+            rate: FrameRate::new(60, 1).unwrap(),
+        };
+        DraftSettings {
+            video: crate::domain::capture::ModeRequest {
+                identity: session_fixture(&["/dev/video0"], mode).devices()[0]
+                    .identity()
+                    .clone(),
+                mode,
+            },
+            audio: AudioSelection::default(),
+        }
+    }
+    fn validate(
+        request: ValidationRequest,
+    ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>) {
+        let prepared = fixture_prepared(request.settings.clone());
+        (request, prepared)
+    }
+    fn runtime() -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+        let (tx, rx) = mpsc::channel();
+        let runner = GateRunner::with_spawner(move |generation, config| {
+            let requested = config.video.requested();
+            let input = config
+                .video
+                .validate_snapshot(&session_fixture(&["/dev/video0"], requested.mode))
+                .unwrap();
+            let requested = input.requested().clone();
+            let (driver, backend) = Driver::pair(Config::default());
+            tx.send(driver).unwrap();
+            OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
+        });
+        let engine = ApplyCoordinator::new(
+            settings(),
+            PlaybackGain::default(),
+            CaptureValidator::with_runner(validate),
+            runner,
+        );
+        (
+            RuntimeCoordinator {
+                engine: Some(engine),
+                sources: vec![
+                    AudioSourceIdentity::new(
+                        "explicit-source".into(),
+                        vec![("device.serial".into(), "fixture".into())],
+                    )
+                    .unwrap(),
+                ],
+                dirty: true,
+                last_state: None,
+                command_error: String::new(),
+                quit_empty: false,
+            },
+            rx,
+        )
+    }
+    fn await_update(
+        runtime: &mut RuntimeCoordinator,
+        predicate: impl Fn(&UiUpdate) -> bool,
+    ) -> UiUpdate {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let update = runtime.poll();
+            if predicate(&update) {
+                return update;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime event not delivered"
+            );
+            std::thread::yield_now();
+        }
+    }
+    fn cleanup(runtime: &mut RuntimeCoordinator) {
+        let first = runtime.quit();
+        let update = if first.release_native || first.quit {
+            first
+        } else {
+            await_update(runtime, |update| update.release_native || update.quit)
+        };
+        if update.release_native {
+            let released = runtime.native_released(AttemptId::new(update.generation).unwrap());
+            if !released.quit {
+                await_update(runtime, |update| update.quit);
+            }
+        }
+    }
+    #[test]
+    fn draft_audio_and_video_commands_edit_only_until_explicit_apply() {
+        let (mut runtime, drivers) = runtime();
+        runtime.poll();
+        runtime.qualification_command("draft-video 0 YUYV 1920x1080 30/1");
+        runtime.qualification_command("draft-source 1 explicit-source");
+        runtime.qualification_command("draft-audio 2 enable");
+        let model = runtime.engine.as_ref().unwrap().model();
+        assert_eq!(model.draft().revision.get(), 3);
+        assert!(model.draft().settings.audio.enabled());
+        assert_eq!(model.phase(), ProductPhase::Stopped);
+        assert!(model.last_valid().is_none());
+        assert!(drivers.try_recv().is_err());
+        runtime.qualification_command("draft-audio 3 disable");
+        assert_eq!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .draft()
+                .settings
+                .audio
+                .source()
+                .unwrap()
+                .name(),
+            "explicit-source"
+        );
+        cleanup(&mut runtime);
+    }
+    #[test]
+    fn stale_full_state_or_revision_rejected_without_worker_or_owner_effect() {
+        let (mut runtime, drivers) = runtime();
+        for line in [
+            "apply Active 0 0 Complete 0",
+            "apply Stopped 1 0 Complete 0",
+            "apply Stopped 0 1 Complete 0",
+            "apply Stopped 0 0 Draining 0",
+            "apply Stopped 0 0 Complete 1",
+        ] {
+            let update = runtime.qualification_command(line);
+            assert!(update.changed && !update.create_native);
+            assert!(!runtime.command_error.is_empty());
+            assert_eq!(
+                runtime.engine.as_ref().unwrap().model().phase(),
+                ProductPhase::Stopped
+            );
+            assert!(drivers.try_recv().is_err());
+        }
+        cleanup(&mut runtime);
+    }
+    #[test]
+    fn open_and_restart_routes_use_engine_native_barrier_and_last_valid_not_draft() {
+        let (mut runtime, drivers) = runtime();
+        runtime.poll();
+        let initial = runtime.qualification_command("open Stopped 0 0 Complete 0");
+        let open = if initial.create_native {
+            initial
+        } else {
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        assert_eq!(open.generation, 1);
+        let first = drivers.recv().unwrap();
+        runtime.surface_ready(SurfaceToken {
+            generation: Generation::new(1).unwrap(),
+            xid: X11WindowId::new(71).unwrap(),
+        });
+        first.initialized.recv().unwrap();
+        first.submitted.recv().unwrap();
+        first.send(BackendEvent::PlaybackRestart);
+        first.fence();
+        await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
+        runtime.qualification_command("draft-video 0 YUYV 1920x1080 30/1");
+        assert_eq!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .last_valid()
+                .unwrap()
+                .settings()
+                .video
+                .mode,
+            settings().video.mode
+        );
+        runtime.restart(1);
+        let stopped = await_update(&mut runtime, |update| update.release_native);
+        assert!(!stopped.create_native);
+        assert!(drivers.try_recv().is_err());
+        first.destroyed.recv().unwrap();
+        let released = runtime.native_released(AttemptId::new(1).unwrap());
+        let second_open = if released.create_native {
+            released
+        } else {
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        assert_eq!(second_open.generation, 2);
+        let second = drivers.recv().unwrap();
+        runtime.surface_ready(SurfaceToken {
+            generation: Generation::new(2).unwrap(),
+            xid: X11WindowId::new(71).unwrap(),
+        });
+        second.initialized.recv().unwrap();
+        second.submitted.recv().unwrap();
+        second.send(BackendEvent::PlaybackRestart);
+        second.fence();
+        await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
+        assert_eq!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .active()
+                .unwrap()
+                .applied()
+                .settings()
+                .video
+                .mode,
+            settings().video.mode
+        );
+        assert_eq!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .draft()
+                .settings
+                .video
+                .mode
+                .rate,
+            FrameRate::new(30, 1).unwrap()
+        );
+        cleanup(&mut runtime);
+        second.destroyed.recv().unwrap();
+    }
+    #[test]
+    fn rejected_immediate_gain_never_mutates_stored_gain_or_draft() {
+        let (mut runtime, _) = runtime();
+        runtime.poll();
+        runtime.qualification_command("volume 1 20");
+        runtime.qualification_command("mute 1 on");
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().gain(),
+            PlaybackGain::default()
+        );
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().model().draft().settings,
+            settings()
+        );
+        cleanup(&mut runtime);
+    }
+    #[test]
+    fn source_command_requires_enumerated_identity_and_stale_revision_preserves_draft() {
+        let (mut runtime, _) = runtime();
+        runtime.qualification_command("draft-source 0 missing");
+        assert_eq!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .draft()
+                .revision
+                .get(),
+            0
+        );
+        runtime.qualification_command("draft-source 0 explicit-source");
+        runtime.qualification_command("draft-audio 0 enable");
+        let draft = runtime.engine.as_ref().unwrap().model().draft();
+        assert_eq!(draft.revision.get(), 1);
+        assert!(!draft.settings.audio.enabled());
+        assert!(
+            draft
+                .settings
+                .audio
+                .source()
+                .unwrap()
+                .compatible_with(&runtime.sources[0])
+        );
+        cleanup(&mut runtime);
+    }
+
+    fn validate_enabled_audio(
+        request: ValidationRequest,
+    ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>) {
+        let snapshot = session_fixture(&["/dev/video0"], request.settings.video.mode);
+        let catalog = request
+            .settings
+            .audio
+            .source()
+            .map(|source| crate::capture::audio::AudioSource {
+                identity: source.clone(),
+                description: "fixture source".into(),
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        let result =
+            crate::capture::validate_prepared(request.settings.clone(), &snapshot, &catalog);
+        (request, result)
+    }
+
+    #[test]
+    fn live_audio_projection_ignores_unapplied_draft_and_clears_on_real_retirement() {
+        let source_a = AudioSourceIdentity::new("source-a".into(), Vec::new()).unwrap();
+        let source_b = AudioSourceIdentity::new("source-b".into(), Vec::new()).unwrap();
+        let mut initial = settings();
+        initial.audio = AudioSelection::Enabled {
+            source: source_a.clone(),
+        };
+        let (tx, rx) = mpsc::channel();
+        let runner = GateRunner::with_spawner(move |generation, config| {
+            let requested = config.video.requested();
+            let input = config
+                .video
+                .validate_snapshot(&session_fixture(&["/dev/video0"], requested.mode))
+                .unwrap();
+            let requested = input.requested().clone();
+            let (driver, backend) = Driver::pair(Config::default());
+            tx.send(driver).unwrap();
+            OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
+        });
+        let engine = ApplyCoordinator::new(
+            initial,
+            PlaybackGain::default(),
+            CaptureValidator::with_runner(validate_enabled_audio),
+            runner,
+        );
+        let mut runtime = RuntimeCoordinator {
+            engine: Some(engine),
+            sources: vec![source_a, source_b],
+            dirty: true,
+            last_state: None,
+            command_error: String::new(),
+            quit_empty: false,
+        };
+        let initial = runtime.qualification_command("open Stopped 0 0 Complete 0");
+        let opening = if initial.create_native {
+            initial
+        } else {
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        let driver = rx.recv().unwrap();
+        runtime.surface_ready(SurfaceToken {
+            generation: Generation::new(opening.generation).unwrap(),
+            xid: X11WindowId::new(71).unwrap(),
+        });
+        driver.initialized.recv().unwrap();
+        driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::AudioStatus(AudioStatus::Active));
+        driver.send(BackendEvent::PlaybackRestart);
+        driver.fence();
+        let active = await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
+        assert_eq!(active.audio_source, "source-a");
+        assert_eq!(active.audio_status, "Active");
+        let edited = runtime.qualification_command("draft-source 0 source-b");
+        assert_eq!(edited.audio_source, "source-a");
+        assert_eq!(edited.audio_status, "Active");
+        let disabled_draft = runtime.qualification_command("draft-audio 1 disable");
+        assert!(disabled_draft.audio_enabled);
+        assert_eq!(disabled_draft.audio_source, "source-a");
+        let close = runtime.close(opening.generation);
+        let retired = if close.release_native {
+            close
+        } else {
+            await_update(&mut runtime, |update| update.release_native)
+        };
+        assert_eq!(retired.audio_status, "Disabled");
+        driver.destroyed.recv().unwrap();
+        let released = runtime.native_released(AttemptId::new(opening.generation).unwrap());
+        assert_eq!(released.audio_status, "Disabled");
+        assert!(runtime.engine.as_ref().unwrap().model().active().is_none());
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn poisoned_genuine_retirement_then_quit_keeps_fatal_surface_loss_status() {
+        let (mut runtime, drivers) = runtime();
+        let initial = runtime.qualification_command("open Stopped 0 0 Complete 0");
+        let opening = if initial.create_native {
+            initial
+        } else {
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        let driver = drivers.recv().unwrap();
+        runtime.surface_ready(SurfaceToken {
+            generation: Generation::new(opening.generation).unwrap(),
+            xid: X11WindowId::new(71).unwrap(),
+        });
+        driver.initialized.recv().unwrap();
+        driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::PlaybackRestart);
+        driver.fence();
+        await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
+        let attempt = AttemptId::new(opening.generation).unwrap();
+        let loss = runtime.surface_lost(attempt);
+        assert!(loss.failed);
+        let quitting = runtime.quit();
+        let retired = if loss.release_native {
+            loss
+        } else if quitting.release_native {
+            quitting
+        } else {
+            await_update(&mut runtime, |update| update.release_native)
+        };
+        assert!(retired.failed);
+        driver.destroyed.recv().unwrap();
+        let released = runtime.native_released(attempt);
+        let final_update = if released.quit {
+            released
+        } else {
+            await_update(&mut runtime, |update| update.quit)
+        };
+        assert_eq!(final_update.phase, GatePhase::QuitReady);
+        assert!(final_update.failed);
+        assert!(final_update.diagnostic.contains("surface_lost"));
+        assert!(!final_update.can_open && !final_update.can_restart);
+    }
+}

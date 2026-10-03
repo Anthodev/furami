@@ -184,7 +184,7 @@ private:
     bool m_poisoned = false;
 };
 
-FuramiBridge::FuramiBridge(rust::Box<GateCoordinator> gate)
+FuramiBridge::FuramiBridge(rust::Box<RuntimeCoordinator> gate)
     : m_gate(std::move(gate))
 {
     assertGuiThread();
@@ -225,6 +225,7 @@ QString FuramiBridge::diagnostic() const { assertGuiThread(); return m_diagnosti
 bool FuramiBridge::paused() const { assertGuiThread(); return m_paused; }
 bool FuramiBridge::ended() const { assertGuiThread(); return m_ended; }
 bool FuramiBridge::captureSelected() const { assertGuiThread(); return m_captureSelected; }
+bool FuramiBridge::canOpen() const { assertGuiThread(); return m_canOpen; }
 bool FuramiBridge::canRestart() const { assertGuiThread(); return m_canRestart; }
 QString FuramiBridge::restartGeneration() const { assertGuiThread(); return QString::number(m_restartGeneration); }
 QString FuramiBridge::audioStatus() const { assertGuiThread(); return m_audioStatus; }
@@ -344,7 +345,7 @@ bool FuramiBridge::enableQualificationInput(QString &diagnostic)
     m_qualificationInput = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read, this);
     connect(m_qualificationInput.data(), &QSocketNotifier::activated, this,
         [this](QSocketDescriptor, QSocketNotifier::Type) { readQualificationInput(); });
-    qInfo().noquote() << "qualification_stdin_enabled grammar=open|restart|enable|disable|volume|mute|close|quit generation=required initial_open=0";
+    qInfo().noquote() << "qualification_stdin_enabled grammar=snapshot|draft-video|draft-identity|draft-audio|draft-source|open|apply|restart|reconnect|volume|mute|close|quit state=phase,apply,attempt,cleanup revision=required_for_draft_apply";
     return true;
 }
 
@@ -391,7 +392,7 @@ void FuramiBridge::readQualificationInput()
 void FuramiBridge::openCapture()
 {
     assertGuiThread();
-    if (m_actualPhase != QStringLiteral("Idle") || m_failed || !m_captureSelected)
+    if (!m_canOpen || m_bootstrapFailed)
         return;
     qInfo().noquote() << "input_intent action=OpenCapture source=panel";
     applyUpdate(gate_open(*m_gate));
@@ -402,7 +403,7 @@ void FuramiBridge::restartCapture(const QString &expectedGeneration)
     assertGuiThread();
     bool valid = false;
     const auto generation = expectedGeneration.toULongLong(&valid);
-    if (!valid || !generation)
+    if (!valid || !m_canRestart || m_bootstrapFailed)
         return;
     qInfo().noquote() << QStringLiteral("input_intent action=RestartCapture source=panel generation=%1 current_attempt=%2 can_restart=%3")
         .arg(generation).arg(m_restartGeneration).arg(boolean(m_canRestart));
@@ -420,13 +421,11 @@ void FuramiBridge::closeCapture()
 void FuramiBridge::openAndCloseDuringOpeningForProof()
 {
     assertGuiThread();
-    if (m_actualPhase != QStringLiteral("Idle") || m_failed || !m_captureSelected)
+    if (!m_canOpen || m_bootstrapFailed)
         return;
     qInfo().noquote() << "input_intent action=OpenAndCloseDuringOpening source=panel";
-    auto update = gate_open(*m_gate);
-    if (update.create_native)
-        m_closeDuringOpening = update.generation;
-    applyUpdate(std::move(update));
+    m_closeOnNextOpening = true;
+    applyUpdate(gate_open(*m_gate));
 }
 
 void FuramiBridge::forceSurfaceLossForProof()
@@ -592,6 +591,13 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     m_generation = update.generation;
     m_restartGeneration = update.restart_generation;
     m_canRestart = update.can_restart && !m_bootstrapFailed;
+    m_canOpen = update.can_open && !m_bootstrapFailed;
+    if (m_closeOnNextOpening && update.create_native) {
+        m_closeDuringOpening = update.generation;
+        m_closeOnNextOpening = false;
+    } else if (m_closeOnNextOpening && update.can_open) {
+        m_closeOnNextOpening = false;
+    }
     m_audioStatus = fromRust(update.audio_status);
     m_audioDiagnostic = fromRust(update.audio_diagnostic);
     m_audioSource = fromRust(update.audio_source);
@@ -854,7 +860,7 @@ void FuramiBridge::logGeometry()
     }
 }
 
-LaunchResult run_qt_application(rust::Box<GateCoordinator> gate, rust::Str display, bool qualificationStdin)
+LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, bool qualificationStdin)
 {
     const QByteArray captured(display.data(), static_cast<qsizetype>(display.size()));
     if (captured.isEmpty() || qgetenv("DISPLAY").isEmpty())

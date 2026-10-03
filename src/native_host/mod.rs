@@ -11,12 +11,16 @@ pub struct NativeLaunchError {
 pub fn run_application(
     media_prefix: &str,
     display: &str,
-    config: Option<crate::media::controller::SessionConfig>,
+    settings: Option<crate::domain::state::DraftSettings>,
+    gain: crate::domain::capture::PlaybackGain,
+    sources: Vec<crate::domain::capture::AudioSourceIdentity>,
     qualification_stdin: bool,
 ) -> Result<(), NativeLaunchError> {
-    let gate = Box::new(crate::app::gate::GateCoordinator::new(
+    let gate = Box::new(crate::ui::runtime::RuntimeCoordinator::new(
         media_prefix.to_owned(),
-        config,
+        settings,
+        gain,
+        sources,
     ));
     let result = crate::ui::bridge::ffi::run_qt_application(gate, display, qualification_stdin);
     if result.exit_code == 0 {

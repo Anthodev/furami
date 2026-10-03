@@ -1,6 +1,11 @@
 //! Value-only CXX boundary. C++ retains every Qt object and notification target.
 
-use crate::app::gate::{self, GateCoordinator, Generation, SurfaceToken, X11WindowId};
+use super::runtime::{self, RuntimeCoordinator};
+use crate::{
+    app::{gate::GatePhase, ports::SubmitStatus},
+    domain::state::AttemptId,
+    media::controller::{Generation, SurfaceToken, X11WindowId},
+};
 
 #[cxx_qt::bridge(namespace = "furami::bridge")]
 pub(crate) mod ffi {
@@ -9,7 +14,6 @@ pub(crate) mod ffi {
         exit_code: i32,
         diagnostic: String,
     }
-
     #[derive(Debug)]
     enum GatePhase {
         Idle,
@@ -21,7 +25,6 @@ pub(crate) mod ffi {
         Failed,
         QuitReady,
     }
-
     #[derive(Debug)]
     enum SubmitStatus {
         Accepted,
@@ -30,13 +33,13 @@ pub(crate) mod ffi {
         Closing,
         CapacityExceeded,
     }
-
     #[derive(Debug)]
     struct UiUpdate {
         changed: bool,
         phase: GatePhase,
         generation: u64,
         restart_generation: u64,
+        can_open: bool,
         can_restart: bool,
         audio_status: String,
         audio_diagnostic: String,
@@ -50,63 +53,61 @@ pub(crate) mod ffi {
         release_native: bool,
         quit: bool,
     }
-
-    // SAFETY: host.h declares this exact C++ ABI. The opaque Rust coordinator
-    // carries owned values only; C++ owns Qt lifetime through event-loop exit.
+    // SAFETY: host.h declares this exact ABI. Rust owns only values and adapters;
+    // C++ owns Qt lifetime through authorized event-loop exit.
     unsafe extern "C++" {
         include!("host.h");
         fn run_qt_application(
-            gate: Box<GateCoordinator>,
+            gate: Box<RuntimeCoordinator>,
             display: &str,
             qualification_stdin: bool,
         ) -> LaunchResult;
     }
-
     extern "Rust" {
-        type GateCoordinator;
-        fn gate_capture_selected(gate: &GateCoordinator) -> bool;
-        fn gate_open(gate: &mut GateCoordinator) -> UiUpdate;
-        fn gate_restart(gate: &mut GateCoordinator, generation: u64) -> UiUpdate;
-        fn gate_qualification_command(gate: &mut GateCoordinator, line: &str) -> UiUpdate;
-        fn gate_surface_ready(gate: &mut GateCoordinator, generation: u64, xid: u64) -> UiUpdate;
-        fn gate_surface_lost(gate: &mut GateCoordinator, generation: u64) -> UiUpdate;
-        fn gate_wait_for_owner_ack(gate: &mut GateCoordinator, generation: u64) -> String;
-        fn gate_pause(gate: &mut GateCoordinator, generation: u64) -> SubmitStatus;
-        fn gate_close(gate: &mut GateCoordinator, generation: u64, application: bool) -> UiUpdate;
-        fn gate_quit(gate: &mut GateCoordinator) -> UiUpdate;
-        fn gate_native_released(gate: &mut GateCoordinator, generation: u64) -> UiUpdate;
-        fn gate_poll(gate: &mut GateCoordinator) -> UiUpdate;
+        type RuntimeCoordinator;
+        fn gate_capture_selected(gate: &RuntimeCoordinator) -> bool;
+        fn gate_open(gate: &mut RuntimeCoordinator) -> UiUpdate;
+        fn gate_restart(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
+        fn gate_qualification_command(gate: &mut RuntimeCoordinator, line: &str) -> UiUpdate;
+        fn gate_surface_ready(gate: &mut RuntimeCoordinator, generation: u64, xid: u64)
+        -> UiUpdate;
+        fn gate_surface_lost(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
+        fn gate_wait_for_owner_ack(gate: &mut RuntimeCoordinator, generation: u64) -> String;
+        fn gate_pause(gate: &mut RuntimeCoordinator, generation: u64) -> SubmitStatus;
+        fn gate_close(
+            gate: &mut RuntimeCoordinator,
+            generation: u64,
+            application: bool,
+        ) -> UiUpdate;
+        fn gate_quit(gate: &mut RuntimeCoordinator) -> UiUpdate;
+        fn gate_native_released(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
+        fn gate_poll(gate: &mut RuntimeCoordinator) -> UiUpdate;
         fn display_check(platform: &str, captured: &str, qt_display: &str, current: &str)
         -> String;
     }
 }
-
-impl From<gate::UiUpdate> for ffi::UiUpdate {
-    fn from(update: gate::UiUpdate) -> Self {
-        let phase = match update.phase {
-            gate::GatePhase::Idle => ffi::GatePhase::Idle,
-            gate::GatePhase::WaitingSurface => ffi::GatePhase::WaitingSurface,
-            gate::GatePhase::Opening => ffi::GatePhase::Opening,
-            gate::GatePhase::Ready => ffi::GatePhase::Ready,
-            gate::GatePhase::Stopping => ffi::GatePhase::Stopping,
-            gate::GatePhase::Releasing => ffi::GatePhase::Releasing,
-            gate::GatePhase::Failed => ffi::GatePhase::Failed,
-            gate::GatePhase::QuitReady => ffi::GatePhase::QuitReady,
-        };
+impl From<runtime::UiUpdate> for ffi::UiUpdate {
+    fn from(update: runtime::UiUpdate) -> Self {
         Self {
             changed: update.changed,
-            phase,
-            generation: update.generation.map(Generation::get).unwrap_or(0),
-            restart_generation: update.restart_generation.map(Generation::get).unwrap_or(0),
-            can_restart: update.can_restart,
-            audio_status: if update.changed {
-                update.audio_status.to_owned()
-            } else {
-                String::new()
+            phase: match update.phase {
+                GatePhase::Idle => ffi::GatePhase::Idle,
+                GatePhase::WaitingSurface => ffi::GatePhase::WaitingSurface,
+                GatePhase::Opening => ffi::GatePhase::Opening,
+                GatePhase::Ready => ffi::GatePhase::Ready,
+                GatePhase::Stopping => ffi::GatePhase::Stopping,
+                GatePhase::Releasing => ffi::GatePhase::Releasing,
+                GatePhase::Failed => ffi::GatePhase::Failed,
+                GatePhase::QuitReady => ffi::GatePhase::QuitReady,
             },
+            generation: update.generation,
+            restart_generation: update.restart_generation,
+            can_open: update.can_open,
+            can_restart: update.can_restart,
+            audio_status: update.audio_status,
+            audio_diagnostic: update.audio_diagnostic,
             audio_source: update.audio_source,
             audio_enabled: update.audio_enabled,
-            audio_diagnostic: update.audio_diagnostic,
             failed: update.failed,
             diagnostic: update.diagnostic,
             paused: update.paused,
@@ -117,23 +118,19 @@ impl From<gate::UiUpdate> for ffi::UiUpdate {
         }
     }
 }
-
-fn gate_capture_selected(gate: &GateCoordinator) -> bool {
+fn gate_capture_selected(gate: &RuntimeCoordinator) -> bool {
     gate.capture_selected()
 }
-fn gate_open(gate: &mut GateCoordinator) -> ffi::UiUpdate {
+fn gate_open(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
     gate.open().into()
 }
-fn gate_restart(gate: &mut GateCoordinator, generation: u64) -> ffi::UiUpdate {
-    Generation::new(generation)
-        .map(|generation| gate.restart(generation))
-        .unwrap_or_else(|| gate.unchanged())
-        .into()
+fn gate_restart(gate: &mut RuntimeCoordinator, generation: u64) -> ffi::UiUpdate {
+    gate.restart(generation).into()
 }
-fn gate_qualification_command(gate: &mut GateCoordinator, line: &str) -> ffi::UiUpdate {
+fn gate_qualification_command(gate: &mut RuntimeCoordinator, line: &str) -> ffi::UiUpdate {
     gate.qualification_command(line).into()
 }
-fn gate_surface_ready(gate: &mut GateCoordinator, generation: u64, xid: u64) -> ffi::UiUpdate {
+fn gate_surface_ready(gate: &mut RuntimeCoordinator, generation: u64, xid: u64) -> ffi::UiUpdate {
     match (Generation::new(generation), X11WindowId::new(xid)) {
         (Some(generation), Some(xid)) => {
             gate.surface_ready(SurfaceToken { generation, xid }).into()
@@ -141,54 +138,48 @@ fn gate_surface_ready(gate: &mut GateCoordinator, generation: u64, xid: u64) -> 
         _ => gate.unchanged().into(),
     }
 }
-fn gate_surface_lost(gate: &mut GateCoordinator, generation: u64) -> ffi::UiUpdate {
-    Generation::new(generation)
-        .map(|g| gate.surface_lost(g))
-        .unwrap_or_else(|| gate.unchanged())
-        .into()
-}
-fn gate_wait_for_owner_ack(gate: &mut GateCoordinator, generation: u64) -> String {
-    let Some(generation) = Generation::new(generation) else {
-        return "surface_loss_barrier: invalid generation".to_owned();
-    };
-    match gate.wait_for_owner_ack(generation) {
-        Ok(()) => String::new(),
-        Err(error) => error.to_string(),
+fn gate_surface_lost(gate: &mut RuntimeCoordinator, generation: u64) -> ffi::UiUpdate {
+    match AttemptId::new(generation) {
+        Some(attempt) => gate.surface_lost(attempt).into(),
+        None => gate.unchanged().into(),
     }
 }
-fn gate_pause(gate: &mut GateCoordinator, generation: u64) -> ffi::SubmitStatus {
-    let status = Generation::new(generation)
-        .map(|g| gate.submit(g, gate::PlaybackIntent::TogglePause))
-        .unwrap_or(gate::SubmitStatus::StaleGeneration);
+fn gate_wait_for_owner_ack(gate: &mut RuntimeCoordinator, generation: u64) -> String {
+    match AttemptId::new(generation) {
+        Some(attempt) => gate.wait_for_owner_ack(attempt),
+        None => "surface_loss_barrier: invalid generation".into(),
+    }
+}
+fn gate_pause(gate: &mut RuntimeCoordinator, generation: u64) -> ffi::SubmitStatus {
+    let status = AttemptId::new(generation)
+        .map(|attempt| gate.pause(attempt))
+        .unwrap_or(SubmitStatus::StaleGeneration);
     match status {
-        gate::SubmitStatus::Accepted => ffi::SubmitStatus::Accepted,
-        gate::SubmitStatus::StaleGeneration => ffi::SubmitStatus::StaleGeneration,
-        gate::SubmitStatus::NotReady => ffi::SubmitStatus::NotReady,
-        gate::SubmitStatus::Closing => ffi::SubmitStatus::Closing,
-        gate::SubmitStatus::CapacityExceeded => ffi::SubmitStatus::CapacityExceeded,
+        SubmitStatus::Accepted => ffi::SubmitStatus::Accepted,
+        SubmitStatus::StaleGeneration => ffi::SubmitStatus::StaleGeneration,
+        SubmitStatus::NotReady => ffi::SubmitStatus::NotReady,
+        SubmitStatus::Closing => ffi::SubmitStatus::Closing,
+        SubmitStatus::CapacityExceeded => ffi::SubmitStatus::CapacityExceeded,
     }
 }
-fn gate_close(gate: &mut GateCoordinator, generation: u64, application: bool) -> ffi::UiUpdate {
-    let target = if application {
-        gate::CloseTarget::Application
+fn gate_close(gate: &mut RuntimeCoordinator, generation: u64, application: bool) -> ffi::UiUpdate {
+    if application {
+        gate.quit()
     } else {
-        gate::CloseTarget::Session
-    };
-    Generation::new(generation)
-        .map(|g| gate.close(g, target))
-        .unwrap_or_else(|| gate.unchanged())
-        .into()
+        gate.close(generation)
+    }
+    .into()
 }
-fn gate_quit(gate: &mut GateCoordinator) -> ffi::UiUpdate {
-    gate.request_quit().into()
+fn gate_quit(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
+    gate.quit().into()
 }
-fn gate_native_released(gate: &mut GateCoordinator, generation: u64) -> ffi::UiUpdate {
-    Generation::new(generation)
-        .map(|g| gate.native_released(g))
-        .unwrap_or_else(|| gate.unchanged())
-        .into()
+fn gate_native_released(gate: &mut RuntimeCoordinator, generation: u64) -> ffi::UiUpdate {
+    match AttemptId::new(generation) {
+        Some(attempt) => gate.native_released(attempt).into(),
+        None => gate.unchanged().into(),
+    }
 }
-fn gate_poll(gate: &mut GateCoordinator) -> ffi::UiUpdate {
+fn gate_poll(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
     gate.poll().into()
 }
 fn display_check(platform: &str, captured: &str, qt_display: &str, current: &str) -> String {

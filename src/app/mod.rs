@@ -1,5 +1,7 @@
 //! Responsibility: Transitions, draft/active separation, apply and recovery.
 //! Allowed dependencies: `domain`, narrow media/capture/persistence interfaces.
 
-mod control;
-pub mod gate;
+pub mod apply;
+pub(crate) mod control;
+pub(crate) mod gate;
+pub mod ports;

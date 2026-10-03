@@ -14,7 +14,7 @@ use furami::{
         linux,
     },
     domain::capture::{AudioError, AudioSelection, AudioSourceIdentity, PlaybackGain},
-    media::controller::SessionConfig,
+    domain::state::DraftSettings,
 };
 use std::ffi::OsString;
 use tracing_subscriber::EnvFilter;
@@ -165,9 +165,23 @@ fn run() -> Result<(), StartupError> {
         }
         return Ok(());
     }
+    let audio_sources = if arguments.audio_source.is_some()
+        || (arguments.qualification_stdin && arguments.video.is_some())
+    {
+        match audio::discover() {
+            Ok(sources) => sources,
+            Err(error) if arguments.audio_source.is_none() => {
+                tracing::warn!(%error, "qualification_audio_catalog_unavailable");
+                Vec::new()
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        Vec::new()
+    };
     let audio = match arguments.audio_source.as_deref() {
         Some(name) => {
-            let source = audio::select(&audio::discover()?, name)?;
+            let source = audio::select(&audio_sources, name)?;
             if arguments.audio_off {
                 AudioSelection::Disabled {
                     retained: Some(source),
@@ -190,10 +204,13 @@ fn run() -> Result<(), StartupError> {
                     request: args.to_string(),
                     source,
                 })?;
-            Ok::<_, StartupError>(SessionConfig {
-                video: selection,
+            let requested = selection.requested();
+            Ok::<_, StartupError>(DraftSettings {
+                video: furami::domain::capture::ModeRequest {
+                    identity: requested.identity,
+                    mode: requested.mode,
+                },
                 audio,
-                gain: PlaybackGain::default(),
             })
         })
         .transpose()?;
@@ -217,6 +234,11 @@ fn run() -> Result<(), StartupError> {
         &media_prefix,
         &x11_display,
         capture,
+        PlaybackGain::default(),
+        audio_sources
+            .into_iter()
+            .map(|source| source.identity)
+            .collect(),
         arguments.qualification_stdin,
     )?;
     tracing::info!("Qt application exited");
