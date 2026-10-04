@@ -48,6 +48,11 @@ pub(crate) mod ffi {
         failed: bool,
         diagnostic: String,
         paused: bool,
+        volume_percent: i32,
+        muted: bool,
+        can_toggle_pause: bool,
+        can_set_gain: bool,
+        playback_status: String,
         ended: bool,
         create_native: bool,
         release_native: bool,
@@ -74,6 +79,8 @@ pub(crate) mod ffi {
         fn gate_surface_lost(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
         fn gate_wait_for_owner_ack(gate: &mut RuntimeCoordinator, generation: u64) -> String;
         fn gate_pause(gate: &mut RuntimeCoordinator, generation: u64) -> SubmitStatus;
+        fn gate_set_volume(gate: &mut RuntimeCoordinator, percent: i32) -> SubmitStatus;
+        fn gate_set_muted(gate: &mut RuntimeCoordinator, muted: bool) -> SubmitStatus;
         fn gate_close(
             gate: &mut RuntimeCoordinator,
             generation: u64,
@@ -111,6 +118,11 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
             failed: update.failed,
             diagnostic: update.diagnostic,
             paused: update.paused,
+            volume_percent: update.volume_percent,
+            muted: update.muted,
+            can_toggle_pause: update.can_toggle_pause,
+            can_set_gain: update.can_set_gain,
+            playback_status: update.playback_status,
             ended: update.ended,
             create_native: update.create_native,
             release_native: update.release_native,
@@ -150,10 +162,7 @@ fn gate_wait_for_owner_ack(gate: &mut RuntimeCoordinator, generation: u64) -> St
         None => "surface_loss_barrier: invalid generation".into(),
     }
 }
-fn gate_pause(gate: &mut RuntimeCoordinator, generation: u64) -> ffi::SubmitStatus {
-    let status = AttemptId::new(generation)
-        .map(|attempt| gate.pause(attempt))
-        .unwrap_or(SubmitStatus::StaleGeneration);
+fn submit_status(status: SubmitStatus) -> ffi::SubmitStatus {
     match status {
         SubmitStatus::Accepted => ffi::SubmitStatus::Accepted,
         SubmitStatus::StaleGeneration => ffi::SubmitStatus::StaleGeneration,
@@ -161,6 +170,18 @@ fn gate_pause(gate: &mut RuntimeCoordinator, generation: u64) -> ffi::SubmitStat
         SubmitStatus::Closing => ffi::SubmitStatus::Closing,
         SubmitStatus::CapacityExceeded => ffi::SubmitStatus::CapacityExceeded,
     }
+}
+fn gate_pause(gate: &mut RuntimeCoordinator, generation: u64) -> ffi::SubmitStatus {
+    let status = AttemptId::new(generation)
+        .map(|attempt| gate.pause(attempt))
+        .unwrap_or(SubmitStatus::StaleGeneration);
+    submit_status(status)
+}
+fn gate_set_volume(gate: &mut RuntimeCoordinator, percent: i32) -> ffi::SubmitStatus {
+    submit_status(gate.set_volume(percent))
+}
+fn gate_set_muted(gate: &mut RuntimeCoordinator, muted: bool) -> ffi::SubmitStatus {
+    submit_status(gate.set_muted(muted))
 }
 fn gate_close(gate: &mut RuntimeCoordinator, generation: u64, application: bool) -> ffi::UiUpdate {
     if application {

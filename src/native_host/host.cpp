@@ -8,6 +8,7 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPlatformSurfaceEvent>
+#include <QResizeEvent>
 #include <QQmlApplicationEngine>
 #include <QQmlEngine>
 #include <QThread>
@@ -223,6 +224,11 @@ QWindow *FuramiBridge::hostWindow() const { assertGuiThread(); return m_host.dat
 QString FuramiBridge::phase() const { assertGuiThread(); return m_failed ? QStringLiteral("Failed") : m_actualPhase; }
 QString FuramiBridge::diagnostic() const { assertGuiThread(); return m_diagnostic; }
 bool FuramiBridge::paused() const { assertGuiThread(); return m_paused; }
+int FuramiBridge::volumePercent() const { assertGuiThread(); return m_volumePercent; }
+bool FuramiBridge::muted() const { assertGuiThread(); return m_muted; }
+bool FuramiBridge::canTogglePause() const { assertGuiThread(); return m_canTogglePause; }
+bool FuramiBridge::canSetGain() const { assertGuiThread(); return m_canSetGain; }
+QString FuramiBridge::playbackStatus() const { assertGuiThread(); return m_playbackStatus; }
 bool FuramiBridge::ended() const { assertGuiThread(); return m_ended; }
 bool FuramiBridge::captureSelected() const { assertGuiThread(); return m_captureSelected; }
 bool FuramiBridge::canOpen() const { assertGuiThread(); return m_canOpen; }
@@ -418,6 +424,36 @@ void FuramiBridge::closeCapture()
     applyUpdate(gate_close(*m_gate, m_generation, false));
 }
 
+void FuramiBridge::togglePause()
+{
+    assertGuiThread();
+    if (!m_canTogglePause || m_bootstrapFailed)
+        return;
+    const auto status = gate_pause(*m_gate, m_generation);
+    qInfo().noquote() << QStringLiteral("input_intent action=TogglePause generation=%1 status=%2")
+        .arg(m_generation).arg(statusName(status));
+    applyUpdate(gate_poll(*m_gate));
+}
+
+void FuramiBridge::setVolume(int percent)
+{
+    assertGuiThread();
+    const auto status = gate_set_volume(*m_gate, percent);
+    qInfo().noquote() << QStringLiteral("input_intent action=SetVolume percent=%1 status=%2")
+        .arg(percent).arg(statusName(status));
+    // Every admission outcome publishes the authoritative retained preference.
+    applyUpdate(gate_poll(*m_gate));
+}
+
+void FuramiBridge::setMuted(bool muted)
+{
+    assertGuiThread();
+    const auto status = gate_set_muted(*m_gate, muted);
+    qInfo().noquote() << QStringLiteral("input_intent action=SetMuted muted=%1 status=%2")
+        .arg(boolean(muted)).arg(statusName(status));
+    applyUpdate(gate_poll(*m_gate));
+}
+
 void FuramiBridge::openAndCloseDuringOpeningForProof()
 {
     assertGuiThread();
@@ -460,14 +496,75 @@ void FuramiBridge::toggleFullscreen()
     assertGuiThread();
     if (!m_root)
         return;
+    const auto transition = ++m_fullscreenTransition;
+    QObject::disconnect(m_fullscreenSyncConnection);
+    QObject::disconnect(m_fullscreenSwapConnection);
     const bool wasFullscreen = m_root->visibility() == QWindow::FullScreen;
     qInfo().noquote() << QStringLiteral("input_intent action=ToggleFullscreen root=%1 generation=%2 fullscreen=%3")
         .arg(m_rootXid).arg(m_generation).arg(boolean(!wasFullscreen));
-    if (wasFullscreen)
-        m_root->showNormal();
-    else
+    if (wasFullscreen) {
+        m_fullscreenFocusRestorePending = true;
+        m_fullscreenNativeTransitionObserved = false;
+        auto *root = m_root.data();
+        m_fullscreenSyncConnection = connect(root, &QQuickWindow::beforeSynchronizing, this,
+            [this, root, transition] {
+                // Qt blocks the GUI thread during this DirectConnection signal.
+                // A pre-exit/in-flight frame cannot arm its own swap callback.
+                if (transition != m_fullscreenTransition || !m_fullscreenFocusRestorePending
+                    || !m_fullscreenNativeTransitionObserved
+                    || root->visibility() != (m_windowedVisibility == QWindow::Maximized
+                        ? QWindow::Maximized : QWindow::Windowed)
+                    || root->geometry() != m_windowedGeometry)
+                    return;
+                QObject::disconnect(m_fullscreenSyncConnection);
+                m_fullscreenSwapConnection = connect(root, &QQuickWindow::frameSwapped, this,
+                    [this, transition] {
+                        if (transition == m_fullscreenTransition)
+                            restoreFullscreenFocus();
+                    }, static_cast<Qt::ConnectionType>(Qt::QueuedConnection | Qt::SingleShotConnection));
+            }, Qt::DirectConnection);
+        if (m_windowedVisibility == QWindow::Maximized) {
+            m_root->showMaximized();
+        } else {
+            m_root->showNormal();
+            m_root->setGeometry(m_windowedGeometry);
+        }
+    } else {
+        m_fullscreenFocusRestorePending = false;
+        m_windowedGeometry = m_root->geometry();
+        m_windowedVisibility = m_root->visibility();
+        m_fullscreenFocusItem = m_root->activeFocusItem();
+        m_fullscreenNativeFocus = m_host && QGuiApplication::focusWindow() == m_host.data();
         m_root->showFullScreen();
+    }
     scheduleGeometryLog();
+}
+
+void FuramiBridge::restoreFullscreenFocus()
+{
+    assertGuiThread();
+    if (!m_fullscreenFocusRestorePending || !m_root
+        || m_root->visibility() != (m_windowedVisibility == QWindow::Maximized
+            ? QWindow::Maximized : QWindow::Windowed))
+        return;
+    // The exit's native transition and matching layout have synchronized and swapped.
+    // Consume the restoration even when inactive: never steal focus later.
+    m_fullscreenFocusRestorePending = false;
+    if (!m_root->isActive() || m_quitAuthorized)
+        return;
+    auto *target = m_fullscreenFocusItem.data();
+    if (!target || target->window() != m_root.data() || !target->isVisible() || !target->isEnabled())
+        target = m_container.data();
+    if (target)
+        target->forceActiveFocus(Qt::OtherFocusReason);
+    // Only the current published host may regain native focus; no saved host/XID.
+    if (m_fullscreenNativeFocus && m_root->isActive() && m_host && m_published
+        && !m_poisoned && !m_host->poisoned() && m_host->parent() == m_root.data()
+        && m_container && m_container->property("window").value<QWindow *>() == m_host.data())
+        m_host->requestActivate();
+    qInfo().noquote() << QStringLiteral("fullscreen_focus_restored root=%1 item=%2 native_previously_focused=%3 generation=%4")
+        .arg(m_rootXid).arg(target ? target->objectName() : QStringLiteral("none"))
+        .arg(boolean(m_fullscreenNativeFocus)).arg(m_generation);
 }
 
 void FuramiBridge::focusVideo()
@@ -506,13 +603,21 @@ bool FuramiBridge::handleKey(QKeyEvent *event, const char *source)
             return true;
         }
     }
-    if (m_textEntryActive || m_popupOpen)
+    if (m_popupOpen)
         return false;
-    // Panel controls retain normal Qt Space activation. Playback owns Space only
-    // while native video, or its root-side container focus, owns keyboard input.
-    if (key == Qt::Key_Space && qstrcmp(source, "host") != 0
-        && (!m_root || m_root->activeFocusItem() != m_container.data()))
+    if (key == Qt::Key_Space) {
+        if (m_textEntryActive || event->modifiers() != Qt::NoModifier)
+            return false;
+        const bool hostOwnsFocus = m_host && !m_poisoned
+            && QGuiApplication::focusWindow() == m_host.data();
+        const bool containerOwnsFocus = m_root && m_root->isActive() && m_container
+            && m_root->activeFocusItem() == m_container.data();
+        // A stale host-origin event is not permission to bypass a focused control.
+        if (qstrcmp(source, "host") == 0 ? !(hostOwnsFocus || containerOwnsFocus) : !containerOwnsFocus)
+            return false;
+    } else if (event->modifiers() != Qt::NoModifier) {
         return false;
+    }
     if (key != Qt::Key_Space && key != Qt::Key_F11 && key != Qt::Key_Escape)
         return false;
     if (event->isAutoRepeat()) {
@@ -520,11 +625,7 @@ bool FuramiBridge::handleKey(QKeyEvent *event, const char *source)
         return true;
     }
     if (key == Qt::Key_Space) {
-        const auto status = gate_pause(*m_gate, m_generation);
-        qInfo().noquote() << QStringLiteral("input_intent action=TogglePause source=%1 generation=%2 status=%3")
-            .arg(QString::fromLatin1(source)).arg(m_generation).arg(statusName(status));
-        // Overload/failure is visible through the same nonblocking coordinator poll.
-        applyUpdate(gate_poll(*m_gate));
+        togglePause();
     } else if (key == Qt::Key_F11) {
         toggleFullscreen();
     } else if (m_root && m_root->visibility() == QWindow::FullScreen) {
@@ -574,8 +675,23 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
         }
         if (event->type() == QEvent::KeyPress)
             return handleKey(static_cast<QKeyEvent *>(event), "root");
-        if (event->type() == QEvent::Resize || event->type() == QEvent::WindowStateChange)
+        if (event->type() == QEvent::Resize || event->type() == QEvent::WindowStateChange) {
+            if (m_fullscreenFocusRestorePending && !m_fullscreenNativeTransitionObserved && event->spontaneous()) {
+                // XCB may report the already-requested state as oldState.
+                const bool exitStateObserved = event->type() == QEvent::WindowStateChange
+                    && m_root->visibility() == (m_windowedVisibility == QWindow::Maximized
+                        ? QWindow::Maximized : QWindow::Windowed);
+                const bool exitSizeObserved = event->type() == QEvent::Resize
+                    && static_cast<QResizeEvent *>(event)->size() == m_windowedGeometry.size();
+                if (exitStateObserved || exitSizeObserved) {
+                    m_fullscreenNativeTransitionObserved = true;
+                    qInfo().noquote() << QStringLiteral("fullscreen_exit_transition_observed root=%1 transition=%2 native_event=%3")
+                        .arg(m_rootXid).arg(m_fullscreenTransition).arg(static_cast<int>(event->type()));
+                    m_root->update();
+                }
+            }
             scheduleGeometryLog();
+        }
     }
     return QObject::eventFilter(watched, event);
 }
@@ -604,17 +720,24 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     m_audioEnabled = update.audio_enabled;
     m_failed = update.failed || m_bootstrapFailed;
     m_paused = update.paused;
+    m_volumePercent = update.volume_percent;
+    m_muted = update.muted;
+    m_canTogglePause = update.can_toggle_pause && !m_bootstrapFailed;
+    m_canSetGain = update.can_set_gain && !m_bootstrapFailed;
+    m_playbackStatus = fromRust(update.playback_status);
     m_ended = update.ended;
     m_diagnostic = fromRust(update.diagnostic);
     if (m_failed && !m_nativeDiagnostic.isEmpty()) {
         m_diagnostic = m_diagnostic.isEmpty() ? m_nativeDiagnostic
             : m_nativeDiagnostic + QStringLiteral("; ") + m_diagnostic;
     }
-    qInfo().noquote() << QStringLiteral("ui_phase phase=%1 visible_phase=%2 generation=%3 failed=%4 paused=%5 ended=%6 restart_generation=%7 can_restart=%8 audio_status=%9 audio_enabled=%10 audio_source=%11 audio_diagnostic=%12 diagnostic=%13")
+    qInfo().noquote() << QStringLiteral("ui_phase phase=%1 visible_phase=%2 generation=%3 failed=%4 paused=%5 ended=%6 restart_generation=%7 can_restart=%8 audio_status=%9 audio_enabled=%10 audio_source=%11 audio_diagnostic=%12 diagnostic=%13 playback_status=%14 volume=%15 muted=%16 can_toggle_pause=%17 can_set_gain=%18")
         .arg(m_actualPhase, phase()).arg(m_generation).arg(boolean(m_failed))
         .arg(boolean(m_paused)).arg(boolean(m_ended))
         .arg(m_restartGeneration).arg(boolean(m_canRestart)).arg(m_audioStatus)
-        .arg(boolean(m_audioEnabled)).arg(m_audioSource, m_audioDiagnostic, m_diagnostic);
+        .arg(boolean(m_audioEnabled)).arg(m_audioSource, m_audioDiagnostic, m_diagnostic)
+        .arg(m_playbackStatus).arg(m_volumePercent).arg(boolean(m_muted))
+        .arg(boolean(m_canTogglePause)).arg(boolean(m_canSetGain));
     emit stateChanged();
     scheduleGeometryLog();
     // The reducer emits effects in this order. Native effects never invent an ack.
@@ -846,6 +969,7 @@ void FuramiBridge::logGeometry()
         .arg(m_rootXid).arg(m_generation).arg(m_root->width()).arg(m_root->height())
         .arg(video.x()).arg(video.y()).arg(video.width()).arg(video.height()).arg(boolean(m_panelVisible)).arg(dpr);
     const char *names[] = {"openProof", "restartCapture", "closeProof", "closeDuringOpenProof", "forceSurfaceLossProof",
+                          "togglePlayback", "playbackVolume", "playbackMute",
                           "proofText", "togglePanelProof", "fullscreenProof", "popupOpenProof",
                           "closePopupProof", "videoContainer", "proofPanel"};
     for (const auto *name : names) {

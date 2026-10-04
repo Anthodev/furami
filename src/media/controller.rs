@@ -16,6 +16,7 @@ use super::session::{ObservedFacts, RequestedFacts, SessionError, SessionFacts};
 use crate::capture::input::InputSpec;
 use crate::capture::input::{CaptureSelection, SelectionError};
 use crate::domain::capture::{AudioError, AudioSelection, PlaybackGain};
+use crate::domain::state::PauseRequestId;
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
@@ -74,7 +75,10 @@ pub struct SurfaceToken {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaybackIntent {
-    TogglePause,
+    SetPaused {
+        request: PauseRequestId,
+        paused: bool,
+    },
     SetGain(PlaybackGain),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +115,12 @@ impl MediaError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PauseObservation {
+    pub request: Option<PauseRequestId>,
+    pub paused: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Snapshot {
     pub generation: Generation,
@@ -118,7 +128,7 @@ pub(crate) struct Snapshot {
     pub file_loaded: bool,
     pub playback_started: bool,
     pub session: Option<SessionFacts>,
-    pub paused: bool,
+    pub pause: Option<PauseObservation>,
     pub ended: bool,
     pub failure: Option<MediaError>,
     pub audio: AudioStatus,
@@ -143,6 +153,10 @@ impl StopFlag {
             reason: Mutex::new(None),
             audio_cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::new()
     }
     pub(crate) fn is_set(&self) -> bool {
         self.state.load(Ordering::Acquire) != 0
@@ -183,6 +197,11 @@ impl RequestId {
     pub(crate) fn get(self) -> u64 {
         self.0.get()
     }
+    #[cfg(test)]
+    pub(crate) fn for_test(value: u64) -> Self {
+        assert!(value < (1 << 63));
+        Self(NonZeroU64::new(value).expect("nonzero test request"))
+    }
     fn next(last: &mut u64) -> Result<Self, MediaError> {
         *last = last
             .checked_add(1)
@@ -196,7 +215,10 @@ impl RequestId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BackendCommand {
     LoadInput,
-    TogglePause,
+    SetPaused {
+        request: PauseRequestId,
+        paused: bool,
+    },
     SetGain(PlaybackGain),
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -217,7 +239,7 @@ pub(crate) enum BackendEvent {
     QueueOverflow,
     /// A copied log or an irrelevant event still counts toward the drain limit.
     Other,
-    PauseObserved(bool),
+    PauseObserved(PauseObservation),
     Observed {
         started: bool,
         facts: ObservedFacts,
@@ -243,7 +265,8 @@ pub(crate) trait OwnerBackend {
 pub(crate) struct OwnerEndpoint {
     generation: Generation,
     surface: SyncSender<SurfaceToken>,
-    commands: SyncSender<PlaybackIntent>,
+    commands: SyncSender<(PauseRequestId, bool)>,
+    gain: Arc<Mutex<Option<PlaybackGain>>>,
     stop_flag: Arc<StopFlag>,
     published: AtomicBool,
     thread: Thread,
@@ -269,7 +292,7 @@ impl OwnerEndpoint {
         };
         Self::spawn_task(
             generation,
-            move |surface, commands, stop, latest, snapshot| {
+            move |surface, commands, gain, stop, latest, snapshot| {
                 if stop.is_set() {
                     return stop.outcome();
                 }
@@ -324,6 +347,7 @@ impl OwnerEndpoint {
                     super::ffi::MpvBackend::new(prefix, input, config.audio, config.gain),
                     surface,
                     commands,
+                    gain,
                     stop,
                     latest,
                     snapshot,
@@ -348,7 +372,7 @@ impl OwnerEndpoint {
     {
         Self::spawn_task(
             generation,
-            move |surface, commands, stop, latest, snapshot| {
+            move |surface, commands, gain, stop, latest, snapshot| {
                 if stop.is_set() {
                     return stop.outcome();
                 }
@@ -364,6 +388,7 @@ impl OwnerEndpoint {
                     factory(input),
                     surface,
                     commands,
+                    gain,
                     stop,
                     latest,
                     snapshot,
@@ -401,11 +426,12 @@ impl OwnerEndpoint {
     {
         Self::spawn_task(
             generation,
-            move |surface, commands, stop, latest, snapshot| {
+            move |surface, commands, gain, stop, latest, snapshot| {
                 run_backend(
                     factory(),
                     surface,
                     commands,
+                    gain,
                     stop,
                     latest,
                     snapshot,
@@ -428,11 +454,12 @@ impl OwnerEndpoint {
     {
         Self::spawn_task(
             generation,
-            move |surface, commands, stop, latest, snapshot| {
+            move |surface, commands, gain, stop, latest, snapshot| {
                 run_backend(
                     factory(),
                     surface,
                     commands,
+                    gain,
                     stop,
                     latest,
                     snapshot,
@@ -447,7 +474,8 @@ impl OwnerEndpoint {
         generation: Generation,
         task: impl FnOnce(
             &Receiver<SurfaceToken>,
-            &Receiver<PlaybackIntent>,
+            &Receiver<(PauseRequestId, bool)>,
+            &Mutex<Option<PlaybackGain>>,
             &StopFlag,
             &Mutex<Option<Snapshot>>,
             &mut Snapshot,
@@ -458,6 +486,8 @@ impl OwnerEndpoint {
         let (surface, surface_rx) = mpsc::sync_channel(1);
         let (commands, command_rx) = mpsc::sync_channel(64);
         let (stopped_tx, stopped) = mpsc::sync_channel(1);
+        let gain = Arc::new(Mutex::new(None));
+        let owner_gain = Arc::clone(&gain);
         let latest = Arc::new(Mutex::new(None));
         let owner_latest = Arc::clone(&latest);
         let stop_flag = Arc::new(StopFlag::new());
@@ -471,7 +501,7 @@ impl OwnerEndpoint {
                     file_loaded: false,
                     playback_started: false,
                     session: None,
-                    paused: false,
+                    pause: None,
                     ended: false,
                     failure: None,
                     audio: AudioStatus::Disabled,
@@ -479,6 +509,7 @@ impl OwnerEndpoint {
                 let outcome = task(
                     &surface_rx,
                     &command_rx,
+                    &owner_gain,
                     &owner_stop,
                     &owner_latest,
                     &mut snapshot,
@@ -502,6 +533,7 @@ impl OwnerEndpoint {
             generation,
             surface,
             commands,
+            gain,
             stop_flag,
             published: AtomicBool::new(false),
             thread: owner_thread,
@@ -558,7 +590,19 @@ impl OwnerEndpoint {
         if self.stop_flag.is_set() {
             return SubmitStatus::Closing;
         }
-        match self.commands.try_send(intent) {
+        let (request, paused) = match intent {
+            PlaybackIntent::SetGain(gain) => {
+                let mut slot = self.gain.lock().unwrap_or_else(|p| p.into_inner());
+                if self.stop_flag.is_set() {
+                    return SubmitStatus::Closing;
+                }
+                *slot = Some(gain);
+                self.thread.unpark();
+                return SubmitStatus::Accepted;
+            }
+            PlaybackIntent::SetPaused { request, paused } => (request, paused),
+        };
+        match self.commands.try_send((request, paused)) {
             Ok(()) => {
                 self.thread.unpark();
                 SubmitStatus::Accepted
@@ -683,7 +727,8 @@ fn publish(latest: &Mutex<Option<Snapshot>>, snapshot: &Snapshot) {
 fn run_backend<B: OwnerBackend>(
     backend: B,
     surface: &Receiver<SurfaceToken>,
-    commands: &Receiver<PlaybackIntent>,
+    commands: &Receiver<(PauseRequestId, bool)>,
+    gain: &Mutex<Option<PlaybackGain>>,
     stop: &StopFlag,
     latest: &Mutex<Option<Snapshot>>,
     snapshot: &mut Snapshot,
@@ -696,6 +741,7 @@ fn run_backend<B: OwnerBackend>(
             backend,
             surface,
             commands,
+            gain,
             stop,
             latest,
             snapshot,
@@ -742,7 +788,8 @@ fn run_backend<B: OwnerBackend>(
 fn run_owner<B: OwnerBackend>(
     backend: &mut B,
     surface: &Receiver<SurfaceToken>,
-    commands: &Receiver<PlaybackIntent>,
+    commands: &Receiver<(PauseRequestId, bool)>,
+    gain: &Mutex<Option<PlaybackGain>>,
     stop: &StopFlag,
     latest: &Mutex<Option<Snapshot>>,
     snapshot: &mut Snapshot,
@@ -787,19 +834,27 @@ fn run_owner<B: OwnerBackend>(
         }
         if pending.is_none() {
             match commands.try_recv() {
-                Ok(PlaybackIntent::TogglePause) => {
+                Ok((request, paused)) => {
                     if stop.is_set() {
                         return stop.outcome();
                     }
                     let id = RequestId::next(&mut last_request)?;
-                    backend.submit(id, BackendCommand::TogglePause)?;
-                    pending = Some((id, BackendCommand::TogglePause));
+                    let command = BackendCommand::SetPaused { request, paused };
+                    backend.submit(id, command)?;
+                    pending = Some((id, command));
+                    snapshot.pause = None;
+                    publish(latest, snapshot);
                 }
-                Err(TryRecvError::Empty) => {}
-                Ok(PlaybackIntent::SetGain(gain)) => {
-                    let id = RequestId::next(&mut last_request)?;
-                    backend.submit(id, BackendCommand::SetGain(gain))?;
-                    pending = Some((id, BackendCommand::SetGain(gain)));
+                Err(TryRecvError::Empty) => {
+                    let next = gain.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    if let Some(gain) = next {
+                        if stop.is_set() {
+                            return stop.outcome();
+                        }
+                        let id = RequestId::next(&mut last_request)?;
+                        backend.submit(id, BackendCommand::SetGain(gain))?;
+                        pending = Some((id, BackendCommand::SetGain(gain)));
+                    }
                 }
                 Err(TryRecvError::Disconnected) => {
                     return Err(MediaError::new(
@@ -823,7 +878,14 @@ fn run_owner<B: OwnerBackend>(
                 BackendEvent::Other => {}
                 BackendEvent::FileLoaded => {
                     if let Some(paused) = backend.refresh_pause()? {
-                        snapshot.paused = paused;
+                        record_pause(
+                            snapshot,
+                            PauseObservation {
+                                request: None,
+                                paused,
+                            },
+                            pending,
+                        )?;
                     }
                     snapshot.file_loaded = true;
                     publish(latest, snapshot);
@@ -833,7 +895,14 @@ fn run_owner<B: OwnerBackend>(
                     if let Some(observed) = backend.refresh_observed(started)? {
                         apply_observed(snapshot, requested, started, observed)?;
                         if let Some(paused) = backend.refresh_pause()? {
-                            snapshot.paused = paused;
+                            record_pause(
+                                snapshot,
+                                PauseObservation {
+                                    request: None,
+                                    paused,
+                                },
+                                pending,
+                            )?;
                         }
                         publish(latest, snapshot);
                     }
@@ -842,9 +911,10 @@ fn run_owner<B: OwnerBackend>(
                     apply_observed(snapshot, requested, started, facts)?;
                     publish(latest, snapshot);
                 }
-                BackendEvent::PauseObserved(paused) => {
-                    snapshot.paused = paused;
-                    publish(latest, snapshot);
+                BackendEvent::PauseObserved(observation) => {
+                    if record_pause(snapshot, observation, pending)? {
+                        publish(latest, snapshot);
+                    }
                 }
                 BackendEvent::AudioStatus(status) => {
                     // Source loss remains latched until explicit whole-session restart.
@@ -866,19 +936,20 @@ fn run_owner<B: OwnerBackend>(
                                 ),
                             ));
                         }
-                        pending = None;
-                        if kind == BackendCommand::TogglePause {
-                            if let Some(paused) = backend.refresh_pause()? {
-                                snapshot.paused = paused;
-                            }
-                            tracing::info!(
-                                generation = snapshot.generation.get(),
-                                paused = snapshot.paused,
-                                "mpv_pause_observed"
-                            );
-                            publish(latest, snapshot);
+                        if let BackendCommand::SetPaused { request, paused } = kind
+                            && snapshot.pause
+                                != Some(PauseObservation {
+                                    request: Some(request),
+                                    paused,
+                                })
+                        {
+                            return Err(MediaError::new(
+                                "pause_property",
+                                "pause command completed without matching expected readback",
+                            ));
                         }
-                        // Submit the next FIFO intent before waiting for further events.
+                        pending = None;
+                        // Complete the whole transaction before admitting any next intent.
                         break;
                     }
                 }
@@ -927,6 +998,51 @@ fn run_owner<B: OwnerBackend>(
             thread::park_timeout(Duration::from_millis(10));
         }
     }
+}
+
+fn record_pause(
+    snapshot: &mut Snapshot,
+    observation: PauseObservation,
+    pending: Option<(RequestId, BackendCommand)>,
+) -> Result<bool, MediaError> {
+    match observation.request {
+        Some(request) => {
+            let Some((
+                _,
+                BackendCommand::SetPaused {
+                    request: expected,
+                    paused,
+                },
+            )) = pending
+            else {
+                return Ok(false);
+            };
+            if request != expected {
+                return Ok(false);
+            }
+            if observation.paused != paused {
+                return Err(MediaError::new(
+                    "pause_property",
+                    "fresh pause flag differs from requested state",
+                ));
+            }
+            tracing::info!(
+                generation = snapshot.generation.get(),
+                request = request.get(),
+                paused = observation.paused,
+                "mpv_pause_observed"
+            );
+        }
+        None => {
+            if matches!(pending, Some((_, BackendCommand::SetPaused { .. })))
+                || snapshot.pause.is_some_and(|pause| pause.request.is_some())
+            {
+                return Ok(false);
+            }
+        }
+    }
+    snapshot.pause = Some(observation);
+    Ok(true)
 }
 
 fn apply_observed(
@@ -1075,12 +1191,7 @@ pub(crate) mod test_support {
 
         fn next_event(&mut self) -> Result<BackendEvent, MediaError> {
             match self.input.try_recv() {
-                Ok(Input::Event(event)) => {
-                    if matches!(event, BackendEvent::CommandReply { error: 0, .. }) {
-                        self.paused = !self.paused;
-                    }
-                    Ok(event)
-                }
+                Ok(Input::Event(event)) => Ok(event),
                 Ok(Input::Observe(observed)) => {
                     self.observed = observed;
                     Ok(BackendEvent::Other)
@@ -1135,6 +1246,18 @@ mod tests {
     use super::test_support::{Config, Driver};
     use super::*;
 
+    fn pause_intent() -> PlaybackIntent {
+        PlaybackIntent::SetPaused {
+            request: PauseRequestId::new(1).unwrap(),
+            paused: true,
+        }
+    }
+    fn pause_command() -> BackendCommand {
+        BackendCommand::SetPaused {
+            request: PauseRequestId::new(1).unwrap(),
+            paused: true,
+        }
+    }
     fn generation() -> Generation {
         Generation::new(1).unwrap()
     }
@@ -1164,17 +1287,290 @@ mod tests {
     }
 
     #[test]
+    fn correlated_pause_waits_for_readback_and_old_generic_status_cannot_overwrite_it() {
+        let (mut owner, driver) = start(Config::default());
+        let load = load(&driver);
+        let request = PauseRequestId::new(1).unwrap();
+        owner.submit(
+            generation(),
+            PlaybackIntent::SetPaused {
+                request,
+                paused: true,
+            },
+        );
+        owner.submit(
+            generation(),
+            PlaybackIntent::SetGain(PlaybackGain::default()),
+        );
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        let (outer, command) = driver.submitted.recv().unwrap();
+        assert_eq!(
+            command,
+            BackendCommand::SetPaused {
+                request,
+                paused: true
+            }
+        );
+        driver.send(BackendEvent::PauseObserved(PauseObservation {
+            request: Some(PauseRequestId::new(2).unwrap()),
+            paused: true,
+        }));
+        driver.send(BackendEvent::PauseObserved(PauseObservation {
+            request: None,
+            paused: false,
+        }));
+        driver.fence();
+        assert!(owner.take_snapshot().unwrap().pause.is_none());
+        assert!(driver.submitted.try_recv().is_err());
+        let observed = PauseObservation {
+            request: Some(request),
+            paused: true,
+        };
+        driver.send(BackendEvent::PauseObserved(observed));
+        driver.send(BackendEvent::PauseObserved(PauseObservation {
+            request: None,
+            paused: false,
+        }));
+        driver.fence();
+        assert_eq!(owner.take_snapshot().unwrap().pause, Some(observed));
+        assert!(driver.submitted.try_recv().is_err());
+        driver.send(BackendEvent::CommandReply {
+            id: outer.get(),
+            error: 0,
+        });
+        assert!(matches!(
+            driver.submitted.recv().unwrap().1,
+            BackendCommand::SetGain(_)
+        ));
+        driver.send(BackendEvent::PauseObserved(PauseObservation {
+            request: None,
+            paused: false,
+        }));
+        driver.fence();
+        assert!(owner.take_snapshot().is_none());
+        stop(&mut owner, &driver);
+    }
+
+    #[test]
+    fn pause_set_failure_destroys_owner_without_publishing_paused() {
+        let (mut owner, driver) = start(Config::default());
+        let load = load(&driver);
+        owner.submit(generation(), pause_intent());
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        let (outer, _) = driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::CommandReply {
+            id: outer.get(),
+            error: -5,
+        });
+        owner.wait_for_ack().unwrap();
+        assert_eq!(
+            owner
+                .take_stopped()
+                .unwrap()
+                .unwrap()
+                .outcome
+                .unwrap_err()
+                .code,
+            "command_reply"
+        );
+        assert!(
+            !owner
+                .take_snapshot()
+                .unwrap()
+                .pause
+                .is_some_and(|pause| pause.paused)
+        );
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn pause_success_without_expected_correlated_readback_is_terminal() {
+        for observed in [None, Some(false)] {
+            let (mut owner, driver) = start(Config::default());
+            let load = load(&driver);
+            let request = PauseRequestId::new(1).unwrap();
+            owner.submit(
+                generation(),
+                PlaybackIntent::SetPaused {
+                    request,
+                    paused: true,
+                },
+            );
+            driver.send(BackendEvent::CommandReply {
+                id: load.get(),
+                error: 0,
+            });
+            let (outer, _) = driver.submitted.recv().unwrap();
+            if let Some(paused) = observed {
+                driver.send(BackendEvent::PauseObserved(PauseObservation {
+                    request: Some(request),
+                    paused,
+                }));
+            }
+            driver.send(BackendEvent::CommandReply {
+                id: outer.get(),
+                error: 0,
+            });
+            owner.wait_for_ack().unwrap();
+            assert_eq!(
+                owner
+                    .take_stopped()
+                    .unwrap()
+                    .unwrap()
+                    .outcome
+                    .unwrap_err()
+                    .code,
+                "pause_property"
+            );
+            driver.destroyed.recv().unwrap();
+        }
+    }
+
+    #[test]
+    fn thousands_of_gains_coalesce_before_surface_and_never_use_discrete_capacity() {
+        let (driver, backend) = Driver::pair(Config::default());
+        let mut owner = OwnerEndpoint::spawn_with_backend(generation(), move || backend).unwrap();
+        let latest = PlaybackGain::new(80, true).unwrap();
+        for index in 0..5_000 {
+            let gain = PlaybackGain::new((index % 101) as u8, index % 2 == 0).unwrap();
+            assert_eq!(
+                owner.submit(generation(), PlaybackIntent::SetGain(gain)),
+                SubmitStatus::Accepted
+            );
+        }
+        assert_eq!(
+            owner.submit(generation(), PlaybackIntent::SetGain(latest)),
+            SubmitStatus::Accepted
+        );
+        assert!(driver.initialized.try_recv().is_err());
+        assert_eq!(owner.attach(token()), SubmitStatus::Accepted);
+        driver.initialized.recv().unwrap();
+        let load = load(&driver);
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        let (gain_id, command) = driver.submitted.recv().unwrap();
+        assert_eq!(command, BackendCommand::SetGain(latest));
+        driver.send(BackendEvent::CommandReply {
+            id: gain_id.get(),
+            error: 0,
+        });
+        driver.fence();
+        assert!(
+            driver.submitted.try_recv().is_err(),
+            "only the final preference is dispatched"
+        );
+        assert!(stop(&mut owner, &driver).outcome.is_ok());
+    }
+
+    #[test]
+    fn gain_transaction_is_not_interleaved_and_discrete_pause_precedes_latest_pending_gain() {
+        let (mut owner, driver) = start(Config::default());
+        let load = load(&driver);
+        let first = PlaybackGain::new(81, true).unwrap();
+        owner.submit(generation(), PlaybackIntent::SetGain(first));
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        let (in_flight, command) = driver.submitted.recv().unwrap();
+        assert_eq!(command, BackendCommand::SetGain(first));
+        for index in 0..5_000 {
+            assert_eq!(
+                owner.submit(
+                    generation(),
+                    PlaybackIntent::SetGain(PlaybackGain::new((index % 101) as u8, false).unwrap())
+                ),
+                SubmitStatus::Accepted
+            );
+        }
+        let latest = PlaybackGain::new(82, false).unwrap();
+        owner.submit(generation(), PlaybackIntent::SetGain(latest));
+        owner.submit(generation(), pause_intent());
+        driver.fence();
+        assert!(
+            driver.submitted.try_recv().is_err(),
+            "volume/mute outer transaction remains in flight"
+        );
+        driver.send(BackendEvent::CommandReply {
+            id: in_flight.get(),
+            error: 0,
+        });
+        let (pause_id, command) = driver.submitted.recv().unwrap();
+        assert_eq!(command, pause_command());
+        driver.send(BackendEvent::PauseObserved(PauseObservation {
+            request: Some(PauseRequestId::new(1).unwrap()),
+            paused: true,
+        }));
+        driver.send(BackendEvent::CommandReply {
+            id: pause_id.get(),
+            error: 0,
+        });
+        let (last_id, command) = driver.submitted.recv().unwrap();
+        assert_eq!(command, BackendCommand::SetGain(latest));
+        driver.send(BackendEvent::CommandReply {
+            id: last_id.get(),
+            error: 0,
+        });
+        driver.fence();
+        assert!(driver.submitted.try_recv().is_err());
+        assert!(stop(&mut owner, &driver).outcome.is_ok());
+    }
+
+    #[test]
+    fn stop_wins_over_gain_mailbox_while_load_or_gain_transaction_is_pending() {
+        for gain_pending in [false, true] {
+            let (mut owner, driver) = start(Config::default());
+            let load = load(&driver);
+            owner.submit(
+                generation(),
+                PlaybackIntent::SetGain(PlaybackGain::new(80, true).unwrap()),
+            );
+            if gain_pending {
+                driver.send(BackendEvent::CommandReply {
+                    id: load.get(),
+                    error: 0,
+                });
+                assert!(matches!(
+                    driver.submitted.recv().unwrap().1,
+                    BackendCommand::SetGain(_)
+                ));
+            }
+            owner.submit(
+                generation(),
+                PlaybackIntent::SetGain(PlaybackGain::default()),
+            );
+            assert!(stop(&mut owner, &driver).outcome.is_ok());
+            assert!(driver.submitted.try_recv().is_err());
+            assert_eq!(
+                owner.submit(
+                    generation(),
+                    PlaybackIntent::SetGain(PlaybackGain::default())
+                ),
+                SubmitStatus::Closing
+            );
+        }
+    }
+
+    #[test]
     fn bounded_commands_do_not_block_priority_stop_or_accept_a_sixty_fifth_slot() {
         let (mut owner, driver) = start(Config::default());
         load(&driver);
         for _ in 0..64 {
             assert_eq!(
-                owner.submit(generation(), PlaybackIntent::TogglePause),
+                owner.submit(generation(), pause_intent()),
                 SubmitStatus::Accepted
             );
         }
         assert_eq!(
-            owner.submit(generation(), PlaybackIntent::TogglePause),
+            owner.submit(generation(), pause_intent()),
             SubmitStatus::CapacityExceeded
         );
         owner.wait_for_ack().unwrap();
@@ -1188,8 +1584,8 @@ mod tests {
      {
         let (mut owner, driver) = start(Config::default());
         let initial = load(&driver);
-        owner.submit(generation(), PlaybackIntent::TogglePause);
-        owner.submit(generation(), PlaybackIntent::TogglePause);
+        owner.submit(generation(), pause_intent());
+        owner.submit(generation(), pause_intent());
         driver.send(BackendEvent::CommandReply {
             id: initial.get() + 17,
             error: 0,
@@ -1201,15 +1597,19 @@ mod tests {
             error: 0,
         });
         let (first, kind) = driver.submitted.recv().unwrap();
-        assert_eq!(kind, BackendCommand::TogglePause);
+        assert_eq!(kind, pause_command());
         assert!(first.get() > initial.get());
         assert!(driver.submitted.try_recv().is_err());
+        driver.send(BackendEvent::PauseObserved(PauseObservation {
+            request: Some(PauseRequestId::new(1).unwrap()),
+            paused: true,
+        }));
         driver.send(BackendEvent::CommandReply {
             id: first.get(),
             error: 0,
         });
         let (second, kind) = driver.submitted.recv().unwrap();
-        assert_eq!(kind, BackendCommand::TogglePause);
+        assert_eq!(kind, pause_command());
         assert!(second.get() > first.get());
         stop(&mut owner, &driver);
     }
@@ -1268,7 +1668,7 @@ mod tests {
     fn negative_matching_reply_stops_and_does_not_dispatch_queued_intent() {
         let (mut owner, driver) = start(Config::default());
         let initial = load(&driver);
-        owner.submit(generation(), PlaybackIntent::TogglePause);
+        owner.submit(generation(), pause_intent());
         driver.send(BackendEvent::CommandReply {
             id: initial.get(),
             error: -13,
@@ -1310,15 +1710,12 @@ mod tests {
             let (mut owner, driver) = start(Config::default());
             let initial = load(&driver);
             if pause {
-                owner.submit(generation(), PlaybackIntent::TogglePause);
+                owner.submit(generation(), pause_intent());
                 driver.send(BackendEvent::CommandReply {
                     id: initial.get(),
                     error: 0,
                 });
-                assert_eq!(
-                    driver.submitted.recv().unwrap().1,
-                    BackendCommand::TogglePause
-                );
+                assert_eq!(driver.submitted.recv().unwrap().1, pause_command());
             }
             assert!(stop(&mut owner, &driver).outcome.is_ok());
         }
@@ -1358,7 +1755,7 @@ mod tests {
             if on_load {
                 driver.send(BackendEvent::FileLoaded);
             } else {
-                owner.submit(generation(), PlaybackIntent::TogglePause);
+                owner.submit(generation(), pause_intent());
                 driver.send(BackendEvent::CommandReply {
                     id: initial.get(),
                     error: 0,
@@ -1410,7 +1807,7 @@ mod tests {
         load(&driver);
         let stale = Generation::new(2).unwrap();
         assert_eq!(
-            owner.submit(stale, PlaybackIntent::TogglePause),
+            owner.submit(stale, pause_intent()),
             SubmitStatus::StaleGeneration
         );
         assert_eq!(

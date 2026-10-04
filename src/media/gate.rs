@@ -20,7 +20,7 @@ use crate::{
     domain::{
         capture::{AudioSelection, PlaybackGain},
         failure::{ApplyFailure, Cause, FailureCategory, LifecycleFailure, Stage},
-        state::{AttemptId, AttemptKey, DraftSettings},
+        state::{AttemptId, AttemptKey, DraftSettings, PauseRequestId},
     },
 };
 
@@ -42,12 +42,13 @@ pub(crate) struct GateRunner {
     blocked_event: Option<SessionEvent>,
     secondary_blocked_event: Option<SessionEvent>,
     audio_event: Option<SessionEvent>,
+    pause_request: Option<(PauseRequestId, bool)>,
+    last_pause_request: Option<PauseRequestId>,
     create_native: bool,
     release_native: bool,
     dirty: bool,
     last_blocked: Option<ApplyFailure>,
     fatal_native: Option<ApplyFailure>,
-    pub(crate) paused: bool,
     pub(crate) ended: bool,
     pub(crate) audio: AudioStatus,
     pub(crate) report: String,
@@ -78,12 +79,13 @@ impl GateRunner {
             blocked_event: None,
             secondary_blocked_event: None,
             audio_event: None,
+            pause_request: None,
+            last_pause_request: None,
             create_native: false,
             release_native: false,
             dirty: true,
             last_blocked: None,
             fatal_native: None,
-            paused: false,
             ended: false,
             audio: AudioStatus::Disabled,
             report: String::new(),
@@ -155,6 +157,7 @@ impl GateRunner {
             return;
         }
         self.failure_sent = true;
+        self.pause_request = None;
         self.failure_event = Some(if self.verified {
             SessionEvent::SessionFailed {
                 attempt: key.attempt,
@@ -295,11 +298,11 @@ impl GateRunner {
             }
             return self.failure_event.take();
         }
-        self.dirty |= self.paused != snapshot.paused
-            || self.ended != snapshot.ended
-            || self.audio != snapshot.audio;
-        self.paused = snapshot.paused;
+        self.dirty |= self.ended != snapshot.ended || self.audio != snapshot.audio;
         self.ended = snapshot.ended;
+        if snapshot.ended {
+            self.pause_request = None;
+        }
         if self.audio != snapshot.audio {
             self.audio_event = Some(SessionEvent::AudioDiagnostic {
                 attempt: key.attempt,
@@ -358,6 +361,20 @@ impl GateRunner {
             self.ended_sent = true;
             return Some(SessionEvent::SessionEnded {
                 attempt: key.attempt,
+            });
+        }
+        if let Some(observation) = snapshot.pause
+            && let Some(request) = observation.request
+            && self.verified
+            && self.pause_request == Some((request, observation.paused))
+            && self.last_pause_request != Some(request)
+        {
+            self.pause_request = None;
+            self.last_pause_request = Some(request);
+            return Some(SessionEvent::PauseObserved {
+                attempt: key.attempt,
+                request,
+                paused: observation.paused,
             });
         }
         self.audio_event.take()
@@ -438,7 +455,8 @@ impl SessionRunner for GateRunner {
         self.failure_sent = false;
         self.ended_sent = false;
         self.last_blocked = None;
-        self.paused = false;
+        self.pause_request = None;
+        self.last_pause_request = None;
         self.ended = false;
         self.audio = if self
             .requested
@@ -477,6 +495,7 @@ impl SessionRunner for GateRunner {
         ) {
             return StopSubmission::AlreadyStopping;
         }
+        self.pause_request = None;
         let update = self.state.stop(attempt);
         self.apply_native(update);
         if let (Some(endpoint), Some(generation)) = (&self.endpoint, Generation::new(attempt.get()))
@@ -520,6 +539,7 @@ impl SessionRunner for GateRunner {
                     self.endpoint = None;
                     self.audio = AudioStatus::Disabled;
                     self.audio_event = None;
+                    self.pause_request = None;
                     self.owner_event = Some(SessionEvent::OwnerStopped {
                         attempt: key.attempt,
                         outcome,
@@ -572,6 +592,8 @@ impl SessionRunner for GateRunner {
             self.key = None;
             self.requested = None;
             self.audio_event = None;
+            self.pause_request = None;
+            self.last_pause_request = None;
         }
         event
     }
@@ -587,20 +609,35 @@ impl SessionRunner for GateRunner {
         {
             return SubmitStatus::Closing;
         }
-        if self.state.phase() != GatePhase::Ready || !self.state.has_surface() {
-            return SubmitStatus::NotReady;
+        match intent {
+            ImmediateIntent::SetPaused { .. }
+                if self.state.phase() != GatePhase::Ready || !self.state.has_surface() =>
+            {
+                return SubmitStatus::NotReady;
+            }
+            ImmediateIntent::SetGain(_)
+                if !matches!(
+                    self.state.phase(),
+                    GatePhase::WaitingSurface | GatePhase::Opening | GatePhase::Ready
+                ) =>
+            {
+                return SubmitStatus::NotReady;
+            }
+            _ => {}
         }
         let Some(generation) = Generation::new(attempt.get()) else {
             return SubmitStatus::StaleGeneration;
         };
-        let intent = match intent {
-            ImmediateIntent::TogglePause => PlaybackIntent::TogglePause,
+        let playback_intent = match intent {
+            ImmediateIntent::SetPaused { request, paused } => {
+                PlaybackIntent::SetPaused { request, paused }
+            }
             ImmediateIntent::SetGain(gain) => PlaybackIntent::SetGain(gain),
         };
         let status = self
             .endpoint
             .as_ref()
-            .map(|endpoint| endpoint.submit(generation, intent))
+            .map(|endpoint| endpoint.submit(generation, playback_intent))
             .unwrap_or(super::controller::SubmitStatus::Closing);
         let mapped = match status {
             super::controller::SubmitStatus::Accepted => SubmitStatus::Accepted,
@@ -609,6 +646,11 @@ impl SessionRunner for GateRunner {
             super::controller::SubmitStatus::Closing => SubmitStatus::Closing,
             super::controller::SubmitStatus::CapacityExceeded => SubmitStatus::CapacityExceeded,
         };
+        if mapped == SubmitStatus::Accepted
+            && let ImmediateIntent::SetPaused { request, paused } = intent
+        {
+            self.pause_request = Some((request, paused));
+        }
         if matches!(
             mapped,
             SubmitStatus::Closing | SubmitStatus::CapacityExceeded
@@ -721,6 +763,7 @@ fn log_session_event(
         SessionEvent::NativeReleased { attempt } => ("NativeReleased", *attempt),
         SessionEvent::CleanupBlocked { attempt, .. } => ("CleanupBlocked", *attempt),
         SessionEvent::AudioDiagnostic { attempt, .. } => ("AudioDiagnostic", *attempt),
+        SessionEvent::PauseObserved { attempt, .. } => ("PauseObserved", *attempt),
     };
     let failure = match event {
         SessionEvent::OpenFailed { failure, .. }
@@ -771,6 +814,289 @@ mod tests {
     };
     use std::sync::mpsc;
 
+    /// Only the deterministic prepared-value port is synthetic. The product,
+    /// owner, libmpv transactions and retirement below all use their real paths.
+    #[derive(Default)]
+    struct FixtureValidator {
+        result: Option<crate::app::ports::ValidationResult<PreparedCapture>>,
+        requests: Vec<crate::domain::state::ValidationRequest>,
+        shutdown: bool,
+    }
+    impl crate::app::ports::DraftValidator for FixtureValidator {
+        type Prepared = PreparedCapture;
+        fn begin_validate(
+            &mut self,
+            request: crate::domain::state::ValidationRequest,
+        ) -> Result<(), crate::app::ports::SubmitFailure> {
+            if self.shutdown {
+                return Err(crate::app::ports::SubmitFailure::Disconnected);
+            }
+            if self.result.is_some() {
+                return Err(crate::app::ports::SubmitFailure::CapacityUnavailable);
+            }
+            self.requests.push(request.clone());
+            self.result = Some(crate::app::ports::ValidationResult {
+                result: fixture_prepared(request.settings.clone()),
+                request,
+            });
+            Ok(())
+        }
+        fn poll_validation(
+            &mut self,
+        ) -> Option<crate::app::ports::ValidationResult<Self::Prepared>> {
+            self.result.take()
+        }
+        fn cancel_validation(&mut self, _: crate::domain::state::ValidationKey) {
+            // The accepted terminal result still drains through app.poll.
+        }
+        fn shutdown(&mut self) {
+            self.shutdown = true;
+        }
+        fn shutdown_complete(&mut self) -> bool {
+            self.shutdown && self.result.is_none()
+        }
+    }
+    type FixtureApp = crate::app::apply::ApplyCoordinator<FixtureValidator, GateRunner>;
+
+    fn fixture_wait(
+        app: &mut FixtureApp,
+        transition: &str,
+        mut completed: impl FnMut(&mut FixtureApp) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.poll();
+            if completed(app) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let report = app.runner_mut().report.clone();
+                panic!(
+                    "fixture {transition} timed out: product={:?}, failures={:?}, report={report}",
+                    app.model().state_identity(),
+                    app.model().failures()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires frozen libmpv and FURAMI_PLAYBACK_FIXTURE"]
+    fn real_libmpv_guarded_resume() {
+        use crate::{
+            domain::state::{PlaybackState, ProductPhase},
+            media::ffi::{FixtureBackend, FixtureMilestone, FixtureRecorder},
+        };
+        use std::{
+            cell::RefCell,
+            panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+            rc::Rc,
+        };
+
+        let prefix = std::env::var("FURAMI_MEDIA_PREFIX").expect("frozen FURAMI_MEDIA_PREFIX");
+        let fixture = std::path::PathBuf::from(
+            std::env::var_os("FURAMI_PLAYBACK_FIXTURE").expect("FURAMI_PLAYBACK_FIXTURE"),
+        );
+        assert!(
+            fixture.is_absolute() && fixture.is_file(),
+            "absolute existing fixture required"
+        );
+        let fixture = fixture.canonicalize().unwrap();
+        let recorder = FixtureRecorder::default();
+        let owner_recorder = recorder.clone();
+        // Spawning happens on the app thread; the recorder alone crosses threads.
+        let opens = Rc::new(RefCell::new(Vec::new()));
+        let owner_opens = Rc::clone(&opens);
+        let runner = GateRunner::with_spawner(move |generation, config| {
+            let requested = config.video.requested();
+            let input = config
+                .video
+                .validate_snapshot(&session_fixture(&["/dev/video0"], requested.mode))
+                .map_err(|error| MediaError::new("fixture_input", error.to_string()))?;
+            let requested = input.requested().clone();
+            owner_opens
+                .borrow_mut()
+                .push((generation, requested.clone(), config.gain));
+            let prefix = prefix.clone();
+            let fixture = fixture.clone();
+            let recorder = owner_recorder.clone();
+            OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || {
+                FixtureBackend::new(prefix, fixture, input, config.gain, Some(recorder))
+                    .expect("validated fixture constructor on real owner thread")
+            })
+        });
+        let mut applied = settings();
+        applied.video.mode.size = FrameSize::new(320, 240).unwrap();
+        applied.video.mode.rate = FrameRate::new(30, 1).unwrap();
+        let mut app = FixtureApp::new(
+            applied.clone(),
+            PlaybackGain::default(),
+            FixtureValidator::default(),
+            runner,
+        );
+        // Error/assertion/timeout paths still request Quit and drain genuine owners.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            app.apply(app.model().state_identity(), app.model().draft().revision)
+                .unwrap();
+            fixture_wait(&mut app, "initial validation", |app| {
+                app.model().opening().is_some()
+            });
+            let first_update = app.runner_mut().take_native_update();
+            assert!(first_update.create_native && !first_update.release_native);
+            let first = first_update.attempt.unwrap();
+            app.runner_mut().surface_ready(token(first.get()));
+            fixture_wait(&mut app, "initial real playback", |app| {
+                app.model().active().is_some()
+            });
+            assert_eq!(
+                app.model().active().unwrap().playback(),
+                PlaybackState::Live
+            );
+            let mut draft = applied.clone();
+            draft.video.mode.rate = FrameRate::new(15, 1).unwrap();
+            let revision = app
+                .edit_draft(app.model().draft().revision, draft.clone())
+                .unwrap();
+            let paused_gain = PlaybackGain::new(80, true).unwrap();
+            assert_eq!(app.set_gain(paused_gain), SubmitStatus::Accepted);
+            assert_eq!(app.toggle_pause(first).unwrap(), SubmitStatus::Accepted);
+            assert!(matches!(
+                app.model().active().unwrap().playback(),
+                PlaybackState::PausePending { .. }
+            ));
+            fixture_wait(&mut app, "correlated real pause", |app| {
+                app.model()
+                    .active()
+                    .is_some_and(|active| active.playback() == PlaybackState::Paused)
+            });
+            app.resume(app.model().state_identity(), first).unwrap();
+            fixture_wait(&mut app, "genuine first owner destruction", |app| {
+                app.runner_mut().phase() == GatePhase::Releasing
+            });
+            assert_eq!(app.model().phase(), ProductPhase::ClosingResume);
+            assert!(app.runner_mut().endpoint.is_none());
+            assert!(
+                app.runner_mut().owner_event.is_none(),
+                "OwnerStopped consumed by actual coordinator"
+            );
+            let release = app.runner_mut().take_native_update();
+            assert!(release.release_native && !release.create_native);
+            assert_eq!(release.attempt, Some(first));
+            assert!(matches!(recorder.snapshot().unwrap().last(),
+                Some(FixtureMilestone::Destroyed { generation }) if generation.get() == first.get()));
+
+            // Withhold only the modeled native host release after actual destruction.
+            let gap_gain = PlaybackGain::new(83, false).unwrap();
+            assert_eq!(app.set_gain(gap_gain), SubmitStatus::Accepted);
+            for _ in 0..3 {
+                app.poll();
+            }
+            assert_eq!(opens.borrow().len(), 1, "no owner before native release");
+            assert_eq!(app.gain(), gap_gain);
+            assert_eq!(app.model().draft().settings, draft);
+            app.runner_mut().native_released(first);
+            fixture_wait(&mut app, "single fresh resume opening", |app| {
+                app.model().opening().is_some()
+            });
+            let (replacement, target) = app.model().opening().unwrap();
+            assert_eq!(replacement.purpose, AttemptPurpose::Resume);
+            assert_eq!(target, &applied);
+            assert_ne!(replacement.attempt, first);
+            let second_update = app.runner_mut().take_native_update();
+            assert!(second_update.create_native && !second_update.release_native);
+            assert_eq!(second_update.attempt, Some(replacement.attempt));
+            app.runner_mut()
+                .surface_ready(token(replacement.attempt.get()));
+            fixture_wait(&mut app, "fresh real Live playback", |app| {
+                app.model()
+                    .active()
+                    .is_some_and(|active| active.attempt() == replacement.attempt)
+            });
+            assert_eq!(
+                app.model().active().unwrap().playback(),
+                PlaybackState::Live
+            );
+            assert_eq!(app.model().active().unwrap().applied().settings(), &applied);
+            assert_eq!(app.model().draft().revision, revision);
+            assert_eq!(app.model().draft().settings, draft);
+            assert_eq!(app.gain(), gap_gain);
+            assert_eq!(app.validator_mut().requests.len(), 2);
+            let actual_opens = opens.borrow();
+            assert_eq!(actual_opens.len(), 2);
+            for (_, facts, _) in actual_opens.iter() {
+                assert_eq!(facts.identity, applied.video.identity);
+                assert_eq!(facts.mode, applied.video.mode);
+            }
+            assert_eq!(actual_opens[1].2, gap_gain);
+            drop(actual_opens);
+            assert_eq!(
+                recorder.snapshot().unwrap(),
+                vec![
+                    FixtureMilestone::Created {
+                        generation: Generation::new(first.get()).unwrap()
+                    },
+                    FixtureMilestone::Initialized {
+                        generation: Generation::new(first.get()).unwrap(),
+                        gain: PlaybackGain::default()
+                    },
+                    FixtureMilestone::Destroyed {
+                        generation: Generation::new(first.get()).unwrap()
+                    },
+                    FixtureMilestone::Created {
+                        generation: Generation::new(replacement.attempt.get()).unwrap()
+                    },
+                    FixtureMilestone::Initialized {
+                        generation: Generation::new(replacement.attempt.get()).unwrap(),
+                        gain: gap_gain
+                    },
+                ],
+                "destroy precedes replacement initialization; fresh init checks pause=no"
+            );
+        }));
+        app.quit();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.model().shutdown_ready() && std::time::Instant::now() < deadline {
+            app.poll();
+            let update = app.runner_mut().take_native_update();
+            // A failed assertion may have consumed the held host effect already.
+            // Releasing still proves the real ack was consumed; never invent it.
+            let release_pending = app.runner_mut().phase() == GatePhase::Releasing
+                && app.runner_mut().endpoint.is_none()
+                && app.runner_mut().owner_event.is_none();
+            if update.release_native || release_pending {
+                assert!(app.runner_mut().endpoint.is_none());
+                assert!(app.runner_mut().owner_event.is_none());
+                app.runner_mut().native_released(update.attempt.unwrap());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            app.model().shutdown_ready(),
+            "Quit must drain every genuine owner: {:?}",
+            app.model().state_identity()
+        );
+        let milestones = recorder.snapshot().unwrap();
+        assert_eq!(
+            milestones
+                .iter()
+                .filter(|entry| matches!(entry, FixtureMilestone::Created { .. }))
+                .count(),
+            milestones
+                .iter()
+                .filter(|entry| matches!(entry, FixtureMilestone::Destroyed { .. }))
+                .count()
+        );
+        if let Err(payload) = result {
+            resume_unwind(payload);
+        }
+        assert_eq!(opens.borrow().len(), 2, "Quit cannot reopen");
+        eprintln!("real guarded resume milestones: {milestones:?}");
+        eprintln!(
+            "finite null-output owner/coordinator qualification only; no live freshness, audible silence or Qt/XID proof"
+        );
+    }
+
     fn settings() -> DraftSettings {
         let mode = CaptureMode {
             captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
@@ -798,6 +1124,12 @@ mod tests {
         SurfaceToken {
             generation: Generation::new(value).unwrap(),
             xid: X11WindowId::new(71).unwrap(),
+        }
+    }
+    fn pause_intent() -> ImmediateIntent {
+        ImmediateIntent::SetPaused {
+            request: PauseRequestId::new(1).unwrap(),
+            paused: true,
         }
     }
     fn runner(config: Config) -> (GateRunner, mpsc::Receiver<Driver>) {
@@ -836,6 +1168,195 @@ mod tests {
             matches!(runner.poll(), Some(SessionEvent::OpenVerified { key: received, .. }) if received == key(value))
         );
     }
+    #[test]
+    fn pause_event_is_correlated_once_per_attempt_and_generic_status_is_not_presentation() {
+        let (mut runner, drivers) = runner(Config::default());
+        open(&mut runner, 1);
+        let driver = drivers.recv().unwrap();
+        ready(&mut runner, &driver, 1);
+        let request = PauseRequestId::new(1).unwrap();
+        let mut progress = snapshot(&settings(), AudioStatus::Disabled);
+        progress.pause = Some(super::super::controller::PauseObservation {
+            request: None,
+            paused: true,
+        });
+        assert!(runner.snapshot(progress.clone()).is_none());
+        runner.submit_immediate(
+            key(1).attempt,
+            ImmediateIntent::SetPaused {
+                request,
+                paused: true,
+            },
+        );
+        progress.pause = Some(super::super::controller::PauseObservation {
+            request: Some(PauseRequestId::new(2).unwrap()),
+            paused: true,
+        });
+        assert!(runner.snapshot(progress.clone()).is_none());
+        progress.pause = Some(super::super::controller::PauseObservation {
+            request: Some(request),
+            paused: true,
+        });
+        assert_eq!(
+            runner.snapshot(progress.clone()),
+            Some(SessionEvent::PauseObserved {
+                attempt: key(1).attempt,
+                request,
+                paused: true
+            })
+        );
+        assert!(runner.snapshot(progress.clone()).is_none());
+        runner.stop(key(1).attempt, StopReason::Close);
+        assert!(runner.snapshot(progress.clone()).is_none());
+        stopped(&mut runner);
+        driver.destroyed.recv().unwrap();
+        runner.native_released(key(1).attempt);
+        assert_eq!(
+            runner.poll(),
+            Some(SessionEvent::NativeReleased {
+                attempt: key(1).attempt
+            })
+        );
+        open(&mut runner, 2);
+        let second = drivers.recv().unwrap();
+        ready(&mut runner, &second, 2);
+        runner.submit_immediate(
+            key(2).attempt,
+            ImmediateIntent::SetPaused {
+                request,
+                paused: true,
+            },
+        );
+        assert!(runner.snapshot(progress.clone()).is_none());
+        progress.generation = Generation::new(2).unwrap();
+        assert_eq!(
+            runner.snapshot(progress),
+            Some(SessionEvent::PauseObserved {
+                attempt: key(2).attempt,
+                request,
+                paused: true
+            })
+        );
+        runner.stop(key(2).attempt, StopReason::Close);
+        stopped(&mut runner);
+        second.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn ended_snapshot_cannot_emit_pause_after_terminal_event() {
+        let (mut runner, drivers) = runner(Config::default());
+        open(&mut runner, 1);
+        let driver = drivers.recv().unwrap();
+        ready(&mut runner, &driver, 1);
+        let request = PauseRequestId::new(1).unwrap();
+        runner.submit_immediate(
+            key(1).attempt,
+            ImmediateIntent::SetPaused {
+                request,
+                paused: true,
+            },
+        );
+        let mut progress = snapshot(&settings(), AudioStatus::Disabled);
+        progress.pause = Some(super::super::controller::PauseObservation {
+            request: Some(request),
+            paused: true,
+        });
+        progress.ended = true;
+        assert_eq!(
+            runner.snapshot(progress.clone()),
+            Some(SessionEvent::SessionEnded {
+                attempt: key(1).attempt
+            })
+        );
+        assert!(runner.snapshot(progress).is_none());
+        runner.stop(key(1).attempt, StopReason::Close);
+        stopped(&mut runner);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn snapshot_failure_and_real_owner_stop_outrank_correlated_pause() {
+        for failed_snapshot in [true, false] {
+            let (mut runner, drivers) = runner(Config::default());
+            open(&mut runner, 1);
+            let driver = drivers.recv().unwrap();
+            ready(&mut runner, &driver, 1);
+            let request = PauseRequestId::new(1).unwrap();
+            runner.submit_immediate(
+                key(1).attempt,
+                ImmediateIntent::SetPaused {
+                    request,
+                    paused: true,
+                },
+            );
+            if failed_snapshot {
+                let mut progress = snapshot(&settings(), AudioStatus::Disabled);
+                progress.pause = Some(super::super::controller::PauseObservation {
+                    request: Some(request),
+                    paused: true,
+                });
+                progress.failure = Some(MediaError::new("pause_property", "failed read"));
+                assert!(matches!(
+                    runner.snapshot(progress),
+                    Some(SessionEvent::SessionFailed { .. })
+                ));
+            } else {
+                runner
+                    .endpoint
+                    .as_ref()
+                    .unwrap()
+                    .stop(Generation::new(1).unwrap(), None);
+            }
+            runner.endpoint.as_mut().unwrap().wait_for_ack().unwrap();
+            while let Some(event) = runner.poll() {
+                assert!(!matches!(event, SessionEvent::PauseObserved { .. }));
+            }
+            assert!(runner.take_native_update().release_native);
+            driver.destroyed.recv().unwrap();
+        }
+    }
+    #[test]
+    fn gain_is_admitted_during_opening_before_surface_but_pause_requires_ready() {
+        let (mut runner, drivers) = runner(Config::default());
+        open(&mut runner, 1);
+        let driver = drivers.recv().unwrap();
+        let gain = PlaybackGain::new(80, true).unwrap();
+        assert_eq!(
+            runner.submit_immediate(key(1).attempt, ImmediateIntent::SetGain(gain)),
+            SubmitStatus::Accepted
+        );
+        assert_eq!(
+            runner.submit_immediate(key(1).attempt, pause_intent()),
+            SubmitStatus::NotReady
+        );
+        assert_eq!(
+            runner.submit_immediate(key(2).attempt, ImmediateIntent::SetGain(gain)),
+            SubmitStatus::StaleGeneration
+        );
+        runner.surface_ready(token(1));
+        driver.initialized.recv().unwrap();
+        let (load, command) = driver.submitted.recv().unwrap();
+        assert_eq!(command, super::super::controller::BackendCommand::LoadInput);
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        assert_eq!(
+            driver.submitted.recv().unwrap().1,
+            super::super::controller::BackendCommand::SetGain(gain)
+        );
+        runner.stop(key(1).attempt, StopReason::Close);
+        assert_eq!(
+            runner.submit_immediate(
+                key(1).attempt,
+                ImmediateIntent::SetGain(PlaybackGain::default())
+            ),
+            SubmitStatus::Closing
+        );
+        stopped(&mut runner);
+        driver.destroyed.recv().unwrap();
+    }
+
     fn stopped(runner: &mut GateRunner) {
         runner.endpoint.as_mut().unwrap().wait_for_ack().unwrap();
         for _ in 0..4 {
@@ -856,7 +1377,7 @@ mod tests {
         runner.surface_ready(token(1));
         assert!(driver.initialized.try_recv().is_err());
         assert_eq!(
-            runner.submit_immediate(key(1).attempt, ImmediateIntent::TogglePause),
+            runner.submit_immediate(key(1).attempt, pause_intent()),
             SubmitStatus::NotReady
         );
         runner.stop(key(1).attempt, StopReason::Close);
@@ -917,7 +1438,7 @@ mod tests {
         let second = drivers.recv().unwrap();
         ready(&mut runner, &second, 2);
         assert_eq!(
-            runner.submit_immediate(key(1).attempt, ImmediateIntent::TogglePause),
+            runner.submit_immediate(key(1).attempt, pause_intent()),
             SubmitStatus::StaleGeneration
         );
         runner.stop(key(2).attempt, StopReason::Close);
@@ -1040,12 +1561,12 @@ mod tests {
         ready(&mut runner, &driver, 1);
         for _ in 0..64 {
             assert_eq!(
-                runner.submit_immediate(key(1).attempt, ImmediateIntent::TogglePause),
+                runner.submit_immediate(key(1).attempt, pause_intent()),
                 SubmitStatus::Accepted
             );
         }
         assert_eq!(
-            runner.submit_immediate(key(1).attempt, ImmediateIntent::TogglePause),
+            runner.submit_immediate(key(1).attempt, pause_intent()),
             SubmitStatus::CapacityExceeded
         );
         assert!(
@@ -1053,7 +1574,7 @@ mod tests {
         );
         assert!(!runner.take_native_update().release_native);
         assert_eq!(
-            runner.submit_immediate(key(1).attempt, ImmediateIntent::TogglePause),
+            runner.submit_immediate(key(1).attempt, pause_intent()),
             SubmitStatus::Closing
         );
         driver.shutdown_release.send(()).unwrap();
@@ -1129,7 +1650,7 @@ mod tests {
             file_loaded: true,
             playback_started: true,
             session: Some(facts),
-            paused: false,
+            pause: None,
             ended: false,
             failure: None,
             audio,
