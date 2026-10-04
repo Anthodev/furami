@@ -4,10 +4,12 @@
 #include "rust/cxx.h"
 
 #include <QByteArray>
+#include <QMetaObject>
 
 #include <QPointer>
 #include <QQuickItem>
 #include <QQuickWindow>
+#include <QRect>
 #include <QSocketNotifier>
 #include <QString>
 #include <QTimer>
@@ -32,6 +34,11 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(QString phase READ phase NOTIFY stateChanged)
     Q_PROPERTY(QString diagnostic READ diagnostic NOTIFY stateChanged)
     Q_PROPERTY(bool paused READ paused NOTIFY stateChanged)
+    Q_PROPERTY(int volumePercent READ volumePercent NOTIFY stateChanged)
+    Q_PROPERTY(bool muted READ muted NOTIFY stateChanged)
+    Q_PROPERTY(bool canTogglePause READ canTogglePause NOTIFY stateChanged)
+    Q_PROPERTY(bool canSetGain READ canSetGain NOTIFY stateChanged)
+    Q_PROPERTY(QString playbackStatus READ playbackStatus NOTIFY stateChanged)
     Q_PROPERTY(bool ended READ ended NOTIFY stateChanged)
     Q_PROPERTY(bool textEntryActive READ textEntryActive WRITE setTextEntryActive NOTIFY textEntryActiveChanged)
     Q_PROPERTY(bool panelVisible READ panelVisible WRITE setPanelVisible NOTIFY panelVisibleChanged)
@@ -53,6 +60,11 @@ public:
     QString phase() const;
     QString diagnostic() const;
     bool paused() const;
+    int volumePercent() const;
+    bool muted() const;
+    bool canTogglePause() const;
+    bool canSetGain() const;
+    QString playbackStatus() const;
     bool ended() const;
     bool textEntryActive() const;
     bool panelVisible() const;
@@ -77,6 +89,9 @@ public:
     Q_INVOKABLE void openCapture();
     Q_INVOKABLE void restartCapture(const QString &expectedGeneration);
     Q_INVOKABLE void closeCapture();
+    Q_INVOKABLE void togglePause();
+    Q_INVOKABLE void setVolume(int percent);
+    Q_INVOKABLE void setMuted(bool muted);
     Q_INVOKABLE void openAndCloseDuringOpeningForProof();
     Q_INVOKABLE void forceSurfaceLossForProof();
     Q_INVOKABLE void requestApplicationClose();
@@ -107,6 +122,7 @@ private:
     void releaseNative(std::uint64_t generation);
     void failNative(std::uint64_t generation, const QString &diagnostic);
     void scheduleGeometryLog();
+    void restoreFullscreenFocus();
     void logGeometry();
     void readQualificationInput();
 
@@ -120,6 +136,15 @@ private:
     QPointer<QQuickWindow> m_root;
     QPointer<QQuickItem> m_container;
     QString m_actualPhase = QStringLiteral("Idle");
+    QRect m_windowedGeometry;
+    QWindow::Visibility m_windowedVisibility = QWindow::Windowed;
+    QPointer<QQuickItem> m_fullscreenFocusItem;
+    bool m_fullscreenNativeFocus = false;
+    bool m_fullscreenFocusRestorePending = false;
+    bool m_fullscreenNativeTransitionObserved = false;
+    std::uint64_t m_fullscreenTransition = 0;
+    QMetaObject::Connection m_fullscreenSyncConnection;
+    QMetaObject::Connection m_fullscreenSwapConnection;
     QString m_diagnostic;
     QString m_nativeDiagnostic;
     std::uint64_t m_generation = 0;
@@ -139,6 +164,11 @@ private:
     bool m_captureSelected = false;
     bool m_bootstrapFailed = false;
     bool m_paused = false;
+    int m_volumePercent = 100;
+    bool m_muted = false;
+    bool m_canTogglePause = false;
+    bool m_canSetGain = false;
+    QString m_playbackStatus = QStringLiteral("Unavailable");
     bool m_ended = false;
     bool m_textEntryActive = false;
     bool m_panelVisible = true;

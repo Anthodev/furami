@@ -1,13 +1,14 @@
 //! Minimal mpv 0.41.0/client 2.5 ABI. Every handle stays on its creating thread.
 
 use super::controller::{
-    AudioStatus, BackendCommand, BackendEvent, MediaError, OwnerBackend, RequestId, StopFlag,
-    SurfaceToken,
+    AudioStatus, BackendCommand, BackendEvent, MediaError, OwnerBackend, PauseObservation,
+    RequestId, StopFlag, SurfaceToken,
 };
 use super::session::{Observation, ObservedFacts, Source};
 use crate::capture::audio::{AudioEvent, RecordingGuard};
 use crate::capture::input::InputSpec;
 use crate::domain::capture::{AudioError, AudioSelection, FrameSize, PlaybackGain};
+use crate::domain::state::PauseRequestId;
 use libloading::Library;
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_ulong, c_void},
@@ -645,18 +646,35 @@ impl Drop for Handle {
 enum Pending {
     Audio,
     Pause,
+    PauseSet {
+        owner: u64,
+        request: PauseRequestId,
+        expected: bool,
+    },
+    PauseRead {
+        owner: u64,
+        request: PauseRequestId,
+        expected: bool,
+    },
     Metadata(usize),
     TrackList,
     Aid,
     CurrentAudio,
-    GainVolume { owner: u64, gain: PlaybackGain },
-    GainMute { owner: u64 },
+    GainVolume {
+        owner: u64,
+        gain: PlaybackGain,
+    },
+    GainMute {
+        owner: u64,
+    },
+    #[cfg(test)]
+    FixtureProperty(&'static CStr),
 }
 impl Pending {
     fn property(self) -> Option<&'static CStr> {
         Some(match self {
             Self::Audio => return None,
-            Self::Pause => c"pause",
+            Self::Pause | Self::PauseSet { .. } | Self::PauseRead { .. } => c"pause",
             Self::Metadata(0) => c"video-params",
             Self::Metadata(_) => c"container-fps",
             Self::TrackList => c"track-list",
@@ -664,6 +682,8 @@ impl Pending {
             Self::CurrentAudio => c"current-tracks/audio",
             Self::GainVolume { .. } => c"volume",
             Self::GainMute { .. } => c"mute",
+            #[cfg(test)]
+            Self::FixtureProperty(name) => name,
         })
     }
 }
@@ -697,6 +717,10 @@ pub(crate) struct MpvBackend {
     pause_dirty: bool,
     track_id: Option<i64>,
     emitted: VecDeque<BackendEvent>,
+    #[cfg(test)]
+    property_requests: Option<Vec<(u64, &'static CStr, Option<NodeValue>)>>,
+    #[cfg(test)]
+    fixture_properties: Option<VecDeque<(u64, NodeValue)>>,
 }
 impl MpvBackend {
     pub(crate) fn new(
@@ -728,6 +752,10 @@ impl MpvBackend {
             pause_dirty: false,
             track_id: None,
             emitted: VecDeque::new(),
+            #[cfg(test)]
+            property_requests: None,
+            #[cfg(test)]
+            fixture_properties: None,
         }
     }
     fn handle(&self) -> Result<&Handle, MediaError> {
@@ -743,6 +771,12 @@ impl MpvBackend {
     }
     fn get(&mut self, name: &'static CStr, pending: Pending) -> Result<(), MediaError> {
         let id = self.next_internal()?;
+        #[cfg(test)]
+        if let Some(requests) = &mut self.property_requests {
+            requests.push((id, name, None));
+            self.pending.push((id, pending));
+            return Ok(());
+        }
         self.handle()?.get_async(id, name)?;
         self.pending.push((id, pending));
         Ok(())
@@ -754,6 +788,12 @@ impl MpvBackend {
         pending: Pending,
     ) -> Result<(), MediaError> {
         let id = self.next_internal()?;
+        #[cfg(test)]
+        if let Some(requests) = &mut self.property_requests {
+            requests.push((id, name, Some(value.clone())));
+            self.pending.push((id, pending));
+            return Ok(());
+        }
         self.handle()?.set_async(id, name, value)?;
         self.pending.push((id, pending));
         Ok(())
@@ -904,8 +944,8 @@ impl MpvBackend {
             .find(|(_, (request, _))| *request == id)
             .map(|(index, (_, pending))| (index, *pending))
         else {
-            if kind == ReplyKind::Command && id < (1 << 63) {
-                if self.load_id == Some(id) && error >= 0 {
+            if kind == ReplyKind::Command && self.load_id == Some(id) {
+                if error >= 0 {
                     self.load_complete = true;
                     self.begin_audio_if_ready()?;
                 }
@@ -931,7 +971,7 @@ impl MpvBackend {
                     _ => None,
                 }
             }
-            Pending::GainVolume { .. } | Pending::GainMute { .. } => {
+            Pending::GainVolume { .. } | Pending::GainMute { .. } | Pending::PauseSet { .. } => {
                 if kind != ReplyKind::SetProperty {
                     return Ok(BackendEvent::Other);
                 }
@@ -946,7 +986,11 @@ impl MpvBackend {
         };
         if expected.is_some_and(|expected| name.as_deref() != Some(expected)) {
             return Err(MediaError::new(
-                "mpv_event",
+                if matches!(pending, Pending::Pause | Pending::PauseRead { .. }) {
+                    "pause_property"
+                } else {
+                    "mpv_event"
+                },
                 format!("property reply {id} has unexpected name"),
             ));
         }
@@ -986,11 +1030,55 @@ impl MpvBackend {
                         ));
                     }
                 };
-                self.emitted.push_back(BackendEvent::PauseObserved(paused));
+                self.emitted
+                    .push_back(BackendEvent::PauseObserved(PauseObservation {
+                        request: None,
+                        paused,
+                    }));
                 if self.pause_dirty {
                     self.pause_dirty = false;
                     self.refresh_pause()?;
                 }
+            }
+            Pending::PauseSet {
+                owner,
+                request,
+                expected,
+            } => {
+                if error < 0 {
+                    return Ok(BackendEvent::CommandReply { id: owner, error });
+                }
+                // This fresh read belongs exclusively to the original command.
+                // Never reuse a generic read admitted before the set reply.
+                self.get(
+                    c"pause",
+                    Pending::PauseRead {
+                        owner,
+                        request,
+                        expected,
+                    },
+                )?;
+            }
+            Pending::PauseRead {
+                owner,
+                request,
+                expected,
+            } => {
+                if error < 0 || value != Some(NodeValue::Flag(expected)) {
+                    return Err(MediaError::new(
+                        "pause_property",
+                        format!("invalid or mismatched fresh pause flag, mpv error={error}"),
+                    ));
+                }
+                self.emitted
+                    .push_back(BackendEvent::PauseObserved(PauseObservation {
+                        request: Some(request),
+                        paused: expected,
+                    }));
+                self.emitted.push_back(BackendEvent::CommandReply {
+                    id: owner,
+                    error: 0,
+                });
             }
             Pending::Metadata(field) => {
                 let batch = self.metadata.as_mut().ok_or_else(|| {
@@ -1057,8 +1145,32 @@ impl MpvBackend {
             Pending::GainMute { owner } => {
                 return Ok(BackendEvent::CommandReply { id: owner, error });
             }
+            #[cfg(test)]
+            Pending::FixtureProperty(_) => {
+                let value = value.filter(|_| error >= 0).ok_or_else(|| {
+                    MediaError::new(
+                        "fixture_property",
+                        format!("invalid fresh property reply {id}, mpv error={error}"),
+                    )
+                })?;
+                self.fixture_properties
+                    .as_mut()
+                    .ok_or_else(|| {
+                        MediaError::new("fixture_property", "fixture property recorder absent")
+                    })?
+                    .push_back((id, value));
+            }
         }
         Ok(self.emitted.pop_front().unwrap_or(BackendEvent::Other))
+    }
+    fn property_error(&self, id: u64, diagnostic: impl Into<String>) -> MediaError {
+        let pause = self.pending.iter().any(|(request, pending)| {
+            *request == id && matches!(pending, Pending::Pause | Pending::PauseRead { .. })
+        });
+        MediaError::new(
+            if pause { "pause_property" } else { "mpv_event" },
+            diagnostic,
+        )
     }
 }
 
@@ -1149,6 +1261,7 @@ impl OwnerBackend for MpvBackend {
         // build has neither that option nor an OSC, so no `osc=no` is submitted.
         const OPTIONS: &[(&CStr, &CStr)] = &[
             (c"config", c"no"),
+            (c"pause", c"no"),
             (c"load-scripts", c"no"),
             (c"input-default-bindings", c"no"),
             (c"input-vo-keyboard", c"no"),
@@ -1220,6 +1333,17 @@ impl OwnerBackend for MpvBackend {
         Ok(())
     }
     fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
+        if let BackendCommand::SetPaused { request, paused } = command {
+            return self.set(
+                c"pause",
+                &NodeValue::Flag(paused),
+                Pending::PauseSet {
+                    owner: id.get(),
+                    request,
+                    expected: paused,
+                },
+            );
+        }
         if let BackendCommand::SetGain(gain) = command {
             return self.set(
                 c"volume",
@@ -1238,8 +1362,9 @@ impl OwnerBackend for MpvBackend {
             BackendCommand::LoadInput => {
                 [c"loadfile".as_ptr(), self.input.url().as_ptr(), ptr::null()]
             }
-            BackendCommand::TogglePause => [c"cycle".as_ptr(), c"pause".as_ptr(), ptr::null()],
-            BackendCommand::SetGain(_) => unreachable!("gain uses property requests"),
+            BackendCommand::SetGain(_) | BackendCommand::SetPaused { .. } => {
+                unreachable!("playback controls use property requests")
+            }
         };
         // SAFETY: Live owner-thread handle, checked nonzero ID, terminated argv
         // of separately owned NUL-free strings. mpv copies before returning;
@@ -1302,25 +1427,40 @@ impl OwnerBackend for MpvBackend {
             }
             3 => {
                 if event.data.is_null() {
-                    return Err(MediaError::new("mpv_event", "null property reply payload"));
+                    return Err(
+                        self.property_error(event.reply_userdata, "null property reply payload")
+                    );
                 }
                 // SAFETY: GET_PROPERTY_REPLY payload matches pinned C layout.
                 // NODE contents and name copied before any further mpv wait.
                 let (name, value) = unsafe {
                     let property = &*event.data.cast::<MpvPropertyEvent>();
                     if property.name.is_null() {
-                        return Err(MediaError::new("mpv_event", "null property name"));
+                        return Err(self.property_error(event.reply_userdata, "null property name"));
                     }
                     let value = if property.format == 0 {
                         None
                     } else {
                         if property.format != 6 || property.data.is_null() {
-                            return Err(MediaError::new(
-                                "mpv_event",
+                            return Err(self.property_error(
+                                event.reply_userdata,
                                 "unexpected property node payload",
                             ));
                         }
-                        Some(copy_node(&*property.data.cast::<MpvNode>(), 0)?)
+                        let node = &*property.data.cast::<MpvNode>();
+                        if self.pending.iter().any(|(id, pending)| {
+                            *id == event.reply_userdata
+                                && matches!(pending, Pending::Pause | Pending::PauseRead { .. })
+                        }) && node.format == 3
+                            && !matches!(node.value.flag, 0 | 1)
+                        {
+                            return Err(
+                                self.property_error(event.reply_userdata, "malformed pause flag")
+                            );
+                        }
+                        Some(copy_node(node, 0).map_err(|error| {
+                            self.property_error(event.reply_userdata, error.diagnostic)
+                        })?)
                     };
                     (CStr::from_ptr(property.name).to_owned(), value)
                 };
@@ -1454,10 +1594,589 @@ impl OwnerBackend for MpvBackend {
     }
 }
 
+/// Isolated observations of actual fixture handle lifetimes, never scripted acks.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FixtureMilestone {
+    Created {
+        generation: super::controller::Generation,
+    },
+    /// Gain records the checked initial configuration; probe reads prove values.
+    Initialized {
+        generation: super::controller::Generation,
+        gain: PlaybackGain,
+    },
+    Destroyed {
+        generation: super::controller::Generation,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct FixtureRecorder(std::sync::Arc<std::sync::Mutex<Vec<FixtureMilestone>>>);
+
+#[cfg(test)]
+impl FixtureRecorder {
+    fn record(&self, milestone: FixtureMilestone) -> Result<(), MediaError> {
+        self.0
+            .lock()
+            .map_err(|_| {
+                MediaError::new("fixture_recorder", "fixture milestone recorder poisoned")
+            })?
+            .push(milestone);
+        Ok(())
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<Vec<FixtureMilestone>, MediaError> {
+        self.0
+            .lock()
+            .map(|milestones| milestones.clone())
+            .map_err(|_| MediaError::new("fixture_recorder", "fixture milestone recorder poisoned"))
+    }
+}
+
+/// Finite-file qualification adapter. Only initialization and input selection
+/// differ from production; control transactions and event/lifetime logic do not.
+#[cfg(test)]
+pub(crate) struct FixtureBackend {
+    inner: MpvBackend,
+    fixture: CString,
+    recorder: Option<FixtureRecorder>,
+    generation: Option<super::controller::Generation>,
+}
+
+#[cfg(test)]
+impl FixtureBackend {
+    /// Construct on the owner thread, using a synthetically validated InputSpec
+    /// only for requested metadata. No capture device or Pulse source is opened.
+    pub(crate) fn new(
+        prefix: String,
+        fixture: PathBuf,
+        input: InputSpec,
+        gain: PlaybackGain,
+        recorder: Option<FixtureRecorder>,
+    ) -> Result<Self, MediaError> {
+        use std::os::unix::ffi::OsStrExt;
+        if !fixture.is_absolute() || !fixture.is_file() {
+            return Err(MediaError::new(
+                "fixture_path",
+                "FURAMI_PLAYBACK_FIXTURE must be an absolute existing file",
+            ));
+        }
+        let fixture = fixture
+            .canonicalize()
+            .map_err(|error| MediaError::new("fixture_path", error.to_string()))?;
+        let fixture = CString::new(fixture.as_os_str().as_bytes())
+            .map_err(|error| MediaError::new("fixture_path", error.to_string()))?;
+        Ok(Self {
+            inner: MpvBackend::new(prefix, input, AudioSelection::default(), gain),
+            fixture,
+            recorder,
+            generation: None,
+        })
+    }
+
+    fn record(&self, milestone: FixtureMilestone) -> Result<(), MediaError> {
+        self.recorder
+            .as_ref()
+            .map_or(Ok(()), |recorder| recorder.record(milestone))
+    }
+}
+
+#[cfg(test)]
+impl OwnerBackend for FixtureBackend {
+    fn initialize(&mut self, token: SurfaceToken, stop: &StopFlag) -> Result<(), MediaError> {
+        check_stop(stop)?;
+        if self.inner.handle.is_some() {
+            return Err(MediaError::new(
+                "fixture_handle",
+                "fixture already initialized",
+            ));
+        }
+        let path = qualified_library(&self.inner.prefix)?;
+        self.inner.handle = Some(Handle::create(&path, stop)?);
+        self.generation = Some(token.generation);
+        self.record(FixtureMilestone::Created {
+            generation: token.generation,
+        })?;
+        let handle = self.inner.handle()?;
+        const OPTIONS: &[(&CStr, &CStr)] = &[
+            (c"config", c"no"),
+            (c"load-scripts", c"no"),
+            (c"input-default-bindings", c"no"),
+            (c"input-vo-keyboard", c"no"),
+            (c"input-terminal", c"no"),
+            (c"input-cursor", c"no"),
+            (c"terminal", c"no"),
+            (c"vo", c"null"),
+            (c"ao", c"null"),
+            (c"ao-null-untimed", c"no"),
+            (c"aid", c"auto"),
+            (c"pause", c"no"),
+        ];
+        for &(name, value) in OPTIONS {
+            check_stop(stop)?;
+            handle.option(name, value)?;
+        }
+        let volume = CString::new(self.inner.gain.volume_percent.to_string())
+            .map_err(|error| MediaError::new("audio_gain", error.to_string()))?;
+        handle.option(c"volume", &volume)?;
+        handle.option(c"mute", if self.inner.gain.muted { c"yes" } else { c"no" })?;
+        check_stop(stop)?;
+        // SAFETY: The genuine owner-thread handle is live; options above were
+        // checked before initialization and no native window/Pulse guard exists.
+        let result = unsafe { (handle.functions.initialize)(handle.raw.as_ptr()) };
+        handle.checked(result, "fixture initialize")?;
+        check_stop(stop)?;
+        let version = handle.property(c"mpv-version")?;
+        if version.trim() != "mpv v0.41.0" {
+            return Err(MediaError::new(
+                "mpv_version",
+                format!("runtime mpv-version {version:?}, expected mpv v0.41.0"),
+            ));
+        }
+        self.record(FixtureMilestone::Initialized {
+            generation: token.generation,
+            gain: self.inner.gain,
+        })
+    }
+
+    fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
+        if command != BackendCommand::LoadInput {
+            return self.inner.submit(id, command);
+        }
+        self.inner.load_id = Some(id.get());
+        let handle = self.inner.handle()?;
+        let arguments = [c"loadfile".as_ptr(), self.fixture.as_ptr(), ptr::null()];
+        // SAFETY: Owner-only live handle, checked request ID and owned,
+        // NUL-terminated argv. libmpv copies the finite-file path on submission.
+        let result = unsafe {
+            (handle.functions.command_async)(handle.raw.as_ptr(), id.get(), arguments.as_ptr())
+        };
+        handle.checked(result, "fixture loadfile")
+    }
+
+    fn next_event(&mut self) -> Result<BackendEvent, MediaError> {
+        self.inner.next_event()
+    }
+
+    fn refresh_pause(&mut self) -> Result<Option<bool>, MediaError> {
+        self.inner.refresh_pause()
+    }
+
+    fn refresh_observed(&mut self, started: bool) -> Result<Option<ObservedFacts>, MediaError> {
+        self.inner.refresh_observed(started)
+    }
+
+    fn diagnostic(&self) -> Option<String> {
+        self.inner.diagnostic()
+    }
+
+    fn audio_status(&self) -> AudioStatus {
+        self.inner.audio_status()
+    }
+
+    fn shutdown(&mut self) -> Result<(), MediaError> {
+        // This returns only after the real Handle::drop/terminate_destroy.
+        self.inner.shutdown()?;
+        if let Some(generation) = self.generation.take() {
+            self.record(FixtureMilestone::Destroyed { generation })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for FixtureBackend {
+    fn drop(&mut self) {
+        // Assertion/error/timeout paths must retire the same genuine handle.
+        if let Err(error) = self.shutdown() {
+            tracing::error!(%error, "fixture_shutdown_failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const FIXTURE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn fixture_input() -> InputSpec {
+        use crate::{
+            capture::{input::CaptureSelection, linux},
+            domain::capture::{CaptureMode, CapturedFourCc, FrameRate},
+        };
+        let mode = CaptureMode {
+            captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
+            size: FrameSize::new(320, 240).unwrap(),
+            rate: FrameRate::new(30, 1).unwrap(),
+        };
+        let catalog = linux::session_fixture(&["/dev/video0"], mode);
+        CaptureSelection::from_snapshot(&catalog, Path::new("/dev/video0"), mode)
+            .unwrap()
+            .validate_snapshot(&catalog)
+            .unwrap()
+    }
+
+    fn fixture_token(generation: u64) -> SurfaceToken {
+        use super::super::controller::{Generation, X11WindowId};
+        SurfaceToken {
+            generation: Generation::new(generation).unwrap(),
+            // Null output never reads this test-only surface ID.
+            xid: X11WindowId::new(generation).unwrap(),
+        }
+    }
+
+    fn fixture_wait(
+        backend: &mut FixtureBackend,
+        transition: &str,
+        completed: impl FnMut(&mut FixtureBackend, BackendEvent) -> Result<bool, MediaError>,
+    ) -> Result<(), MediaError> {
+        fixture_wait_until(
+            backend,
+            transition,
+            std::time::Instant::now() + FIXTURE_WAIT,
+            completed,
+        )
+    }
+
+    fn fixture_wait_until(
+        backend: &mut FixtureBackend,
+        transition: &str,
+        deadline: std::time::Instant,
+        mut completed: impl FnMut(&mut FixtureBackend, BackendEvent) -> Result<bool, MediaError>,
+    ) -> Result<(), MediaError> {
+        loop {
+            if std::time::Instant::now() >= deadline {
+                // Genuine terminate_destroy runs even on a transition timeout.
+                backend.shutdown()?;
+                return Err(MediaError::new(
+                    "fixture_timeout",
+                    format!("{transition} did not complete within 10 seconds"),
+                ));
+            }
+            let event = backend.next_event()?;
+            match &event {
+                BackendEvent::CommandReply { id, error } if *error < 0 => {
+                    return Err(MediaError::new(
+                        "fixture_command",
+                        format!("request {id} failed with mpv error {error}"),
+                    ));
+                }
+                BackendEvent::EndFile { .. }
+                | BackendEvent::Shutdown
+                | BackendEvent::QueueOverflow => {
+                    return Err(MediaError::new(
+                        "fixture_event",
+                        format!("unexpected {event:?} during {transition}"),
+                    ));
+                }
+                _ => {}
+            }
+            let idle = event == BackendEvent::None;
+            if completed(backend, event)? {
+                return Ok(());
+            }
+            if idle {
+                thread::park_timeout(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    fn fixture_load(backend: &mut FixtureBackend) -> Result<(), MediaError> {
+        let id = RequestId::for_test(1);
+        backend.submit(id, BackendCommand::LoadInput)?;
+        let mut loaded = false;
+        let mut started = false;
+        let mut observed = false;
+        fixture_wait(
+            backend,
+            "file playback and fresh decoded metadata",
+            |backend, event| {
+                match event {
+                    BackendEvent::CommandReply {
+                        id: reply,
+                        error: 0,
+                    } if reply == id.get() => {
+                        loaded = true;
+                    }
+                    BackendEvent::PlaybackRestart if !started => {
+                        started = true;
+                        backend.refresh_observed(true)?;
+                    }
+                    BackendEvent::Observed {
+                        started: true,
+                        facts,
+                    } => {
+                        let size = facts.decoded_size.as_ref().map(|value| value.value);
+                        let rate = facts.nominal_rate.as_ref().map(|value| value.value);
+                        if size != Some(FrameSize::new(320, 240).unwrap()) || rate != Some(30.0) {
+                            return Err(MediaError::new(
+                                "fixture_metadata",
+                                format!("expected decoded 320x240 at nominal 30fps, got {facts:?}"),
+                            ));
+                        }
+                        observed = true;
+                    }
+                    _ => {}
+                }
+                Ok(loaded && started && observed)
+            },
+        )
+    }
+
+    fn fixture_property(
+        backend: &mut FixtureBackend,
+        name: &'static CStr,
+    ) -> Result<NodeValue, MediaError> {
+        fixture_property_until(backend, name, std::time::Instant::now() + FIXTURE_WAIT)
+    }
+
+    fn fixture_property_until(
+        backend: &mut FixtureBackend,
+        name: &'static CStr,
+        deadline: std::time::Instant,
+    ) -> Result<NodeValue, MediaError> {
+        backend
+            .inner
+            .fixture_properties
+            .get_or_insert_with(VecDeque::new);
+        backend.inner.get(name, Pending::FixtureProperty(name))?;
+        let id = backend.inner.last_internal;
+        let mut value = None;
+        fixture_wait_until(
+            backend,
+            &format!("fresh {}", name.to_string_lossy()),
+            deadline,
+            |backend, _| {
+                let replies = backend
+                    .inner
+                    .fixture_properties
+                    .as_mut()
+                    .expect("probe enabled");
+                if let Some(index) = replies.iter().position(|(reply, _)| *reply == id) {
+                    value = Some(replies.remove(index).expect("matched property reply").1);
+                }
+                Ok(value.is_some())
+            },
+        )?;
+        Ok(value.expect("wait completed only with exact property reply"))
+    }
+
+    fn fixture_time(backend: &mut FixtureBackend) -> Result<f64, MediaError> {
+        fixture_time_until(backend, std::time::Instant::now() + FIXTURE_WAIT)
+    }
+
+    fn fixture_time_until(
+        backend: &mut FixtureBackend,
+        deadline: std::time::Instant,
+    ) -> Result<f64, MediaError> {
+        match fixture_property_until(backend, c"time-pos", deadline)? {
+            NodeValue::Double(value) if value.is_finite() && value >= 0.0 => Ok(value),
+            value => Err(MediaError::new(
+                "fixture_time",
+                format!("expected finite nonnegative time-pos, got {value:?}"),
+            )),
+        }
+    }
+
+    fn fixture_advancing(backend: &mut FixtureBackend) -> Result<(), MediaError> {
+        let deadline = std::time::Instant::now() + FIXTURE_WAIT;
+        let first = fixture_time_until(backend, deadline)?;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                backend.shutdown()?;
+                return Err(MediaError::new(
+                    "fixture_timeout",
+                    "time-pos did not advance within 10 seconds",
+                ));
+            }
+            thread::park_timeout(std::time::Duration::from_millis(100));
+            let latest = fixture_time_until(backend, deadline)?;
+            if latest > first + 0.1 {
+                eprintln!("fixture time-pos advanced: {first:.6} -> {latest:.6}");
+                return Ok(());
+            }
+        }
+    }
+
+    fn fixture_pause(
+        backend: &mut FixtureBackend,
+        id: u64,
+        paused: bool,
+    ) -> Result<(), MediaError> {
+        let request = PauseRequestId::new(id).unwrap();
+        let owner = RequestId::for_test(id);
+        backend.submit(owner, BackendCommand::SetPaused { request, paused })?;
+        let mut observed = false;
+        let mut replied = false;
+        fixture_wait(backend, "correlated pause set/readback", |_, event| {
+            match event {
+                BackendEvent::PauseObserved(PauseObservation {
+                    request: Some(reply),
+                    paused: value,
+                }) if reply == request && value == paused => observed = true,
+                BackendEvent::CommandReply {
+                    id: reply,
+                    error: 0,
+                } if reply == owner.get() => {
+                    replied = true;
+                }
+                _ => {}
+            }
+            Ok(observed && replied)
+        })?;
+        assert_eq!(
+            fixture_property(backend, c"pause")?,
+            NodeValue::Flag(paused)
+        );
+        Ok(())
+    }
+
+    fn fixture_gain(
+        backend: &mut FixtureBackend,
+        id: u64,
+        gain: PlaybackGain,
+    ) -> Result<(), MediaError> {
+        let owner = RequestId::for_test(id);
+        backend.submit(owner, BackendCommand::SetGain(gain))?;
+        fixture_wait(backend, "volume then mute transaction", |_, event| {
+            Ok(matches!(event, BackendEvent::CommandReply { id, error: 0 } if id == owner.get()))
+        })?;
+        assert_eq!(
+            fixture_property(backend, c"volume")?,
+            NodeValue::Double(f64::from(gain.volume_percent)),
+        );
+        assert_eq!(
+            fixture_property(backend, c"mute")?,
+            NodeValue::Flag(gain.muted)
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires frozen libmpv and FURAMI_PLAYBACK_FIXTURE"]
+    fn real_libmpv_playback_controls() {
+        let prefix = std::env::var("FURAMI_MEDIA_PREFIX").expect("set frozen FURAMI_MEDIA_PREFIX");
+        let fixture = PathBuf::from(
+            std::env::var_os("FURAMI_PLAYBACK_FIXTURE").expect("set FURAMI_PLAYBACK_FIXTURE"),
+        );
+        let recorder = FixtureRecorder::default();
+        let stop = StopFlag::for_test();
+        let latest_gain = PlaybackGain::new(80, false).unwrap();
+        {
+            let mut backend = FixtureBackend::new(
+                prefix.clone(),
+                fixture.clone(),
+                fixture_input(),
+                PlaybackGain::default(),
+                Some(recorder.clone()),
+            )
+            .unwrap();
+            let result = (|| -> Result<(), MediaError> {
+                backend.initialize(fixture_token(1), &stop)?;
+                fixture_load(&mut backend)?;
+                let handle = backend.inner.handle()?.raw;
+                fixture_advancing(&mut backend)?;
+                fixture_pause(&mut backend, 2, true)?;
+                let paused = fixture_time(&mut backend)?;
+                for _ in 0..3 {
+                    thread::park_timeout(std::time::Duration::from_millis(200));
+                    assert_eq!(
+                        fixture_time(&mut backend)?,
+                        paused,
+                        "paused time-pos changed"
+                    );
+                }
+                eprintln!("fixture paused time-pos stable across four fresh reads: {paused:.6}");
+                fixture_gain(&mut backend, 3, PlaybackGain::new(80, true).unwrap())?;
+                fixture_gain(&mut backend, 4, latest_gain)?;
+                assert_eq!(
+                    backend.inner.handle()?.raw,
+                    handle,
+                    "gain replaced the handle"
+                );
+                // Unpause is permitted only for this finite file, never live input.
+                fixture_pause(&mut backend, 5, false)?;
+                fixture_advancing(&mut backend)?;
+                assert_eq!(
+                    backend.inner.handle()?.raw,
+                    handle,
+                    "controls replaced the handle"
+                );
+                Ok(())
+            })();
+            backend
+                .shutdown()
+                .expect("genuine first handle destruction");
+            result.expect("real finite-file controls");
+        }
+        assert!(matches!(recorder.snapshot().unwrap().last(),
+            Some(FixtureMilestone::Destroyed { generation }) if generation.get() == 1));
+        {
+            let mut backend = FixtureBackend::new(
+                prefix,
+                fixture,
+                fixture_input(),
+                latest_gain,
+                Some(recorder.clone()),
+            )
+            .unwrap();
+            let result = (|| -> Result<(), MediaError> {
+                backend.initialize(fixture_token(2), &stop)?;
+                fixture_load(&mut backend)?;
+                assert_eq!(
+                    fixture_property(&mut backend, c"volume")?,
+                    NodeValue::Double(80.0)
+                );
+                assert_eq!(
+                    fixture_property(&mut backend, c"mute")?,
+                    NodeValue::Flag(false)
+                );
+                assert_eq!(
+                    fixture_property(&mut backend, c"pause")?,
+                    NodeValue::Flag(false)
+                );
+                fixture_advancing(&mut backend)?;
+                Ok(())
+            })();
+            backend
+                .shutdown()
+                .expect("genuine second handle destruction");
+            result.expect("fresh finite-file handle retained latest gain and started unpaused");
+        }
+        let milestones = recorder.snapshot().unwrap();
+        assert_eq!(
+            milestones,
+            vec![
+                FixtureMilestone::Created {
+                    generation: fixture_token(1).generation
+                },
+                FixtureMilestone::Initialized {
+                    generation: fixture_token(1).generation,
+                    gain: PlaybackGain::default()
+                },
+                FixtureMilestone::Destroyed {
+                    generation: fixture_token(1).generation
+                },
+                FixtureMilestone::Created {
+                    generation: fixture_token(2).generation
+                },
+                FixtureMilestone::Initialized {
+                    generation: fixture_token(2).generation,
+                    gain: latest_gain
+                },
+                FixtureMilestone::Destroyed {
+                    generation: fixture_token(2).generation
+                },
+            ]
+        );
+        eprintln!("real libmpv finite-file milestones: {milestones:?}");
+        eprintln!(
+            "finite time/property qualification only; no audible silence, live freshness, or Qt/XID claim"
+        );
+    }
     #[test]
     fn audio_window_ignores_unmatched_and_wrong_reply_kinds() {
         let mut open = AudioOpen::new();
@@ -1675,6 +2394,225 @@ mod reply_tests {
     }
 
     #[test]
+    fn pause_set_success_submits_new_read_separate_from_existing_generic_refresh() {
+        let mut backend = backend();
+        backend.property_requests = Some(Vec::new());
+        let request = PauseRequestId::new(6).unwrap();
+        backend.refresh_pause().unwrap();
+        let generic = backend.property_requests.as_ref().unwrap()[0].0;
+        backend
+            .submit(
+                RequestId::for_test(20),
+                BackendCommand::SetPaused {
+                    request,
+                    paused: true,
+                },
+            )
+            .unwrap();
+        let set = backend.property_requests.as_ref().unwrap()[1].0;
+        assert_eq!(
+            backend.property_requests.as_ref().unwrap()[1].2,
+            Some(NodeValue::Flag(true))
+        );
+        assert_eq!(
+            backend
+                .reply(set, ReplyKind::SetProperty, 0, None, None)
+                .unwrap(),
+            BackendEvent::Other
+        );
+        let requests = backend.property_requests.as_ref().unwrap();
+        assert_eq!(requests.len(), 3);
+        let read = requests[2].0;
+        assert_ne!(read, generic);
+        assert_ne!(read, set);
+        assert_eq!(requests[2].1, c"pause");
+        assert_eq!(requests[2].2, None);
+        assert_eq!(
+            backend
+                .reply(
+                    generic,
+                    ReplyKind::Property,
+                    0,
+                    Some(c"pause".to_owned()),
+                    Some(NodeValue::Flag(false))
+                )
+                .unwrap(),
+            BackendEvent::PauseObserved(PauseObservation {
+                request: None,
+                paused: false
+            })
+        );
+        assert_eq!(
+            backend
+                .reply(
+                    read,
+                    ReplyKind::Property,
+                    0,
+                    Some(c"pause".to_owned()),
+                    Some(NodeValue::Flag(true))
+                )
+                .unwrap(),
+            BackendEvent::PauseObserved(PauseObservation {
+                request: Some(request),
+                paused: true
+            })
+        );
+        assert_eq!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::CommandReply { id: 20, error: 0 })
+        );
+    }
+
+    #[test]
+    fn correlated_pause_read_requires_exact_kind_id_name_and_expected_flag() {
+        let request = PauseRequestId::new(3).unwrap();
+        let id = (1 << 63) + 9;
+        let mut backend = backend();
+        backend.pending.push((
+            id,
+            Pending::PauseRead {
+                owner: 17,
+                request,
+                expected: true,
+            },
+        ));
+        for (reply, kind) in [
+            (id + 1, ReplyKind::Property),
+            (id, ReplyKind::Command),
+            (id, ReplyKind::SetProperty),
+        ] {
+            assert_eq!(
+                backend
+                    .reply(
+                        reply,
+                        kind,
+                        0,
+                        Some(c"pause".to_owned()),
+                        Some(NodeValue::Flag(true))
+                    )
+                    .unwrap(),
+                BackendEvent::Other
+            );
+            assert_eq!(backend.pending.len(), 1);
+        }
+        assert_eq!(
+            backend
+                .reply(
+                    id,
+                    ReplyKind::Property,
+                    0,
+                    Some(c"pause".to_owned()),
+                    Some(NodeValue::Flag(true))
+                )
+                .unwrap(),
+            BackendEvent::PauseObserved(PauseObservation {
+                request: Some(request),
+                paused: true
+            })
+        );
+        assert_eq!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::CommandReply { id: 17, error: 0 })
+        );
+        assert!(backend.pending.is_empty());
+        assert_eq!(
+            backend
+                .reply(
+                    id,
+                    ReplyKind::Property,
+                    0,
+                    Some(c"pause".to_owned()),
+                    Some(NodeValue::Flag(false))
+                )
+                .unwrap(),
+            BackendEvent::Other
+        );
+    }
+
+    #[test]
+    fn correlated_pause_invalid_or_failed_read_is_pause_property_failure() {
+        for (error, name, value) in [
+            (-5, Some(c"pause".to_owned()), Some(NodeValue::Flag(true))),
+            (0, Some(c"mute".to_owned()), Some(NodeValue::Flag(true))),
+            (0, None, Some(NodeValue::Flag(true))),
+            (0, Some(c"pause".to_owned()), Some(NodeValue::Int(1))),
+            (0, Some(c"pause".to_owned()), Some(NodeValue::Flag(false))),
+            (0, Some(c"pause".to_owned()), None),
+        ] {
+            let mut backend = backend();
+            let id = (1 << 63) + 10;
+            backend.pending.push((
+                id,
+                Pending::PauseRead {
+                    owner: 18,
+                    request: PauseRequestId::new(4).unwrap(),
+                    expected: true,
+                },
+            ));
+            assert_eq!(
+                backend
+                    .reply(id, ReplyKind::Property, error, name, value)
+                    .unwrap_err()
+                    .code,
+                "pause_property"
+            );
+            assert!(backend.emitted.is_empty());
+        }
+    }
+
+    #[test]
+    fn pause_set_wrong_kind_or_id_cannot_complete_and_negative_reply_keeps_outer_identity() {
+        let mut backend = backend();
+        let id = (1 << 63) + 11;
+        backend.pending.push((
+            id,
+            Pending::PauseSet {
+                owner: 19,
+                request: PauseRequestId::new(5).unwrap(),
+                expected: true,
+            },
+        ));
+        assert_eq!(
+            backend
+                .reply(
+                    id,
+                    ReplyKind::Property,
+                    0,
+                    Some(c"pause".to_owned()),
+                    Some(NodeValue::Flag(true))
+                )
+                .unwrap(),
+            BackendEvent::Other
+        );
+        assert_eq!(
+            backend
+                .reply(id + 1, ReplyKind::SetProperty, 0, None, None)
+                .unwrap(),
+            BackendEvent::Other
+        );
+        assert_eq!(
+            backend
+                .reply(19, ReplyKind::Command, 0, None, None)
+                .unwrap(),
+            BackendEvent::Other
+        );
+        assert_eq!(backend.pending.len(), 1);
+        assert_eq!(
+            backend
+                .reply(id, ReplyKind::SetProperty, -5, None, None)
+                .unwrap(),
+            BackendEvent::CommandReply { id: 19, error: -5 }
+        );
+        assert!(backend.pending.is_empty());
+        assert_eq!(
+            backend
+                .reply(id, ReplyKind::SetProperty, 0, None, None)
+                .unwrap(),
+            BackendEvent::Other
+        );
+    }
+
+    #[test]
     fn live_property_pending_survives_wrong_kind_and_late_duplicate_cannot_change_pause() {
         let mut backend = backend();
         let id = (1 << 63) + 7;
@@ -1710,7 +2648,10 @@ mod reply_tests {
                     Some(NodeValue::Flag(false))
                 )
                 .unwrap(),
-            BackendEvent::PauseObserved(false)
+            BackendEvent::PauseObserved(PauseObservation {
+                request: None,
+                paused: false
+            })
         );
         assert!(backend.pending.is_empty());
         assert_eq!(
@@ -1743,7 +2684,7 @@ mod reply_tests {
                 )
                 .unwrap_err()
                 .code,
-            "mpv_event"
+            "pause_property"
         );
         assert_eq!(backend.pending.len(), 1);
     }

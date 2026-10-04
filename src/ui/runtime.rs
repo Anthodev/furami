@@ -5,13 +5,14 @@ use crate::{
         apply::ApplyCoordinator,
         control::{self, Command, ExpectedCleanup, ExpectedState},
         gate::GatePhase,
-        ports::{ImmediateIntent, SubmitStatus},
+        ports::{AudioDiagnostic, SubmitStatus},
     },
     capture::CaptureValidator,
     domain::{
         capture::{AudioSelection, AudioSourceIdentity, PlaybackGain},
         state::{
-            AttemptId, CleanupStatus, CommandRejection, DraftRevision, DraftSettings, StateIdentity,
+            AttemptId, CleanupStatus, CommandRejection, DraftRevision, DraftSettings,
+            PlaybackState, ProductPhase, StateIdentity,
         },
     },
     media::{
@@ -36,6 +37,11 @@ pub(crate) struct UiUpdate {
     pub failed: bool,
     pub diagnostic: String,
     pub paused: bool,
+    pub volume_percent: i32,
+    pub muted: bool,
+    pub can_toggle_pause: bool,
+    pub can_set_gain: bool,
+    pub playback_status: String,
     pub ended: bool,
     pub create_native: bool,
     pub release_native: bool,
@@ -46,7 +52,12 @@ pub(crate) struct RuntimeCoordinator {
     engine: Option<Engine>,
     sources: Vec<AudioSourceIdentity>,
     dirty: bool,
-    last_state: Option<(StateIdentity, DraftRevision, PlaybackGain)>,
+    last_state: Option<(
+        StateIdentity,
+        DraftRevision,
+        PlaybackGain,
+        Option<PlaybackState>,
+    )>,
     command_error: String,
     quit_empty: bool,
 }
@@ -183,10 +194,77 @@ impl RuntimeCoordinator {
         self.poll()
     }
     pub(crate) fn pause(&mut self, attempt: AttemptId) -> SubmitStatus {
-        self.engine
+        let result = self
+            .engine
             .as_mut()
-            .map(|engine| engine.submit_immediate(attempt, ImmediateIntent::TogglePause))
-            .unwrap_or(SubmitStatus::NotReady)
+            .map(|engine| engine.toggle_pause(attempt));
+        self.dirty = true;
+        match result {
+            Some(Ok(status)) => {
+                if status == SubmitStatus::Accepted {
+                    self.command_error.clear();
+                } else {
+                    self.rejection(format!("pause submission {status:?}"));
+                }
+                status
+            }
+            Some(Err(error)) => {
+                let status = match error {
+                    CommandRejection::StaleState => SubmitStatus::StaleGeneration,
+                    CommandRejection::ShuttingDown | CommandRejection::CleanupIncomplete => {
+                        SubmitStatus::Closing
+                    }
+                    _ => SubmitStatus::NotReady,
+                };
+                self.rejection(error);
+                status
+            }
+            None => SubmitStatus::NotReady,
+        }
+    }
+    /// Immediate application gain from a visible control. Every admission
+    /// outcome, including a rejected update or an unchanged accepted integer,
+    /// forces presentation dirty so the next poll publishes an authoritative
+    /// reconciliation instead of being suppressed by stamp equality.
+    pub(crate) fn set_volume(&mut self, percent: i32) -> SubmitStatus {
+        self.dirty = true;
+        let Some(current) = self.engine.as_ref().map(|engine| engine.gain()) else {
+            self.rejection("volume requires an active capture engine");
+            return SubmitStatus::NotReady;
+        };
+        let Some(gain) = u8::try_from(percent)
+            .ok()
+            .filter(|value| *value <= 100)
+            .and_then(|value| PlaybackGain::new(value, current.muted).ok())
+        else {
+            self.rejection("volume requires playback percent 0..100");
+            return SubmitStatus::NotReady;
+        };
+        self.submit_gain(gain)
+    }
+    pub(crate) fn set_muted(&mut self, muted: bool) -> SubmitStatus {
+        self.dirty = true;
+        let gain = self.engine.as_ref().map(|engine| PlaybackGain {
+            muted,
+            ..engine.gain()
+        });
+        let Some(gain) = gain else {
+            self.rejection("mute requires an active capture engine");
+            return SubmitStatus::NotReady;
+        };
+        self.submit_gain(gain)
+    }
+    fn submit_gain(&mut self, gain: PlaybackGain) -> SubmitStatus {
+        let status = match self.engine.as_mut() {
+            Some(engine) => engine.set_gain(gain),
+            None => SubmitStatus::NotReady,
+        };
+        if status == SubmitStatus::Accepted {
+            self.command_error.clear();
+        } else {
+            self.rejection(format!("gain submission {status:?}"));
+        }
+        status
     }
     fn checked_state(
         engine: &Engine,
@@ -303,24 +381,42 @@ impl RuntimeCoordinator {
                     engine.quit();
                 }
                 Command::Volume(attempt, percent) => {
+                    if engine.model().state_identity().attempt() != Some(attempt) {
+                        return Err("volume submission StaleGeneration".into());
+                    }
                     let gain = PlaybackGain::new(percent, engine.gain().muted)
                         .map_err(|error| error.to_string())?;
-                    let status = engine.submit_immediate(attempt, ImmediateIntent::SetGain(gain));
+                    let status = engine.set_gain(gain);
                     tracing::info!(attempt_id = attempt.get(), ?status, "qualification_volume");
                     if status != SubmitStatus::Accepted {
                         return Err(format!("volume submission {status:?}"));
                     }
                 }
                 Command::Mute(attempt, muted) => {
+                    if engine.model().state_identity().attempt() != Some(attempt) {
+                        return Err("mute submission StaleGeneration".into());
+                    }
                     let gain = PlaybackGain {
                         muted,
                         ..engine.gain()
                     };
-                    let status = engine.submit_immediate(attempt, ImmediateIntent::SetGain(gain));
+                    let status = engine.set_gain(gain);
                     tracing::info!(attempt_id = attempt.get(), ?status, "qualification_mute");
                     if status != SubmitStatus::Accepted {
                         return Err(format!("mute submission {status:?}"));
                     }
+                }
+                Command::Pause(attempt) => {
+                    let status = engine.pause(attempt).map_err(|error| error.to_string())?;
+                    if status != SubmitStatus::Accepted {
+                        return Err(format!("pause submission {status:?}"));
+                    }
+                }
+                Command::Resume(attempt) => {
+                    let state = engine.model().state_identity();
+                    engine
+                        .resume(state, attempt)
+                        .map_err(|error| error.to_string())?;
                 }
                 Command::Snapshot => {}
             }
@@ -368,6 +464,11 @@ impl RuntimeCoordinator {
                     String::new()
                 },
                 paused: false,
+                volume_percent: 0,
+                muted: false,
+                can_toggle_pause: false,
+                can_set_gain: false,
+                playback_status: "Unavailable".into(),
                 ended: false,
                 create_native: false,
                 release_native: false,
@@ -377,7 +478,13 @@ impl RuntimeCoordinator {
         engine.poll();
         let native = engine.runner_mut().take_native_update();
         let identity = engine.model().state_identity();
-        let stamp = (identity, engine.model().draft().revision, engine.gain());
+        let active_playback = engine.model().active().map(|active| active.playback());
+        let stamp = (
+            identity,
+            engine.model().draft().revision,
+            engine.gain(),
+            active_playback,
+        );
         let changed =
             std::mem::take(&mut self.dirty) || native.changed || self.last_state != Some(stamp);
         self.last_state = Some(stamp);
@@ -420,6 +527,7 @@ impl RuntimeCoordinator {
                     .iter()
                     .chain(failures.candidate.iter())
                     .chain(failures.restore.iter())
+                    .chain(failures.resume.iter())
                     .chain(failures.cleanup.iter())
                 {
                     if !diagnostic.is_empty() {
@@ -459,6 +567,45 @@ impl RuntimeCoordinator {
                 engine.runner_mut().report.clone()
             };
         }
+        let paused = engine
+            .model()
+            .active()
+            .is_some_and(|active| active.playback() == PlaybackState::Paused);
+        let model = engine.model();
+        let restart_required = matches!(
+            engine.audio_diagnostic(),
+            Some(AudioDiagnostic::RestartRequired(_))
+        );
+        let playback_status = match model.phase() {
+            ProductPhase::ValidatingResume
+            | ProductPhase::ClosingResume
+            | ProductPhase::OpeningResume
+            | ProductPhase::CleaningFailedResume => "Resuming",
+            _ => match model.active() {
+                Some(active) => match active.playback() {
+                    PlaybackState::Live => "Live",
+                    PlaybackState::PausePending { .. } => "Pausing",
+                    PlaybackState::Paused => "Paused",
+                },
+                None => "Unavailable",
+            },
+        };
+        let can_toggle_pause = !quit
+            && !restart_required
+            && match model.phase() {
+                ProductPhase::Active
+                | ProductPhase::Paused
+                | ProductPhase::ErrorWithActiveRestored => {
+                    matches!(
+                        active_playback,
+                        Some(PlaybackState::Live) | Some(PlaybackState::Paused)
+                    )
+                }
+                _ => false,
+            };
+        let can_set_gain = engine.gain_admission_open();
+        let volume_percent = i32::from(engine.gain().volume_percent);
+        let muted = engine.gain().muted;
         let runner = engine.runner_mut();
         UiUpdate {
             changed,
@@ -490,7 +637,12 @@ impl RuntimeCoordinator {
             },
             failed: phase == GatePhase::Failed || runner.fatal_native_failure().is_some(),
             diagnostic,
-            paused: runner.paused,
+            paused,
+            volume_percent,
+            muted,
+            can_toggle_pause,
+            can_set_gain,
+            playback_status: playback_status.into(),
             ended: runner.ended,
             create_native: native.create_native,
             release_native: native.release_native,
@@ -511,6 +663,7 @@ fn log_snapshot(engine: &Engine) {
         "draft_revision": model.draft().revision.get(), "draft": model.draft().settings,
         "last_valid": model.last_valid().map(|settings| settings.settings()),
         "active_attempt": model.active().map(|active| active.attempt().get()), "active_settings": model.active().map(|active| active.applied().settings()),
+        "active_playback": model.active().map(|active| active.playback()),
         "failures": model.failures(), "validation_rejection": model.validation_rejection().map(|rejection| serde_json::json!({"request": rejection.request, "failure": rejection.failure})),
         "gain": engine.gain(), "can_apply": model.can_apply(), "can_restart": model.can_restart(), "can_reconnect": model.can_reconnect(), "shutdown_ready": model.shutdown_ready(),
     });
@@ -557,8 +710,29 @@ mod tests {
         (request, prepared)
     }
     fn runtime() -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+        runtime_with_validator(validate)
+    }
+    fn runtime_with_validator(
+        execute: fn(
+            ValidationRequest,
+        ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
+    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+        runtime_fixture(execute, None)
+    }
+    fn runtime_fixture(
+        execute: fn(
+            ValidationRequest,
+        ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
+        fail_spawn: Option<u64>,
+    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
         let (tx, rx) = mpsc::channel();
         let runner = GateRunner::with_spawner(move |generation, config| {
+            if fail_spawn == Some(generation.get()) {
+                return Err(crate::media::controller::MediaError::new(
+                    "fixture_spawn",
+                    "candidate owner spawn rejected",
+                ));
+            }
             let requested = config.video.requested();
             let input = config
                 .video
@@ -572,7 +746,7 @@ mod tests {
         let engine = ApplyCoordinator::new(
             settings(),
             PlaybackGain::default(),
-            CaptureValidator::with_runner(validate),
+            CaptureValidator::with_runner(execute),
             runner,
         );
         (
@@ -609,6 +783,113 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+    fn start_live(runtime: &mut RuntimeCoordinator, drivers: &mpsc::Receiver<Driver>) -> Driver {
+        let opening = runtime.open();
+        if !opening.create_native {
+            await_update(runtime, |update| update.create_native);
+        }
+        let driver = drivers.recv().unwrap();
+        runtime.surface_ready(SurfaceToken {
+            generation: Generation::new(1).unwrap(),
+            xid: X11WindowId::new(71).unwrap(),
+        });
+        driver.initialized.recv().unwrap();
+        let (load, _) = driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        driver.send(BackendEvent::PlaybackRestart);
+        driver.fence();
+        await_update(runtime, |update| update.can_toggle_pause);
+        driver
+    }
+    fn confirm_explicit_pause(runtime: &mut RuntimeCoordinator, driver: &Driver) {
+        let attempt = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .active()
+            .unwrap()
+            .attempt();
+        let pausing = runtime.qualification_command(&format!("pause {}", attempt.get()));
+        assert_eq!(pausing.playback_status, "Pausing");
+        assert!(!pausing.paused && !pausing.can_toggle_pause);
+        snapshot_expected(runtime);
+        let (outer, command) = driver.submitted.recv().unwrap();
+        let crate::media::controller::BackendCommand::SetPaused {
+            request,
+            paused: true,
+        } = command
+        else {
+            panic!("explicit pause transaction required");
+        };
+        driver.send(BackendEvent::PauseObserved(
+            crate::media::controller::PauseObservation {
+                request: Some(request),
+                paused: true,
+            },
+        ));
+        driver.send(BackendEvent::CommandReply {
+            id: outer.get(),
+            error: 0,
+        });
+        driver.fence();
+        let paused = await_update(runtime, |update| update.playback_status == "Paused");
+        assert!(paused.paused && paused.can_toggle_pause);
+    }
+    fn assert_command_rejection(
+        runtime: &RuntimeCoordinator,
+        update: &UiUpdate,
+        expected: CommandRejection,
+    ) {
+        assert!(update.changed);
+        assert_eq!(runtime.command_error, expected.to_string());
+        assert!(update.diagnostic.contains(&expected.to_string()));
+    }
+    fn snapshot_expected(runtime: &RuntimeCoordinator) -> ExpectedState {
+        let engine = runtime.engine.as_ref().unwrap();
+        let model = engine.model();
+        let identity = model.state_identity();
+        let scalar = format!(
+            "close {:?} {} {} Complete",
+            model.phase(),
+            identity.operation().map(|id| id.get()).unwrap_or(0),
+            identity.attempt().map(AttemptId::get).unwrap_or(0),
+        );
+        let Command::Close(expected) = control::parse(&scalar).unwrap() else {
+            panic!("snapshot close grammar");
+        };
+        assert_eq!(
+            RuntimeCoordinator::checked_state(engine, expected),
+            Ok(identity)
+        );
+        for wrong in [
+            ExpectedState {
+                phase: ProductPhase::Stopped,
+                ..expected
+            },
+            ExpectedState {
+                apply: expected.apply + 1,
+                ..expected
+            },
+            ExpectedState {
+                attempt: expected.attempt + 1,
+                ..expected
+            },
+            ExpectedState {
+                cleanup: ExpectedCleanup::Draining,
+                ..expected
+            },
+        ] {
+            assert_eq!(
+                RuntimeCoordinator::checked_state(engine, wrong),
+                Err(CommandRejection::StaleState)
+            );
+        }
+        expected
     }
     fn cleanup(runtime: &mut RuntimeCoordinator) {
         let first = runtime.quit();
@@ -763,6 +1044,444 @@ mod tests {
         second.destroyed.recv().unwrap();
     }
     #[test]
+    fn visible_pause_remains_false_until_correlated_observation_and_pending_action_is_rejected() {
+        let (mut runtime, drivers) = runtime();
+        let update = runtime.open();
+        if !update.create_native {
+            await_update(&mut runtime, |update| update.create_native);
+        }
+        let driver = drivers.recv().unwrap();
+        let attempt = AttemptId::new(1).unwrap();
+        runtime.surface_ready(SurfaceToken {
+            generation: Generation::new(1).unwrap(),
+            xid: X11WindowId::new(71).unwrap(),
+        });
+        driver.initialized.recv().unwrap();
+        let (load, _) = driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        driver.send(BackendEvent::PlaybackRestart);
+        driver.fence();
+        await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
+        assert_eq!(runtime.pause(attempt), SubmitStatus::Accepted);
+        assert!(!runtime.poll().paused);
+        assert_eq!(runtime.pause(attempt), SubmitStatus::NotReady);
+        assert!(
+            runtime
+                .poll()
+                .diagnostic
+                .contains("playback transition already in progress")
+        );
+        let (outer, command) = driver.submitted.recv().unwrap();
+        let crate::media::controller::BackendCommand::SetPaused {
+            request,
+            paused: true,
+        } = command
+        else {
+            panic!("explicit pause")
+        };
+        driver.send(BackendEvent::PauseObserved(
+            crate::media::controller::PauseObservation {
+                request: None,
+                paused: true,
+            },
+        ));
+        driver.fence();
+        assert!(!runtime.poll().paused);
+        driver.send(BackendEvent::PauseObserved(
+            crate::media::controller::PauseObservation {
+                request: Some(request),
+                paused: true,
+            },
+        ));
+        driver.send(BackendEvent::CommandReply {
+            id: outer.get(),
+            error: 0,
+        });
+        driver.fence();
+        assert!(runtime.poll().paused);
+        assert_eq!(runtime.pause(attempt), SubmitStatus::Accepted);
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().model().phase(),
+            ProductPhase::ValidatingResume
+        );
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn signed_volume_range_is_rejected_with_exact_diagnostic_without_mutation() {
+        let (mut runtime, _) = runtime();
+        runtime.poll();
+        assert_eq!(runtime.set_volume(80), SubmitStatus::Accepted);
+        assert_eq!(runtime.set_muted(true), SubmitStatus::Accepted);
+        let preference = PlaybackGain::new(80, true).unwrap();
+        let retained = runtime.poll();
+        assert_eq!(retained.volume_percent, 80);
+        assert!(retained.muted);
+        assert_eq!(runtime.engine.as_ref().unwrap().gain(), preference);
+        for percent in [-1, 101] {
+            assert_eq!(runtime.set_volume(percent), SubmitStatus::NotReady);
+            let update = runtime.poll();
+            assert!(update.changed);
+            assert_eq!(update.volume_percent, 80);
+            assert!(update.muted);
+            assert_eq!(runtime.engine.as_ref().unwrap().gain(), preference);
+            assert!(
+                update
+                    .diagnostic
+                    .contains("volume requires playback percent 0..100"),
+                "{}",
+                update.diagnostic
+            );
+        }
+        cleanup(&mut runtime);
+    }
+    #[test]
+    fn gain_setters_preserve_other_component_and_reconcile_unchanged_acceptance() {
+        let (mut runtime, _) = runtime();
+        runtime.poll();
+        assert_eq!(runtime.set_volume(80), SubmitStatus::Accepted);
+        assert_eq!(runtime.set_muted(true), SubmitStatus::Accepted);
+        let muted = PlaybackGain::new(80, true).unwrap();
+        assert_eq!(runtime.engine.as_ref().unwrap().gain(), muted);
+        assert_eq!(runtime.set_volume(80), SubmitStatus::Accepted);
+        let reconciled = runtime.poll();
+        assert!(reconciled.changed);
+        assert_eq!(reconciled.volume_percent, 80);
+        assert!(reconciled.muted);
+        assert!(reconciled.can_set_gain);
+        assert_eq!(runtime.set_muted(false), SubmitStatus::Accepted);
+        let unmuted = runtime.poll();
+        assert!(unmuted.changed);
+        assert_eq!(unmuted.volume_percent, 80);
+        assert!(!unmuted.muted);
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().gain(),
+            PlaybackGain::new(80, false).unwrap()
+        );
+        cleanup(&mut runtime);
+    }
+    #[test]
+    fn rejected_gain_admission_still_publishes_authoritative_preference() {
+        let (mut runtime, drivers) = runtime();
+        runtime.poll();
+        assert_eq!(runtime.set_volume(64), SubmitStatus::Accepted);
+        cleanup(&mut runtime);
+        assert!(drivers.try_recv().is_err());
+        let before = runtime.engine.as_ref().unwrap().gain();
+        assert_eq!(runtime.set_volume(20), SubmitStatus::Closing);
+        let update = runtime.poll();
+        assert!(update.changed);
+        assert_eq!(update.volume_percent, i32::from(before.volume_percent));
+        assert_eq!(runtime.engine.as_ref().unwrap().gain(), before);
+        assert!(update.diagnostic.contains("gain submission Closing"));
+    }
+    #[test]
+    fn muted_setter_without_engine_is_rejected_and_published() {
+        let mut runtime = {
+            let (mut runtime, _) = runtime();
+            runtime.engine = None;
+            runtime
+        };
+        runtime.poll();
+        assert_eq!(runtime.set_muted(true), SubmitStatus::NotReady);
+        let update = runtime.poll();
+        assert!(update.changed);
+        assert!(!update.can_set_gain);
+        assert_eq!(update.playback_status, "Unavailable");
+        assert!(
+            update
+                .diagnostic
+                .contains("mute requires an active capture engine")
+        );
+    }
+    #[test]
+    fn explicit_playback_commands_preserve_typed_guards_without_mutation() {
+        let (mut runtime, drivers) = runtime();
+        for command in ["pause 1", "resume 1"] {
+            let before = runtime.engine.as_ref().unwrap().model().state_identity();
+            let rejected = runtime.qualification_command(command);
+            assert_command_rejection(&runtime, &rejected, CommandRejection::PlaybackUnavailable);
+            assert_eq!(
+                runtime.engine.as_ref().unwrap().model().state_identity(),
+                before
+            );
+            assert!(drivers.try_recv().is_err());
+        }
+        let driver = start_live(&mut runtime, &drivers);
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().audio_diagnostic(),
+            Some(&AudioDiagnostic::Disabled)
+        );
+        for (command, rejection) in [
+            ("pause 2", CommandRejection::StaleState),
+            ("resume 2", CommandRejection::StaleState),
+            ("resume 1", CommandRejection::PlaybackUnavailable),
+        ] {
+            let before = runtime.engine.as_ref().unwrap().model().state_identity();
+            let rejected = runtime.qualification_command(command);
+            assert_command_rejection(&runtime, &rejected, rejection);
+            assert_eq!(
+                runtime.engine.as_ref().unwrap().model().state_identity(),
+                before
+            );
+            assert_eq!(rejected.playback_status, "Live");
+            assert!(rejected.can_toggle_pause && !rejected.paused);
+            assert!(driver.submitted.try_recv().is_err());
+        }
+        let pausing = runtime.qualification_command("pause 1");
+        assert_eq!(pausing.playback_status, "Pausing");
+        let pending = runtime.engine.as_ref().unwrap().model().state_identity();
+        for command in ["pause 1", "resume 1"] {
+            let rejected = runtime.qualification_command(command);
+            assert_command_rejection(&runtime, &rejected, CommandRejection::PlaybackBusy);
+            assert_eq!(
+                runtime.engine.as_ref().unwrap().model().state_identity(),
+                pending
+            );
+            assert!(!rejected.can_toggle_pause && !rejected.paused);
+        }
+        let (outer, command) = driver.submitted.recv().unwrap();
+        let crate::media::controller::BackendCommand::SetPaused {
+            request,
+            paused: true,
+        } = command
+        else {
+            panic!("explicit pause transaction required");
+        };
+        driver.send(BackendEvent::PauseObserved(
+            crate::media::controller::PauseObservation {
+                request: Some(request),
+                paused: true,
+            },
+        ));
+        driver.send(BackendEvent::CommandReply {
+            id: outer.get(),
+            error: 0,
+        });
+        driver.fence();
+        let paused = await_update(&mut runtime, |update| update.playback_status == "Paused");
+        assert!(paused.paused && paused.can_toggle_pause);
+        for (command, rejection) in [
+            ("pause 2", CommandRejection::StaleState),
+            ("resume 2", CommandRejection::StaleState),
+            ("pause 1", CommandRejection::PlaybackUnavailable),
+        ] {
+            let before = runtime.engine.as_ref().unwrap().model().state_identity();
+            let rejected = runtime.qualification_command(command);
+            assert_command_rejection(&runtime, &rejected, rejection);
+            assert_eq!(
+                runtime.engine.as_ref().unwrap().model().state_identity(),
+                before
+            );
+            assert_eq!(rejected.playback_status, "Paused");
+            assert!(rejected.can_toggle_pause && rejected.paused);
+            assert!(driver.submitted.try_recv().is_err());
+            assert!(drivers.try_recv().is_err());
+        }
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+        for command in ["pause 1", "resume 1"] {
+            let before = runtime.engine.as_ref().unwrap().model().state_identity();
+            let rejected = runtime.qualification_command(command);
+            assert_command_rejection(&runtime, &rejected, CommandRejection::ShuttingDown);
+            assert_eq!(
+                runtime.engine.as_ref().unwrap().model().state_identity(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_pause_rejected_by_unavailable_port_keeps_live_state_and_reports_status() {
+        let (mut runtime, drivers) = runtime();
+        let driver = start_live(&mut runtime, &drivers);
+        let before = runtime.engine.as_ref().unwrap().model().state_identity();
+        // Replace only the admission port. Keep the real owner alive, then
+        // restore its port before cleanup; this is not a physical owner failure.
+        let unavailable =
+            GateRunner::with_spawner(|_, _| panic!("no replacement opening requested"));
+        let original =
+            std::mem::replace(runtime.engine.as_mut().unwrap().runner_mut(), unavailable);
+        let rejected = runtime.qualification_command("pause 1");
+        *runtime.engine.as_mut().unwrap().runner_mut() = original;
+        assert!(rejected.changed);
+        assert_eq!(
+            runtime.command_error,
+            format!("pause submission {:?}", SubmitStatus::StaleGeneration)
+        );
+        assert!(rejected.diagnostic.contains(&runtime.command_error));
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().model().state_identity(),
+            before
+        );
+        assert_eq!(rejected.playback_status, "Live");
+        assert!(rejected.can_toggle_pause && !rejected.paused);
+        assert!(driver.submitted.try_recv().is_err());
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn validating_resume_status_outranks_paused_incumbent_and_cancelled_validation_blocks_gain() {
+        use std::sync::{Mutex, OnceLock};
+        static STARTED: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+        static RELEASE: OnceLock<Mutex<mpsc::Receiver<()>>> = OnceLock::new();
+        fn execute(
+            request: ValidationRequest,
+        ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>) {
+            if request.key.apply.get() == 2 {
+                STARTED.get().unwrap().send(()).unwrap();
+                let receiver = RELEASE
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let _ = receiver.recv();
+            }
+            validate(request)
+        }
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        STARTED.set(started_tx).unwrap();
+        RELEASE.set(Mutex::new(release_rx)).unwrap();
+        let (mut runtime, drivers) = runtime_with_validator(execute);
+        let driver = start_live(&mut runtime, &drivers);
+        confirm_explicit_pause(&mut runtime, &driver);
+        assert_eq!(runtime.set_volume(80), SubmitStatus::Accepted);
+        assert_eq!(runtime.set_muted(true), SubmitStatus::Accepted);
+        let resuming = runtime.qualification_command("resume 1");
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().model().phase(),
+            ProductPhase::ValidatingResume
+        );
+        assert_eq!(resuming.playback_status, "Resuming");
+        assert!(resuming.paused && !resuming.can_toggle_pause);
+        assert_eq!(resuming.volume_percent, 80);
+        assert!(resuming.muted && resuming.can_set_gain);
+        let before = runtime.engine.as_ref().unwrap().model().state_identity();
+        for command in ["pause 1", "resume 1"] {
+            let rejected = runtime.qualification_command(command);
+            assert_command_rejection(&runtime, &rejected, CommandRejection::ApplyInProgress);
+            assert_eq!(
+                runtime.engine.as_ref().unwrap().model().state_identity(),
+                before
+            );
+            assert_eq!(rejected.playback_status, "Resuming");
+        }
+        let closed = runtime.close(1);
+        let retired = if closed.release_native {
+            closed
+        } else {
+            await_update(&mut runtime, |update| update.release_native)
+        };
+        driver.destroyed.recv().unwrap();
+        let waiting = runtime.native_released(AttemptId::new(1).unwrap());
+        assert!(!waiting.can_set_gain);
+        let preference = runtime.engine.as_ref().unwrap().gain();
+        assert_eq!(runtime.set_volume(81), SubmitStatus::Closing);
+        assert_eq!(runtime.set_muted(false), SubmitStatus::Closing);
+        let rejected_gain = runtime.poll();
+        assert!(!rejected_gain.can_set_gain);
+        assert_eq!(runtime.engine.as_ref().unwrap().gain(), preference);
+        assert_eq!(rejected_gain.volume_percent, 80);
+        assert!(rejected_gain.muted);
+        assert!(!retired.create_native && !waiting.create_native);
+        for command in ["pause 1", "resume 1"] {
+            let rejected = runtime.qualification_command(command);
+            assert_command_rejection(&runtime, &rejected, CommandRejection::CleanupIncomplete);
+        }
+        release_tx.send(()).unwrap();
+        let drained = await_update(&mut runtime, |update| update.can_set_gain);
+        assert!(!drained.create_native);
+        assert!(drivers.try_recv().is_err());
+        assert_eq!(runtime.set_volume(81), SubmitStatus::Accepted);
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn snapshot_lifecycle_commands_preserve_full_playback_identity_including_restored_active() {
+        for restored in [false, true] {
+            for paused in [false, true] {
+                for verb in ["restart", "close", "quit"] {
+                    let (mut runtime, drivers) = runtime_fixture(validate, restored.then_some(2));
+                    let first = start_live(&mut runtime, &drivers);
+                    let driver = if restored {
+                        let expected = snapshot_expected(&runtime);
+                        let restart = runtime.qualification_command(&format!(
+                            "restart {:?} {} {} Complete",
+                            expected.phase, expected.apply, expected.attempt,
+                        ));
+                        let retired = if restart.release_native {
+                            restart
+                        } else {
+                            await_update(&mut runtime, |update| update.release_native)
+                        };
+                        first.destroyed.recv().unwrap();
+                        let released =
+                            runtime.native_released(AttemptId::new(retired.generation).unwrap());
+                        let opening = if released.create_native {
+                            released
+                        } else {
+                            await_update(&mut runtime, |update| update.create_native)
+                        };
+                        let restored_owner = drivers.recv().unwrap();
+                        runtime.surface_ready(SurfaceToken {
+                            generation: Generation::new(opening.generation).unwrap(),
+                            xid: X11WindowId::new(71).unwrap(),
+                        });
+                        restored_owner.initialized.recv().unwrap();
+                        let (load, _) = restored_owner.submitted.recv().unwrap();
+                        restored_owner.send(BackendEvent::CommandReply {
+                            id: load.get(),
+                            error: 0,
+                        });
+                        restored_owner.send(BackendEvent::PlaybackRestart);
+                        restored_owner.fence();
+                        await_update(&mut runtime, |update| update.can_toggle_pause);
+                        assert_eq!(
+                            runtime.engine.as_ref().unwrap().model().phase(),
+                            ProductPhase::ErrorWithActiveRestored
+                        );
+                        restored_owner
+                    } else {
+                        first
+                    };
+                    if paused {
+                        confirm_explicit_pause(&mut runtime, &driver);
+                    }
+                    let expected = snapshot_expected(&runtime);
+                    let before = runtime.engine.as_ref().unwrap().model().state_identity();
+                    let update = runtime.qualification_command(&format!(
+                        "{verb} {:?} {} {} Complete",
+                        expected.phase, expected.apply, expected.attempt,
+                    ));
+                    assert!(runtime.command_error.is_empty(), "{}", update.diagnostic);
+                    assert_ne!(
+                        runtime.engine.as_ref().unwrap().model().state_identity(),
+                        before
+                    );
+                    if update.release_native {
+                        // Quit before acknowledging a held release so restart
+                        // cannot spawn another owner during test cleanup.
+                        runtime.quit();
+                        runtime.native_released(AttemptId::new(update.generation).unwrap());
+                    }
+                    cleanup(&mut runtime);
+                    driver.destroyed.recv().unwrap();
+                    assert!(drivers.try_recv().is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rejected_immediate_gain_never_mutates_stored_gain_or_draft() {
         let (mut runtime, _) = runtime();
         runtime.poll();
@@ -778,6 +1497,46 @@ mod tests {
         );
         cleanup(&mut runtime);
     }
+    #[test]
+    fn qualification_gain_checks_attempt_before_preference_api_and_accepts_opening_without_surface()
+    {
+        let (mut runtime, drivers) = runtime();
+        let update = runtime.open();
+        if !update.create_native {
+            await_update(&mut runtime, |update| update.create_native);
+        }
+        let driver = drivers.recv().unwrap();
+        runtime.qualification_command("volume 1 80");
+        runtime.qualification_command("mute 1 on");
+        let admitted = PlaybackGain::new(80, true).unwrap();
+        assert_eq!(runtime.engine.as_ref().unwrap().gain(), admitted);
+        let rejected = runtime.qualification_command("volume 2 77");
+        assert!(rejected.diagnostic.contains("StaleGeneration"));
+        runtime.qualification_command("mute 2 off");
+        assert_eq!(runtime.engine.as_ref().unwrap().gain(), admitted);
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().model().draft().settings,
+            settings()
+        );
+        assert!(driver.initialized.try_recv().is_err());
+        runtime.surface_ready(SurfaceToken {
+            generation: Generation::new(1).unwrap(),
+            xid: X11WindowId::new(71).unwrap(),
+        });
+        driver.initialized.recv().unwrap();
+        let (load, _) = driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        assert_eq!(
+            driver.submitted.recv().unwrap().1,
+            crate::media::controller::BackendCommand::SetGain(admitted)
+        );
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
     #[test]
     fn source_command_requires_enumerated_identity_and_stale_revision_preserves_draft() {
         let (mut runtime, _) = runtime();
@@ -874,11 +1633,21 @@ mod tests {
             xid: X11WindowId::new(71).unwrap(),
         });
         driver.initialized.recv().unwrap();
-        driver.submitted.recv().unwrap();
+        let (load, _) = driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
         driver.send(BackendEvent::AudioStatus(AudioStatus::Active));
         driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
-        let active = await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
+        let active = await_update(&mut runtime, |update| update.can_toggle_pause);
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().audio_diagnostic(),
+            Some(&AudioDiagnostic::Active)
+        );
+        assert_eq!(active.playback_status, "Live");
+        assert!(active.can_set_gain);
         assert_eq!(active.audio_source, "source-a");
         assert_eq!(active.audio_status, "Active");
         let edited = runtime.qualification_command("draft-source 0 source-b");
@@ -887,6 +1656,22 @@ mod tests {
         let disabled_draft = runtime.qualification_command("draft-audio 1 disable");
         assert!(disabled_draft.audio_enabled);
         assert_eq!(disabled_draft.audio_source, "source-a");
+        confirm_explicit_pause(&mut runtime, &driver);
+        let paused = runtime.engine.as_ref().unwrap().model().state_identity();
+        driver.send(BackendEvent::AudioStatus(AudioStatus::RestartRequired(
+            crate::domain::capture::AudioError::Cancelled,
+        )));
+        driver.fence();
+        let unavailable = await_update(&mut runtime, |update| !update.can_toggle_pause);
+        assert!(unavailable.paused && unavailable.can_restart);
+        for command in ["pause 1", "resume 1", "pause 2", "resume 2"] {
+            let rejected = runtime.qualification_command(command);
+            assert_command_rejection(&runtime, &rejected, CommandRejection::PlaybackUnavailable);
+            assert_eq!(
+                runtime.engine.as_ref().unwrap().model().state_identity(),
+                paused
+            );
+        }
         let close = runtime.close(opening.generation);
         let retired = if close.release_native {
             close

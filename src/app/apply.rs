@@ -4,8 +4,9 @@ use crate::domain::{
     capture::PlaybackGain,
     failure::{ApplyFailure, Cause, FailureCategory, LifecycleFailure, Stage, ValidationLayer},
     state::{
-        ApplyId, AttemptId, AttemptKey, CommandRejection, DraftRevision, DraftSettings,
-        ModelEffect, ProductModel, StateIdentity, StopIntent, ValidationRequest,
+        ApplyId, AttemptId, AttemptKey, CleanupStatus, CommandRejection, DraftRevision,
+        DraftSettings, ModelEffect, PlaybackState, ProductModel, ProductPhase, StateIdentity,
+        StopIntent, ValidationRequest,
     },
 };
 
@@ -111,6 +112,52 @@ where
         let (id, effect) = self.model.reconnect(expected_state)?;
         self.drive(Some(effect))?;
         Ok(id)
+    }
+    /// Decide the toggle from confirmed product state, never from queued media work.
+    pub fn toggle_pause(&mut self, attempt: AttemptId) -> Result<SubmitStatus, CommandRejection> {
+        if self
+            .model
+            .active()
+            .is_some_and(|active| active.playback() == PlaybackState::Paused)
+        {
+            self.resume(self.model.state_identity(), attempt)?;
+            return Ok(SubmitStatus::Accepted);
+        }
+        self.pause(attempt)
+    }
+    /// Explicit pause never resumes a Paused incumbent. Share the same typed
+    /// guards and prepare → admit → observed transaction with the toggle route.
+    pub(crate) fn pause(&mut self, attempt: AttemptId) -> Result<SubmitStatus, CommandRejection> {
+        self.check_playback()?;
+        let request = self.model.prepare_pause(attempt)?;
+        let status = self.runner.submit_immediate(
+            attempt,
+            ImmediateIntent::SetPaused {
+                request,
+                paused: true,
+            },
+        );
+        if status == SubmitStatus::Accepted {
+            self.model.pause_admitted(attempt, request);
+        }
+        Ok(status)
+    }
+    pub fn resume(
+        &mut self,
+        expected_state: StateIdentity,
+        attempt: AttemptId,
+    ) -> Result<ApplyId, CommandRejection> {
+        self.check_playback()?;
+        let (id, effect) = self.model.resume(expected_state, attempt)?;
+        self.drive(Some(effect))?;
+        Ok(id)
+    }
+    fn check_playback(&self) -> Result<(), CommandRejection> {
+        self.check_drain()?;
+        if matches!(self.audio, Some(AudioDiagnostic::RestartRequired(_))) {
+            return Err(CommandRejection::PlaybackUnavailable);
+        }
+        Ok(())
     }
     pub fn close(&mut self, expected_state: StateIdentity) -> Result<(), CommandRejection> {
         let effect = self.model.close(expected_state)?;
@@ -315,6 +362,17 @@ where
                 let effect = self.model.session_failed(attempt, failure);
                 let _ = self.drive(effect);
             }
+            SessionEvent::PauseObserved {
+                attempt,
+                request,
+                paused,
+            } => {
+                if self.known_attempt(attempt)
+                    && !self.lease.as_ref().is_some_and(|lease| lease.stopping)
+                {
+                    self.model.pause_observed(attempt, request, paused);
+                }
+            }
             SessionEvent::OwnerStopped { attempt, outcome } => {
                 let Some(lease) = self
                     .lease
@@ -484,27 +542,36 @@ where
         self.model
             .drain_complete(self.validation.is_none(), retired);
     }
-    pub fn submit_immediate(
-        &mut self,
-        attempt: AttemptId,
-        intent: ImmediateIntent,
-    ) -> SubmitStatus {
-        if self.model.active().map(|active| active.attempt()) != Some(attempt) {
-            return match &self.lease {
-                Some(lease) if lease.key.attempt == attempt && lease.stopping => {
-                    SubmitStatus::Closing
-                }
-                Some(lease) if lease.key.attempt == attempt => SubmitStatus::NotReady,
-                _ => SubmitStatus::StaleGeneration,
-            };
+    /// Retain an admitted application preference, including owner-free replacement
+    /// gaps. A healthy Opening/Ready owner must admit it before it is retained.
+    pub fn set_gain(&mut self, gain: PlaybackGain) -> SubmitStatus {
+        if !self.gain_admission_open() {
+            return SubmitStatus::Closing;
         }
-        let status = self.runner.submit_immediate(attempt, intent);
-        if status == SubmitStatus::Accepted
-            && let ImmediateIntent::SetGain(gain) = intent
+        if let Some(lease) = &self.lease
+            && !lease.stopping
+            && !lease.owner_stopped
         {
-            self.gain = gain;
+            let status = self
+                .runner
+                .submit_immediate(lease.key.attempt, ImmediateIntent::SetGain(gain));
+            if status != SubmitStatus::Accepted {
+                return status;
+            }
         }
-        status
+        self.gain = gain;
+        SubmitStatus::Accepted
+    }
+    /// Shared known Closing gates for preference admission and presentation.
+    /// A healthy owner's port may still reject a submission independently.
+    pub(crate) fn gain_admission_open(&self) -> bool {
+        self.check_drain().is_ok()
+            && !matches!(
+                self.model.phase(),
+                ProductPhase::Stopping | ProductPhase::ShutdownReady
+            )
+            && !matches!(self.model.cleanup(), CleanupStatus::Blocked { .. })
+            && !self.lease.as_ref().is_some_and(|lease| lease.blocked)
     }
 }
 
@@ -520,7 +587,10 @@ mod tests {
             UsbTopology,
         },
         failure::{Cause, FailureCategory, Stage, ValidationLayer},
-        state::{AttemptPurpose, CleanupStatus, ProductPhase, ValidationKey},
+        state::{
+            AttemptPurpose, CleanupStatus, PauseRequestId, PlaybackState, ProductPhase,
+            ValidationKey,
+        },
     };
 
     fn settings(rate: u32) -> DraftSettings {
@@ -622,6 +692,7 @@ mod tests {
         opens: Vec<(AttemptKey, DraftSettings, PlaybackGain)>,
         stops: Vec<(AttemptId, StopReason)>,
         immediate: Option<SubmitStatus>,
+        intents: Vec<(AttemptId, ImmediateIntent)>,
         start_failure: Option<StartFailure>,
         stop_failure: Option<StopSubmission>,
     }
@@ -667,7 +738,12 @@ mod tests {
         fn poll(&mut self) -> Option<SessionEvent> {
             self.events.pop_front()
         }
-        fn submit_immediate(&mut self, _: AttemptId, _: ImmediateIntent) -> SubmitStatus {
+        fn submit_immediate(
+            &mut self,
+            attempt: AttemptId,
+            intent: ImmediateIntent,
+        ) -> SubmitStatus {
+            self.intents.push((attempt, intent));
             self.immediate.take().unwrap_or(SubmitStatus::Accepted)
         }
     }
@@ -709,6 +785,675 @@ mod tests {
         engine.runner_mut().barrier(old);
         engine.poll();
         (old, engine.runner_mut().opens.last().unwrap().0.attempt)
+    }
+
+    fn confirm_pause(engine: &mut Engine, attempt: AttemptId) {
+        assert_eq!(
+            engine.toggle_pause(attempt).unwrap(),
+            SubmitStatus::Accepted
+        );
+        let PlaybackState::PausePending { request } = engine.model().active().unwrap().playback()
+        else {
+            panic!("pause admission must remain pending");
+        };
+        engine
+            .runner_mut()
+            .events
+            .push_back(SessionEvent::PauseObserved {
+                attempt,
+                request,
+                paused: true,
+            });
+        engine.poll();
+        assert_eq!(
+            engine.model().active().unwrap().playback(),
+            PlaybackState::Paused
+        );
+    }
+
+    #[test]
+    fn toggle_resume_opens_applied_not_draft_once_with_gain_from_retirement_and_opening() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        confirm_pause(&mut engine, old);
+        let revision = engine
+            .edit_draft(engine.model().draft().revision, settings(30))
+            .unwrap();
+        assert_eq!(engine.toggle_pause(old).unwrap(), SubmitStatus::Accepted);
+        assert_eq!(engine.model().phase(), ProductPhase::ValidatingResume);
+        assert_eq!(
+            engine.validator.requests.last().unwrap().settings,
+            settings(60)
+        );
+        assert_eq!(
+            engine.validator.requests.last().unwrap().key.purpose,
+            AttemptPurpose::Resume
+        );
+        assert!(engine.runner_mut().stops.is_empty());
+        validate(&mut engine);
+        assert_eq!(engine.model().phase(), ProductPhase::ClosingResume);
+        let intents = engine.runner_mut().intents.len();
+        let gap_gain = PlaybackGain::new(80, true).unwrap();
+        assert_eq!(engine.set_gain(gap_gain), SubmitStatus::Accepted);
+        assert_eq!(
+            engine.runner_mut().intents.len(),
+            intents,
+            "retiring handle receives no gain"
+        );
+        engine
+            .runner_mut()
+            .events
+            .push_back(SessionEvent::NativeReleased { attempt: old });
+        engine.poll();
+        assert_eq!(
+            engine.runner_mut().opens.len(),
+            1,
+            "release without owner ack is not a barrier"
+        );
+        engine
+            .runner_mut()
+            .events
+            .push_back(SessionEvent::OwnerStopped {
+                attempt: old,
+                outcome: Ok(()),
+            });
+        engine.poll();
+        assert_eq!(engine.set_gain(gap_gain), SubmitStatus::Accepted);
+        assert_eq!(engine.runner_mut().opens.len(), 1);
+        engine
+            .runner_mut()
+            .events
+            .push_back(SessionEvent::NativeReleased { attempt: old });
+        engine.poll();
+        let (new, applied, initial_gain) = engine.runner_mut().opens.last().unwrap().clone();
+        assert_eq!(new.purpose, AttemptPurpose::Resume);
+        assert_eq!(applied, settings(60));
+        assert_eq!(initial_gain, gap_gain);
+        assert_ne!(new.attempt, old);
+        let opening_gain = PlaybackGain::new(81, false).unwrap();
+        assert_eq!(engine.set_gain(opening_gain), SubmitStatus::Accepted);
+        assert_eq!(
+            engine.runner_mut().intents.last(),
+            Some(&(new.attempt, ImmediateIntent::SetGain(opening_gain)))
+        );
+        engine.runner_mut().verified();
+        engine.poll();
+        assert_eq!(
+            engine.model().active().unwrap().playback(),
+            PlaybackState::Live
+        );
+        assert_eq!(engine.model().draft().revision, revision);
+        assert_eq!(engine.model().draft().settings, settings(30));
+        assert_eq!(engine.gain(), opening_gain);
+        assert_eq!(engine.runner_mut().opens.len(), 2);
+    }
+
+    #[test]
+    fn pending_pause_and_each_resume_transition_reject_overlap_without_accumulating_commands() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        engine.toggle_pause(old).unwrap();
+        let pending = engine.model().state_identity();
+        assert_eq!(
+            engine.apply(pending, engine.model().draft().revision),
+            Err(CommandRejection::PlaybackBusy)
+        );
+        assert_eq!(engine.restart(pending), Err(CommandRejection::PlaybackBusy));
+        assert_eq!(
+            engine.resume(pending, old),
+            Err(CommandRejection::PlaybackBusy)
+        );
+        let PlaybackState::PausePending { request } = engine.model().active().unwrap().playback()
+        else {
+            panic!("pending")
+        };
+        engine
+            .runner_mut()
+            .events
+            .push_back(SessionEvent::PauseObserved {
+                attempt: old,
+                request,
+                paused: true,
+            });
+        engine.poll();
+        engine.resume(engine.model().state_identity(), old).unwrap();
+        for phase in [
+            ProductPhase::ValidatingResume,
+            ProductPhase::ClosingResume,
+            ProductPhase::OpeningResume,
+        ] {
+            assert_eq!(engine.model().phase(), phase);
+            let expected = engine.model().state_identity();
+            assert_eq!(
+                engine.toggle_pause(old),
+                Err(CommandRejection::ApplyInProgress)
+            );
+            assert_eq!(
+                engine.resume(expected, old),
+                Err(CommandRejection::ApplyInProgress)
+            );
+            assert_eq!(
+                engine.apply(expected, engine.model().draft().revision),
+                Err(CommandRejection::ApplyInProgress)
+            );
+            assert_eq!(
+                engine.restart(expected),
+                Err(CommandRejection::ApplyInProgress)
+            );
+            if phase == ProductPhase::ValidatingResume {
+                validate(&mut engine);
+            } else if phase == ProductPhase::ClosingResume {
+                engine.runner_mut().barrier(old);
+                engine.poll();
+            }
+        }
+        assert_eq!(engine.runner_mut().intents.len(), 1, "no queued overlaps");
+        assert_eq!(engine.runner_mut().opens.len(), 2);
+    }
+
+    #[test]
+    fn resume_validation_rejection_keeps_paused_owner_and_submission_failure_is_typed() {
+        for admission in [false, true] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            confirm_pause(&mut engine, old);
+            if admission {
+                engine.validator_mut().reject = Some(SubmitFailure::Disconnected);
+                assert_eq!(
+                    engine.resume(engine.model().state_identity(), old),
+                    Err(CommandRejection::Disconnected)
+                );
+            } else {
+                engine.resume(engine.model().state_identity(), old).unwrap();
+                engine.validator_mut().finish(Err(failure(
+                    settings(60),
+                    FailureCategory::Validation(ValidationLayer::Mode),
+                    "invalid resume",
+                )));
+                engine.poll();
+            }
+            assert_eq!(engine.model().active().unwrap().attempt(), old);
+            assert_eq!(
+                engine.model().active().unwrap().playback(),
+                PlaybackState::Paused
+            );
+            assert!(engine.model().validation_rejection().is_some());
+            assert!(engine.runner_mut().stops.is_empty());
+            assert_eq!(engine.runner_mut().opens.len(), 1);
+        }
+    }
+
+    #[test]
+    fn incumbent_terminal_event_beats_resume_validation_result_and_never_resurrects_pause() {
+        for valid in [false, true] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            confirm_pause(&mut engine, old);
+            engine.resume(engine.model().state_identity(), old).unwrap();
+            engine
+                .runner_mut()
+                .events
+                .push_back(SessionEvent::SessionFailed {
+                    attempt: old,
+                    failure: failure(settings(60), FailureCategory::Session, "incumbent died"),
+                });
+            engine.validator_mut().finish(if valid {
+                Ok(())
+            } else {
+                Err(failure(
+                    settings(60),
+                    FailureCategory::Validation(ValidationLayer::Mode),
+                    "resume rejected",
+                ))
+            });
+            engine.poll();
+            assert!(engine.model().active().is_none());
+            assert_eq!(engine.runner_mut().opens.len(), 1);
+            assert_eq!(engine.runner_mut().stops.len(), 1);
+            engine.runner_mut().barrier(old);
+            engine.poll();
+            assert_eq!(engine.runner_mut().opens.len(), if valid { 2 } else { 1 });
+            assert!(engine.model().active().is_none());
+        }
+    }
+
+    #[test]
+    fn failed_resume_drains_created_resources_without_restore_and_clean_error_retains_gain() {
+        for resources in [false, true] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            confirm_pause(&mut engine, old);
+            engine.resume(engine.model().state_identity(), old).unwrap();
+            validate(&mut engine);
+            let failed = failure(settings(60), FailureCategory::Session, "resume open failed");
+            engine.runner_mut().start_failure = Some(if resources {
+                StartFailure::ResourcesCreated(failed)
+            } else {
+                StartFailure::NoResourcesCreated(failed)
+            });
+            engine.runner_mut().barrier(old);
+            engine.poll();
+            let resumed = engine.runner_mut().opens.last().unwrap().0.attempt;
+            if resources {
+                assert_eq!(engine.model().phase(), ProductPhase::CleaningFailedResume);
+                assert!(!engine.model().can_reconnect());
+                engine.runner_mut().barrier(resumed);
+                engine.poll();
+            }
+            assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+            assert!(engine.model().failures().unwrap().resume.is_some());
+            assert!(engine.model().failures().unwrap().restore.is_none());
+            assert_eq!(engine.runner_mut().opens.len(), 2);
+            assert_eq!(engine.validator.requests.len(), 2);
+            let gain = PlaybackGain::new(77, true).unwrap();
+            let intents = engine.runner_mut().intents.len();
+            assert_eq!(engine.set_gain(gain), SubmitStatus::Accepted);
+            assert_eq!(engine.gain(), gain);
+            assert_eq!(engine.runner_mut().intents.len(), intents);
+            engine.reconnect(engine.model().state_identity()).unwrap();
+            validate(&mut engine);
+            assert_eq!(engine.runner_mut().opens.last().unwrap().2, gain);
+        }
+    }
+
+    #[test]
+    fn close_or_quit_cancels_resume_at_validation_old_drain_and_new_open_without_late_reopen() {
+        for quitting in [false, true] {
+            for phase in [
+                ProductPhase::ValidatingResume,
+                ProductPhase::ClosingResume,
+                ProductPhase::OpeningResume,
+            ] {
+                let mut engine = engine();
+                let old = initial(&mut engine);
+                confirm_pause(&mut engine, old);
+                engine.resume(engine.model().state_identity(), old).unwrap();
+                if phase != ProductPhase::ValidatingResume {
+                    validate(&mut engine);
+                }
+                if phase == ProductPhase::OpeningResume {
+                    engine.runner_mut().barrier(old);
+                    engine.poll();
+                }
+                assert_eq!(engine.model().phase(), phase);
+                let owned = engine.lease.as_ref().unwrap().key.attempt;
+                let opens = engine.runner_mut().opens.len();
+                if quitting {
+                    engine.quit();
+                } else {
+                    engine.close(engine.model().state_identity()).unwrap();
+                }
+                let gain = engine.gain();
+                assert_eq!(
+                    engine.set_gain(PlaybackGain::new(11, true).unwrap()),
+                    SubmitStatus::Closing
+                );
+                assert_eq!(engine.gain(), gain);
+                if phase == ProductPhase::ValidatingResume {
+                    assert!(engine.validator.cancelled);
+                    engine.validator_mut().finish(Ok(()));
+                } else if phase == ProductPhase::OpeningResume {
+                    engine.runner_mut().verified();
+                }
+                engine.runner_mut().barrier(owned);
+                engine.validator.retired = quitting;
+                engine.poll();
+                assert_eq!(engine.runner_mut().opens.len(), opens);
+                assert!(engine.model().active().is_none());
+                assert_eq!(
+                    engine.model().phase(),
+                    if quitting {
+                        ProductPhase::ShutdownReady
+                    } else {
+                        ProductPhase::Stopped
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gain_is_accepted_preference_without_owner_but_rejected_admission_and_blocked_cleanup_preserve_it()
+     {
+        let mut engine = engine();
+        let initial_gain = PlaybackGain::new(80, true).unwrap();
+        assert_eq!(engine.set_gain(initial_gain), SubmitStatus::Accepted);
+        assert_eq!(engine.gain(), initial_gain);
+        assert!(engine.runner_mut().intents.is_empty());
+        let old = initial(&mut engine);
+        assert_eq!(engine.runner_mut().opens.last().unwrap().2, initial_gain);
+        for status in [
+            SubmitStatus::NotReady,
+            SubmitStatus::Closing,
+            SubmitStatus::CapacityExceeded,
+            SubmitStatus::StaleGeneration,
+        ] {
+            engine.runner_mut().immediate = Some(status);
+            assert_eq!(engine.set_gain(PlaybackGain::default()), status);
+            assert_eq!(engine.gain(), initial_gain);
+        }
+        engine
+            .runner_mut()
+            .events
+            .push_back(SessionEvent::CleanupBlocked {
+                attempt: old,
+                failure: failure(
+                    settings(60),
+                    FailureCategory::Lifecycle(LifecycleFailure::Acknowledgement),
+                    "missing ack",
+                ),
+            });
+        engine.poll();
+        assert_eq!(
+            engine.set_gain(PlaybackGain::default()),
+            SubmitStatus::Closing
+        );
+        assert_eq!(engine.gain(), initial_gain);
+    }
+
+    #[test]
+    fn explicit_pause_never_resumes_and_preserves_ordered_typed_guards() {
+        let mut engine = engine();
+        assert_eq!(
+            engine.pause(AttemptId::new(1).unwrap()),
+            Err(CommandRejection::PlaybackUnavailable)
+        );
+        let current = initial(&mut engine);
+        let stale = AttemptId::new(current.get() + 1).unwrap();
+        assert_eq!(engine.pause(stale), Err(CommandRejection::StaleState));
+        assert_eq!(engine.pause(current), Ok(SubmitStatus::Accepted));
+        let pending = engine.model().state_identity();
+        assert_eq!(engine.pause(current), Err(CommandRejection::PlaybackBusy));
+        assert_eq!(
+            engine.resume(pending, current),
+            Err(CommandRejection::PlaybackBusy)
+        );
+        let PlaybackState::PausePending { request } = engine.model().active().unwrap().playback()
+        else {
+            panic!("admitted pause must remain pending");
+        };
+        engine
+            .runner_mut()
+            .events
+            .push_back(SessionEvent::PauseObserved {
+                attempt: current,
+                request,
+                paused: true,
+            });
+        engine.poll();
+        let paused = engine.model().state_identity();
+        let submissions = engine.runner_mut().intents.len();
+        assert_eq!(engine.pause(stale), Err(CommandRejection::StaleState));
+        assert_eq!(
+            engine.pause(current),
+            Err(CommandRejection::PlaybackUnavailable)
+        );
+        assert_eq!(engine.model().state_identity(), paused);
+        assert!(engine.model().validation_request().is_none());
+        assert_eq!(engine.runner_mut().intents.len(), submissions);
+        engine.audio = Some(AudioDiagnostic::RestartRequired(
+            crate::domain::capture::AudioError::Cancelled,
+        ));
+        assert_eq!(
+            engine.pause(stale),
+            Err(CommandRejection::PlaybackUnavailable)
+        );
+        assert_eq!(
+            engine.resume(paused, stale),
+            Err(CommandRejection::PlaybackUnavailable)
+        );
+        assert_eq!(engine.model().state_identity(), paused);
+        engine.quit();
+        assert_eq!(engine.pause(current), Err(CommandRejection::ShuttingDown));
+    }
+
+    #[test]
+    fn explicit_pause_rejected_admission_keeps_live_playback_eligible() {
+        let mut engine = engine();
+        let current = initial(&mut engine);
+        let before = engine.model().state_identity();
+        for status in [
+            SubmitStatus::NotReady,
+            SubmitStatus::Closing,
+            SubmitStatus::CapacityExceeded,
+            SubmitStatus::StaleGeneration,
+        ] {
+            engine.runner_mut().immediate = Some(status);
+            assert_eq!(engine.pause(current), Ok(status));
+            assert_eq!(engine.model().state_identity(), before);
+            assert_eq!(
+                engine.model().active().unwrap().playback(),
+                PlaybackState::Live
+            );
+            assert!(engine.model().can_apply() && engine.model().can_restart());
+            assert!(engine.model().validation_request().is_none());
+        }
+        assert_eq!(engine.pause(current), Ok(SubmitStatus::Accepted));
+        assert!(matches!(
+            engine.model().active().unwrap().playback(),
+            PlaybackState::PausePending { .. }
+        ));
+    }
+
+    #[test]
+    fn pause_admission_is_pending_until_current_request_observed_and_rejection_is_not_paused() {
+        let mut engine = engine();
+        let attempt = initial(&mut engine);
+        engine.runner_mut().immediate = Some(SubmitStatus::NotReady);
+        assert_eq!(
+            engine.toggle_pause(attempt).unwrap(),
+            SubmitStatus::NotReady
+        );
+        assert_eq!(
+            engine.model().active().unwrap().playback(),
+            PlaybackState::Live
+        );
+        assert_eq!(
+            engine.toggle_pause(attempt).unwrap(),
+            SubmitStatus::Accepted
+        );
+        let PlaybackState::PausePending { request } = engine.model().active().unwrap().playback()
+        else {
+            panic!("pause must remain pending")
+        };
+        assert_eq!(
+            engine.runner_mut().intents.last(),
+            Some(&(
+                attempt,
+                ImmediateIntent::SetPaused {
+                    request,
+                    paused: true
+                }
+            ))
+        );
+        assert_eq!(
+            engine.toggle_pause(attempt),
+            Err(CommandRejection::PlaybackBusy)
+        );
+        for (received_attempt, received_request) in [
+            (AttemptId::new(attempt.get() + 1).unwrap(), request),
+            (attempt, PauseRequestId::new(request.get() + 1).unwrap()),
+        ] {
+            engine
+                .runner_mut()
+                .events
+                .push_back(SessionEvent::PauseObserved {
+                    attempt: received_attempt,
+                    request: received_request,
+                    paused: true,
+                });
+            engine.poll();
+            assert_eq!(
+                engine.model().active().unwrap().playback(),
+                PlaybackState::PausePending { request }
+            );
+        }
+        engine
+            .runner_mut()
+            .events
+            .push_back(SessionEvent::PauseObserved {
+                attempt,
+                request,
+                paused: true,
+            });
+        engine.poll();
+        assert_eq!(
+            engine.model().active().unwrap().playback(),
+            PlaybackState::Paused
+        );
+        assert_eq!(
+            engine.resume(
+                engine.model().state_identity(),
+                AttemptId::new(attempt.get() + 1).unwrap()
+            ),
+            Err(CommandRejection::StaleState)
+        );
+    }
+
+    #[test]
+    fn terminal_session_event_revokes_pause_and_late_readback_cannot_resurrect_it() {
+        let mut engine = engine();
+        let attempt = initial(&mut engine);
+        engine.toggle_pause(attempt).unwrap();
+        let PlaybackState::PausePending { request } = engine.model().active().unwrap().playback()
+        else {
+            panic!("pending")
+        };
+        engine
+            .runner_mut()
+            .events
+            .push_back(SessionEvent::SessionFailed {
+                attempt,
+                failure: failure(settings(60), FailureCategory::Session, "pause failed"),
+            });
+        engine
+            .runner_mut()
+            .events
+            .push_back(SessionEvent::PauseObserved {
+                attempt,
+                request,
+                paused: true,
+            });
+        engine.poll();
+        assert!(engine.model().active().is_none());
+        assert_eq!(engine.runner_mut().stops.len(), 1);
+    }
+
+    #[test]
+    fn audio_restart_required_rejects_pause_without_submitting_or_changing_playback() {
+        let mut engine = engine();
+        let attempt = initial(&mut engine);
+        engine.audio = Some(AudioDiagnostic::RestartRequired(
+            crate::domain::capture::AudioError::Backend {
+                operation: "audio".into(),
+                code: None,
+                detail: "source lost".into(),
+            },
+        ));
+        assert_eq!(
+            engine.toggle_pause(attempt),
+            Err(CommandRejection::PlaybackUnavailable)
+        );
+        assert_eq!(
+            engine.model().active().unwrap().playback(),
+            PlaybackState::Live
+        );
+        assert!(engine.model().can_restart());
+        assert!(engine.runner_mut().intents.is_empty());
+    }
+
+    #[test]
+    fn audio_restart_required_rejects_paused_resume_but_explicit_restart_remains_available() {
+        let mut engine = engine();
+        let attempt = initial(&mut engine);
+        confirm_pause(&mut engine, attempt);
+        engine.audio = Some(AudioDiagnostic::RestartRequired(
+            crate::domain::capture::AudioError::Backend {
+                operation: "audio".into(),
+                code: None,
+                detail: "source lost".into(),
+            },
+        ));
+        let expected = engine.model().state_identity();
+        assert_eq!(
+            engine.toggle_pause(attempt),
+            Err(CommandRejection::PlaybackUnavailable)
+        );
+        assert_eq!(
+            engine.resume(expected, attempt),
+            Err(CommandRejection::PlaybackUnavailable)
+        );
+        assert_eq!(
+            engine.model().active().unwrap().playback(),
+            PlaybackState::Paused
+        );
+        assert!(matches!(
+            engine.audio_diagnostic(),
+            Some(AudioDiagnostic::RestartRequired(_))
+        ));
+        engine.restart(expected).unwrap();
+        assert_eq!(
+            engine.validator.requests.last().unwrap().key.purpose,
+            AttemptPurpose::Candidate
+        );
+        validate(&mut engine);
+        engine.runner_mut().barrier(attempt);
+        engine.poll();
+        engine.runner_mut().verified();
+        engine.poll();
+        assert_eq!(
+            engine.model().active().unwrap().playback(),
+            PlaybackState::Live
+        );
+        assert_eq!(engine.audio_diagnostic(), Some(&AudioDiagnostic::Disabled));
+    }
+
+    #[test]
+    fn stable_paused_apply_or_restart_preserves_pause_on_rejection_and_replacement_starts_live() {
+        for restart in [false, true] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            confirm_pause(&mut engine, old);
+            engine
+                .edit_draft(engine.model().draft().revision, settings(30))
+                .unwrap();
+            let target = if restart { settings(60) } else { settings(30) };
+            for rejected in [true, false] {
+                if restart {
+                    engine.restart(engine.model().state_identity()).unwrap();
+                } else {
+                    apply(&mut engine);
+                }
+                assert_eq!(engine.validator.requests.last().unwrap().settings, target);
+                if rejected {
+                    engine.validator_mut().finish(Err(failure(
+                        target.clone(),
+                        FailureCategory::Validation(ValidationLayer::Mode),
+                        "rejected replacement",
+                    )));
+                    engine.poll();
+                    assert_eq!(
+                        engine.model().active().unwrap().playback(),
+                        PlaybackState::Paused
+                    );
+                    assert!(engine.runner_mut().stops.is_empty());
+                } else {
+                    validate(&mut engine);
+                    engine.runner_mut().barrier(old);
+                    engine.poll();
+                    engine.runner_mut().verified();
+                    engine.poll();
+                    assert_eq!(
+                        engine.model().active().unwrap().playback(),
+                        PlaybackState::Live
+                    );
+                    assert_eq!(
+                        engine.model().active().unwrap().applied().settings(),
+                        &target
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -949,13 +1694,10 @@ mod tests {
         let old = initial(&mut engine);
         apply(&mut engine);
         let gain = PlaybackGain::new(73, true).unwrap();
-        assert_eq!(
-            engine.submit_immediate(old, ImmediateIntent::SetGain(gain)),
-            SubmitStatus::Accepted
-        );
+        assert_eq!(engine.set_gain(gain), SubmitStatus::Accepted);
         engine.runner_mut().immediate = Some(SubmitStatus::CapacityExceeded);
         assert_eq!(
-            engine.submit_immediate(old, ImmediateIntent::SetGain(PlaybackGain::default())),
+            engine.set_gain(PlaybackGain::default()),
             SubmitStatus::CapacityExceeded
         );
         validate(&mut engine);
@@ -1520,9 +2262,17 @@ mod tests {
             ),
             Err(CommandRejection::CleanupIncomplete)
         );
+        assert!(!engine.gain_admission_open());
+        let preference = engine.gain();
+        assert_eq!(
+            engine.set_gain(PlaybackGain::new(80, true).unwrap()),
+            SubmitStatus::Closing
+        );
+        assert_eq!(engine.gain(), preference);
         engine.validator_mut().finish(Ok(()));
         engine.poll();
         assert_eq!(engine.model().phase(), ProductPhase::Stopped);
+        assert!(engine.gain_admission_open());
         engine.reconnect(engine.model().state_identity()).unwrap();
         validate(&mut engine);
         let current = engine.runner_mut().opens.last().unwrap().0.attempt;

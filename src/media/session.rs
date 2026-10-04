@@ -521,7 +521,10 @@ mod tests {
         assert_eq!(
             second.submit(
                 Generation::new(1).unwrap(),
-                crate::media::controller::PlaybackIntent::TogglePause
+                crate::media::controller::PlaybackIntent::SetPaused {
+                    request: crate::domain::state::PauseRequestId::new(1).unwrap(),
+                    paused: true,
+                }
             ),
             SubmitStatus::StaleGeneration
         );

@@ -33,6 +33,8 @@ pub(crate) enum Command {
     Quit(ExpectedState),
     Volume(AttemptId, u8),
     Mute(AttemptId, bool),
+    Pause(AttemptId),
+    Resume(AttemptId),
 }
 
 fn unsigned(value: Option<&str>) -> Result<u64, &'static str> {
@@ -59,6 +61,8 @@ fn expected(
     let phase = match fields.next() {
         Some("Stopped") => ProductPhase::Stopped,
         Some("Active") => ProductPhase::Active,
+        Some("PausePending") => ProductPhase::PausePending,
+        Some("Paused") => ProductPhase::Paused,
         Some("Validating") => ProductPhase::Validating,
         Some("ClosingOld") => ProductPhase::ClosingOld,
         Some("OpeningCandidate") => ProductPhase::OpeningCandidate,
@@ -66,6 +70,10 @@ fn expected(
         Some("ValidatingPrior") => ProductPhase::ValidatingPrior,
         Some("OpeningRestore") => ProductPhase::OpeningRestore,
         Some("CleaningFailedRestore") => ProductPhase::CleaningFailedRestore,
+        Some("ValidatingResume") => ProductPhase::ValidatingResume,
+        Some("ClosingResume") => ProductPhase::ClosingResume,
+        Some("OpeningResume") => ProductPhase::OpeningResume,
+        Some("CleaningFailedResume") => ProductPhase::CleaningFailedResume,
         Some("ErrorWithActiveRestored") => ProductPhase::ErrorWithActiveRestored,
         Some("ErrorWithoutActive") => ProductPhase::ErrorWithoutActive,
         Some("Stopping") => ProductPhase::Stopping,
@@ -203,6 +211,12 @@ pub(crate) fn parse(line: &str) -> Result<Command, &'static str> {
             };
             Command::Mute(attempt, muted)
         }
+        "pause" => Command::Pause(
+            AttemptId::new(unsigned(fields.next())?).ok_or("nonzero attempt required")?,
+        ),
+        "resume" => Command::Resume(
+            AttemptId::new(unsigned(fields.next())?).ok_or("nonzero attempt required")?,
+        ),
         _ => return Err("unknown qualification command"),
     };
     if fields.next().is_some() {
@@ -240,6 +254,46 @@ mod tests {
             "apply Active 1 1 Complete 0 extra",
         ] {
             assert!(parse(line).is_err(), "{line}");
+        }
+    }
+    #[test]
+    fn correlated_close_and_restart_accept_pause_presentation_phases() {
+        for phase in ["PausePending", "Paused"] {
+            assert!(parse(&format!("close {phase} 1 1 Complete")).is_ok());
+            assert!(parse(&format!("restart {phase} 1 1 Complete")).is_ok());
+        }
+    }
+    #[test]
+    fn explicit_playback_commands_require_single_nonzero_attempt() {
+        assert_eq!(
+            parse("pause 7"),
+            Ok(Command::Pause(AttemptId::new(7).unwrap()))
+        );
+        assert_eq!(
+            parse("resume 9"),
+            Ok(Command::Resume(AttemptId::new(9).unwrap()))
+        );
+        for line in [
+            "pause",
+            "pause 0",
+            "pause 7 extra",
+            "resume",
+            "resume 0",
+            "resume 9 extra",
+        ] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+    }
+    #[test]
+    fn correlated_close_and_restart_accept_resume_presentation_phases() {
+        for phase in [
+            "ValidatingResume",
+            "ClosingResume",
+            "OpeningResume",
+            "CleaningFailedResume",
+        ] {
+            assert!(parse(&format!("close {phase} 1 1 Complete")).is_ok());
+            assert!(parse(&format!("restart {phase} 1 1 Complete")).is_ok());
         }
     }
     #[test]

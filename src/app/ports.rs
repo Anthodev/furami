@@ -3,7 +3,9 @@
 use crate::domain::{
     capture::{AudioError, AudioSourceIdentity, PlaybackGain},
     failure::ApplyFailure,
-    state::{AttemptId, AttemptKey, DraftSettings, ValidationKey, ValidationRequest},
+    state::{
+        AttemptId, AttemptKey, DraftSettings, PauseRequestId, ValidationKey, ValidationRequest,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -51,7 +53,10 @@ pub enum StopReason {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImmediateIntent {
-    TogglePause,
+    SetPaused {
+        request: PauseRequestId,
+        paused: bool,
+    },
     SetGain(PlaybackGain),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +146,11 @@ pub enum SessionEvent {
     },
     SessionEnded {
         attempt: AttemptId,
+    },
+    PauseObserved {
+        attempt: AttemptId,
+        request: PauseRequestId,
+        paused: bool,
     },
     OwnerStopped {
         attempt: AttemptId,
