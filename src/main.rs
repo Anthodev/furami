@@ -6,14 +6,16 @@ extern crate furami as _;
 
 mod diagnostics;
 mod profiles;
-mod settings;
 use furami::{
+    app::settings::{PersistenceSession, decide_startup, resolve_settings_path},
     capture::{
         audio,
         input::{CaptureArgumentError, CaptureArguments, CaptureSelection, SelectionError},
         linux,
     },
-    domain::capture::{AudioError, AudioSelection, AudioSourceIdentity, PlaybackGain},
+    domain::capture::{
+        AudioError, AudioSelection, AudioSourceIdentity, ObservationEpoch, WatchId, WatchStamp,
+    },
     domain::state::DraftSettings,
 };
 use std::ffi::{OsStr, OsString};
@@ -199,13 +201,27 @@ fn run() -> Result<(), StartupError> {
         }
         return Ok(());
     }
+    let mut persistence = PersistenceSession::load(resolve_settings_path(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    ));
+    let saved = persistence.saved_selection();
+    let restore_audio = arguments.video.is_none()
+        && saved
+            .as_ref()
+            .is_some_and(|settings| settings.audio.enabled());
+    let mut restore_audio_error = None;
     let audio_sources = if arguments.audio_source.is_some()
+        || restore_audio
         || (arguments.qualification_stdin && arguments.video.is_some())
     {
         match audio::discover() {
             Ok(sources) => sources,
             Err(error) if arguments.audio_source.is_none() => {
-                tracing::warn!(%error, "qualification_audio_catalog_unavailable");
+                restore_audio_error = Some(format!(
+                    "Cannot establish saved audio source inventory: {error}"
+                ));
+                tracing::warn!(%error, "startup_audio_catalog_unavailable");
                 Vec::new()
             }
             Err(error) => return Err(error.into()),
@@ -248,6 +264,26 @@ fn run() -> Result<(), StartupError> {
             })
         })
         .transpose()?;
+    let sources: Vec<_> = audio_sources
+        .into_iter()
+        .map(|source| source.identity)
+        .collect();
+    let startup = decide_startup(
+        saved,
+        capture,
+        |settings| {
+            let snapshot = linux::discover().map_err(|error| error.to_string())?;
+            let stamp = WatchStamp {
+                watch: WatchId::new(1).ok_or("invalid initial preflight watch")?,
+                epoch: ObservationEpoch::new(1).ok_or("invalid initial preflight epoch")?,
+            };
+            furami::capture::validate_prepared(settings.clone(), &snapshot, &[], stamp)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+        restore_audio_error.map_or_else(|| Ok(sources.as_slice()), Err),
+    );
+    persistence.prepare_startup(&startup);
     let x11_display = match std::env::var("DISPLAY") {
         Ok(value) if !value.is_empty() => value,
         Ok(_) | Err(std::env::VarError::NotPresent) => return Err(StartupError::NoDisplay),
@@ -267,12 +303,9 @@ fn run() -> Result<(), StartupError> {
     furami::native_host::run_application(
         &media_prefix,
         &x11_display,
-        capture,
-        PlaybackGain::default(),
-        audio_sources
-            .into_iter()
-            .map(|source| source.identity)
-            .collect(),
+        startup,
+        persistence,
+        sources,
         arguments.qualification_stdin,
     )?;
     tracing::info!("Qt application exited");

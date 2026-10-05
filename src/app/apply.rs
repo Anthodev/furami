@@ -7,9 +7,10 @@ use crate::domain::{
     },
     failure::{ApplyFailure, Cause, FailureCategory, LifecycleFailure, Stage, ValidationLayer},
     state::{
-        ApplyId, AttemptId, AttemptKey, CleanupStatus, CommandRejection, DraftRevision,
-        DraftSettings, InitialPlayback, ModelEffect, PlaybackState, ProductModel, ProductPhase,
-        ReconnectAdmission, StateIdentity, StopIntent, ValidationRequest,
+        AppliedSettings, ApplyId, AttemptId, AttemptKey, AttemptPurpose, CleanupStatus,
+        CommandRejection, DraftRevision, DraftSettings, InitialPlayback, ModelEffect,
+        PlaybackState, ProductModel, ProductPhase, ReconnectAdmission, StateIdentity, StopIntent,
+        ValidationRequest,
     },
 };
 
@@ -18,6 +19,15 @@ use super::ports::{
     SessionRunner, StartFailure, StopReason, StopSubmission, SubmitFailure, SubmitStatus,
     ValidationOutcome,
 };
+
+/// An exact verified open, after committed health monitoring has been installed.
+/// Its purpose alone does not identify a user Apply; consumers correlate the key
+/// with their admitted application intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedOpen {
+    pub key: AttemptKey,
+    pub applied: AppliedSettings,
+}
 
 struct Lease {
     key: AttemptKey,
@@ -54,6 +64,8 @@ where
     installed_watch: Option<RecoveryWatchTarget>,
     pending_validation: Option<ValidationRequest>,
     deferred_ready: Option<(AttemptKey, OpenReceipt)>,
+    verified_open: Option<VerifiedOpen>,
+    strict_startup_apply: Option<ApplyId>,
 }
 impl<V, R> ApplyCoordinator<V, R>
 where
@@ -74,6 +86,8 @@ where
             installed_watch: None,
             pending_validation: None,
             deferred_ready: None,
+            verified_open: None,
+            strict_startup_apply: None,
         }
     }
     pub fn model(&self) -> &ProductModel {
@@ -90,6 +104,43 @@ where
     }
     pub fn audio_availability(&self) -> Option<&AudioAvailability> {
         self.audio.as_ref()
+    }
+    /// Consume the latest verified open once. Drain after each poll before
+    /// admitting another operation: a later verified open replaces an untaken
+    /// notification. Session loss or draft edits do not revoke a past success.
+    pub fn take_verified_open(&mut self) -> Option<VerifiedOpen> {
+        self.verified_open.take()
+    }
+    /// Startup auto-open requires genuinely active requested audio, unlike the
+    /// ordinary FUR-011 policy that keeps healthy video when audio is silent.
+    /// Arm immediately after admitting this initial Candidate, before polling.
+    /// The guard cannot attach to an incumbent, rollback, or stale operation.
+    pub fn require_startup_restore_audio(
+        &mut self,
+        apply: ApplyId,
+    ) -> Result<(), CommandRejection> {
+        self.check_drain()?;
+        if !self.startup_restore_candidate(apply) {
+            return Err(CommandRejection::StaleState);
+        }
+        self.strict_startup_apply = Some(apply);
+        Ok(())
+    }
+    fn startup_restore_candidate(&self, apply: ApplyId) -> bool {
+        self.model.last_valid().is_none()
+            && (self.model.validation_request().is_some_and(|request| {
+                request.key.apply == apply && request.key.purpose == AttemptPurpose::Candidate
+            }) || self.model.opening().is_some_and(|(key, _)| {
+                key.apply == apply && key.purpose == AttemptPurpose::Candidate
+            }))
+    }
+    fn retire_startup_restore_guard(&mut self) {
+        if self
+            .strict_startup_apply
+            .is_some_and(|apply| !self.startup_restore_candidate(apply))
+        {
+            self.strict_startup_apply = None;
+        }
     }
     pub fn edit_draft(
         &mut self,
@@ -470,6 +521,7 @@ where
         }
     }
     fn drive(&mut self, mut effect: Option<ModelEffect>) -> Result<(), CommandRejection> {
+        self.retire_startup_restore_guard();
         // Each event has at most one next effect. Synchronous no-resource failure
         // can advance through the single rollback, never create an unbounded retry.
         while let Some(next) = effect.take() {
@@ -855,17 +907,36 @@ where
             }),
             AudioOutcome::Silent { .. } | AudioOutcome::Disabled => true,
         };
-        if !receipt.matches(settings) || !readiness_matches || !audio_matches {
+        let startup_audio_matches = self.strict_startup_apply != Some(key.apply)
+            || key.purpose != AttemptPurpose::Candidate
+            || !settings.audio.enabled()
+            || matches!(&receipt.audio, AudioOutcome::Active { .. });
+        if !receipt.matches(settings)
+            || !readiness_matches
+            || !audio_matches
+            || !startup_audio_matches
+        {
             let failure = Self::protocol_failure(
                 settings.clone(),
                 "open_receipt",
-                "receipt settings or requested audio outcome mismatch",
+                if startup_audio_matches {
+                    "receipt settings or requested audio outcome mismatch"
+                } else {
+                    "startup restore requires active requested audio"
+                },
             );
             let effect = self.model.open_failed(key, failure);
             let _ = self.drive(effect);
             return;
         }
         self.model.open_verified(key);
+        if !self
+            .model
+            .active()
+            .is_some_and(|active| active.attempt() == key.attempt)
+        {
+            return;
+        }
         if let Some(lease) = &mut self.lease {
             lease.verified = true;
         }
@@ -904,6 +975,17 @@ where
                 let effect = self.model.session_failed(key.attempt, failure);
                 let _ = self.drive(effect);
             }
+            return;
+        }
+        if let Some(active) = self
+            .model
+            .active()
+            .filter(|active| active.attempt() == key.attempt)
+        {
+            self.verified_open = Some(VerifiedOpen {
+                key,
+                applied: active.applied().clone(),
+            });
         }
     }
     pub fn poll(&mut self) {
@@ -1030,6 +1112,7 @@ where
         self.finish_drain();
     }
     fn finish_drain(&mut self) {
+        self.retire_startup_restore_guard();
         let retired = self.validator_shutdown && self.validator.shutdown_complete();
         self.model.drain_complete(
             self.validation.is_none() && self.pending_validation.is_none(),
@@ -1150,6 +1233,7 @@ mod tests {
         shutdown: bool,
         retired: bool,
         reject: Option<SubmitFailure>,
+        reject_watch: Option<SubmitFailure>,
         target: Option<RecoveryWatchTarget>,
         observation: Option<RecoveryObservation>,
         watches: Vec<RecoveryWatchTarget>,
@@ -1218,6 +1302,9 @@ mod tests {
             self.cancelled = true;
         }
         fn watch(&mut self, target: RecoveryWatchTarget) -> Result<(), SubmitFailure> {
+            if let Some(rejection) = self.reject_watch.take() {
+                return Err(rejection);
+            }
             if !self.delay_initial {
                 self.observation = Some(RecoveryObservation {
                     stamp: WatchStamp {
@@ -1397,6 +1484,317 @@ mod tests {
             engine.model().active().unwrap().playback(),
             PlaybackState::Paused
         );
+    }
+
+    #[test]
+    fn verified_open_uses_exact_committed_settings_and_is_consumed_once() {
+        let mut engine = engine();
+        let apply = apply(&mut engine);
+        assert!(engine.take_verified_open().is_none());
+        validate(&mut engine);
+        assert!(engine.take_verified_open().is_none());
+        let key = engine.runner.opens.last().unwrap().0;
+        engine
+            .edit_draft(engine.model().draft().revision, settings(30))
+            .unwrap();
+        // Both coalesced and later duplicate receipts must produce one event.
+        engine.runner.verified();
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.installed_watch.as_ref(), engine.model.watch_target());
+        let event = engine.take_verified_open().unwrap();
+        assert_eq!(event.key, key);
+        assert_eq!(event.key.apply, apply);
+        assert_eq!(event.applied.settings(), &settings(60));
+        assert_eq!(engine.model.draft().settings, settings(30));
+        assert!(engine.take_verified_open().is_none());
+        engine.runner.verified();
+        engine.poll();
+        assert!(engine.take_verified_open().is_none());
+    }
+
+    #[test]
+    fn stale_or_wrong_receipts_never_publish_verified_open() {
+        let mut engine = engine();
+        apply(&mut engine);
+        validate(&mut engine);
+        let key = engine.runner.opens.last().unwrap().0;
+        for stale in [
+            AttemptKey {
+                apply: ApplyId::new(key.apply.get() + 1).unwrap(),
+                ..key
+            },
+            AttemptKey {
+                attempt: AttemptId::new(key.attempt.get() + 1).unwrap(),
+                ..key
+            },
+            AttemptKey {
+                purpose: AttemptPurpose::Restore,
+                ..key
+            },
+        ] {
+            engine.runner.events.push_back(SessionEvent::OpenVerified {
+                key: stale,
+                receipt: receipt(settings(60)),
+            });
+            engine.poll();
+            assert_eq!(engine.model.opening().unwrap().0, key);
+            assert!(engine.take_verified_open().is_none());
+        }
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key,
+            receipt: receipt(settings(30)),
+        });
+        engine.poll();
+        assert!(engine.model.active().is_none());
+        assert!(engine.model.last_valid().is_none());
+        assert!(engine.take_verified_open().is_none());
+        engine.runner.verified();
+        engine.poll();
+        assert!(engine.take_verified_open().is_none());
+    }
+
+    #[test]
+    fn canceled_open_and_terminal_barrier_cannot_publish_cached_readiness() {
+        for close in [false, true] {
+            let mut engine = engine();
+            apply(&mut engine);
+            validate(&mut engine);
+            let key = engine.runner.opens.last().unwrap().0;
+            engine.runner.verified();
+            if close {
+                engine.close(engine.model.state_identity()).unwrap();
+            } else {
+                engine.runner.barrier(key.attempt);
+            }
+            engine.poll();
+            assert!(engine.model.active().is_none());
+            assert!(engine.take_verified_open().is_none());
+        }
+    }
+
+    #[test]
+    fn verified_open_requires_successful_committed_watch_installation() {
+        for rejection in [
+            None,
+            Some(SubmitFailure::CapacityUnavailable),
+            Some(SubmitFailure::Disconnected),
+        ] {
+            let mut engine = engine();
+            apply(&mut engine);
+            engine.validator.finish(Ok(()));
+            let mut relocated = settings(60);
+            relocated.video.identity = DeviceIdentity::new(
+                0x32ed,
+                0x3701,
+                UsbTopology::new(
+                    "controller".into(),
+                    vec![std::num::NonZeroU8::new(2).unwrap()],
+                )
+                .unwrap(),
+                Some("serial".into()),
+            )
+            .unwrap();
+            let ValidationOutcome::Prepared(prepared) =
+                &mut engine.validator.result.as_mut().unwrap().result
+            else {
+                panic!("prepared validation required");
+            };
+            prepared.settings = relocated.clone();
+            engine.poll();
+            let key = engine.runner.opens.last().unwrap().0;
+            let prior_watch = engine.installed_watch.clone();
+            engine.validator.reject_watch = rejection;
+            engine.runner.verified();
+            engine.poll();
+            assert_eq!(engine.model.last_valid().unwrap().settings(), &relocated);
+            if rejection.is_some() {
+                assert!(engine.model.active().is_none());
+                assert_eq!(engine.installed_watch, prior_watch);
+                assert!(engine.take_verified_open().is_none());
+                assert_eq!(
+                    engine
+                        .model
+                        .failures()
+                        .unwrap()
+                        .incumbent
+                        .as_ref()
+                        .unwrap()
+                        .operation,
+                    "committed_watch"
+                );
+            } else {
+                assert_ne!(engine.installed_watch, prior_watch);
+                assert_eq!(engine.installed_watch.as_ref(), engine.model.watch_target());
+                let event = engine.take_verified_open().unwrap();
+                assert_eq!(event.key, key);
+                assert_eq!(event.applied.settings(), &relocated);
+                assert!(engine.take_verified_open().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn strict_startup_restore_refuses_silent_enabled_audio_without_changing_user_apply() {
+        use crate::domain::capture::{AudioError, AudioSourceIdentity, VideoPresence};
+        for strict in [false, true] {
+            let source = AudioSourceIdentity::new("exact.capture".into(), vec![]).unwrap();
+            let mut desired = settings(60);
+            desired.audio = AudioSelection::Enabled {
+                source: source.clone(),
+            };
+            let mut engine = ApplyCoordinator::new(
+                desired.clone(),
+                PlaybackGain::default(),
+                Validator::default(),
+                Runner::default(),
+            );
+            let apply = apply(&mut engine);
+            if strict {
+                engine.require_startup_restore_audio(apply).unwrap();
+            }
+            let absent = observation(
+                &engine,
+                2,
+                VideoPresence::Present,
+                SourcePresence::Absent(AudioError::Cancelled),
+                None,
+            );
+            observe(&mut engine, absent);
+            validate(&mut engine);
+            let key = engine.runner.opens.last().unwrap().0;
+            let mut opened = receipt(desired.clone());
+            opened.audio = AudioOutcome::Silent {
+                source,
+                reason: AudioSilence::WaitingForSource(AudioError::Cancelled),
+            };
+            engine.runner.events.push_back(SessionEvent::OpenVerified {
+                key,
+                receipt: opened,
+            });
+            engine.poll();
+            assert_eq!(engine.model.active().is_some(), !strict);
+            assert_eq!(engine.model.last_valid().is_some(), !strict);
+            assert_eq!(engine.take_verified_open().is_some(), !strict);
+            assert!(engine.strict_startup_apply.is_none());
+            if strict {
+                assert_eq!(engine.runner.stops, vec![(key.attempt, StopReason::Failed)]);
+                engine.runner.barrier(key.attempt);
+                engine.poll();
+                assert_eq!(engine.model.phase(), ProductPhase::ErrorWithoutActive);
+                assert_eq!(engine.runner.opens.len(), 1);
+                assert_eq!(engine.model.draft().settings, desired);
+            }
+        }
+    }
+
+    #[test]
+    fn strict_startup_active_audio_commits_once_and_later_loss_keeps_video() {
+        use crate::domain::capture::{
+            AudioError, AudioRouteReceipt, AudioSourceIdentity, VideoPresence,
+        };
+        let source = AudioSourceIdentity::new("exact.capture".into(), vec![]).unwrap();
+        let mut desired = settings(60);
+        desired.audio = AudioSelection::Enabled {
+            source: source.clone(),
+        };
+        let mut engine = ApplyCoordinator::new(
+            desired.clone(),
+            PlaybackGain::default(),
+            Validator::default(),
+            Runner::default(),
+        );
+        let apply = apply(&mut engine);
+        engine.require_startup_restore_audio(apply).unwrap();
+        validate(&mut engine);
+        let key = engine.runner.opens.last().unwrap().0;
+        let route = AudioRouteReceipt {
+            epoch: AudioEpoch::new(1).unwrap(),
+            stamp: engine.lease.as_ref().unwrap().watch,
+            source_index: 7,
+            source_output_index: 8,
+            client_index: 9,
+        };
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt: key.attempt,
+                status: AudioAvailability::Active {
+                    source: source.clone(),
+                    route: route.clone(),
+                },
+            });
+        let mut opened = receipt(desired.clone());
+        opened.audio = AudioOutcome::Active { source, route };
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key,
+            receipt: opened,
+        });
+        engine.poll();
+        let event = engine.take_verified_open().unwrap();
+        assert_eq!(event.key, key);
+        assert_eq!(event.applied.settings(), &desired);
+        assert!(engine.strict_startup_apply.is_none());
+        let absent = observation(
+            &engine,
+            2,
+            VideoPresence::Present,
+            SourcePresence::Absent(AudioError::Cancelled),
+            None,
+        );
+        observe(&mut engine, absent);
+        engine.runner.events.push_back(SessionEvent::AudioDetached {
+            attempt: key.attempt,
+            epoch: AudioEpoch::new(1).unwrap(),
+            outcome: Ok(()),
+        });
+        engine.poll();
+        assert_eq!(engine.model.active().unwrap().attempt(), key.attempt);
+        assert!(matches!(
+            engine.audio_availability(),
+            Some(AudioAvailability::Silent { .. })
+        ));
+        assert!(engine.runner.stops.is_empty());
+        assert!(engine.take_verified_open().is_none());
+    }
+
+    #[test]
+    fn strict_startup_guard_rejects_stale_ids_and_retires_on_failure_or_cancel() {
+        for canceled in [false, true] {
+            let mut engine = engine();
+            let id = apply(&mut engine);
+            assert_eq!(
+                engine.require_startup_restore_audio(ApplyId::new(id.get() + 1).unwrap()),
+                Err(CommandRejection::StaleState)
+            );
+            engine.require_startup_restore_audio(id).unwrap();
+            assert_eq!(engine.strict_startup_apply, Some(id));
+            if canceled {
+                engine.close(engine.model.state_identity()).unwrap();
+                assert!(engine.strict_startup_apply.is_none());
+                validate(&mut engine);
+            } else {
+                engine.validator.finish(Err(failure(
+                    settings(60),
+                    FailureCategory::Validation(ValidationLayer::Mode),
+                    "startup validation refused",
+                )));
+                engine.poll();
+            }
+            assert!(engine.strict_startup_apply.is_none());
+            assert!(engine.take_verified_open().is_none());
+            let next = apply(&mut engine);
+            assert_ne!(next, id);
+            validate(&mut engine);
+            engine.runner.verified();
+            engine.poll();
+            assert_eq!(engine.take_verified_open().unwrap().key.apply, next);
+            assert_eq!(
+                engine.require_startup_restore_audio(next),
+                Err(CommandRejection::StaleState)
+            );
+        }
     }
 
     #[test]

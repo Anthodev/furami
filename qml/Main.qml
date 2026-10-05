@@ -15,6 +15,13 @@ ApplicationWindow {
     minimumHeight: 540
     color: palette.window
 
+    // Qt 6.11 Popup.Window also resizes its native window from implicit sizes.
+    // Keep those sizes bounded independently of the scrollable message.
+    readonly property real settingsDialogWidth: Math.max(1, Math.min(460, root.width - 32,
+        (bridge.screenAvailableWidth > 0 ? bridge.screenAvailableWidth : root.width) - 32))
+    readonly property real settingsDialogHeight: Math.max(1, Math.min(520, root.height - 32,
+        (bridge.screenAvailableHeight > 0 ? bridge.screenAvailableHeight : root.height) - 32))
+
     onClosing: function(close) {
         close.accepted = bridge.quitAuthorized()
         if (!close.accepted)
@@ -25,13 +32,22 @@ ApplicationWindow {
         playbackVolume.value = Qt.binding(function() { return root.bridge.volumePercent })
         playbackMute.checked = Qt.binding(function() { return root.bridge.muted })
     }
+    function reconcileSettingsDialogs() {
+        dirtyCloseDialog.visible = bridge.closeDialog === "draft"
+        saveFailureDialog.visible = bridge.closeDialog === "save" || bridge.closeDialog === "warning"
+        resetSettingsDialog.visible = bridge.resetToken !== "0"
+        bridge.popupOpen = panelPopup.visible || dirtyCloseDialog.visible
+            || saveFailureDialog.visible || resetSettingsDialog.visible
+    }
 
     Connections {
         target: root.bridge
         function onStateChanged() {
             root.reconcilePlaybackControls()
+            root.reconcileSettingsDialogs()
         }
     }
+    Component.onCompleted: reconcileSettingsDialogs()
 
     header: ToolBar {
         RowLayout {
@@ -58,6 +74,7 @@ ApplicationWindow {
                 objectName: "fullscreenProof"
                 text: root.visibility === Window.FullScreen ? "Leave fullscreen" : "Fullscreen"
                 onClicked: root.bridge.toggleFullscreen()
+                enabled: !root.bridge.closing
             }
         }
     }
@@ -113,17 +130,52 @@ ApplicationWindow {
             Layout.minimumWidth: 240
             Layout.maximumWidth: 240
             Layout.fillHeight: true
+            Layout.minimumHeight: 0
+            implicitHeight: 0
             padding: 12
 
             ScrollView {
                 id: panelScroll
                 anchors.fill: parent
+                // Content height must not become the pane's layout minimum.
+                implicitWidth: 0
+                implicitHeight: 0
+                clip: true
                 contentWidth: availableWidth
+                contentHeight: panelContent.implicitHeight
+                activeFocusOnTab: true
                 ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
                 ScrollBar.vertical.policy: ScrollBar.AsNeeded
 
+                function revealFocusedControl() {
+                    const item = root.activeFocusItem
+                    let ancestor = item
+                    while (ancestor && ancestor !== panelContent)
+                        ancestor = ancestor.parent
+                    if (!ancestor)
+                        return
+                    const viewport = panelScroll.contentItem
+                    const top = item.mapToItem(panelContent, 0, 0).y
+                    const bottom = top + item.height
+                    let position = viewport.contentY
+                    if (top < position)
+                        position = top
+                    else if (bottom > position + viewport.height)
+                        position = bottom - viewport.height
+                    viewport.contentY = Math.max(0, Math.min(position,
+                        Math.max(0, panelScroll.contentHeight - viewport.height)))
+                }
+
+                Connections {
+                    target: root
+                    function onActiveFocusItemChanged() {
+                        panelScroll.revealFocusedControl()
+                    }
+                }
+
                 ColumnLayout {
-                    width: panelScroll.availableWidth
+                    id: panelContent
+                    width: Math.max(0, panelScroll.availableWidth - panelScroll.effectiveScrollBarWidth)
                     spacing: 8
 
                     Label {
@@ -131,6 +183,50 @@ ApplicationWindow {
                         font.bold: true
                         wrapMode: Text.WordWrap
                         Layout.fillWidth: true
+                    }
+                    Label {
+                        objectName: "savedSelection"
+                        visible: root.bridge.savedSelection.length > 0
+                        text: root.bridge.savedSelection
+                            + (root.bridge.draftDirty ? "\nUnapplied selection changes" : "\nSelection unchanged")
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WrapAnywhere
+                        Layout.fillWidth: true
+                        Accessible.name: "Capture selection and exact mode"
+                    }
+                    Label {
+                        objectName: "startupRestoreReason"
+                        text: root.bridge.startupReason
+                        textFormat: Text.PlainText
+                        visible: text.length > 0
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                        Accessible.name: "Startup restoration status"
+                    }
+                    Label {
+                        objectName: "settingsStatus"
+                        text: root.bridge.settingsStatus
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WrapAnywhere
+                        Layout.fillWidth: true
+                        Accessible.name: "Settings persistence status"
+                    }
+                    Label {
+                        objectName: "settingsPath"
+                        text: root.bridge.settingsPath
+                        textFormat: Text.PlainText
+                        visible: text.length > 0
+                        wrapMode: Text.WrapAnywhere
+                        Layout.fillWidth: true
+                        Accessible.name: "Settings file path"
+                    }
+                    Button {
+                        objectName: "resetSettings"
+                        text: "Reset saved file…"
+                        enabled: !root.bridge.closing && root.bridge.settingsPath.length > 0
+                        Layout.fillWidth: true
+                        Accessible.name: "Reset the saved settings file with confirmation"
+                        onClicked: root.bridge.requestSettingsReset()
                     }
                     Button {
                         objectName: "openProof"
@@ -153,14 +249,15 @@ ApplicationWindow {
                         objectName: "reconnectCapture"
                         text: "Reconnect capture"
                         Layout.fillWidth: true
-                        enabled: root.bridge.phase !== "QuitReady"
+                        enabled: !root.bridge.closing
                         onClicked: root.bridge.reconnectCapture(root.bridge.restartGeneration)
                     }
                     Button {
                         objectName: "closeProof"
                         text: "Close session"
                         Layout.fillWidth: true
-                        enabled: root.bridge.captureSelected && root.bridge.phase !== "QuitReady"
+                        enabled: !root.bridge.closing && root.bridge.captureSelected
+                            && root.bridge.phase !== "QuitReady"
                             && (root.bridge.phase !== "Idle" || !root.bridge.canOpen)
                         onClicked: root.bridge.closeCapture()
                     }
@@ -286,6 +383,7 @@ ApplicationWindow {
                             + (root.bridge.audioStatus === "Disabled" && root.bridge.audioDesired.length > 0
                                 ? "\nAudio off — selected source retained: " + root.bridge.audioDesired : "")
                             + (root.bridge.audioDiagnostic.length > 0 ? "\n" + root.bridge.audioDiagnostic : "")
+                        textFormat: Text.PlainText
                         wrapMode: Text.WrapAnywhere
                         Layout.fillWidth: true
                         Accessible.name: "Capture audio status"
@@ -314,6 +412,7 @@ ApplicationWindow {
                     Label {
                         objectName: "proofDiagnostic"
                         text: root.bridge.diagnostic
+                        textFormat: Text.PlainText
                         visible: root.bridge.diagnostic.length > 0
                         wrapMode: Text.WrapAnywhere
                         Layout.fillWidth: true
@@ -336,7 +435,7 @@ ApplicationWindow {
                 dim: false
                 focus: true
                 closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
-                onVisibleChanged: root.bridge.popupOpen = visible
+                onVisibleChanged: root.reconcileSettingsDialogs()
                 onClosed: popupButton.forceActiveFocus(Qt.TabFocusReason)
 
                 contentItem: ColumnLayout {
@@ -352,6 +451,283 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         onClicked: panelPopup.close()
                     }
+                }
+            }
+        }
+    }
+    footer: ToolBar {
+        visible: root.bridge.settingsRefused || root.bridge.settingsPath.length === 0
+        Label {
+            objectName: "settingsRefusalBanner"
+            width: parent.width
+            padding: 12
+            text: root.bridge.settingsRefused
+                ? "Settings file refused. Changes are session-only until a confirmed reset. Details in the panel."
+                : "Settings location unavailable. Changes are session-only. Details in the panel."
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            Accessible.name: "Settings not persistent"
+        }
+    }
+
+    // Native capture children stack above Item popups. Real modal Qt windows
+    // keep confirmation visible and focusable without replacing the video host.
+    Dialog {
+        id: dirtyCloseDialog
+        objectName: "dirtyCloseDialog"
+        popupType: Popup.Window
+        title: "Unapplied selection changes"
+        modal: true
+        dim: false
+        focus: true
+        implicitWidth: root.settingsDialogWidth
+        implicitHeight: root.settingsDialogHeight
+        width: implicitWidth
+        height: implicitHeight
+        // Use the root overlay, not the popup window's attached overlay.
+        // Explicit coordinates also retain Qt's native QScreen fitting step.
+        parent: root.Overlay.overlay
+        x: Math.round((parent.width - width) / 2)
+        y: Math.round((parent.height - height) / 2)
+        closePolicy: Popup.NoAutoClose
+        property string expectedRevision: "0"
+        onOpened: {
+            expectedRevision = root.bridge.closeRevision
+            cancelDirtyClose.forceActiveFocus(Qt.TabFocusReason)
+        }
+        onRejected: root.bridge.decideClose(false, expectedRevision)
+        onClosed: {
+            if (root.bridge.closeDialog === "draft")
+                root.bridge.decideClose(false, expectedRevision)
+        }
+        header: Label {
+            text: dirtyCloseDialog.title
+            textFormat: Text.PlainText
+            wrapMode: Text.WrapAnywhere
+            font.bold: true
+            padding: 12
+        }
+        // A plain Item isolates viewport sizing from the full message height.
+        contentItem: Item {
+            implicitWidth: 0
+            implicitHeight: 0
+            ScrollView {
+                id: dirtyCloseContent
+                objectName: "dirtyCloseContent"
+                anchors.fill: parent
+                implicitWidth: 0
+                implicitHeight: 0
+                clip: true
+                activeFocusOnTab: true
+                contentWidth: availableWidth
+                contentHeight: dirtyCloseMessage.implicitHeight
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                ScrollBar.vertical.policy: ScrollBar.AsNeeded
+                Keys.onEscapePressed: dirtyCloseDialog.reject()
+                ColumnLayout {
+                    id: dirtyCloseMessage
+                    width: Math.max(0, dirtyCloseContent.availableWidth - dirtyCloseContent.effectiveScrollBarWidth)
+                    spacing: 12
+                    Label {
+                        text: "The selection has changes that were never applied. Quit without applying them? Only the last saved/applied capture and your current local preferences may be saved."
+                        wrapMode: Text.WrapAnywhere
+                        Layout.fillWidth: true
+                        Accessible.name: text
+                    }
+                    Label {
+                        text: root.bridge.savedSelection
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WrapAnywhere
+                        Layout.fillWidth: true
+                    }
+                }
+            }
+        }
+        footer: Pane {
+            padding: 12
+            Keys.onEscapePressed: dirtyCloseDialog.reject()
+            contentItem: ColumnLayout {
+                spacing: 8
+                Button {
+                    id: cancelDirtyClose
+                    objectName: "cancelDirtyClose"
+                    text: "Cancel close"
+                    Layout.fillWidth: true
+                    onClicked: dirtyCloseDialog.reject()
+                }
+                Button {
+                    objectName: "discardDirtyClose"
+                    text: "Quit without applying"
+                    Layout.fillWidth: true
+                    onClicked: {
+                        root.bridge.decideClose(true, dirtyCloseDialog.expectedRevision)
+                        // A stale answer vetoes close; the next decision uses
+                        // the refreshed displayed selection and revision.
+                        dirtyCloseDialog.expectedRevision = root.bridge.closeRevision
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: saveFailureDialog
+        objectName: "saveFailureDialog"
+        popupType: Popup.Window
+        title: root.bridge.closeDialog === "warning" ? "Durability not confirmed" : "Unable to save settings"
+        modal: true
+        dim: false
+        focus: true
+        implicitWidth: root.settingsDialogWidth
+        implicitHeight: root.settingsDialogHeight
+        width: implicitWidth
+        height: implicitHeight
+        parent: root.Overlay.overlay
+        x: Math.round((parent.width - width) / 2)
+        y: Math.round((parent.height - height) / 2)
+        closePolicy: Popup.NoAutoClose
+        onOpened: {
+            if (root.bridge.closeDialog === "warning")
+                closeWithoutSaving.forceActiveFocus(Qt.TabFocusReason)
+            else
+                retrySettingsSave.forceActiveFocus(Qt.TabFocusReason)
+        }
+        onClosed: {
+            if (root.bridge.closeDialog === "save" || root.bridge.closeDialog === "warning")
+                Qt.callLater(root.reconcileSettingsDialogs)
+        }
+        header: Label {
+            text: saveFailureDialog.title
+            textFormat: Text.PlainText
+            wrapMode: Text.WrapAnywhere
+            font.bold: true
+            padding: 12
+        }
+        contentItem: Item {
+            implicitWidth: 0
+            implicitHeight: 0
+            ScrollView {
+                id: saveFailureContent
+                objectName: "saveFailureContent"
+                anchors.fill: parent
+                implicitWidth: 0
+                implicitHeight: 0
+                clip: true
+                activeFocusOnTab: true
+                contentWidth: availableWidth
+                contentHeight: saveFailureMessage.implicitHeight
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                ScrollBar.vertical.policy: ScrollBar.AsNeeded
+                Label {
+                    id: saveFailureMessage
+                    width: Math.max(0, saveFailureContent.availableWidth - saveFailureContent.effectiveScrollBarWidth)
+                    text: "Capture teardown is complete. No media owner will reopen.\n\n" + root.bridge.settingsStatus
+                    textFormat: Text.PlainText
+                    wrapMode: Text.WrapAnywhere
+                    Accessible.name: text
+                }
+            }
+        }
+        footer: Pane {
+            padding: 12
+            contentItem: ColumnLayout {
+                spacing: 8
+                Button {
+                    id: retrySettingsSave
+                    objectName: "retrySettingsSave"
+                    text: "Retry save"
+                    visible: root.bridge.closeDialog === "save"
+                    Layout.fillWidth: true
+                    onClicked: root.bridge.retrySave()
+                }
+                Button {
+                    id: closeWithoutSaving
+                    objectName: "closeWithoutSaving"
+                    text: root.bridge.closeDialog === "warning" ? "Close with durability unconfirmed" : "Close without saving"
+                    Layout.fillWidth: true
+                    onClicked: root.bridge.closeWithoutSave()
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: resetSettingsDialog
+        objectName: "resetSettingsDialog"
+        popupType: Popup.Window
+        title: "Replace the saved settings file?"
+        modal: true
+        dim: false
+        focus: true
+        implicitWidth: root.settingsDialogWidth
+        implicitHeight: root.settingsDialogHeight
+        width: implicitWidth
+        height: implicitHeight
+        parent: root.Overlay.overlay
+        x: Math.round((parent.width - width) / 2)
+        y: Math.round((parent.height - height) / 2)
+        closePolicy: Popup.NoAutoClose
+        property string confirmationToken: "0"
+        onOpened: {
+            confirmationToken = root.bridge.resetToken
+            cancelSettingsReset.forceActiveFocus(Qt.TabFocusReason)
+        }
+        onRejected: root.bridge.decideSettingsReset(confirmationToken, false)
+        onClosed: {
+            if (root.bridge.resetToken === confirmationToken)
+                root.bridge.decideSettingsReset(confirmationToken, false)
+        }
+        header: Label {
+            text: resetSettingsDialog.title
+            textFormat: Text.PlainText
+            wrapMode: Text.WrapAnywhere
+            font.bold: true
+            padding: 12
+        }
+        contentItem: Item {
+            implicitWidth: 0
+            implicitHeight: 0
+            ScrollView {
+                id: resetSettingsContent
+                objectName: "resetSettingsContent"
+                anchors.fill: parent
+                implicitWidth: 0
+                implicitHeight: 0
+                clip: true
+                activeFocusOnTab: true
+                contentWidth: availableWidth
+                contentHeight: resetSettingsMessage.implicitHeight
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                ScrollBar.vertical.policy: ScrollBar.AsNeeded
+                Keys.onEscapePressed: resetSettingsDialog.reject()
+                Label {
+                    id: resetSettingsMessage
+                    width: Math.max(0, resetSettingsContent.availableWidth - resetSettingsContent.effectiveScrollBarWidth)
+                    text: "The original file will be replaced and its contents lost:\n" + root.bridge.settingsPath
+                        + "\n\nThe new file saves your current volume, mute and fullscreen choice, with no saved capture. This does not stop live capture, apply or change the draft, or reset live preferences."
+                    textFormat: Text.PlainText
+                    wrapMode: Text.WrapAnywhere
+                    Accessible.name: text
+                }
+            }
+        }
+        footer: Pane {
+            padding: 12
+            Keys.onEscapePressed: resetSettingsDialog.reject()
+            contentItem: ColumnLayout {
+                spacing: 8
+                Button {
+                    id: cancelSettingsReset
+                    objectName: "cancelSettingsReset"
+                    text: "Cancel reset"
+                    Layout.fillWidth: true
+                    onClicked: resetSettingsDialog.reject()
+                }
+                Button {
+                    objectName: "confirmSettingsReset"
+                    text: "Replace original file"
+                    Layout.fillWidth: true
+                    onClicked: root.bridge.decideSettingsReset(resetSettingsDialog.confirmationToken, true)
                 }
             }
         }

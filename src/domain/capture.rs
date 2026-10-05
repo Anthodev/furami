@@ -223,6 +223,13 @@ impl AudioSourceIdentity {
         &self.name
     }
 
+    /// Read-only view of the sorted stable properties, for persistence and
+    /// display seams. The vector stays private: identity is built only through
+    /// the validating constructor.
+    pub fn stable_properties(&self) -> &[(String, String)] {
+        &self.stable_properties
+    }
+
     pub fn compatible_with(&self, observed: &Self) -> bool {
         self.name == observed.name
             && self.stable_properties.iter().all(|property| {

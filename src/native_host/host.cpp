@@ -9,6 +9,7 @@
 #include <QMouseEvent>
 #include <QPlatformSurfaceEvent>
 #include <QResizeEvent>
+#include <QScreen>
 #include <QQmlApplicationEngine>
 #include <QQmlEngine>
 #include <QThread>
@@ -192,6 +193,14 @@ FuramiBridge::FuramiBridge(rust::Box<RuntimeCoordinator> gate)
     QQmlEngine::setObjectOwnership(this, QQmlEngine::CppOwnership);
     m_captureSelected = gate_capture_selected(*m_gate);
     applyUpdate(gate_poll(*m_gate));
+    // X11 may never acknowledge a WM state request. This deadline abandons
+    // intent/focus hooks only: it proves neither rejection nor success.
+    m_fullscreenChoiceDeadline.setSingleShot(true);
+    m_fullscreenChoiceDeadline.setInterval(5000);
+    connect(&m_fullscreenChoiceDeadline, &QTimer::timeout, this, [this] {
+        if (m_fullscreenChoicePending || m_fullscreenFocusRestorePending)
+            cancelFullscreenChoice("deadline");
+    });
     m_pollTimer.setInterval(16);
     connect(&m_pollTimer, &QTimer::timeout, this, [this] {
         assertGuiThread();
@@ -247,6 +256,40 @@ bool FuramiBridge::panelVisible() const { assertGuiThread(); return m_panelVisib
 bool FuramiBridge::popupOpen() const { assertGuiThread(); return m_popupOpen; }
 bool FuramiBridge::quitAuthorized() const { assertGuiThread(); return m_quitAuthorized; }
 bool FuramiBridge::failed() const { assertGuiThread(); return m_failed; }
+QString FuramiBridge::settingsStatus() const { assertGuiThread(); return m_settingsStatus; }
+QString FuramiBridge::settingsPath() const { assertGuiThread(); return m_settingsPath; }
+bool FuramiBridge::settingsRefused() const { assertGuiThread(); return m_settingsRefused; }
+QString FuramiBridge::savedSelection() const { assertGuiThread(); return m_savedSelection; }
+QString FuramiBridge::startupReason() const { assertGuiThread(); return m_startupReason; }
+bool FuramiBridge::draftDirty() const { assertGuiThread(); return m_draftDirty; }
+QString FuramiBridge::closeDialog() const { assertGuiThread(); return m_closeDialog; }
+QString FuramiBridge::closeRevision() const { assertGuiThread(); return QString::number(m_closeRevision); }
+QString FuramiBridge::resetToken() const { assertGuiThread(); return QString::number(m_resetToken); }
+bool FuramiBridge::fullscreenPreference() const { assertGuiThread(); return m_fullscreenPreference; }
+bool FuramiBridge::closing() const { assertGuiThread(); return m_closing; }
+int FuramiBridge::screenAvailableWidth() const
+{
+    assertGuiThread();
+    const auto *screen = m_root ? m_root->screen() : QGuiApplication::primaryScreen();
+    return screen ? screen->availableGeometry().width() : 0;
+}
+int FuramiBridge::screenAvailableHeight() const
+{
+    assertGuiThread();
+    const auto *screen = m_root ? m_root->screen() : QGuiApplication::primaryScreen();
+    return screen ? screen->availableGeometry().height() : 0;
+}
+
+void FuramiBridge::watchScreenGeometry()
+{
+    assertGuiThread();
+    QObject::disconnect(m_screenGeometryConnection);
+    if (m_root && m_root->screen()) {
+        m_screenGeometryConnection = connect(m_root->screen(), &QScreen::availableGeometryChanged,
+            this, [this](const QRect &) { emit screenGeometryChanged(); });
+    }
+    emit screenGeometryChanged();
+}
 
 void FuramiBridge::setTextEntryActive(bool active)
 {
@@ -300,11 +343,13 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
         return false;
     }
     root->setCursor(Qt::ArrowCursor);
+    m_fullscreenObserved = root->visibility() == QWindow::FullScreen;
     qInfo().noquote() << QStringLiteral("native_root root=%1 container=videoContainer generation=0")
         .arg(m_rootXid);
     connect(root, &QWindow::widthChanged, this, [this] { scheduleGeometryLog(); });
     connect(root, &QWindow::heightChanged, this, [this] { scheduleGeometryLog(); });
-    connect(root, &QWindow::screenChanged, this, [this] { scheduleGeometryLog(); });
+    connect(root, &QWindow::screenChanged, this, [this] { watchScreenGeometry(); scheduleGeometryLog(); });
+    watchScreenGeometry();
     connect(root, &QQuickWindow::activeFocusItemChanged, this, [this] {
         if (!m_root)
             return;
@@ -319,6 +364,7 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
     connect(container, &QQuickItem::heightChanged, this, [this] { scheduleGeometryLog(); });
     connect(root, &QObject::destroyed, this, [this] {
         assertGuiThread();
+        cancelFullscreenChoice("root-destroyed");
         m_root.clear();
         m_container.clear();
         qInfo().noquote() << QStringLiteral("native_root_destroyed root=%1 generation=%2 authorized=%3")
@@ -337,6 +383,17 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
                 failNative(m_nativeGeneration, QStringLiteral("application root was destroyed before owner acknowledgement"));
             applyUpdate(gate_quit(*m_gate));
         }
+    });
+    connect(root, &QWindow::visibilityChanged, this, [this](QWindow::Visibility visibility) {
+        if (visibility == QWindow::Hidden || visibility == QWindow::Minimized)
+            cancelFullscreenChoice("not-visible");
+        else if (m_fullscreenChoicePending && m_root)
+            m_root->update();
+    });
+    QTimer::singleShot(0, this, [this] {
+        if (!m_root) return;
+        if (m_fullscreenPreference && m_root->visibility() != QWindow::FullScreen) toggleFullscreen();
+        applyUpdate(gate_ui_ready(*m_gate));
     });
     scheduleGeometryLog();
     return true;
@@ -383,7 +440,13 @@ void FuramiBridge::readQualificationInput()
             if (!m_dropQualificationLine && !m_qualificationLine.isEmpty()) {
                 const auto command = QString::fromUtf8(m_qualificationLine).toUtf8();
                 qInfo().noquote() << "qualification_command" << QString::fromUtf8(command);
-                applyUpdate(gate_qualification_command(*m_gate, asRust(command)));
+                if (command == "fullscreen") toggleFullscreen();
+                else if (command == "application-close") requestApplicationClose();
+                else if (command == "reset-confirm") decideSettingsReset(QString::number(m_resetToken), true);
+                else {
+                    if (command == "close-discard" || command.startsWith("quit ")) observeFullscreenChoice();
+                    applyUpdate(gate_qualification_command(*m_gate, asRust(command)));
+                }
             }
             m_qualificationLine.clear();
             m_dropQualificationLine = false;
@@ -519,7 +582,113 @@ void FuramiBridge::requestApplicationClose()
         return;
     qInfo().noquote() << QStringLiteral("input_intent action=ApplicationClose root=%1 generation=%2 phase=%3")
         .arg(m_rootXid).arg(m_generation).arg(m_actualPhase);
-    applyUpdate(gate_quit(*m_gate));
+    // Only an already-observed and synchronized transition may commit here.
+    // Otherwise shutdown retains the last confirmed preference, not a request.
+    observeFullscreenChoice();
+    cancelFullscreenChoice("application-close");
+    applyUpdate(gate_request_application_close(*m_gate));
+}
+
+void FuramiBridge::decideClose(bool discard, const QString &revision)
+{
+    assertGuiThread();
+    bool valid = false;
+    const auto value = revision.toULongLong(&valid);
+    if (valid) applyUpdate(gate_decide_close(*m_gate, discard, value));
+}
+void FuramiBridge::retrySave() { assertGuiThread(); applyUpdate(gate_retry_save(*m_gate)); }
+void FuramiBridge::closeWithoutSave() { assertGuiThread(); applyUpdate(gate_close_without_save(*m_gate)); }
+void FuramiBridge::requestSettingsReset() { assertGuiThread(); applyUpdate(gate_request_reset(*m_gate)); }
+void FuramiBridge::decideSettingsReset(const QString &token, bool confirmed)
+{
+    assertGuiThread();
+    bool valid = false;
+    const auto value = token.toULongLong(&valid);
+    if (valid && confirmed) observeFullscreenChoice();
+    if (valid) applyUpdate(gate_decide_reset(*m_gate, value, confirmed));
+}
+
+void FuramiBridge::observeFullscreenChoice()
+{
+    assertGuiThread();
+    if (!m_root || !m_fullscreenChoicePending || !m_fullscreenNativeTransitionObserved
+        || !m_fullscreenChoiceSynchronized || m_quitAuthorized || m_closing)
+        return;
+    const auto visibility = m_root->visibility();
+    if (visibility == QWindow::Minimized || visibility == QWindow::Hidden
+        || (visibility == QWindow::FullScreen) != m_fullscreenRequested)
+        return;
+    m_fullscreenChoicePending = false;
+    if (!m_fullscreenFocusRestorePending)
+        m_fullscreenChoiceDeadline.stop();
+    qInfo().noquote() << QStringLiteral("fullscreen_preference_readback effective=%1 root=%2 transition=%3")
+        .arg(boolean(m_fullscreenObserved)).arg(m_rootXid).arg(m_fullscreenTransition);
+    applyUpdate(gate_set_fullscreen(*m_gate, m_fullscreenObserved));
+}
+
+void FuramiBridge::synchronizeFullscreenChoice()
+{
+    assertGuiThread();
+    if (!m_root || (!m_fullscreenChoicePending && !m_fullscreenFocusRestorePending)
+        || !m_fullscreenNativeTransitionObserved)
+        return;
+    const auto transition = m_fullscreenTransition;
+    auto *root = m_root.data();
+    m_fullscreenSyncConnection = connect(root, &QQuickWindow::beforeSynchronizing, this,
+        [this, root, transition] {
+            // Qt blocks the GUI thread during this DirectConnection signal.
+            // Only a frame synchronized after the matching native state event
+            // may arm readback; a pre-WM/in-flight frame cannot acknowledge it.
+            if (transition != m_fullscreenTransition
+                || (!m_fullscreenChoicePending && !m_fullscreenFocusRestorePending)
+                || !m_fullscreenNativeTransitionObserved
+                || root->visibility() == QWindow::Hidden
+                || root->visibility() == QWindow::Minimized
+                || (root->visibility() == QWindow::FullScreen) != m_fullscreenRequested)
+                return;
+            // Preference readiness depends on native fullscreen state, not on
+            // the WM reproducing a saved rectangle after a work-area change.
+            const bool choiceReady = m_fullscreenChoicePending;
+            const bool focusReady = m_fullscreenFocusRestorePending
+                && root->visibility() == (m_windowedVisibility == QWindow::Maximized
+                    ? QWindow::Maximized : QWindow::Windowed)
+                && root->geometry() == m_windowedGeometry;
+            if (!choiceReady && !focusReady)
+                return;
+            if (choiceReady)
+                m_fullscreenChoiceSynchronized = true;
+            QObject::disconnect(m_fullscreenSyncConnection);
+            m_fullscreenSwapConnection = connect(root, &QQuickWindow::frameSwapped, this,
+                [this, transition, focusReady] {
+                    if (transition != m_fullscreenTransition)
+                        return;
+                    observeFullscreenChoice();
+                    if (focusReady)
+                        restoreFullscreenFocus();
+                    if (m_fullscreenFocusRestorePending)
+                        synchronizeFullscreenChoice();
+                }, static_cast<Qt::ConnectionType>(Qt::QueuedConnection | Qt::SingleShotConnection));
+        }, Qt::DirectConnection);
+    root->update();
+}
+
+void FuramiBridge::cancelFullscreenChoice(const char *reason)
+{
+    assertGuiThread();
+    if (m_fullscreenChoicePending || m_fullscreenFocusRestorePending) {
+        qInfo().noquote() << QStringLiteral("fullscreen_transition_cancelled reason=%1 requested=%2 observed=%3 retained_preference=%4 root=%5 transition=%6 focus_restore_pending=%7")
+            .arg(QString::fromLatin1(reason)).arg(boolean(m_fullscreenRequested))
+            .arg(boolean(m_fullscreenObserved)).arg(boolean(m_fullscreenPreference))
+            .arg(m_rootXid).arg(m_fullscreenTransition).arg(boolean(m_fullscreenFocusRestorePending));
+    }
+    m_fullscreenChoiceDeadline.stop();
+    ++m_fullscreenTransition;
+    QObject::disconnect(m_fullscreenSyncConnection);
+    QObject::disconnect(m_fullscreenSwapConnection);
+    m_fullscreenChoicePending = false;
+    m_fullscreenChoiceSynchronized = false;
+    m_fullscreenFocusRestorePending = false;
+    m_fullscreenNativeTransitionObserved = false;
 }
 
 void FuramiBridge::togglePanel()
@@ -531,35 +700,23 @@ void FuramiBridge::togglePanel()
 void FuramiBridge::toggleFullscreen()
 {
     assertGuiThread();
-    if (!m_root)
+    if (!m_root || m_closing)
         return;
-    const auto transition = ++m_fullscreenTransition;
-    QObject::disconnect(m_fullscreenSyncConnection);
-    QObject::disconnect(m_fullscreenSwapConnection);
-    const bool wasFullscreen = m_root->visibility() == QWindow::FullScreen;
+    // During a burst, toggle the latest intent, not a stale native event.
+    // After cancellation, follow Qt visibility/the existing button label:
+    // a subsequent explicit Leave cancels an unacknowledged optimistic Enter.
+    const bool preserveWindowed = m_fullscreenChoicePending || m_fullscreenFocusRestorePending;
+    const bool wasFullscreen = m_fullscreenChoicePending ? m_fullscreenRequested
+        : m_root->visibility() == QWindow::FullScreen;
+    cancelFullscreenChoice("superseded");
+    m_fullscreenRequested = !wasFullscreen;
+    m_fullscreenChoicePending = true;
+    m_fullscreenChoiceDeadline.start();
     qInfo().noquote() << QStringLiteral("input_intent action=ToggleFullscreen root=%1 generation=%2 fullscreen=%3")
         .arg(m_rootXid).arg(m_generation).arg(boolean(!wasFullscreen));
     if (wasFullscreen) {
         m_fullscreenFocusRestorePending = true;
         m_fullscreenNativeTransitionObserved = false;
-        auto *root = m_root.data();
-        m_fullscreenSyncConnection = connect(root, &QQuickWindow::beforeSynchronizing, this,
-            [this, root, transition] {
-                // Qt blocks the GUI thread during this DirectConnection signal.
-                // A pre-exit/in-flight frame cannot arm its own swap callback.
-                if (transition != m_fullscreenTransition || !m_fullscreenFocusRestorePending
-                    || !m_fullscreenNativeTransitionObserved
-                    || root->visibility() != (m_windowedVisibility == QWindow::Maximized
-                        ? QWindow::Maximized : QWindow::Windowed)
-                    || root->geometry() != m_windowedGeometry)
-                    return;
-                QObject::disconnect(m_fullscreenSyncConnection);
-                m_fullscreenSwapConnection = connect(root, &QQuickWindow::frameSwapped, this,
-                    [this, transition] {
-                        if (transition == m_fullscreenTransition)
-                            restoreFullscreenFocus();
-                    }, static_cast<Qt::ConnectionType>(Qt::QueuedConnection | Qt::SingleShotConnection));
-            }, Qt::DirectConnection);
         if (m_windowedVisibility == QWindow::Maximized) {
             m_root->showMaximized();
         } else {
@@ -568,12 +725,16 @@ void FuramiBridge::toggleFullscreen()
         }
     } else {
         m_fullscreenFocusRestorePending = false;
-        m_windowedGeometry = m_root->geometry();
-        m_windowedVisibility = m_root->visibility();
-        m_fullscreenFocusItem = m_root->activeFocusItem();
-        m_fullscreenNativeFocus = m_host && QGuiApplication::focusWindow() == m_host.data();
+        if (!preserveWindowed && (m_root->visibility() == QWindow::Windowed
+            || m_root->visibility() == QWindow::Maximized)) {
+            m_windowedGeometry = m_root->geometry();
+            m_windowedVisibility = m_root->visibility();
+            m_fullscreenFocusItem = m_root->activeFocusItem();
+            m_fullscreenNativeFocus = m_host && QGuiApplication::focusWindow() == m_host.data();
+        }
         m_root->showFullScreen();
     }
+    m_root->update();
     scheduleGeometryLog();
 }
 
@@ -582,11 +743,14 @@ void FuramiBridge::restoreFullscreenFocus()
     assertGuiThread();
     if (!m_fullscreenFocusRestorePending || !m_root
         || m_root->visibility() != (m_windowedVisibility == QWindow::Maximized
-            ? QWindow::Maximized : QWindow::Windowed))
+            ? QWindow::Maximized : QWindow::Windowed)
+        || m_root->geometry() != m_windowedGeometry)
         return;
     // The exit's native transition and matching layout have synchronized and swapped.
     // Consume the restoration even when inactive: never steal focus later.
     m_fullscreenFocusRestorePending = false;
+    if (!m_fullscreenChoicePending)
+        m_fullscreenChoiceDeadline.stop();
     if (!m_root->isActive() || m_quitAuthorized)
         return;
     auto *target = m_fullscreenFocusItem.data();
@@ -712,21 +876,43 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
         }
         if (event->type() == QEvent::KeyPress)
             return handleKey(static_cast<QKeyEvent *>(event), "root");
-        if (event->type() == QEvent::Resize || event->type() == QEvent::WindowStateChange) {
-            if (m_fullscreenFocusRestorePending && !m_fullscreenNativeTransitionObserved && event->spontaneous()) {
-                // XCB may report the already-requested state as oldState.
-                const bool exitStateObserved = event->type() == QEvent::WindowStateChange
-                    && m_root->visibility() == (m_windowedVisibility == QWindow::Maximized
-                        ? QWindow::Maximized : QWindow::Windowed);
-                const bool exitSizeObserved = event->type() == QEvent::Resize
-                    && static_cast<QResizeEvent *>(event)->size() == m_windowedGeometry.size();
-                if (exitStateObserved || exitSizeObserved) {
-                    m_fullscreenNativeTransitionObserved = true;
-                    qInfo().noquote() << QStringLiteral("fullscreen_exit_transition_observed root=%1 transition=%2 native_event=%3")
-                        .arg(m_rootXid).arg(m_fullscreenTransition).arg(static_cast<int>(event->type()));
-                    m_root->update();
+        if (event->type() == QEvent::WindowStateChange && event->spontaneous()) {
+            if (!m_fullscreenChoicePending && m_fullscreenFocusRestorePending)
+                cancelFullscreenChoice("native-state-superseded");
+            // Qt emits request-side visibility/state signals synchronously.
+            // Its spontaneous state event instead follows the WM observation,
+            // with windowStates()/visibility() already updated by Qt.
+            ++m_fullscreenTransition;
+            QObject::disconnect(m_fullscreenSyncConnection);
+            QObject::disconnect(m_fullscreenSwapConnection);
+            m_fullscreenChoiceSynchronized = false;
+            m_fullscreenNativeTransitionObserved = false;
+            const auto visibility = m_root->visibility();
+            if (visibility == QWindow::Hidden || visibility == QWindow::Minimized) {
+                cancelFullscreenChoice("not-visible");
+            } else if (!m_quitAuthorized && !m_closing) {
+                m_fullscreenObserved = visibility == QWindow::FullScreen;
+                if (!m_fullscreenChoicePending && m_fullscreenObserved != m_fullscreenPreference) {
+                    // A late acknowledgement or a WM-initiated choice remains
+                    // an actual choice after an earlier request was canceled.
+                    m_fullscreenRequested = m_fullscreenObserved;
+                    m_fullscreenChoicePending = true;
+                    m_fullscreenChoiceDeadline.start();
+                }
+                if (m_fullscreenChoicePending) {
+                    m_fullscreenNativeTransitionObserved = m_fullscreenObserved == m_fullscreenRequested;
+                    qInfo().noquote() << QStringLiteral("fullscreen_native_state_observed requested=%1 effective=%2 matched=%3 root=%4 transition=%5")
+                        .arg(boolean(m_fullscreenRequested)).arg(boolean(m_fullscreenObserved))
+                        .arg(boolean(m_fullscreenNativeTransitionObserved)).arg(m_rootXid).arg(m_fullscreenTransition);
+                    if (m_fullscreenNativeTransitionObserved)
+                        synchronizeFullscreenChoice();
                 }
             }
+        }
+        if (event->type() == QEvent::Resize || event->type() == QEvent::WindowStateChange) {
+            if ((m_fullscreenChoicePending || m_fullscreenFocusRestorePending)
+                && m_fullscreenNativeTransitionObserved)
+                m_root->update();
             scheduleGeometryLog();
         }
     }
@@ -775,6 +961,19 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     m_canTogglePause = update.can_toggle_pause && !m_bootstrapFailed;
     m_canSetGain = update.can_set_gain && !m_bootstrapFailed;
     m_playbackStatus = fromRust(update.playback_status);
+    m_settingsStatus = fromRust(update.settings_status);
+    m_settingsPath = fromRust(update.settings_path);
+    m_settingsRefused = update.settings_refused;
+    m_savedSelection = fromRust(update.saved_selection);
+    m_startupReason = fromRust(update.startup_reason);
+    m_draftDirty = update.draft_dirty;
+    m_closeDialog = fromRust(update.close_dialog);
+    m_closeRevision = update.close_revision;
+    m_resetToken = update.reset_token;
+    m_fullscreenPreference = update.fullscreen;
+    m_closing = update.closing;
+    if (m_closing)
+        cancelFullscreenChoice("application-close");
     m_diagnostic = fromRust(update.diagnostic);
     if (m_failed && !m_nativeDiagnostic.isEmpty()) {
         m_diagnostic = m_diagnostic.isEmpty() ? m_nativeDiagnostic
@@ -1033,7 +1232,10 @@ void FuramiBridge::logGeometry()
     const char *names[] = {"openProof", "restartCapture", "closeProof", "closeDuringOpenProof", "forceSurfaceLossProof",
                           "togglePlayback", "playbackVolume", "playbackMute",
                           "proofText", "togglePanelProof", "fullscreenProof", "popupOpenProof",
-                          "closePopupProof", "videoContainer", "proofPanel"};
+                          "closePopupProof", "videoContainer", "proofPanel", "savedSelection",
+                          "startupRestoreReason", "settingsStatus", "resetSettings",
+                          "cancelDirtyClose", "discardDirtyClose", "retrySettingsSave",
+                          "closeWithoutSaving", "cancelSettingsReset", "confirmSettingsReset"};
     for (const auto *name : names) {
         auto *item = m_root->findChild<QQuickItem *>(QString::fromLatin1(name));
         if (!item)
