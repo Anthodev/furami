@@ -1,14 +1,17 @@
 //! Minimal mpv 0.41.0/client 2.5 ABI. Every handle stays on its creating thread.
 
 use super::controller::{
-    AudioStatus, BackendCommand, BackendEvent, MediaError, OwnerBackend, PauseObservation,
-    RequestId, StopFlag, SurfaceToken,
+    BackendCommand, BackendEvent, MediaError, OwnerBackend, PauseObservation, RequestId, StopFlag,
+    SurfaceToken,
 };
 use super::session::{Observation, ObservedFacts, Source};
 use crate::capture::audio::{AudioEvent, RecordingGuard};
 use crate::capture::input::InputSpec;
-use crate::domain::capture::{AudioError, AudioSelection, FrameSize, PlaybackGain};
-use crate::domain::state::PauseRequestId;
+use crate::domain::capture::{
+    AudioAvailability, AudioEpoch, AudioError, AudioRouteReceipt, AudioSelection, AudioSilence,
+    AudioSourceIdentity, FrameSize, PlaybackGain, WatchStamp,
+};
+use crate::domain::state::{InitialPlayback, PauseRequestId};
 use libloading::Library;
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_ulong, c_void},
@@ -411,6 +414,7 @@ type Free = unsafe extern "C" fn(*mut c_void);
 type WaitEvent = unsafe extern "C" fn(*mut c_void, f64) -> *mut MpvEvent;
 type SetWakeup =
     unsafe extern "C" fn(*mut c_void, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void);
+type AbortAsync = unsafe extern "C" fn(*mut c_void, u64);
 type ClientApi = unsafe extern "C" fn() -> c_ulong;
 type ErrorString = unsafe extern "C" fn(c_int) -> *const c_char;
 type TerminateDestroy = unsafe extern "C" fn(*mut c_void);
@@ -427,6 +431,7 @@ struct Functions {
     free: Free,
     wait_event: WaitEvent,
     set_wakeup: SetWakeup,
+    abort_async: AbortAsync,
     client_api: ClientApi,
     error_string: ErrorString,
     terminate_destroy: TerminateDestroy,
@@ -466,6 +471,9 @@ impl Functions {
                     .map_err(missing)?,
                 set_wakeup: *library
                     .get::<SetWakeup>(b"mpv_set_wakeup_callback\0")
+                    .map_err(missing)?,
+                abort_async: *library
+                    .get::<AbortAsync>(b"mpv_abort_async_command\0")
                     .map_err(missing)?,
                 client_api: *library
                     .get::<ClientApi>(b"mpv_client_api_version\0")
@@ -660,12 +668,15 @@ enum Pending {
     TrackList,
     Aid,
     CurrentAudio,
+    DetachTracks,
+    RemoveAudio,
+    CheckRemoved,
+    GateMute {
+        expected: bool,
+    },
     GainVolume {
         owner: u64,
         gain: PlaybackGain,
-    },
-    GainMute {
-        owner: u64,
     },
     #[cfg(test)]
     FixtureProperty(&'static CStr),
@@ -673,15 +684,15 @@ enum Pending {
 impl Pending {
     fn property(self) -> Option<&'static CStr> {
         Some(match self {
-            Self::Audio => return None,
+            Self::Audio | Self::RemoveAudio => return None,
             Self::Pause | Self::PauseSet { .. } | Self::PauseRead { .. } => c"pause",
             Self::Metadata(0) => c"video-params",
             Self::Metadata(_) => c"container-fps",
-            Self::TrackList => c"track-list",
+            Self::TrackList | Self::DetachTracks | Self::CheckRemoved => c"track-list",
             Self::Aid => c"aid",
             Self::CurrentAudio => c"current-tracks/audio",
             Self::GainVolume { .. } => c"volume",
-            Self::GainMute { .. } => c"mute",
+            Self::GateMute { .. } => c"mute",
             #[cfg(test)]
             Self::FixtureProperty(name) => name,
         })
@@ -694,6 +705,13 @@ struct MetadataBatch {
     rerun: Option<bool>,
 }
 
+struct AudioDetach {
+    epoch: AudioEpoch,
+    reason: AudioError,
+    checking: bool,
+    demux_retired: bool,
+    blocked: bool,
+}
 pub(crate) struct MpvBackend {
     prefix: String,
     handle: Option<Handle>,
@@ -701,15 +719,29 @@ pub(crate) struct MpvBackend {
     diagnostics: std::collections::VecDeque<String>,
     audio: AudioSelection,
     gain: PlaybackGain,
-    audio_status: AudioStatus,
+    pending_gain: Option<(u64, PlaybackGain)>,
+    audio_status: AudioAvailability,
     guard: Option<RecordingGuard>,
+    guard_ready: bool,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    owner_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    playback: InitialPlayback,
+    paused: bool,
+    watch: WatchStamp,
+    generation: u64,
+    epoch: Option<AudioEpoch>,
+    last_audio_epoch: u64,
+    route: Option<AudioRouteReceipt>,
+    track_verified: bool,
+    detach: Option<AudioDetach>,
     audio_url: Option<CString>,
     audio_open: Option<AudioOpen>,
     audio_attempted: bool,
+    initial_audio_checked: bool,
     load_id: Option<u64>,
     load_complete: bool,
     video_started: bool,
+    video_ended: bool,
     last_internal: u64,
     pending: Vec<(u64, Pending)>,
     metadata: Option<MetadataBatch>,
@@ -728,7 +760,10 @@ impl MpvBackend {
         input: InputSpec,
         audio: AudioSelection,
         gain: PlaybackGain,
+        playback: InitialPlayback,
+        watch: WatchStamp,
     ) -> Self {
+        let audio_enabled = audio.enabled();
         Self {
             prefix,
             handle: None,
@@ -736,15 +771,39 @@ impl MpvBackend {
             diagnostics: std::collections::VecDeque::new(),
             audio,
             gain,
-            audio_status: AudioStatus::Disabled,
+            pending_gain: None,
+            audio_status: if audio_enabled {
+                AudioAvailability::Silent {
+                    reason: if playback == InitialPlayback::Paused {
+                        AudioSilence::Paused
+                    } else {
+                        AudioSilence::PendingRoute
+                    },
+                }
+            } else {
+                AudioAvailability::Disabled
+            },
             guard: None,
+            guard_ready: false,
             cancel: None,
+            owner_cancel: None,
+            playback,
+            paused: playback == InitialPlayback::Paused,
+            watch,
+            generation: 0,
+            epoch: None,
+            last_audio_epoch: 0,
+            route: None,
+            track_verified: false,
+            detach: None,
             audio_url: None,
             audio_open: None,
             audio_attempted: false,
+            initial_audio_checked: false,
             load_id: None,
             load_complete: false,
             video_started: false,
+            video_ended: false,
             last_internal: 1 << 63,
             pending: Vec::with_capacity(8),
             metadata: None,
@@ -798,13 +857,250 @@ impl MpvBackend {
         self.pending.push((id, pending));
         Ok(())
     }
-    fn audio_failed(&mut self, error: AudioError) {
-        if !matches!(self.audio_status, AudioStatus::RestartRequired(_)) {
-            tracing::warn!(error = %error, requested = ?self.audio, "audio_restart_required");
-            self.audio_status = AudioStatus::RestartRequired(error);
-            self.emitted
-                .push_back(BackendEvent::AudioStatus(self.audio_status.clone()));
+    fn effective_mute(&self) -> bool {
+        let gain = self.pending_gain.map_or(self.gain, |(_, gain)| gain);
+        gain.muted
+            || (self.audio.enabled()
+                && (self.paused || !matches!(self.audio_status, AudioAvailability::Active { .. })))
+    }
+
+    fn request_mute(&mut self) -> Result<(), MediaError> {
+        // One in-flight write prevents old gain/route continuations from
+        // overwriting a later safety gate in arbitrary async API order.
+        if !self
+            .pending
+            .iter()
+            .any(|(_, pending)| matches!(pending, Pending::GateMute { .. }))
+        {
+            let expected = self.effective_mute();
+            self.set(
+                c"mute",
+                &NodeValue::Flag(expected),
+                Pending::GateMute { expected },
+            )?;
         }
+        Ok(())
+    }
+
+    fn remove_audio(&mut self, id: u64, track_id: i64) -> Result<(), MediaError> {
+        #[cfg(test)]
+        if let Some(requests) = &mut self.property_requests {
+            requests.push((id, c"audio-remove", Some(NodeValue::Int(track_id))));
+            return Ok(());
+        }
+        let track = CString::new(track_id.to_string()).expect("integer has no NUL");
+        let argv = [c"audio-remove".as_ptr(), track.as_ptr(), ptr::null()];
+        let handle = self.handle()?;
+        // SAFETY: Exact owned external track, asynchronous owner command. On
+        // pinned mpv the last-track handler joins/frees its demux before reply.
+        let result =
+            unsafe { (handle.functions.command_async)(handle.raw.as_ptr(), id, argv.as_ptr()) };
+        handle.checked(result, "audio-remove")
+    }
+
+    fn publish_audio(&mut self, status: AudioAvailability) -> Result<(), MediaError> {
+        if self.audio_status != status {
+            self.audio_status = status;
+            self.emitted
+                .push_back(BackendEvent::AudioAvailability(self.audio_status.clone()));
+            if self.handle.is_some() {
+                self.request_mute()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn audio_failed(&mut self, error: AudioError) -> Result<(), MediaError> {
+        if let Some(epoch) = self.epoch {
+            self.begin_detach(epoch, error)
+        } else {
+            self.publish_audio(AudioAvailability::Silent {
+                reason: AudioSilence::WaitingForSource(error),
+            })
+        }
+    }
+
+    fn start_audio(
+        &mut self,
+        epoch: AudioEpoch,
+        source: AudioSourceIdentity,
+        stamp: WatchStamp,
+        admitted: bool,
+    ) -> Result<(), MediaError> {
+        if self.epoch.is_some()
+            || self.detach.is_some()
+            || self.audio_open.is_some()
+            || epoch.get() <= self.last_audio_epoch
+            || self.paused
+        {
+            return Err(MediaError::new(
+                "audio_admission",
+                "previous audio epoch unresolved or playback paused",
+            ));
+        }
+        if !matches!(&self.audio, AudioSelection::Enabled { source: desired } if desired == &source)
+        {
+            return Err(MediaError::new(
+                "audio_admission",
+                "attachment differs from saved exact source",
+            ));
+        }
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.guard_ready = false;
+        let owner_cancel = self
+            .owner_cancel
+            .as_ref()
+            .ok_or_else(|| MediaError::new("audio_admission", "owner cancel absent"))?;
+        match RecordingGuard::start(
+            &source,
+            self.generation,
+            epoch,
+            stamp,
+            std::sync::Arc::clone(&cancel),
+            std::sync::Arc::clone(owner_cancel),
+        ) {
+            Ok(guard) => self.guard = Some(guard),
+            Err(error) => {
+                self.audio_failed(error)?;
+                if admitted {
+                    // Guard initialization joined without submitting any Add.
+                    self.last_audio_epoch = epoch.get();
+                    self.emitted.push_back(BackendEvent::AudioDetached {
+                        epoch,
+                        outcome: Ok(()),
+                    });
+                }
+                return Ok(());
+            }
+        }
+        self.cancel = Some(cancel);
+        self.epoch = Some(epoch);
+        self.last_audio_epoch = epoch.get();
+        self.watch = stamp;
+        self.route = None;
+        self.track_verified = false;
+        self.audio_attempted = false;
+        self.track_id = None;
+        self.audio_url = Some(
+            CString::new(format!("av://pulse:{}", source.name()))
+                .map_err(|error| MediaError::new("audio_input", error.to_string()))?,
+        );
+        self.publish_audio(AudioAvailability::Opening { epoch })?;
+        self.begin_audio_if_ready()
+    }
+
+    fn begin_detach(&mut self, epoch: AudioEpoch, reason: AudioError) -> Result<(), MediaError> {
+        if self.epoch != Some(epoch) {
+            return Err(MediaError::new(
+                "audio_admission",
+                "detach does not match current audio epoch",
+            ));
+        }
+        if self.detach.is_some() {
+            return Ok(());
+        }
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.route = None;
+        self.track_verified = false;
+        self.detach = Some(AudioDetach {
+            epoch,
+            reason,
+            checking: false,
+            demux_retired: false,
+            blocked: false,
+        });
+        self.publish_audio(AudioAvailability::Detaching { epoch })?;
+        if let Some(open) = &self.audio_open
+            && open.step == AudioStep::Add
+            && let Some((cookie, ReplyKind::Command)) = open.pending
+        {
+            let handle = self.handle()?;
+            // SAFETY: Exact outstanding Add cookie on this owner-only handle;
+            // cancellation does not replace its genuine terminal reply.
+            unsafe { (handle.functions.abort_async)(handle.raw.as_ptr(), cookie) };
+        }
+        self.drive_detach()
+    }
+
+    fn block_detach(&mut self, error: AudioError) -> Result<(), MediaError> {
+        let Some(detach) = &mut self.detach else {
+            return Ok(());
+        };
+        if detach.blocked {
+            return Ok(());
+        }
+        detach.blocked = true;
+        let epoch = detach.epoch;
+        self.publish_audio(AudioAvailability::Blocked {
+            epoch,
+            error: error.clone(),
+        })?;
+        self.emitted.push_back(BackendEvent::AudioDetached {
+            epoch,
+            outcome: Err(error),
+        });
+        Ok(())
+    }
+
+    fn drive_detach(&mut self) -> Result<(), MediaError> {
+        let Some(detach) = &self.detach else {
+            return Ok(());
+        };
+        if detach.blocked {
+            return Ok(());
+        }
+        if detach.demux_retired {
+            if self.guard.as_ref().is_some_and(RecordingGuard::is_finished) {
+                let result = self.guard.take().expect("finished guard").quiesce();
+                if let Err(error) = result {
+                    return self.block_detach(error);
+                }
+                let detach = self.detach.take().expect("retired epoch");
+                self.epoch = None;
+                self.cancel = None;
+                self.guard_ready = false;
+                self.audio_url = None;
+                self.track_id = None;
+                self.publish_audio(AudioAvailability::Silent {
+                    reason: AudioSilence::WaitingForSource(detach.reason),
+                })?;
+                self.emitted.push_back(BackendEvent::AudioDetached {
+                    epoch: detach.epoch,
+                    outcome: Ok(()),
+                });
+            }
+        } else if !detach.checking
+            && self.audio_open.is_none()
+            && !self.pending.iter().any(|(_, pending)| {
+                matches!(
+                    pending,
+                    Pending::Audio | Pending::TrackList | Pending::Aid | Pending::CurrentAudio
+                )
+            })
+        {
+            self.detach.as_mut().expect("detaching").checking = true;
+            self.get(c"track-list", Pending::DetachTracks)?;
+        }
+        Ok(())
+    }
+
+    fn activate_audio_if_verified(&mut self) -> Result<(), MediaError> {
+        if self.detach.is_none()
+            && self.audio_open.is_none()
+            && self.track_verified
+            && let Some(route) = self.route.clone()
+            && self.epoch == Some(route.epoch)
+            && self.watch == route.stamp
+            && let AudioSelection::Enabled { source } = &self.audio
+        {
+            self.publish_audio(AudioAvailability::Active {
+                source: source.clone(),
+                route,
+            })?;
+        }
+        Ok(())
     }
     fn backend_audio_error(
         operation: &str,
@@ -818,10 +1114,28 @@ impl MpvBackend {
         }
     }
     fn begin_audio_if_ready(&mut self) -> Result<(), MediaError> {
-        if self.audio_attempted
-            || !self.load_complete
+        if !self.load_complete
             || !self.video_started
+            || self.video_ended
+            || self.paused
+            || self.detach.is_some()
+        {
+            return Ok(());
+        }
+        if self.guard.is_none() && !self.initial_audio_checked {
+            self.initial_audio_checked = true;
+            if let AudioSelection::Enabled { source } = &self.audio {
+                return self.start_audio(
+                    AudioEpoch::new(1).expect("nonzero initial epoch"),
+                    source.clone(),
+                    self.watch,
+                    false,
+                );
+            }
+        }
+        if self.audio_attempted
             || self.guard.is_none()
+            || !self.guard_ready
             || self
                 .cancel
                 .as_ref()
@@ -837,11 +1151,23 @@ impl MpvBackend {
         // Stop wins every continuation, including SetOptions -> audio-add.
         // Leave unresolved options on old handle for safe whole-handle teardown.
         if self
-            .cancel
+            .owner_cancel
             .as_ref()
             .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire))
         {
             return Ok(());
+        }
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire))
+            && let Some(open) = &mut self.audio_open
+            && open.step == AudioStep::Add
+            && open.pending.is_none()
+        {
+            // No Add was submitted; restore the actual saved options, without
+            // inventing a command completion for an operation that never ran.
+            open.step = AudioStep::RestoreFormat;
         }
         let step = self
             .audio_open
@@ -885,6 +1211,29 @@ impl MpvBackend {
             AudioStep::Add => (ReplyKind::Command, c"", None),
             AudioStep::Done => return Ok(()),
         };
+        #[cfg(test)]
+        if let Some(property_requests) = self.property_requests.as_mut() {
+            let saved = self.audio_open.as_ref().and_then(|open| match step {
+                AudioStep::RestoreFormat => open.saved_format.clone(),
+                AudioStep::RestoreOptions => open.saved_options.clone(),
+                _ => None,
+            });
+            property_requests.push((
+                id,
+                if kind == ReplyKind::Command {
+                    c"audio-add"
+                } else {
+                    name
+                },
+                value.or(saved),
+            ));
+            self.audio_open
+                .as_mut()
+                .expect("audio state retained")
+                .arm(id, kind, step);
+            self.pending.push((id, Pending::Audio));
+            return Ok(());
+        }
         let handle = self.handle()?;
         match kind {
             ReplyKind::Property => handle.get_async(id, name)?,
@@ -971,7 +1320,13 @@ impl MpvBackend {
                     _ => None,
                 }
             }
-            Pending::GainVolume { .. } | Pending::GainMute { .. } | Pending::PauseSet { .. } => {
+            Pending::RemoveAudio => {
+                if kind != ReplyKind::Command {
+                    return Ok(BackendEvent::Other);
+                }
+                None
+            }
+            Pending::GateMute { .. } | Pending::GainVolume { .. } | Pending::PauseSet { .. } => {
                 if kind != ReplyKind::SetProperty {
                     return Ok(BackendEvent::Other);
                 }
@@ -999,24 +1354,94 @@ impl MpvBackend {
         match pending {
             Pending::Audio => {
                 let open = self.audio_open.as_mut().expect("matched audio state");
-                let add_completed = open.step == AudioStep::Add && error >= 0;
+                let add_terminal = open.step == AudioStep::Add;
                 let step = open.advance(error, value)?;
-                if add_completed && let Some(guard) = &self.guard {
+                if add_terminal && let Some(guard) = &self.guard {
                     guard.mark_open_complete();
                 }
                 if step == AudioStep::Done {
                     let open = self.audio_open.take().expect("completed audio state");
+                    if let Some(guard) = &self.guard {
+                        guard.mark_open_complete();
+                    }
                     if let Some(code) = open.add_error {
                         self.audio_failed(Self::backend_audio_error(
                             "audio-add",
                             Some(code),
                             self.diagnostic().unwrap_or_default(),
-                        ));
+                        ))?;
                     } else {
-                        self.get(c"track-list", Pending::TrackList)?;
+                        if self.detach.is_none() {
+                            self.get(c"track-list", Pending::TrackList)?;
+                        }
                     }
                 } else {
                     self.submit_audio_step()?;
+                }
+            }
+            Pending::DetachTracks => {
+                let tracks = external_audio_track(value.as_ref(), self.audio_url.as_deref());
+                match tracks {
+                    Ok(None) if error >= 0 => {
+                        self.get(c"track-list", Pending::CheckRemoved)?;
+                    }
+                    Ok(Some(track_id)) if error >= 0 => {
+                        let id = self.next_internal()?;
+                        self.remove_audio(id, track_id)?;
+                        self.pending.push((id, Pending::RemoveAudio));
+                    }
+                    _ => self.block_detach(Self::backend_audio_error(
+                        "audio-remove",
+                        Some(error),
+                        "cannot identify exactly one owned external demux",
+                    ))?,
+                }
+            }
+            Pending::RemoveAudio => {
+                if error < 0 {
+                    self.block_detach(Self::backend_audio_error(
+                        "audio-remove",
+                        Some(error),
+                        "genuine external demux removal failed",
+                    ))?;
+                } else {
+                    self.get(c"track-list", Pending::CheckRemoved)?;
+                }
+            }
+            Pending::CheckRemoved => {
+                if error < 0
+                    || external_audio_track(value.as_ref(), self.audio_url.as_deref()) != Ok(None)
+                {
+                    self.block_detach(Self::backend_audio_error(
+                        "track-list",
+                        Some(error),
+                        "external audio still present after retirement",
+                    ))?;
+                } else if let Some(detach) = &mut self.detach {
+                    detach.demux_retired = true;
+                    if let Some(guard) = &self.guard {
+                        guard.mark_demux_retired();
+                    }
+                }
+            }
+            Pending::GateMute { expected } => {
+                if error < 0 {
+                    if let Some((owner, _)) = self.pending_gain.take() {
+                        return Ok(BackendEvent::CommandReply { id: owner, error });
+                    }
+                    return Err(MediaError::new(
+                        "audio_gate",
+                        "effective audio silence request failed",
+                    ));
+                }
+                if expected != self.effective_mute() {
+                    self.request_mute()?;
+                } else if let Some((owner, gain)) = self.pending_gain.take() {
+                    self.gain = gain;
+                    self.emitted.push_back(BackendEvent::CommandReply {
+                        id: owner,
+                        error: 0,
+                    });
                 }
             }
             Pending::Pause => {
@@ -1030,6 +1455,7 @@ impl MpvBackend {
                         ));
                     }
                 };
+                self.paused = paused;
                 self.emitted
                     .push_back(BackendEvent::PauseObserved(PauseObservation {
                         request: None,
@@ -1070,6 +1496,10 @@ impl MpvBackend {
                         format!("invalid or mismatched fresh pause flag, mpv error={error}"),
                     ));
                 }
+                self.paused = expected;
+                if self.audio.enabled() {
+                    self.request_mute()?;
+                }
                 self.emitted
                     .push_back(BackendEvent::PauseObserved(PauseObservation {
                         request: Some(request),
@@ -1100,7 +1530,7 @@ impl MpvBackend {
             Pending::TrackList => {
                 self.track_id = exact_audio_track(value.as_ref(), self.audio_url.as_deref());
                 if error < 0 || self.track_id.is_none() {
-                    self.audio_failed(Self::backend_audio_error("track-list", Some(error), "audio-add did not expose exactly one selected external track for requested source"));
+                    self.audio_failed(Self::backend_audio_error("track-list", Some(error), "audio-add did not expose exactly one selected external track for requested source"))?;
                 } else {
                     self.get(c"aid", Pending::Aid)?;
                 }
@@ -1111,7 +1541,7 @@ impl MpvBackend {
                         "aid",
                         Some(error),
                         "selected audio ID does not match exact requested external track",
-                    ));
+                    ))?;
                 } else {
                     self.get(c"current-tracks/audio", Pending::CurrentAudio)?;
                 }
@@ -1125,25 +1555,18 @@ impl MpvBackend {
                         "current-tracks/audio",
                         Some(error),
                         "current audio track does not match requested source",
-                    ));
-                } else if !matches!(self.audio_status, AudioStatus::RestartRequired(_)) {
-                    self.audio_status = AudioStatus::Active;
-                    self.emitted
-                        .push_back(BackendEvent::AudioStatus(AudioStatus::Active));
+                    ))?;
+                } else if self.detach.is_none() {
+                    self.track_verified = true;
+                    self.activate_audio_if_verified()?;
                 }
             }
             Pending::GainVolume { owner, gain } => {
                 if error < 0 {
                     return Ok(BackendEvent::CommandReply { id: owner, error });
                 }
-                self.set(
-                    c"mute",
-                    &NodeValue::Flag(gain.muted),
-                    Pending::GainMute { owner },
-                )?;
-            }
-            Pending::GainMute { owner } => {
-                return Ok(BackendEvent::CommandReply { id: owner, error });
+                self.pending_gain = Some((owner, gain));
+                self.request_mute()?;
             }
             #[cfg(test)]
             Pending::FixtureProperty(_) => {
@@ -1161,6 +1584,7 @@ impl MpvBackend {
                     .push_back((id, value));
             }
         }
+        self.drive_detach()?;
         Ok(self.emitted.pop_front().unwrap_or(BackendEvent::Other))
     }
     fn property_error(&self, id: u64, diagnostic: impl Into<String>) -> MediaError {
@@ -1191,6 +1615,30 @@ fn exact_audio_track(tracks: Option<&NodeValue>, url: Option<&CStr>) -> Option<i
         Some(NodeValue::Int(id)) if *id > 0 => Some(*id),
         _ => None,
     }
+}
+
+fn external_audio_track(
+    tracks: Option<&NodeValue>,
+    url: Option<&CStr>,
+) -> Result<Option<i64>, &'static str> {
+    let (Some(NodeValue::Array(tracks)), Some(url)) = (tracks, url) else {
+        return Err("missing external track inventory or exact URL");
+    };
+    let mut id = None;
+    for track in tracks {
+        if track.field("external") == Some(&NodeValue::Flag(true))
+            && track.field("external-filename").and_then(NodeValue::text) == url.to_str().ok()
+        {
+            if id.is_some() || track.field("type").and_then(NodeValue::text) != Some("audio") {
+                return Err("external demux has multiple tracks or a non-audio sibling");
+            }
+            match track.field("id") {
+                Some(NodeValue::Int(value)) if *value > 0 => id = Some(*value),
+                _ => return Err("external audio has invalid track ID"),
+            }
+        }
+    }
+    Ok(id)
 }
 
 fn observed_from_nodes(values: &[Option<NodeValue>; 2]) -> ObservedFacts {
@@ -1240,18 +1688,16 @@ fn check_stop(stop: &StopFlag) -> Result<(), MediaError> {
 impl OwnerBackend for MpvBackend {
     fn initialize(&mut self, token: SurfaceToken, stop: &StopFlag) -> Result<(), MediaError> {
         check_stop(stop)?;
-        if let AudioSelection::Enabled { source } = &self.audio {
-            self.audio_status = AudioStatus::Opening;
-            self.cancel = Some(stop.audio_cancel());
-            let url = CString::new(format!("av://pulse:{}", source.name()))
-                .map_err(|error| MediaError::new("audio_input", error.to_string()))?;
-            self.audio_url = Some(url);
-            match RecordingGuard::start(source, token.generation.get(), stop.audio_cancel()) {
-                Ok(guard) => self.guard = Some(guard),
-                Err(AudioError::Cancelled) if stop.is_set() => return check_stop(stop),
-                Err(error) => self.audio_failed(error),
-            }
-            check_stop(stop)?;
+        self.generation = token.generation.get();
+        self.owner_cancel = Some(stop.audio_cancel());
+        if self.audio.enabled() {
+            self.audio_status = AudioAvailability::Silent {
+                reason: if self.paused {
+                    AudioSilence::Paused
+                } else {
+                    AudioSilence::PendingRoute
+                },
+            };
         }
         let path = qualified_library(&self.prefix)?;
         self.handle = Some(Handle::create(&path, stop)?);
@@ -1261,7 +1707,6 @@ impl OwnerBackend for MpvBackend {
         // build has neither that option nor an OSC, so no `osc=no` is submitted.
         const OPTIONS: &[(&CStr, &CStr)] = &[
             (c"config", c"no"),
-            (c"pause", c"no"),
             (c"load-scripts", c"no"),
             (c"input-default-bindings", c"no"),
             (c"input-vo-keyboard", c"no"),
@@ -1278,6 +1723,14 @@ impl OwnerBackend for MpvBackend {
             handle.option(name, value)?;
         }
         check_stop(stop)?;
+        handle.option(
+            c"pause",
+            if self.playback == InitialPlayback::Paused {
+                c"yes"
+            } else {
+                c"no"
+            },
+        )?;
         handle.option(c"demuxer-lavf-format", c"v4l2")?;
         let common_clock = if matches!(self.audio, AudioSelection::Enabled { .. }) {
             Some(
@@ -1299,7 +1752,7 @@ impl OwnerBackend for MpvBackend {
         let volume = CString::new(self.gain.volume_percent.to_string())
             .map_err(|error| MediaError::new("audio_gain", error.to_string()))?;
         handle.option(c"volume", &volume)?;
-        handle.option(c"mute", if self.gain.muted { c"yes" } else { c"no" })?;
+        handle.option(c"mute", if self.effective_mute() { c"yes" } else { c"no" })?;
         check_stop(stop)?;
         let xid = CString::new(token.xid.get().to_string())
             .map_err(|error| MediaError::new("mpv_xid", error.to_string()))?;
@@ -1333,8 +1786,8 @@ impl OwnerBackend for MpvBackend {
         Ok(())
     }
     fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
-        if let BackendCommand::SetPaused { request, paused } = command {
-            return self.set(
+        match command {
+            BackendCommand::SetPaused { request, paused } => self.set(
                 c"pause",
                 &NodeValue::Flag(paused),
                 Pending::PauseSet {
@@ -1342,48 +1795,120 @@ impl OwnerBackend for MpvBackend {
                     request,
                     expected: paused,
                 },
-            );
-        }
-        if let BackendCommand::SetGain(gain) = command {
-            return self.set(
+            ),
+            BackendCommand::SetGain(gain) => self.set(
                 c"volume",
                 &NodeValue::Double(f64::from(gain.volume_percent)),
                 Pending::GainVolume {
                     owner: id.get(),
                     gain,
                 },
-            );
-        }
-        if command == BackendCommand::LoadInput {
-            self.load_id = Some(id.get());
-        }
-        let handle = self.handle()?;
-        let arguments = match command {
+            ),
+            BackendCommand::DetachAudio { epoch } => {
+                if self.epoch == Some(epoch) {
+                    self.begin_detach(
+                        epoch,
+                        AudioError::RecordingLost {
+                            detail: "selected source unavailable in authoritative observation"
+                                .into(),
+                        },
+                    )?;
+                } else if self.last_audio_epoch != epoch.get() || self.detach.is_some() {
+                    return Err(MediaError::new("audio_admission", "stale detach epoch"));
+                }
+                self.emitted.push_back(BackendEvent::CommandReply {
+                    id: id.get(),
+                    error: 0,
+                });
+                Ok(())
+            }
+            BackendCommand::AttachAudio {
+                epoch,
+                source,
+                stamp,
+            } => {
+                if self.epoch == Some(epoch)
+                    && self.watch == stamp
+                    && matches!(&self.audio, AudioSelection::Enabled { source: desired } if desired == &source)
+                    && self.detach.is_none()
+                {
+                    self.emitted.push_back(BackendEvent::CommandReply {
+                        id: id.get(),
+                        error: 0,
+                    });
+                    return Ok(());
+                }
+                self.initial_audio_checked = true;
+                self.start_audio(epoch, source, stamp, true)?;
+                self.emitted.push_back(BackendEvent::CommandReply {
+                    id: id.get(),
+                    error: 0,
+                });
+                Ok(())
+            }
             BackendCommand::LoadInput => {
-                [c"loadfile".as_ptr(), self.input.url().as_ptr(), ptr::null()]
+                if self.audio_open.is_some() || self.epoch.is_some() {
+                    return Err(MediaError::new(
+                        "audio_options",
+                        "video load cannot interleave audio option window",
+                    ));
+                }
+                self.load_id = Some(id.get());
+                let handle = self.handle()?;
+                let argv = [c"loadfile".as_ptr(), self.input.url().as_ptr(), ptr::null()];
+                // SAFETY: Owner-only handle, exact cookie and copied argv.
+                let result = unsafe {
+                    (handle.functions.command_async)(handle.raw.as_ptr(), id.get(), argv.as_ptr())
+                };
+                handle.checked(result, "loadfile")
             }
-            BackendCommand::SetGain(_) | BackendCommand::SetPaused { .. } => {
-                unreachable!("playback controls use property requests")
-            }
-        };
-        // SAFETY: Live owner-thread handle, checked nonzero ID, terminated argv
-        // of separately owned NUL-free strings. mpv copies before returning;
-        // the node never enters the lavf option string.
-        let result = unsafe {
-            (handle.functions.command_async)(handle.raw.as_ptr(), id.get(), arguments.as_ptr())
-        };
-        handle.checked(result, "command_async")
+        }
     }
     fn next_event(&mut self) -> Result<BackendEvent, MediaError> {
-        if let Some(event) = self.guard.as_ref().and_then(RecordingGuard::poll_event) {
-            match event {
-                AudioEvent::SourceLost(error) => self.audio_failed(error),
-                AudioEvent::CancelFailed(error) => {
-                    return Err(MediaError::new("audio_cancel", error.to_string()));
+        if let Some(result) = self.guard.as_mut().and_then(RecordingGuard::poll_ready) {
+            match result {
+                Ok(()) => {
+                    self.guard_ready = true;
+                    self.begin_audio_if_ready()?;
                 }
-                AudioEvent::Cancelled => {}
+                Err(error) => self.audio_failed(error)?,
             }
         }
+        if let Some(event) = self.guard.as_ref().and_then(RecordingGuard::poll_event) {
+            match event {
+                AudioEvent::RoutePending { epoch }
+                    if self.epoch == Some(epoch) && self.detach.is_none() =>
+                {
+                    self.route = None;
+                    self.publish_audio(AudioAvailability::Silent {
+                        reason: AudioSilence::PendingRoute,
+                    })?;
+                }
+                AudioEvent::RouteVerified { receipt }
+                    if self.epoch == Some(receipt.epoch)
+                        && self.watch == receipt.stamp
+                        && self.detach.is_none() =>
+                {
+                    self.route = Some(receipt);
+                    self.activate_audio_if_verified()?;
+                }
+                AudioEvent::SourceLost { epoch, error } if self.epoch == Some(epoch) => {
+                    self.begin_detach(epoch, error)?;
+                }
+                AudioEvent::CancelFailed { epoch, error } if self.epoch == Some(epoch) => {
+                    if self.detach.is_none() {
+                        self.begin_detach(epoch, error.clone())?;
+                    }
+                    self.block_detach(error)?;
+                }
+                AudioEvent::Cancelled { .. }
+                | AudioEvent::RoutePending { .. }
+                | AudioEvent::RouteVerified { .. }
+                | AudioEvent::SourceLost { .. }
+                | AudioEvent::CancelFailed { .. } => {}
+            }
+        }
+        self.drive_detach()?;
         if let Some(event) = self.emitted.pop_front() {
             return Ok(event);
         }
@@ -1503,6 +2028,7 @@ impl OwnerBackend for MpvBackend {
                 // SAFETY: END_FILE data matches the complete pinned repr(C)
                 // payload. Copy only scalar reason/error; never retain its pointer.
                 let end = unsafe { &*event.data.cast::<MpvEndFile>() };
+                self.video_ended = true;
                 Ok(BackendEvent::EndFile {
                     reason: end.reason,
                     error: end.error,
@@ -1511,7 +2037,7 @@ impl OwnerBackend for MpvBackend {
             8 => Ok(BackendEvent::FileLoaded),
             17 => Ok(BackendEvent::VideoReconfig),
             18 => {
-                if self.audio_status == AudioStatus::Active
+                if matches!(self.audio_status, AudioAvailability::Active { .. })
                     && !self.pending.iter().any(|(_, pending)| {
                         matches!(
                             pending,
@@ -1570,8 +2096,14 @@ impl OwnerBackend for MpvBackend {
             )
         }
     }
-    fn audio_status(&self) -> AudioStatus {
+    fn audio_status(&self) -> AudioAvailability {
         self.audio_status.clone()
+    }
+    fn initial_playback(&self) -> InitialPlayback {
+        self.playback
+    }
+    fn audio_epoch(&self) -> Option<AudioEpoch> {
+        self.epoch
     }
     fn shutdown(&mut self) -> Result<(), MediaError> {
         if let Some(cancel) = &self.cancel {
@@ -1591,6 +2123,14 @@ impl OwnerBackend for MpvBackend {
         self.pending.clear();
         self.audio_open = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+fn fixture_watch_stamp() -> WatchStamp {
+    WatchStamp {
+        watch: crate::domain::capture::WatchId::new(1).unwrap(),
+        epoch: crate::domain::capture::ObservationEpoch::new(1).unwrap(),
     }
 }
 
@@ -1654,6 +2194,8 @@ impl FixtureBackend {
         fixture: PathBuf,
         input: InputSpec,
         gain: PlaybackGain,
+        playback: InitialPlayback,
+        watch: WatchStamp,
         recorder: Option<FixtureRecorder>,
     ) -> Result<Self, MediaError> {
         use std::os::unix::ffi::OsStrExt;
@@ -1669,7 +2211,14 @@ impl FixtureBackend {
         let fixture = CString::new(fixture.as_os_str().as_bytes())
             .map_err(|error| MediaError::new("fixture_path", error.to_string()))?;
         Ok(Self {
-            inner: MpvBackend::new(prefix, input, AudioSelection::default(), gain),
+            inner: MpvBackend::new(
+                prefix,
+                input,
+                AudioSelection::default(),
+                gain,
+                playback,
+                watch,
+            ),
             fixture,
             recorder,
             generation: None,
@@ -1712,12 +2261,19 @@ impl OwnerBackend for FixtureBackend {
             (c"ao", c"null"),
             (c"ao-null-untimed", c"no"),
             (c"aid", c"auto"),
-            (c"pause", c"no"),
         ];
         for &(name, value) in OPTIONS {
             check_stop(stop)?;
             handle.option(name, value)?;
         }
+        handle.option(
+            c"pause",
+            if self.inner.playback == InitialPlayback::Paused {
+                c"yes"
+            } else {
+                c"no"
+            },
+        )?;
         let volume = CString::new(self.inner.gain.volume_percent.to_string())
             .map_err(|error| MediaError::new("audio_gain", error.to_string()))?;
         handle.option(c"volume", &volume)?;
@@ -1772,8 +2328,11 @@ impl OwnerBackend for FixtureBackend {
         self.inner.diagnostic()
     }
 
-    fn audio_status(&self) -> AudioStatus {
+    fn audio_status(&self) -> AudioAvailability {
         self.inner.audio_status()
+    }
+    fn initial_playback(&self) -> InitialPlayback {
+        self.inner.playback
     }
 
     fn shutdown(&mut self) -> Result<(), MediaError> {
@@ -2071,6 +2630,8 @@ mod tests {
                 fixture.clone(),
                 fixture_input(),
                 PlaybackGain::default(),
+                InitialPlayback::Live,
+                fixture_watch_stamp(),
                 Some(recorder.clone()),
             )
             .unwrap();
@@ -2120,6 +2681,8 @@ mod tests {
                 fixture,
                 fixture_input(),
                 latest_gain,
+                InitialPlayback::Live,
+                fixture_watch_stamp(),
                 Some(recorder.clone()),
             )
             .unwrap();
@@ -2390,6 +2953,8 @@ mod reply_tests {
             selection.validate_snapshot(&snapshot).unwrap(),
             AudioSelection::default(),
             PlaybackGain::default(),
+            InitialPlayback::Live,
+            fixture_watch_stamp(),
         )
     }
 
@@ -2702,12 +3267,283 @@ mod reply_tests {
         let first = AudioError::SourceMissing {
             name: "selected-source".into(),
         };
-        backend.audio_failed(first.clone());
-        backend.audio_failed(AudioError::Control("later failure".into()));
-        assert_eq!(backend.audio_status(), AudioStatus::RestartRequired(first));
+        backend.audio_failed(first.clone()).unwrap();
+        assert_eq!(
+            backend.audio_status(),
+            AudioAvailability::Silent {
+                reason: AudioSilence::WaitingForSource(first),
+            }
+        );
         assert!(backend.audio.enabled());
         assert_eq!(backend.audio.source().unwrap().name(), "selected-source");
         assert_eq!(backend.emitted.len(), 1);
+        assert!(backend.effective_mute());
+    }
+
+    #[test]
+    fn active_requires_exact_epoch_stamp_track_and_restored_option_window() {
+        let mut backend = backend();
+        let source = AudioSourceIdentity::new("selected-source".into(), vec![]).unwrap();
+        backend.audio = AudioSelection::Enabled {
+            source: source.clone(),
+        };
+        backend.audio_status = AudioAvailability::Silent {
+            reason: AudioSilence::PendingRoute,
+        };
+        backend.epoch = Some(AudioEpoch::new(1).unwrap());
+        backend.track_verified = true;
+        let mut route = AudioRouteReceipt {
+            epoch: AudioEpoch::new(2).unwrap(),
+            stamp: backend.watch,
+            source_index: 5,
+            source_output_index: 6,
+            client_index: 7,
+        };
+        backend.route = Some(route.clone());
+        backend.activate_audio_if_verified().unwrap();
+        assert!(backend.effective_mute());
+        assert!(backend.emitted.is_empty());
+        route.epoch = AudioEpoch::new(1).unwrap();
+        route.stamp.epoch = crate::domain::capture::ObservationEpoch::new(2).unwrap();
+        backend.route = Some(route.clone());
+        backend.activate_audio_if_verified().unwrap();
+        assert!(backend.emitted.is_empty());
+        route.stamp = backend.watch;
+        backend.route = Some(route.clone());
+        backend.audio_open = Some(AudioOpen::new());
+        backend.activate_audio_if_verified().unwrap();
+        assert!(backend.emitted.is_empty());
+        backend.audio_open = None;
+        backend.activate_audio_if_verified().unwrap();
+        assert_eq!(
+            backend.audio_status,
+            AudioAvailability::Active { source, route }
+        );
+        assert!(!backend.effective_mute());
+        assert_eq!(backend.gain, PlaybackGain::default());
+    }
+
+    #[test]
+    fn late_add_success_restores_exact_options_before_real_remove_terminal_and_guard_barrier() {
+        let mut backend = backend();
+        backend.property_requests = Some(Vec::new());
+        backend.audio_url = Some(c"av://pulse:selected-source".to_owned());
+        let epoch = AudioEpoch::new(1).unwrap();
+        backend.epoch = Some(epoch);
+        backend.last_audio_epoch = 1;
+        backend.cancel = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )));
+        backend.detach = Some(AudioDetach {
+            epoch,
+            reason: AudioError::Cancelled,
+            checking: false,
+            demux_retired: false,
+            blocked: false,
+        });
+        let format = NodeValue::String(c"v4l2".to_owned());
+        let options = NodeValue::Map(vec![
+            (
+                c"input_format".to_owned(),
+                NodeValue::String(c"nv12".to_owned()),
+            ),
+            (
+                c"timestamps".to_owned(),
+                NodeValue::String(c"abs".to_owned()),
+            ),
+        ]);
+        let cookie = (1 << 63) + 90;
+        let mut open = AudioOpen::new();
+        open.saved_format = Some(format.clone());
+        open.saved_options = Some(options.clone());
+        open.arm(cookie, ReplyKind::Command, AudioStep::Add);
+        backend.audio_open = Some(open);
+        backend.pending.push((cookie, Pending::Audio));
+        backend
+            .reply(cookie + 1, ReplyKind::Command, 0, None, None)
+            .unwrap();
+        assert_eq!(backend.audio_open.as_ref().unwrap().step, AudioStep::Add);
+        backend
+            .reply(cookie, ReplyKind::Command, 0, None, None)
+            .unwrap();
+        for (kind, property, value) in [
+            (ReplyKind::SetProperty, None, None),
+            (ReplyKind::SetProperty, None, None),
+            (
+                ReplyKind::Property,
+                Some(c"options/demuxer-lavf-format".to_owned()),
+                Some(format.clone()),
+            ),
+            (
+                ReplyKind::Property,
+                Some(c"options/demuxer-lavf-o".to_owned()),
+                Some(options.clone()),
+            ),
+        ] {
+            let id = backend
+                .property_requests
+                .as_ref()
+                .unwrap()
+                .last()
+                .unwrap()
+                .0;
+            backend.reply(id, kind, 0, property, value).unwrap();
+        }
+        let requests = backend.property_requests.as_ref().unwrap();
+        assert_eq!(requests[0].2, Some(format));
+        assert_eq!(requests[1].2, Some(options));
+        assert_eq!(requests.last().unwrap().1, c"track-list");
+        assert!(backend.audio_open.is_none());
+        assert!(
+            !backend
+                .emitted
+                .iter()
+                .any(|event| matches!(event, BackendEvent::AudioDetached { .. }))
+        );
+        let inventory_cookie = requests.last().unwrap().0;
+        let track = NodeValue::Map(vec![
+            (c"id".to_owned(), NodeValue::Int(7)),
+            (c"type".to_owned(), NodeValue::String(c"audio".to_owned())),
+            (c"external".to_owned(), NodeValue::Flag(true)),
+            (
+                c"external-filename".to_owned(),
+                NodeValue::String(c"av://pulse:selected-source".to_owned()),
+            ),
+            (c"selected".to_owned(), NodeValue::Flag(false)),
+        ]);
+        backend
+            .reply(
+                inventory_cookie,
+                ReplyKind::Property,
+                0,
+                Some(c"track-list".to_owned()),
+                Some(NodeValue::Array(vec![track])),
+            )
+            .unwrap();
+        let remove_cookie = backend
+            .property_requests
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap()
+            .0;
+        assert_eq!(
+            backend
+                .property_requests
+                .as_ref()
+                .unwrap()
+                .last()
+                .unwrap()
+                .1,
+            c"audio-remove"
+        );
+        assert!(!backend.detach.as_ref().unwrap().demux_retired);
+        backend
+            .reply(remove_cookie + 1, ReplyKind::Command, 0, None, None)
+            .unwrap();
+        assert!(!backend.detach.as_ref().unwrap().demux_retired);
+        backend
+            .reply(remove_cookie, ReplyKind::Command, 0, None, None)
+            .unwrap();
+        let absence_cookie = backend
+            .property_requests
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap()
+            .0;
+        assert_ne!(absence_cookie, inventory_cookie);
+        backend
+            .reply(
+                absence_cookie,
+                ReplyKind::Property,
+                0,
+                Some(c"track-list".to_owned()),
+                Some(NodeValue::Array(vec![])),
+            )
+            .unwrap();
+        assert!(backend.detach.as_ref().unwrap().demux_retired);
+        // No guard in this pure fixture: never manufacture its retirement/join.
+        assert!(
+            !backend
+                .emitted
+                .iter()
+                .any(|event| matches!(event, BackendEvent::AudioDetached { .. }))
+        );
+        assert!(
+            backend
+                .start_audio(
+                    AudioEpoch::new(2).unwrap(),
+                    AudioSourceIdentity::new("selected-source".into(), vec![]).unwrap(),
+                    backend.watch,
+                    true
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn audio_only_cancel_before_add_restores_without_fake_add_terminal() {
+        let mut backend = backend();
+        backend.property_requests = Some(Vec::new());
+        backend.cancel = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )));
+        let mut open = AudioOpen::new();
+        open.step = AudioStep::Add;
+        open.saved_format = Some(NodeValue::String(c"v4l2".to_owned()));
+        open.saved_options = Some(NodeValue::Map(vec![]));
+        backend.audio_open = Some(open);
+        backend.submit_audio_step().unwrap();
+        assert_eq!(
+            backend.audio_open.as_ref().unwrap().step,
+            AudioStep::RestoreFormat
+        );
+        assert_eq!(
+            backend.property_requests.as_ref().unwrap()[0].1,
+            c"options/demuxer-lavf-format"
+        );
+        assert!(
+            !backend
+                .property_requests
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|(_, name, _)| *name == c"audio-add")
+        );
+    }
+
+    #[test]
+    fn stale_gain_mute_completion_cannot_clear_new_route_silence() {
+        let mut backend = backend();
+        backend.property_requests = Some(Vec::new());
+        backend.audio = AudioSelection::Enabled {
+            source: AudioSourceIdentity::new("selected-source".into(), vec![]).unwrap(),
+        };
+        backend.audio_status = AudioAvailability::Silent {
+            reason: AudioSilence::PendingRoute,
+        };
+        let gain = PlaybackGain::new(70, false).unwrap();
+        backend.pending_gain = Some((15, gain));
+        let cookie = (1 << 63) + 12;
+        backend
+            .pending
+            .push((cookie, Pending::GateMute { expected: false }));
+        backend
+            .reply(cookie, ReplyKind::SetProperty, 0, None, None)
+            .unwrap();
+        let corrective = backend.property_requests.as_ref().unwrap().last().unwrap();
+        assert_eq!(corrective.2, Some(NodeValue::Flag(true)));
+        assert_eq!(backend.gain, PlaybackGain::default());
+        let corrective_cookie = corrective.0;
+        assert_eq!(
+            backend
+                .reply(corrective_cookie, ReplyKind::SetProperty, 0, None, None)
+                .unwrap(),
+            BackendEvent::CommandReply { id: 15, error: 0 }
+        );
+        assert_eq!(backend.gain, gain);
+        assert!(backend.effective_mute());
     }
 }
 
@@ -2734,8 +3570,10 @@ mod opening_cancel_tests {
             selection.validate_snapshot(&snapshot).unwrap(),
             AudioSelection::default(),
             PlaybackGain::default(),
+            InitialPlayback::Live,
+            fixture_watch_stamp(),
         );
-        backend.cancel = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        backend.owner_cancel = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
             true,
         )));
         for step in [

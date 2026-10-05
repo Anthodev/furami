@@ -5,20 +5,21 @@ use crate::{
         apply::ApplyCoordinator,
         control::{self, Command, ExpectedCleanup, ExpectedState},
         gate::GatePhase,
-        ports::{AudioDiagnostic, SubmitStatus},
+        ports::SubmitStatus,
     },
     capture::CaptureValidator,
     domain::{
-        capture::{AudioSelection, AudioSourceIdentity, PlaybackGain},
+        capture::{
+            AudioAvailability, AudioSelection, AudioSilence, AudioSourceIdentity, CandidateId,
+            LossEvidence, ObservationEpoch, PlaybackGain, RecoveryCandidate, SelectionToken,
+            WatchId, WatchStamp,
+        },
         state::{
             AttemptId, CleanupStatus, CommandRejection, DraftRevision, DraftSettings,
-            PlaybackState, ProductPhase, StateIdentity,
+            InitialPlayback, PlaybackState, ProductModel, ProductPhase, StateIdentity,
         },
     },
-    media::{
-        controller::{AudioStatus, SurfaceToken},
-        gate::GateRunner,
-    },
+    media::{controller::SurfaceToken, gate::GateRunner},
 };
 
 type Engine = ApplyCoordinator<CaptureValidator, GateRunner>;
@@ -30,19 +31,28 @@ pub(crate) struct UiUpdate {
     pub restart_generation: u64,
     pub can_open: bool,
     pub can_restart: bool,
+    /// Real product phase (reducer level), projected separately from the
+    /// media gate phase so disconnected/recovering/selection states stay
+    /// truthful while no media is open.
+    pub product_phase: String,
     pub audio_status: String,
     pub audio_source: String,
-    pub audio_enabled: bool,
+    pub audio_desired: String,
     pub audio_diagnostic: String,
     pub failed: bool,
     pub diagnostic: String,
+    pub recovery_evidence: String,
+    pub recovery_stage: String,
+    pub candidates: Vec<String>,
     pub paused: bool,
+    /// This exact native attempt was opened paused, not paused after live playback.
+    /// C++ latches concealment for its host until normal native retirement.
+    pub prepared_paused: bool,
     pub volume_percent: i32,
     pub muted: bool,
     pub can_toggle_pause: bool,
     pub can_set_gain: bool,
     pub playback_status: String,
-    pub ended: bool,
     pub create_native: bool,
     pub release_native: bool,
     pub quit: bool,
@@ -92,16 +102,15 @@ impl RuntimeCoordinator {
         self.dirty = true;
         tracing::warn!(error = %self.command_error, "qualification_command_rejected");
     }
+    /// Open is a plain draft apply. It must never silently reconnect a lost
+    /// session: reconnection is the separate explicit idempotent admission in
+    /// [`Self::reconnect`], and `restart` stays the explicit forced restart.
     pub(crate) fn open(&mut self) -> UiUpdate {
         if let Some(engine) = &mut self.engine {
-            let result = if engine.model().can_reconnect() {
-                engine.reconnect(engine.model().state_identity())
-            } else {
-                engine.apply(
-                    engine.model().state_identity(),
-                    engine.model().draft().revision,
-                )
-            };
+            let result = engine.apply(
+                engine.model().state_identity(),
+                engine.model().draft().revision,
+            );
             if let Err(error) = result {
                 self.rejection(error);
             } else {
@@ -152,6 +161,81 @@ impl RuntimeCoordinator {
                     self.dirty = true;
                 }
             }
+        }
+        self.poll()
+    }
+    /// Reconnect is an idempotent admission, never a forced restart: a healthy
+    /// session no-ops, a pending recovery is joined, a disconnected last-valid
+    /// session starts recovery, and shutdown refuses. There is no default
+    /// capture open behind this path.
+    pub(crate) fn reconnect(&mut self, expected_attempt: u64) -> UiUpdate {
+        if let Some(engine) = &mut self.engine {
+            let current = engine
+                .model()
+                .state_identity()
+                .attempt()
+                .map(AttemptId::get)
+                .unwrap_or(0);
+            if current != expected_attempt {
+                self.rejection(CommandRejection::StaleState);
+            } else {
+                match engine.reconnect(engine.model().state_identity()) {
+                    Ok(admission) => {
+                        tracing::info!(?admission, "ui_reconnect_admitted");
+                        self.command_error.clear();
+                        self.dirty = true;
+                    }
+                    Err(error) => self.rejection(error),
+                }
+            }
+        } else {
+            self.rejection(CommandRejection::ReconnectUnavailable);
+        }
+        self.poll()
+    }
+    /// Explicit choice for an ambiguous recovery target. The token comes from
+    /// a currently offered candidate; the expected attempt guards against a
+    /// stale dialog acting on changed recovery state.
+    pub(crate) fn choose_recovery(
+        &mut self,
+        expected_attempt: u64,
+        watch: u64,
+        epoch: u64,
+        candidate: u64,
+    ) -> UiUpdate {
+        let token = (|| {
+            Some(SelectionToken {
+                stamp: WatchStamp {
+                    watch: WatchId::new(watch)?,
+                    epoch: ObservationEpoch::new(epoch)?,
+                },
+                candidate: CandidateId::new(candidate)?,
+            })
+        })();
+        let Some(token) = token else {
+            self.rejection("choose requires nonzero watch, epoch and candidate identifiers");
+            return self.poll();
+        };
+        if let Some(engine) = &mut self.engine {
+            let current = engine
+                .model()
+                .state_identity()
+                .attempt()
+                .map(AttemptId::get)
+                .unwrap_or(0);
+            if current != expected_attempt {
+                self.rejection(CommandRejection::StaleState);
+            } else {
+                match engine.choose_recovery(engine.model().state_identity(), token) {
+                    Ok(()) => {
+                        self.command_error.clear();
+                        self.dirty = true;
+                    }
+                    Err(error) => self.rejection(error),
+                }
+            }
+        } else {
+            self.rejection("no explicit startup capture selection");
         }
         self.poll()
     }
@@ -369,7 +453,15 @@ impl RuntimeCoordinator {
                 Command::Reconnect(expected) => {
                     let state =
                         Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
-                    engine.reconnect(state).map_err(|error| error.to_string())?;
+                    let admission = engine.reconnect(state).map_err(|error| error.to_string())?;
+                    tracing::info!(?admission, "qualification_reconnect_admitted");
+                }
+                Command::Choose(expected, token) => {
+                    let state =
+                        Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
+                    engine
+                        .choose_recovery(state, token)
+                        .map_err(|error| error.to_string())?;
                 }
                 Command::Close(expected) => {
                     let state =
@@ -445,13 +537,18 @@ impl RuntimeCoordinator {
                 restart_generation: 0,
                 can_open: false,
                 can_restart: false,
+                product_phase: if changed {
+                    phase_name(ProductPhase::Stopped).into()
+                } else {
+                    String::new()
+                },
                 audio_status: if changed {
                     "Disabled".into()
                 } else {
                     String::new()
                 },
                 audio_source: String::new(),
-                audio_enabled: false,
+                audio_desired: String::new(),
                 audio_diagnostic: String::new(),
                 failed: false,
                 diagnostic: if changed {
@@ -463,13 +560,16 @@ impl RuntimeCoordinator {
                 } else {
                     String::new()
                 },
+                recovery_evidence: String::new(),
+                recovery_stage: String::new(),
+                candidates: Vec::new(),
                 paused: false,
+                prepared_paused: false,
                 volume_percent: 0,
                 muted: false,
                 can_toggle_pause: false,
                 can_set_gain: false,
                 playback_status: "Unavailable".into(),
-                ended: false,
                 create_native: false,
                 release_native: false,
                 quit: self.quit_empty,
@@ -479,6 +579,7 @@ impl RuntimeCoordinator {
         let native = engine.runner_mut().take_native_update();
         let identity = engine.model().state_identity();
         let active_playback = engine.model().active().map(|active| active.playback());
+        let prepared_paused = prepared_paused_presentation(engine.model(), native.attempt);
         let stamp = (
             identity,
             engine.model().draft().revision,
@@ -488,30 +589,23 @@ impl RuntimeCoordinator {
         let changed =
             std::mem::take(&mut self.dirty) || native.changed || self.last_state != Some(stamp);
         self.last_state = Some(stamp);
-        let owned_audio = engine.runner_mut().requested_audio().map(|audio| {
-            let source = if changed {
-                audio
-                    .source()
-                    .map(|source| source.name().to_owned())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            (source, audio.enabled())
-        });
+        // Desired audio is reported separately from actual availability so a
+        // draft edit can never overwrite what the running (or lost) session
+        // really had: the applied request wins, then recovery's frozen
+        // applied settings, then the last valid settings, then the draft.
         let model = engine.model();
-        let (source, audio_enabled) = owned_audio.unwrap_or_else(|| {
-            let draft_audio = &model.draft().settings.audio;
-            let source = if changed {
-                draft_audio
-                    .source()
-                    .map(|source| source.name().to_owned())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            (source, draft_audio.enabled())
-        });
+        let desired_settings = model
+            .active()
+            .map(|active| active.applied().settings())
+            .or_else(|| model.recovery().map(|recovery| recovery.applied.settings()))
+            .or_else(|| model.last_valid().map(|applied| applied.settings()))
+            .unwrap_or(&model.draft().settings);
+        let desired_source = desired_settings
+            .audio
+            .source()
+            .map(|source| source.name().to_owned())
+            .unwrap_or_default();
+        let desired_audio_enabled = desired_settings.audio.enabled();
         let can_open = model.can_apply() || model.can_reconnect();
         let can_restart = model.can_restart() || model.can_reconnect();
         let restart_generation = identity.attempt().map(AttemptId::get).unwrap_or(0);
@@ -536,6 +630,19 @@ impl RuntimeCoordinator {
                     diagnostic.push_str(&failure.to_string());
                 }
             }
+            if let Some(recovery) = model.recovery() {
+                if !diagnostic.is_empty() {
+                    diagnostic.push('\n');
+                }
+                diagnostic.push_str(&format!(
+                    "Capture lost: {}",
+                    loss_evidence_text(&recovery.evidence)
+                ));
+                diagnostic.push_str(&format!("\nRecovery stage: {}", recovery.failure));
+                if !model.recovery_candidates().is_empty() {
+                    diagnostic.push_str("\nRecovery needs an explicit source choice.");
+                }
+            }
             if !self.command_error.is_empty() {
                 if !diagnostic.is_empty() {
                     diagnostic.push('\n');
@@ -551,31 +658,10 @@ impl RuntimeCoordinator {
         } else {
             native.phase
         };
-        if changed
-            && diagnostic.is_empty()
-            && let Some(fatal) = engine.runner_mut().fatal_native_failure()
-        {
-            diagnostic = fatal.to_string();
-        }
-        if changed && diagnostic.is_empty() {
-            diagnostic = if engine.runner_mut().report.is_empty() {
-                format!(
-                    "Requested: {:?}\nAudio requested: {audio_enabled}\nOpen capture to apply draft.",
-                    engine.model().draft().settings.video
-                )
-            } else {
-                engine.runner_mut().report.clone()
-            };
-        }
         let paused = engine
             .model()
             .active()
             .is_some_and(|active| active.playback() == PlaybackState::Paused);
-        let model = engine.model();
-        let restart_required = matches!(
-            engine.audio_diagnostic(),
-            Some(AudioDiagnostic::RestartRequired(_))
-        );
         let playback_status = match model.phase() {
             ProductPhase::ValidatingResume
             | ProductPhase::ClosingResume
@@ -590,8 +676,9 @@ impl RuntimeCoordinator {
                 None => "Unavailable",
             },
         };
+        // A recovered Paused session and a live silent video both keep pause
+        // and gain admission; only shutdown and missing media block them.
         let can_toggle_pause = !quit
-            && !restart_required
             && match model.phase() {
                 ProductPhase::Active
                 | ProductPhase::Paused
@@ -606,6 +693,88 @@ impl RuntimeCoordinator {
         let can_set_gain = engine.gain_admission_open();
         let volume_percent = i32::from(engine.gain().volume_percent);
         let muted = engine.gain().muted;
+        // Actual audio availability is canonical coordinator state, never the
+        // desired draft: a draft edit or a desired request cannot masquerade
+        // as a running route.
+        let availability = engine.audio_availability().cloned();
+        let (audio_status, audio_source, audio_diagnostic) = if changed {
+            match &availability {
+                None | Some(AudioAvailability::Disabled) => {
+                    ("Disabled".to_owned(), String::new(), String::new())
+                }
+                Some(AudioAvailability::Silent { reason }) => {
+                    let reason = match reason {
+                        AudioSilence::WaitingForSource(error) => {
+                            format!("waiting for source: {error}")
+                        }
+                        AudioSilence::PendingRoute => "waiting for audio route".to_owned(),
+                        AudioSilence::Paused => "audio paused with live video".to_owned(),
+                    };
+                    ("Silent".to_owned(), String::new(), reason)
+                }
+                Some(AudioAvailability::Opening { epoch }) => (
+                    "Opening".to_owned(),
+                    String::new(),
+                    format!("opening audio route (epoch {})", epoch.get()),
+                ),
+                Some(AudioAvailability::Active { source, .. }) => {
+                    ("Active".to_owned(), source.name().to_owned(), String::new())
+                }
+                Some(AudioAvailability::Detaching { epoch }) => (
+                    "Detaching".to_owned(),
+                    String::new(),
+                    format!("detaching audio route (epoch {})", epoch.get()),
+                ),
+                Some(AudioAvailability::Blocked { error, .. }) => {
+                    ("Blocked".to_owned(), String::new(), error.to_string())
+                }
+            }
+        } else {
+            (String::new(), String::new(), String::new())
+        };
+        let (recovery_evidence, recovery_stage) = if changed {
+            model
+                .recovery()
+                .map(|loss| {
+                    (
+                        loss_evidence_text(&loss.evidence).to_owned(),
+                        loss.failure.to_string(),
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            (String::new(), String::new())
+        };
+        let candidates: Vec<String> = if changed {
+            model
+                .recovery_candidates()
+                .iter()
+                .map(candidate_entry)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let product_phase = if changed {
+            phase_name(model.phase()).into()
+        } else {
+            String::new()
+        };
+        if changed
+            && diagnostic.is_empty()
+            && let Some(fatal) = engine.runner_mut().fatal_native_failure()
+        {
+            diagnostic = fatal.to_string();
+        }
+        if changed && diagnostic.is_empty() {
+            diagnostic = if engine.runner_mut().report.is_empty() {
+                format!(
+                    "Requested: {:?}\nAudio requested: {desired_audio_enabled}\nOpen capture to apply draft.",
+                    engine.model().draft().settings.video
+                )
+            } else {
+                engine.runner_mut().report.clone()
+            };
+        }
         let runner = engine.runner_mut();
         UiUpdate {
             changed,
@@ -614,36 +783,27 @@ impl RuntimeCoordinator {
             restart_generation,
             can_open,
             can_restart,
-            audio_status: if changed {
-                match &runner.audio {
-                    AudioStatus::Disabled => "Disabled",
-                    AudioStatus::Opening => "Opening",
-                    AudioStatus::Active => "Active",
-                    AudioStatus::RestartRequired(_) => "RestartRequired",
-                }
-                .into()
+            product_phase,
+            audio_status,
+            audio_source,
+            audio_desired: if changed {
+                desired_source
             } else {
                 String::new()
             },
-            audio_source: if changed { source } else { String::new() },
-            audio_enabled,
-            audio_diagnostic: if changed {
-                match &runner.audio {
-                    AudioStatus::RestartRequired(error) => error.to_string(),
-                    _ => String::new(),
-                }
-            } else {
-                String::new()
-            },
+            audio_diagnostic,
             failed: phase == GatePhase::Failed || runner.fatal_native_failure().is_some(),
             diagnostic,
+            recovery_evidence,
+            recovery_stage,
+            candidates,
             paused,
+            prepared_paused,
             volume_percent,
             muted,
             can_toggle_pause,
             can_set_gain,
             playback_status: playback_status.into(),
-            ended: runner.ended,
             create_native: native.create_native,
             release_native: native.release_native,
             quit,
@@ -652,6 +812,97 @@ impl RuntimeCoordinator {
     pub(crate) fn unchanged(&mut self) -> UiUpdate {
         self.poll()
     }
+}
+
+/// Initial playback is tied to the physical opening key, which can differ
+/// from the validation request key. A verified paused commit retains that
+/// origin; ordinary live-origin Pause must keep its frozen image visible.
+fn prepared_paused_presentation(model: &ProductModel, attempt: Option<AttemptId>) -> bool {
+    let Some(attempt) = attempt else {
+        return false;
+    };
+    (model
+        .opening()
+        .is_some_and(|(key, _)| key.attempt == attempt)
+        && model
+            .opening_request()
+            .is_some_and(|request| request.playback == InitialPlayback::Paused))
+        || model.active().is_some_and(|active| {
+            active.attempt() == attempt && active.initial_playback() == InitialPlayback::Paused
+        })
+}
+
+/// Human-readable product phase: the reducer-level truth, projected next to
+/// the media gate phase so disconnected/recovering/selection states stay
+/// visible even while no media window exists.
+fn phase_name(phase: ProductPhase) -> &'static str {
+    match phase {
+        ProductPhase::Stopped => "Stopped",
+        ProductPhase::Active => "Active",
+        ProductPhase::PausePending => "PausePending",
+        ProductPhase::Paused => "Paused",
+        ProductPhase::Validating => "Validating",
+        ProductPhase::ClosingOld => "ClosingOld",
+        ProductPhase::OpeningCandidate => "OpeningCandidate",
+        ProductPhase::CleaningFailedCandidate => "CleaningFailedCandidate",
+        ProductPhase::ValidatingPrior => "ValidatingPrior",
+        ProductPhase::OpeningRestore => "OpeningRestore",
+        ProductPhase::CleaningFailedRestore => "CleaningFailedRestore",
+        ProductPhase::ValidatingResume => "ValidatingResume",
+        ProductPhase::ClosingResume => "ClosingResume",
+        ProductPhase::OpeningResume => "OpeningResume",
+        ProductPhase::CleaningFailedResume => "CleaningFailedResume",
+        ProductPhase::ErrorWithActiveRestored => "ErrorWithActiveRestored",
+        ProductPhase::ErrorWithoutActive => "ErrorWithoutActive",
+        ProductPhase::Disconnected => "Disconnected",
+        ProductPhase::Recovering => "Recovering",
+        ProductPhase::SelectionRequired => "SelectionRequired",
+        ProductPhase::Stopping => "Stopping",
+        ProductPhase::ShutdownReady => "ShutdownReady",
+    }
+}
+
+/// Loss evidence distinguishes an ended stream (owner reported an end event)
+/// from a removed capture source (the watcher observed the node disappear).
+fn loss_evidence_text(evidence: &LossEvidence) -> String {
+    match evidence {
+        LossEvidence::StreamEnded { reason, error } => {
+            format!("stream ended (reason {reason}, error {error})")
+        }
+        LossEvidence::Removed { stamp } => format!(
+            "capture source removed (watch {}, observation {})",
+            stamp.watch.get(),
+            stamp.epoch.get()
+        ),
+    }
+}
+
+/// Machine-parseable candidate entry for the selection surface. Fields are
+/// pipe-separated: "watch:epoch:candidate|description|vid:pid|controller|ports|serial".
+/// The technical identity (USB VID/PID, controller, port chain, serial) is
+/// always shown alongside the friendly description.
+fn candidate_entry(candidate: &RecoveryCandidate) -> String {
+    let identity = &candidate.identity;
+    let topology = identity.topology();
+    let ports = topology
+        .ports()
+        .iter()
+        .map(|port| port.get().to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    let serial = identity.serial().unwrap_or("-");
+    format!(
+        "{}:{}:{}|{}|{:04x}:{:04x}|{}|{}|{}",
+        candidate.token.stamp.watch.get(),
+        candidate.token.stamp.epoch.get(),
+        candidate.token.candidate.get(),
+        candidate.description,
+        identity.vendor_id(),
+        identity.product_id(),
+        topology.controller(),
+        ports,
+        serial
+    )
 }
 
 fn log_snapshot(engine: &Engine) {
@@ -676,7 +927,10 @@ mod tests {
     use crate::{
         capture::{PreparedCapture, apply::fixture_prepared, linux::session_fixture},
         domain::{
-            capture::{CaptureMode, CapturedFourCc, FrameRate, FrameSize},
+            capture::{
+                AudioEpoch, AudioError, AudioRouteReceipt, CaptureMode, CapturedFourCc, FrameRate,
+                FrameSize,
+            },
             failure::ApplyFailure,
             state::{ProductPhase, ValidationRequest},
         },
@@ -767,6 +1021,7 @@ mod tests {
             rx,
         )
     }
+    #[track_caller]
     fn await_update(
         runtime: &mut RuntimeCoordinator,
         predicate: impl Fn(&UiUpdate) -> bool,
@@ -779,7 +1034,30 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "runtime event not delivered"
+                "runtime event not delivered: state={:?}, canonical_audio={:?}, active_playback={:?}, failures={:?}, native_phase={:?}, playback={}, pause_admitted={}, gain_admitted={}, changed={}, audio_projection={}",
+                runtime
+                    .engine
+                    .as_ref()
+                    .map(|engine| engine.model().state_identity()),
+                runtime
+                    .engine
+                    .as_ref()
+                    .and_then(|engine| engine.audio_availability()),
+                runtime
+                    .engine
+                    .as_ref()
+                    .and_then(|engine| engine.model().active())
+                    .map(|active| active.playback()),
+                runtime
+                    .engine
+                    .as_ref()
+                    .and_then(|engine| engine.model().failures()),
+                update.phase,
+                update.playback_status,
+                update.can_toggle_pause,
+                update.can_set_gain,
+                update.changed,
+                update.audio_status
             );
             std::thread::yield_now();
         }
@@ -800,6 +1078,7 @@ mod tests {
             id: load.get(),
             error: 0,
         });
+        driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
         await_update(runtime, |update| update.can_toggle_pause);
@@ -839,15 +1118,6 @@ mod tests {
         driver.fence();
         let paused = await_update(runtime, |update| update.playback_status == "Paused");
         assert!(paused.paused && paused.can_toggle_pause);
-    }
-    fn assert_command_rejection(
-        runtime: &RuntimeCoordinator,
-        update: &UiUpdate,
-        expected: CommandRejection,
-    ) {
-        assert!(update.changed);
-        assert_eq!(runtime.command_error, expected.to_string());
-        assert!(update.diagnostic.contains(&expected.to_string()));
     }
     fn snapshot_expected(runtime: &RuntimeCoordinator) -> ExpectedState {
         let engine = runtime.engine.as_ref().unwrap();
@@ -957,6 +1227,96 @@ mod tests {
         cleanup(&mut runtime);
     }
     #[test]
+    fn paused_recovery_presentation_tracks_physical_open_and_not_ordinary_pause() {
+        use crate::domain::{
+            capture::{RecoveryObservation, SourcePresence, VideoPresence},
+            state::ModelEffect,
+        };
+
+        let mut model = ProductModel::new(settings());
+        model
+            .apply(model.state_identity(), model.draft().revision)
+            .unwrap();
+        let initial_request = model.validation_request().unwrap().clone();
+        let Some(ModelEffect::Open { key: old, .. }) = model.validation_succeeded(&initial_request)
+        else {
+            panic!("initial physical opening missing");
+        };
+        assert!(!prepared_paused_presentation(&model, Some(old.attempt)));
+        model.open_verified(old);
+        let pause = model.prepare_pause(old.attempt).unwrap();
+        assert!(model.pause_admitted(old.attempt, pause));
+        assert!(model.pause_observed(old.attempt, pause, true));
+        assert_eq!(model.phase(), ProductPhase::Paused);
+        assert!(!prepared_paused_presentation(&model, Some(old.attempt)));
+
+        let watch = model.watch_target().unwrap().watch;
+        let removal = ObservationEpoch::new(2).unwrap();
+        let mut observation = RecoveryObservation {
+            stamp: WatchStamp {
+                watch,
+                epoch: removal,
+            },
+            video: VideoPresence::Absent,
+            audio: SourcePresence::Disabled,
+            last_video_removal: Some(removal),
+        };
+        assert!(matches!(
+            model.recovery_observed(&observation),
+            Some(ModelEffect::Stop { attempt, .. }) if attempt == old.attempt
+        ));
+        assert!(model.barrier_complete(old.attempt).is_none());
+        observation.stamp.epoch = ObservationEpoch::new(3).unwrap();
+        observation.video = VideoPresence::Present;
+        let Some(ModelEffect::Validate(request)) = model.recovery_observed(&observation) else {
+            panic!("paused recovery validation missing");
+        };
+        assert_eq!(request.playback, InitialPlayback::Paused);
+        let Some(ModelEffect::Open { key: recovered, .. }) = model.validation_succeeded(&request)
+        else {
+            panic!("paused recovery physical opening missing");
+        };
+        // Concealment starts with creation, before any OpenVerified receipt.
+        assert!(prepared_paused_presentation(
+            &model,
+            Some(recovered.attempt)
+        ));
+        assert!(!prepared_paused_presentation(&model, Some(old.attempt)));
+        assert!(!prepared_paused_presentation(&model, None));
+        model.open_verified(recovered);
+        assert_eq!(model.phase(), ProductPhase::Paused);
+        assert!(prepared_paused_presentation(
+            &model,
+            Some(recovered.attempt)
+        ));
+
+        let (_, ModelEffect::Validate(resume)) = model
+            .resume(model.state_identity(), recovered.attempt)
+            .unwrap()
+        else {
+            panic!("fresh resume validation missing");
+        };
+        // Admitting Resume never makes the old prepared owner visible.
+        assert!(prepared_paused_presentation(
+            &model,
+            Some(recovered.attempt)
+        ));
+        assert!(matches!(
+            model.validation_succeeded(&resume),
+            Some(ModelEffect::Stop { attempt, .. }) if attempt == recovered.attempt
+        ));
+        let Some(ModelEffect::Open { key: live, request }) =
+            model.barrier_complete(recovered.attempt)
+        else {
+            panic!("fresh live resume opening missing");
+        };
+        assert_eq!(request.playback, InitialPlayback::Live);
+        assert!(!prepared_paused_presentation(&model, Some(live.attempt)));
+        model.open_verified(live);
+        assert!(!prepared_paused_presentation(&model, Some(live.attempt)));
+    }
+
+    #[test]
     fn open_and_restart_routes_use_engine_native_barrier_and_last_valid_not_draft() {
         let (mut runtime, drivers) = runtime();
         runtime.poll();
@@ -973,7 +1333,12 @@ mod tests {
             xid: X11WindowId::new(71).unwrap(),
         });
         first.initialized.recv().unwrap();
-        first.submitted.recv().unwrap();
+        let (load, _) = first.submitted.recv().unwrap();
+        first.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        first.send(BackendEvent::FileLoaded);
         first.send(BackendEvent::PlaybackRestart);
         first.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
@@ -1009,7 +1374,12 @@ mod tests {
             xid: X11WindowId::new(71).unwrap(),
         });
         second.initialized.recv().unwrap();
-        second.submitted.recv().unwrap();
+        let (load, _) = second.submitted.recv().unwrap();
+        second.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        second.send(BackendEvent::FileLoaded);
         second.send(BackendEvent::PlaybackRestart);
         second.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
@@ -1062,6 +1432,7 @@ mod tests {
             id: load.get(),
             error: 0,
         });
+        driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
@@ -1203,8 +1574,7 @@ mod tests {
         let (mut runtime, drivers) = runtime();
         for command in ["pause 1", "resume 1"] {
             let before = runtime.engine.as_ref().unwrap().model().state_identity();
-            let rejected = runtime.qualification_command(command);
-            assert_command_rejection(&runtime, &rejected, CommandRejection::PlaybackUnavailable);
+            runtime.qualification_command(command);
             assert_eq!(
                 runtime.engine.as_ref().unwrap().model().state_identity(),
                 before
@@ -1213,17 +1583,12 @@ mod tests {
         }
         let driver = start_live(&mut runtime, &drivers);
         assert_eq!(
-            runtime.engine.as_ref().unwrap().audio_diagnostic(),
-            Some(&AudioDiagnostic::Disabled)
+            runtime.engine.as_ref().unwrap().audio_availability(),
+            Some(&AudioAvailability::Disabled)
         );
-        for (command, rejection) in [
-            ("pause 2", CommandRejection::StaleState),
-            ("resume 2", CommandRejection::StaleState),
-            ("resume 1", CommandRejection::PlaybackUnavailable),
-        ] {
+        for command in ["pause 2", "resume 2", "resume 1"] {
             let before = runtime.engine.as_ref().unwrap().model().state_identity();
             let rejected = runtime.qualification_command(command);
-            assert_command_rejection(&runtime, &rejected, rejection);
             assert_eq!(
                 runtime.engine.as_ref().unwrap().model().state_identity(),
                 before
@@ -1237,7 +1602,6 @@ mod tests {
         let pending = runtime.engine.as_ref().unwrap().model().state_identity();
         for command in ["pause 1", "resume 1"] {
             let rejected = runtime.qualification_command(command);
-            assert_command_rejection(&runtime, &rejected, CommandRejection::PlaybackBusy);
             assert_eq!(
                 runtime.engine.as_ref().unwrap().model().state_identity(),
                 pending
@@ -1265,14 +1629,9 @@ mod tests {
         driver.fence();
         let paused = await_update(&mut runtime, |update| update.playback_status == "Paused");
         assert!(paused.paused && paused.can_toggle_pause);
-        for (command, rejection) in [
-            ("pause 2", CommandRejection::StaleState),
-            ("resume 2", CommandRejection::StaleState),
-            ("pause 1", CommandRejection::PlaybackUnavailable),
-        ] {
+        for command in ["pause 2", "resume 2", "pause 1"] {
             let before = runtime.engine.as_ref().unwrap().model().state_identity();
             let rejected = runtime.qualification_command(command);
-            assert_command_rejection(&runtime, &rejected, rejection);
             assert_eq!(
                 runtime.engine.as_ref().unwrap().model().state_identity(),
                 before
@@ -1286,8 +1645,7 @@ mod tests {
         driver.destroyed.recv().unwrap();
         for command in ["pause 1", "resume 1"] {
             let before = runtime.engine.as_ref().unwrap().model().state_identity();
-            let rejected = runtime.qualification_command(command);
-            assert_command_rejection(&runtime, &rejected, CommandRejection::ShuttingDown);
+            runtime.qualification_command(command);
             assert_eq!(
                 runtime.engine.as_ref().unwrap().model().state_identity(),
                 before
@@ -1368,7 +1726,6 @@ mod tests {
         let before = runtime.engine.as_ref().unwrap().model().state_identity();
         for command in ["pause 1", "resume 1"] {
             let rejected = runtime.qualification_command(command);
-            assert_command_rejection(&runtime, &rejected, CommandRejection::ApplyInProgress);
             assert_eq!(
                 runtime.engine.as_ref().unwrap().model().state_identity(),
                 before
@@ -1393,9 +1750,15 @@ mod tests {
         assert_eq!(rejected_gain.volume_percent, 80);
         assert!(rejected_gain.muted);
         assert!(!retired.create_native && !waiting.create_native);
+        let draining = runtime.engine.as_ref().unwrap().model().state_identity();
         for command in ["pause 1", "resume 1"] {
             let rejected = runtime.qualification_command(command);
-            assert_command_rejection(&runtime, &rejected, CommandRejection::CleanupIncomplete);
+            assert_eq!(
+                runtime.engine.as_ref().unwrap().model().state_identity(),
+                draining
+            );
+            assert!(!rejected.can_toggle_pause && !rejected.can_set_gain);
+            assert!(!rejected.create_native);
         }
         release_tx.send(()).unwrap();
         let drained = await_update(&mut runtime, |update| update.can_set_gain);
@@ -1442,6 +1805,7 @@ mod tests {
                             id: load.get(),
                             error: 0,
                         });
+                        restored_owner.send(BackendEvent::FileLoaded);
                         restored_owner.send(BackendEvent::PlaybackRestart);
                         restored_owner.fence();
                         await_update(&mut runtime, |update| update.can_toggle_pause);
@@ -1582,8 +1946,12 @@ mod tests {
             })
             .into_iter()
             .collect::<Vec<_>>();
-        let result =
-            crate::capture::validate_prepared(request.settings.clone(), &snapshot, &catalog);
+        let result = crate::capture::validate_prepared(
+            request.settings.clone(),
+            &snapshot,
+            &catalog,
+            request.watch,
+        );
         (request, result)
     }
 
@@ -1604,18 +1972,24 @@ mod tests {
                 .unwrap();
             let requested = input.requested().clone();
             let (driver, backend) = Driver::pair(Config::default());
-            tx.send(driver).unwrap();
+            tx.send((driver, config.watch)).unwrap();
             OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
         });
         let engine = ApplyCoordinator::new(
             initial,
             PlaybackGain::default(),
-            CaptureValidator::with_runner(validate_enabled_audio),
+            CaptureValidator::with_runner_and_audio_catalog(
+                validate_enabled_audio,
+                vec![crate::capture::audio::AudioSource {
+                    identity: source_a.clone(),
+                    description: "fixture source".into(),
+                }],
+            ),
             runner,
         );
         let mut runtime = RuntimeCoordinator {
             engine: Some(engine),
-            sources: vec![source_a, source_b],
+            sources: vec![source_a.clone(), source_b],
             dirty: true,
             last_state: None,
             command_error: String::new(),
@@ -1627,7 +2001,17 @@ mod tests {
         } else {
             await_update(&mut runtime, |update| update.create_native)
         };
-        let driver = rx.recv().unwrap();
+        assert_eq!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .observation()
+                .map(|observation| &observation.audio),
+            Some(&crate::domain::capture::SourcePresence::Present)
+        );
+        let (driver, watch) = rx.recv().unwrap();
         runtime.surface_ready(SurfaceToken {
             generation: Generation::new(opening.generation).unwrap(),
             xid: X11WindowId::new(71).unwrap(),
@@ -1638,13 +2022,38 @@ mod tests {
             id: load.get(),
             error: 0,
         });
-        driver.send(BackendEvent::AudioStatus(AudioStatus::Active));
+        let epoch = AudioEpoch::new(1).unwrap();
+        // The route is not readiness: the owner must first expose the admitted
+        // audio epoch, and Opening must not grant playback controls.
+        driver.send(BackendEvent::AudioAvailability(
+            AudioAvailability::Opening { epoch },
+        ));
+        driver.fence();
+        let audio_opening = await_update(&mut runtime, |update| update.audio_status == "Opening");
+        assert_eq!(audio_opening.playback_status, "Unavailable");
+        assert!(!audio_opening.can_toggle_pause);
+        assert!(runtime.engine.as_ref().unwrap().model().active().is_none());
+        let route = AudioRouteReceipt {
+            epoch,
+            stamp: watch,
+            source_index: 0,
+            source_output_index: 0,
+            client_index: 0,
+        };
+        driver.send(BackendEvent::AudioAvailability(AudioAvailability::Active {
+            source: source_a.clone(),
+            route: route.clone(),
+        }));
+        driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
         let active = await_update(&mut runtime, |update| update.can_toggle_pause);
         assert_eq!(
-            runtime.engine.as_ref().unwrap().audio_diagnostic(),
-            Some(&AudioDiagnostic::Active)
+            runtime.engine.as_ref().unwrap().audio_availability(),
+            Some(&AudioAvailability::Active {
+                source: source_a.clone(),
+                route: route.clone(),
+            })
         );
         assert_eq!(active.playback_status, "Live");
         assert!(active.can_set_gain);
@@ -1654,23 +2063,46 @@ mod tests {
         assert_eq!(edited.audio_source, "source-a");
         assert_eq!(edited.audio_status, "Active");
         let disabled_draft = runtime.qualification_command("draft-audio 1 disable");
-        assert!(disabled_draft.audio_enabled);
+        assert_eq!(disabled_draft.audio_desired, "source-a");
         assert_eq!(disabled_draft.audio_source, "source-a");
+        assert_eq!(disabled_draft.audio_status, "Active");
         confirm_explicit_pause(&mut runtime, &driver);
         let paused = runtime.engine.as_ref().unwrap().model().state_identity();
-        driver.send(BackendEvent::AudioStatus(AudioStatus::RestartRequired(
-            crate::domain::capture::AudioError::Cancelled,
-        )));
+        driver.send(BackendEvent::AudioAvailability(
+            AudioAvailability::Detaching { epoch },
+        ));
         driver.fence();
-        let unavailable = await_update(&mut runtime, |update| !update.can_toggle_pause);
-        assert!(unavailable.paused && unavailable.can_restart);
-        for command in ["pause 1", "resume 1", "pause 2", "resume 2"] {
+        let detaching = await_update(&mut runtime, |update| update.audio_status == "Detaching");
+        assert_eq!(detaching.playback_status, "Paused");
+        assert!(detaching.can_toggle_pause && detaching.can_set_gain);
+        driver.send(BackendEvent::AudioDetached {
+            epoch,
+            outcome: Ok(()),
+        });
+        driver.send(BackendEvent::AudioAvailability(AudioAvailability::Silent {
+            reason: AudioSilence::WaitingForSource(AudioError::Cancelled),
+        }));
+        driver.fence();
+        let silent = await_update(&mut runtime, |update| update.audio_status == "Silent");
+        // Audio retirement must not withdraw video or pause controls while the
+        // media owner itself stays healthy.
+        assert!(silent.can_toggle_pause && silent.can_set_gain);
+        assert_eq!(silent.playback_status, "Paused");
+        assert!(silent.audio_source.is_empty());
+        assert_eq!(silent.audio_desired, "source-a");
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().audio_availability(),
+            Some(&AudioAvailability::Silent {
+                reason: AudioSilence::WaitingForSource(AudioError::Cancelled),
+            })
+        );
+        for command in ["pause 1", "pause 2"] {
             let rejected = runtime.qualification_command(command);
-            assert_command_rejection(&runtime, &rejected, CommandRejection::PlaybackUnavailable);
             assert_eq!(
                 runtime.engine.as_ref().unwrap().model().state_identity(),
                 paused
             );
+            assert!(rejected.paused && rejected.can_toggle_pause && rejected.can_set_gain);
         }
         let close = runtime.close(opening.generation);
         let retired = if close.release_native {
@@ -1679,6 +2111,16 @@ mod tests {
             await_update(&mut runtime, |update| update.release_native)
         };
         assert_eq!(retired.audio_status, "Disabled");
+        assert!(retired.audio_source.is_empty());
+        assert_eq!(retired.audio_desired, "source-a");
+        assert!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .audio_availability()
+                .is_none()
+        );
         driver.destroyed.recv().unwrap();
         let released = runtime.native_released(AttemptId::new(opening.generation).unwrap());
         assert_eq!(released.audio_status, "Disabled");
@@ -1686,6 +2128,54 @@ mod tests {
         cleanup(&mut runtime);
     }
 
+    #[test]
+    fn reconnect_without_engine_or_history_is_rejected_actionably() {
+        let mut absent = {
+            let (mut runtime, _) = runtime();
+            runtime.engine = None;
+            runtime
+        };
+        absent.poll();
+        let rejected = absent.reconnect(0);
+        assert_eq!(rejected.product_phase, "Stopped");
+
+        let (mut runtime, drivers) = runtime();
+        runtime.poll();
+        runtime.reconnect(0);
+        assert!(drivers.try_recv().is_err());
+        cleanup(&mut runtime);
+    }
+    #[test]
+    fn stale_reconnect_attempt_is_rejected_without_effect() {
+        let (mut runtime, drivers) = runtime();
+        runtime.poll();
+        let before = runtime.engine.as_ref().unwrap().model().state_identity();
+        runtime.reconnect(7);
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().model().state_identity(),
+            before
+        );
+        assert!(drivers.try_recv().is_err());
+        cleanup(&mut runtime);
+    }
+    #[test]
+    fn choose_requires_nonzero_token_identifiers_and_stale_attempt_guard() {
+        let (mut runtime, drivers) = runtime();
+        runtime.poll();
+        let before = runtime.engine.as_ref().unwrap().model().state_identity();
+        runtime.choose_recovery(0, 0, 0, 0);
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().model().state_identity(),
+            before
+        );
+        runtime.choose_recovery(9, 1, 1, 1);
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().model().state_identity(),
+            before
+        );
+        assert!(drivers.try_recv().is_err());
+        cleanup(&mut runtime);
+    }
     #[test]
     fn poisoned_genuine_retirement_then_quit_keeps_fatal_surface_loss_status() {
         let (mut runtime, drivers) = runtime();
@@ -1701,7 +2191,12 @@ mod tests {
             xid: X11WindowId::new(71).unwrap(),
         });
         driver.initialized.recv().unwrap();
-        driver.submitted.recv().unwrap();
+        let (load, _) = driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);

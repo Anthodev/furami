@@ -12,35 +12,24 @@ use std::{
 };
 
 use super::session::{ObservedFacts, RequestedFacts, SessionError, SessionFacts};
+use crate::app::ports::OpenReadiness;
 #[cfg(test)]
 use crate::capture::input::InputSpec;
 use crate::capture::input::{CaptureSelection, SelectionError};
-use crate::domain::capture::{AudioError, AudioSelection, PlaybackGain};
-use crate::domain::state::PauseRequestId;
+use crate::domain::capture::{
+    AudioAvailability, AudioEpoch, AudioError, AudioSelection, AudioSourceIdentity, PlaybackGain,
+    SelectedRouteAuthorization, WatchStamp,
+};
+use crate::domain::state::{InitialPlayback, PauseRequestId};
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     pub video: CaptureSelection,
     pub audio: AudioSelection,
     pub gain: PlaybackGain,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AudioStatus {
-    Disabled,
-    Opening,
-    Active,
-    RestartRequired(AudioError),
-}
-impl AudioStatus {
-    pub fn summary(&self) -> String {
-        match self {
-            Self::Disabled => "Disabled".into(),
-            Self::Opening => "Opening selected audio source".into(),
-            Self::Active => "Selected audio track active".into(),
-            Self::RestartRequired(diagnostic) => format!("Capture restart required: {diagnostic}"),
-        }
-    }
+    pub playback: InitialPlayback,
+    pub watch: WatchStamp,
+    pub selected_route: Option<SelectedRouteAuthorization>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,13 +62,21 @@ pub struct SurfaceToken {
     pub generation: Generation,
     pub xid: X11WindowId,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlaybackIntent {
     SetPaused {
         request: PauseRequestId,
         paused: bool,
     },
     SetGain(PlaybackGain),
+    DetachAudio {
+        epoch: AudioEpoch,
+    },
+    AttachAudio {
+        epoch: AudioEpoch,
+        source: AudioSourceIdentity,
+        stamp: WatchStamp,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmitStatus {
@@ -129,9 +126,14 @@ pub(crate) struct Snapshot {
     pub playback_started: bool,
     pub session: Option<SessionFacts>,
     pub pause: Option<PauseObservation>,
-    pub ended: bool,
+    pub stream_ended: Option<(i32, i32)>,
     pub failure: Option<MediaError>,
-    pub audio: AudioStatus,
+    pub audio: AudioAvailability,
+    pub readiness: Option<OpenReadiness>,
+    pub load_complete: bool,
+    pub playback: InitialPlayback,
+    pub audio_detached: Option<(AudioEpoch, Result<(), AudioError>)>,
+    pub audio_epoch: Option<AudioEpoch>,
 }
 #[derive(Debug)]
 pub(crate) struct OwnerStopped {
@@ -212,7 +214,7 @@ impl RequestId {
         ))
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BackendCommand {
     LoadInput,
     SetPaused {
@@ -220,6 +222,23 @@ pub(crate) enum BackendCommand {
         paused: bool,
     },
     SetGain(PlaybackGain),
+    DetachAudio {
+        epoch: AudioEpoch,
+    },
+    AttachAudio {
+        epoch: AudioEpoch,
+        source: AudioSourceIdentity,
+        stamp: WatchStamp,
+    },
+}
+#[derive(Clone, Copy)]
+enum InFlight {
+    LoadInput,
+    SetPaused {
+        request: PauseRequestId,
+        paused: bool,
+    },
+    Control,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BackendEvent {
@@ -244,7 +263,11 @@ pub(crate) enum BackendEvent {
         started: bool,
         facts: ObservedFacts,
     },
-    AudioStatus(AudioStatus),
+    AudioAvailability(AudioAvailability),
+    AudioDetached {
+        epoch: AudioEpoch,
+        outcome: Result<(), AudioError>,
+    },
 }
 pub(crate) trait OwnerBackend {
     fn initialize(&mut self, token: SurfaceToken, stop: &StopFlag) -> Result<(), MediaError>;
@@ -255,8 +278,14 @@ pub(crate) trait OwnerBackend {
     fn refresh_pause(&mut self) -> Result<Option<bool>, MediaError>;
     fn refresh_observed(&mut self, started: bool) -> Result<Option<ObservedFacts>, MediaError>;
     fn diagnostic(&self) -> Option<String>;
-    fn audio_status(&self) -> AudioStatus {
-        AudioStatus::Disabled
+    fn audio_status(&self) -> AudioAvailability {
+        AudioAvailability::Disabled
+    }
+    fn initial_playback(&self) -> InitialPlayback {
+        InitialPlayback::Live
+    }
+    fn audio_epoch(&self) -> Option<AudioEpoch> {
+        None
     }
     fn shutdown(&mut self) -> Result<(), MediaError>;
 }
@@ -265,7 +294,7 @@ pub(crate) trait OwnerBackend {
 pub(crate) struct OwnerEndpoint {
     generation: Generation,
     surface: SyncSender<SurfaceToken>,
-    commands: SyncSender<(PauseRequestId, bool)>,
+    commands: SyncSender<PlaybackIntent>,
     gain: Arc<Mutex<Option<PlaybackGain>>>,
     stop_flag: Arc<StopFlag>,
     published: AtomicBool,
@@ -304,39 +333,20 @@ impl OwnerEndpoint {
                         SelectionError::Capture(error),
                     ))
                 })?;
-                let audio = if settings.audio.enabled() {
-                    crate::capture::audio::discover().map_err(|error| {
-                        MediaError::from_session(SessionError {
-                            stage: crate::domain::failure::Stage::Prevalidation,
-                            cause: crate::domain::failure::Cause::Generic,
-                            requested: requested.clone(),
-                            diagnostic: error.to_string(),
-                            evidence: None,
-                            source: None,
-                        })
-                    })?
-                } else {
-                    Vec::new()
-                };
-                let prepared = crate::capture::validate_prepared(settings, &fresh, &audio)
-                    .map_err(|failure| {
-                        MediaError::from_session(SessionError {
-                            stage: failure.stage,
-                            cause: failure.cause,
-                            requested: requested.clone(),
-                            diagnostic: failure.diagnostic,
-                            evidence: failure.evidence,
-                            source: None,
-                        })
-                    })?;
-                if stop.is_set() {
-                    return stop.outcome();
-                }
-                let input = prepared.selection().revalidate().map_err(|error| {
-                    MediaError::from_session(SessionError::prevalidation(
-                        prepared.selection().requested(),
-                        error,
-                    ))
+                let input = crate::capture::revalidate_authorized_input(
+                    &settings,
+                    config.selected_route.as_ref(),
+                    &fresh,
+                )
+                .map_err(|failure| {
+                    MediaError::from_session(SessionError {
+                        stage: failure.stage,
+                        cause: failure.cause,
+                        requested: requested.clone(),
+                        diagnostic: failure.diagnostic,
+                        evidence: failure.evidence,
+                        source: None,
+                    })
                 })?;
                 if stop.is_set() {
                     return stop.outcome();
@@ -344,7 +354,14 @@ impl OwnerEndpoint {
                 let requested = input.requested().clone();
                 tracing::info!(generation = generation.get(), requested = %requested, "capture_requested");
                 run_backend(
-                    super::ffi::MpvBackend::new(prefix, input, config.audio, config.gain),
+                    super::ffi::MpvBackend::new(
+                        prefix,
+                        input,
+                        config.audio,
+                        config.gain,
+                        config.playback,
+                        config.watch,
+                    ),
                     surface,
                     commands,
                     gain,
@@ -474,7 +491,7 @@ impl OwnerEndpoint {
         generation: Generation,
         task: impl FnOnce(
             &Receiver<SurfaceToken>,
-            &Receiver<(PauseRequestId, bool)>,
+            &Receiver<PlaybackIntent>,
             &Mutex<Option<PlaybackGain>>,
             &StopFlag,
             &Mutex<Option<Snapshot>>,
@@ -502,9 +519,14 @@ impl OwnerEndpoint {
                     playback_started: false,
                     session: None,
                     pause: None,
-                    ended: false,
+                    stream_ended: None,
                     failure: None,
-                    audio: AudioStatus::Disabled,
+                    audio: AudioAvailability::Disabled,
+                    readiness: None,
+                    load_complete: false,
+                    playback: InitialPlayback::Live,
+                    audio_detached: None,
+                    audio_epoch: None,
                 };
                 let outcome = task(
                     &surface_rx,
@@ -590,7 +612,7 @@ impl OwnerEndpoint {
         if self.stop_flag.is_set() {
             return SubmitStatus::Closing;
         }
-        let (request, paused) = match intent {
+        let command = match intent {
             PlaybackIntent::SetGain(gain) => {
                 let mut slot = self.gain.lock().unwrap_or_else(|p| p.into_inner());
                 if self.stop_flag.is_set() {
@@ -600,9 +622,9 @@ impl OwnerEndpoint {
                 self.thread.unpark();
                 return SubmitStatus::Accepted;
             }
-            PlaybackIntent::SetPaused { request, paused } => (request, paused),
+            command => command,
         };
-        match self.commands.try_send((request, paused)) {
+        match self.commands.try_send(command) {
             Ok(()) => {
                 self.thread.unpark();
                 SubmitStatus::Accepted
@@ -727,7 +749,7 @@ fn publish(latest: &Mutex<Option<Snapshot>>, snapshot: &Snapshot) {
 fn run_backend<B: OwnerBackend>(
     backend: B,
     surface: &Receiver<SurfaceToken>,
-    commands: &Receiver<(PauseRequestId, bool)>,
+    commands: &Receiver<PlaybackIntent>,
     gain: &Mutex<Option<PlaybackGain>>,
     stop: &StopFlag,
     latest: &Mutex<Option<Snapshot>>,
@@ -788,7 +810,7 @@ fn run_backend<B: OwnerBackend>(
 fn run_owner<B: OwnerBackend>(
     backend: &mut B,
     surface: &Receiver<SurfaceToken>,
-    commands: &Receiver<(PauseRequestId, bool)>,
+    commands: &Receiver<PlaybackIntent>,
     gain: &Mutex<Option<PlaybackGain>>,
     stop: &StopFlag,
     latest: &Mutex<Option<Snapshot>>,
@@ -823,26 +845,53 @@ fn run_owner<B: OwnerBackend>(
         return stop.outcome();
     }
     snapshot.initialized = true;
+    snapshot.playback = backend.initial_playback();
     snapshot.audio = backend.audio_status();
     publish(latest, snapshot);
     let id = RequestId::next(&mut last_request)?;
     backend.submit(id, BackendCommand::LoadInput)?;
-    let mut pending = Some((id, BackendCommand::LoadInput));
+    let mut pending = Some((id, InFlight::LoadInput));
     loop {
         if stop.is_set() {
             return stop.outcome();
         }
-        if pending.is_none() {
+        if pending.is_none() && snapshot.stream_ended.is_none() {
             match commands.try_recv() {
-                Ok((request, paused)) => {
+                Ok(intent) => {
                     if stop.is_set() {
                         return stop.outcome();
                     }
                     let id = RequestId::next(&mut last_request)?;
-                    let command = BackendCommand::SetPaused { request, paused };
+                    let command = match intent {
+                        PlaybackIntent::SetPaused { request, paused } => {
+                            BackendCommand::SetPaused { request, paused }
+                        }
+                        PlaybackIntent::DetachAudio { epoch } => {
+                            BackendCommand::DetachAudio { epoch }
+                        }
+                        PlaybackIntent::AttachAudio {
+                            epoch,
+                            source,
+                            stamp,
+                        } => BackendCommand::AttachAudio {
+                            epoch,
+                            source,
+                            stamp,
+                        },
+                        PlaybackIntent::SetGain(_) => unreachable!("gain uses latest slot"),
+                    };
+                    if matches!(command, BackendCommand::SetPaused { .. }) {
+                        snapshot.pause = None;
+                    }
+                    let in_flight = match &command {
+                        BackendCommand::SetPaused { request, paused } => InFlight::SetPaused {
+                            request: *request,
+                            paused: *paused,
+                        },
+                        _ => InFlight::Control,
+                    };
                     backend.submit(id, command)?;
-                    pending = Some((id, command));
-                    snapshot.pause = None;
+                    pending = Some((id, in_flight));
                     publish(latest, snapshot);
                 }
                 Err(TryRecvError::Empty) => {
@@ -853,7 +902,7 @@ fn run_owner<B: OwnerBackend>(
                         }
                         let id = RequestId::next(&mut last_request)?;
                         backend.submit(id, BackendCommand::SetGain(gain))?;
-                        pending = Some((id, BackendCommand::SetGain(gain)));
+                        pending = Some((id, InFlight::Control));
                     }
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -870,6 +919,7 @@ fn run_owner<B: OwnerBackend>(
                 return stop.outcome();
             }
             let event = backend.next_event()?;
+            snapshot.audio_epoch = backend.audio_epoch();
             match event {
                 BackendEvent::None => {
                     drained = true;
@@ -884,10 +934,15 @@ fn run_owner<B: OwnerBackend>(
                                 request: None,
                                 paused,
                             },
-                            pending,
+                            pending.as_ref(),
                         )?;
                     }
                     snapshot.file_loaded = true;
+                    if snapshot.playback == InitialPlayback::Paused
+                        && let Some(observed) = backend.refresh_observed(false)?
+                    {
+                        apply_observed(snapshot, requested, false, observed)?;
+                    }
                     publish(latest, snapshot);
                 }
                 BackendEvent::PlaybackRestart | BackendEvent::VideoReconfig => {
@@ -901,7 +956,7 @@ fn run_owner<B: OwnerBackend>(
                                     request: None,
                                     paused,
                                 },
-                                pending,
+                                pending.as_ref(),
                             )?;
                         }
                         publish(latest, snapshot);
@@ -912,19 +967,20 @@ fn run_owner<B: OwnerBackend>(
                     publish(latest, snapshot);
                 }
                 BackendEvent::PauseObserved(observation) => {
-                    if record_pause(snapshot, observation, pending)? {
+                    if record_pause(snapshot, observation, pending.as_ref())? {
                         publish(latest, snapshot);
                     }
                 }
-                BackendEvent::AudioStatus(status) => {
-                    // Source loss remains latched until explicit whole-session restart.
-                    if !matches!(snapshot.audio, AudioStatus::RestartRequired(_)) {
-                        snapshot.audio = status;
-                        publish(latest, snapshot);
-                    }
+                BackendEvent::AudioAvailability(status) => {
+                    snapshot.audio = status;
+                    publish(latest, snapshot);
+                }
+                BackendEvent::AudioDetached { epoch, outcome } => {
+                    snapshot.audio_detached = Some((epoch, outcome));
+                    publish(latest, snapshot);
                 }
                 BackendEvent::CommandReply { id, error } => {
-                    if let Some((expected, kind)) = pending
+                    if let Some((expected, kind)) = pending.as_ref()
                         && expected.get() == id
                     {
                         if error < 0 {
@@ -936,11 +992,11 @@ fn run_owner<B: OwnerBackend>(
                                 ),
                             ));
                         }
-                        if let BackendCommand::SetPaused { request, paused } = kind
+                        if let InFlight::SetPaused { request, paused } = kind
                             && snapshot.pause
                                 != Some(PauseObservation {
-                                    request: Some(request),
-                                    paused,
+                                    request: Some(*request),
+                                    paused: *paused,
                                 })
                         {
                             return Err(MediaError::new(
@@ -948,9 +1004,13 @@ fn run_owner<B: OwnerBackend>(
                                 "pause command completed without matching expected readback",
                             ));
                         }
+                        if matches!(kind, InFlight::LoadInput) {
+                            snapshot.load_complete = true;
+                            publish(latest, snapshot);
+                        }
                         pending = None;
-                        // Complete the whole transaction before admitting any next intent.
-                        break;
+                        // Keep draining terminal health before publishing any
+                        // readiness; the next intent is admitted next iteration.
                     }
                 }
                 BackendEvent::EndFile { reason, error } => {
@@ -963,6 +1023,9 @@ fn run_owner<B: OwnerBackend>(
                     if stop.is_set() {
                         return stop.outcome();
                     }
+                    snapshot.stream_ended = Some((reason, error));
+                    snapshot.readiness = None;
+                    publish(latest, snapshot);
                     if error < 0 || reason == 4 {
                         return Err(MediaError::new(
                             "playback",
@@ -971,10 +1034,6 @@ fn run_owner<B: OwnerBackend>(
                                 backend.diagnostic().unwrap_or_default()
                             ),
                         ));
-                    }
-                    if reason == 0 {
-                        snapshot.ended = true;
-                        publish(latest, snapshot);
                     }
                 }
                 BackendEvent::Shutdown => {
@@ -994,6 +1053,13 @@ fn run_owner<B: OwnerBackend>(
         if stop.is_set() {
             return stop.outcome();
         }
+        let previous_readiness = snapshot.readiness;
+        if drained {
+            update_readiness(snapshot);
+        }
+        if snapshot.readiness != previous_readiness {
+            publish(latest, snapshot);
+        }
         if drained {
             thread::park_timeout(Duration::from_millis(10));
         }
@@ -1003,13 +1069,13 @@ fn run_owner<B: OwnerBackend>(
 fn record_pause(
     snapshot: &mut Snapshot,
     observation: PauseObservation,
-    pending: Option<(RequestId, BackendCommand)>,
+    pending: Option<&(RequestId, InFlight)>,
 ) -> Result<bool, MediaError> {
     match observation.request {
         Some(request) => {
             let Some((
                 _,
-                BackendCommand::SetPaused {
+                InFlight::SetPaused {
                     request: expected,
                     paused,
                 },
@@ -1017,10 +1083,10 @@ fn record_pause(
             else {
                 return Ok(false);
             };
-            if request != expected {
+            if request != *expected {
                 return Ok(false);
             }
-            if observation.paused != paused {
+            if observation.paused != *paused {
                 return Err(MediaError::new(
                     "pause_property",
                     "fresh pause flag differs from requested state",
@@ -1034,7 +1100,7 @@ fn record_pause(
             );
         }
         None => {
-            if matches!(pending, Some((_, BackendCommand::SetPaused { .. })))
+            if matches!(pending, Some((_, InFlight::SetPaused { .. })))
                 || snapshot.pause.is_some_and(|pause| pause.request.is_some())
             {
                 return Ok(false);
@@ -1051,7 +1117,7 @@ fn apply_observed(
     started: bool,
     observed: ObservedFacts,
 ) -> Result<(), MediaError> {
-    if started || snapshot.playback_started {
+    if started || snapshot.playback_started || snapshot.playback == InitialPlayback::Paused {
         if let Some(requested) = requested {
             let facts = SessionFacts::verify(requested.clone(), observed)
                 .map_err(MediaError::from_session)?;
@@ -1063,6 +1129,29 @@ fn apply_observed(
         snapshot.playback_started |= started;
     }
     Ok(())
+}
+
+fn update_readiness(snapshot: &mut Snapshot) {
+    snapshot.readiness = if !snapshot.initialized
+        || !snapshot.file_loaded
+        || !snapshot.load_complete
+        || snapshot.session.is_none()
+        || snapshot.stream_ended.is_some()
+        || snapshot.failure.is_some()
+    {
+        None
+    } else {
+        match (
+            snapshot.playback,
+            snapshot.pause.as_ref().map(|pause| pause.paused),
+        ) {
+            (InitialPlayback::Live, Some(false)) if snapshot.playback_started => {
+                Some(OpenReadiness::Live)
+            }
+            (InitialPlayback::Paused, Some(true)) => Some(OpenReadiness::PausedPrepared),
+            _ => None,
+        }
+    };
 }
 
 #[cfg(test)]
@@ -1112,6 +1201,7 @@ pub(crate) mod test_support {
         quiesce_release: Receiver<()>,
         has_handle: bool,
         paused: bool,
+        audio_epoch: Option<AudioEpoch>,
         observed: ObservedFacts,
     }
 
@@ -1151,6 +1241,7 @@ pub(crate) mod test_support {
                     quiesce_release: quiesce_rx,
                     has_handle: false,
                     paused: false,
+                    audio_epoch: None,
                     observed: ObservedFacts::default(),
                 },
             )
@@ -1191,7 +1282,21 @@ pub(crate) mod test_support {
 
         fn next_event(&mut self) -> Result<BackendEvent, MediaError> {
             match self.input.try_recv() {
-                Ok(Input::Event(event)) => Ok(event),
+                Ok(Input::Event(event)) => {
+                    match &event {
+                        BackendEvent::AudioAvailability(AudioAvailability::Opening { epoch }) => {
+                            self.audio_epoch = Some(*epoch);
+                        }
+                        BackendEvent::AudioDetached {
+                            epoch,
+                            outcome: Ok(()),
+                        } if self.audio_epoch == Some(*epoch) => {
+                            self.audio_epoch = None;
+                        }
+                        _ => {}
+                    }
+                    Ok(event)
+                }
                 Ok(Input::Observe(observed)) => {
                     self.observed = observed;
                     Ok(BackendEvent::Other)
@@ -1205,6 +1310,10 @@ pub(crate) mod test_support {
                     Err(MediaError::new("fake_disconnect", "backend disconnected"))
                 }
             }
+        }
+
+        fn audio_epoch(&self) -> Option<AudioEpoch> {
+            self.audio_epoch
         }
 
         fn refresh_pause(&mut self) -> Result<Option<bool>, MediaError> {
@@ -1794,7 +1903,7 @@ mod tests {
         }
         driver.fence();
         let snapshot = owner.take_snapshot().unwrap();
-        assert!(snapshot.file_loaded && snapshot.ended);
+        assert!(snapshot.file_loaded && snapshot.stream_ended == Some((0, 0)));
         owner.stop(generation(), None);
         owner.wait_for_ack().unwrap();
         assert!(owner.take_stopped().unwrap().unwrap().outcome.is_ok());
@@ -2042,7 +2151,7 @@ mod audio_tests {
     }
 
     #[test]
-    fn source_failure_stays_explicit_despite_late_active_then_native_failure_is_terminal() {
+    fn source_loss_stays_audio_only_and_actual_stream_failure_is_correlated() {
         let generation = Generation::new(1).unwrap();
         let (driver, backend) = Driver::pair(Config::default());
         let mut owner = OwnerEndpoint::spawn_with_backend(generation, move || backend).unwrap();
@@ -2055,15 +2164,19 @@ mod audio_tests {
         let failure = AudioError::SourceMissing {
             name: "exact-selected-source".into(),
         };
-        driver.send(BackendEvent::AudioStatus(AudioStatus::RestartRequired(
-            failure.clone(),
-        )));
-        driver.send(BackendEvent::AudioStatus(AudioStatus::Active));
+        driver.send(BackendEvent::AudioAvailability(AudioAvailability::Silent {
+            reason: crate::domain::capture::AudioSilence::WaitingForSource(failure.clone()),
+        }));
         driver.send(BackendEvent::FileLoaded);
         driver.fence();
         let snapshot = owner.take_snapshot().unwrap();
         assert!(snapshot.file_loaded);
-        assert_eq!(snapshot.audio, AudioStatus::RestartRequired(failure));
+        assert_eq!(
+            snapshot.audio,
+            AudioAvailability::Silent {
+                reason: crate::domain::capture::AudioSilence::WaitingForSource(failure),
+            }
+        );
         assert!(snapshot.failure.is_none());
         driver.send(BackendEvent::EndFile {
             reason: 4,
@@ -2080,5 +2193,89 @@ mod audio_tests {
                 .code,
             "playback"
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_readiness_tests {
+    use super::*;
+    use crate::domain::capture::{CaptureMode, CapturedFourCc, FrameRate, FrameSize};
+
+    fn paused_snapshot() -> Snapshot {
+        let mode = CaptureMode {
+            captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
+            size: FrameSize::new(2560, 1440).unwrap(),
+            rate: FrameRate::new(60, 1).unwrap(),
+        };
+        let catalog = crate::capture::linux::session_fixture(&["/dev/video0"], mode);
+        let selection =
+            CaptureSelection::from_snapshot(&catalog, std::path::Path::new("/dev/video0"), mode)
+                .unwrap();
+        let input = selection.validate_snapshot(&catalog).unwrap();
+        Snapshot {
+            generation: Generation::new(1).unwrap(),
+            initialized: true,
+            file_loaded: true,
+            playback_started: false,
+            session: Some(
+                SessionFacts::verify(input.requested().clone(), ObservedFacts::default()).unwrap(),
+            ),
+            pause: Some(PauseObservation {
+                request: None,
+                paused: true,
+            }),
+            stream_ended: None,
+            failure: None,
+            audio: AudioAvailability::Disabled,
+            readiness: None,
+            load_complete: false,
+            playback: InitialPlayback::Paused,
+            audio_detached: None,
+            audio_epoch: None,
+        }
+    }
+
+    #[test]
+    fn prepared_paused_needs_load_terminal_and_real_pause_but_not_playback_restart() {
+        let mut snapshot = paused_snapshot();
+        update_readiness(&mut snapshot);
+        assert_eq!(snapshot.readiness, None);
+        snapshot.load_complete = true;
+        update_readiness(&mut snapshot);
+        assert_eq!(snapshot.readiness, Some(OpenReadiness::PausedPrepared));
+        assert!(!snapshot.playback_started);
+        snapshot.pause = None;
+        update_readiness(&mut snapshot);
+        assert_eq!(snapshot.readiness, None);
+        snapshot.pause = Some(PauseObservation {
+            request: None,
+            paused: false,
+        });
+        update_readiness(&mut snapshot);
+        assert_eq!(snapshot.readiness, None);
+    }
+
+    #[test]
+    fn paused_metadata_never_claims_live_and_terminal_health_revokes_prepared_readiness() {
+        let mut snapshot = paused_snapshot();
+        snapshot.load_complete = true;
+        snapshot.playback = InitialPlayback::Live;
+        snapshot.pause = Some(PauseObservation {
+            request: None,
+            paused: false,
+        });
+        update_readiness(&mut snapshot);
+        assert_eq!(snapshot.readiness, None);
+        snapshot.playback_started = true;
+        update_readiness(&mut snapshot);
+        assert_eq!(snapshot.readiness, Some(OpenReadiness::Live));
+        snapshot.stream_ended = Some((4, -13));
+        update_readiness(&mut snapshot);
+        assert_eq!(snapshot.readiness, None);
+        assert_eq!(snapshot.stream_ended, Some((4, -13)));
+        snapshot.stream_ended = None;
+        snapshot.failure = Some(MediaError::new("capture_metadata", "contradictory format"));
+        update_readiness(&mut snapshot);
+        assert_eq!(snapshot.readiness, None);
     }
 }

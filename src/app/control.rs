@@ -1,7 +1,10 @@
 //! Strict bounded qualification grammar. Draft edits never apply implicitly.
 
 use crate::domain::{
-    capture::{CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize, UsbTopology},
+    capture::{
+        CandidateId, CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize,
+        ObservationEpoch, SelectionToken, UsbTopology, WatchId, WatchStamp,
+    },
     state::{AttemptId, DraftRevision, ProductPhase},
 };
 use std::num::NonZeroU8;
@@ -29,6 +32,10 @@ pub(crate) enum Command {
     Apply(ExpectedState, DraftRevision),
     Restart(ExpectedState),
     Reconnect(ExpectedState),
+    /// Explicit recovery choice for an ambiguous target: the token must be
+    /// one of the currently offered candidates and the expected state guards
+    /// a stale choice.
+    Choose(ExpectedState, SelectionToken),
     Close(ExpectedState),
     Quit(ExpectedState),
     Volume(AttemptId, u8),
@@ -76,6 +83,9 @@ fn expected(
         Some("CleaningFailedResume") => ProductPhase::CleaningFailedResume,
         Some("ErrorWithActiveRestored") => ProductPhase::ErrorWithActiveRestored,
         Some("ErrorWithoutActive") => ProductPhase::ErrorWithoutActive,
+        Some("Disconnected") => ProductPhase::Disconnected,
+        Some("Recovering") => ProductPhase::Recovering,
+        Some("SelectionRequired") => ProductPhase::SelectionRequired,
         Some("Stopping") => ProductPhase::Stopping,
         Some("ShutdownReady") => ProductPhase::ShutdownReady,
         _ => return Err("exact product phase required"),
@@ -190,6 +200,18 @@ pub(crate) fn parse(line: &str) -> Result<Command, &'static str> {
         ),
         "restart" => Command::Restart(expected(&mut fields)?),
         "reconnect" => Command::Reconnect(expected(&mut fields)?),
+        "choose" => {
+            let state = expected(&mut fields)?;
+            let token_error = "choose requires nonzero watch, epoch and candidate identifiers";
+            let token = SelectionToken {
+                stamp: WatchStamp {
+                    watch: WatchId::new(unsigned(fields.next())?).ok_or(token_error)?,
+                    epoch: ObservationEpoch::new(unsigned(fields.next())?).ok_or(token_error)?,
+                },
+                candidate: CandidateId::new(unsigned(fields.next())?).ok_or(token_error)?,
+            };
+            Command::Choose(state, token)
+        }
         "close" => Command::Close(expected(&mut fields)?),
         "quit" => Command::Quit(expected(&mut fields)?),
         "volume" => {
@@ -261,6 +283,48 @@ mod tests {
         for phase in ["PausePending", "Paused"] {
             assert!(parse(&format!("close {phase} 1 1 Complete")).is_ok());
             assert!(parse(&format!("restart {phase} 1 1 Complete")).is_ok());
+        }
+    }
+    #[test]
+    fn recovery_states_are_first_class_expected_phases() {
+        for phase in ["Disconnected", "Recovering", "SelectionRequired"] {
+            assert!(parse(&format!("reconnect {phase} 4 5 Complete")).is_ok());
+            assert!(parse(&format!("restart {phase} 4 5 Complete")).is_ok());
+            assert!(parse(&format!("close {phase} 4 5 Complete")).is_ok());
+            assert!(parse(&format!("quit {phase} 4 5 Complete")).is_ok());
+        }
+    }
+    #[test]
+    fn choose_requires_expected_state_and_nonzero_token_identifiers() {
+        let expected = "SelectionRequired 4 5 Complete";
+        assert_eq!(
+            parse(&format!("choose {expected} 2 3 7")),
+            Ok(Command::Choose(
+                ExpectedState {
+                    phase: ProductPhase::SelectionRequired,
+                    apply: 4,
+                    attempt: 5,
+                    cleanup: ExpectedCleanup::Complete,
+                },
+                SelectionToken {
+                    stamp: WatchStamp {
+                        watch: WatchId::new(2).unwrap(),
+                        epoch: ObservationEpoch::new(3).unwrap(),
+                    },
+                    candidate: CandidateId::new(7).unwrap(),
+                },
+            ))
+        );
+        for line in [
+            format!("choose {expected}"),
+            format!("choose {expected} 0 3 7"),
+            format!("choose {expected} 2 0 7"),
+            format!("choose {expected} 2 3 0"),
+            format!("choose {expected} 2 3"),
+            format!("choose {expected} 2 3 7 extra"),
+            "choose Stopped 2 3 7".to_owned(),
+        ] {
+            assert!(parse(&line).is_err(), "{line}");
         }
     }
     #[test]

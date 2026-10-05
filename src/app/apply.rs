@@ -1,18 +1,22 @@
 //! Serialized product orchestration over opaque validation and session ports.
 
 use crate::domain::{
-    capture::PlaybackGain,
+    capture::{
+        AudioAvailability, AudioEpoch, AudioSelection, AudioSilence, LossEvidence, PlaybackGain,
+        RecoveryObservation, RecoveryWatchTarget, SelectionToken, SourcePresence, WatchStamp,
+    },
     failure::{ApplyFailure, Cause, FailureCategory, LifecycleFailure, Stage, ValidationLayer},
     state::{
         ApplyId, AttemptId, AttemptKey, CleanupStatus, CommandRejection, DraftRevision,
-        DraftSettings, ModelEffect, PlaybackState, ProductModel, ProductPhase, StateIdentity,
-        StopIntent, ValidationRequest,
+        DraftSettings, InitialPlayback, ModelEffect, PlaybackState, ProductModel, ProductPhase,
+        ReconnectAdmission, StateIdentity, StopIntent, ValidationRequest,
     },
 };
 
 use super::ports::{
-    AudioDiagnostic, DraftValidator, ImmediateIntent, OpenReceipt, SessionEvent, SessionRunner,
-    StartFailure, StopReason, StopSubmission, SubmitFailure, SubmitStatus,
+    AudioOutcome, DraftValidator, ImmediateIntent, OpenReadiness, OpenReceipt, SessionEvent,
+    SessionRunner, StartFailure, StopReason, StopSubmission, SubmitFailure, SubmitStatus,
+    ValidationOutcome,
 };
 
 struct Lease {
@@ -22,6 +26,15 @@ struct Lease {
     stopping: bool,
     verified: bool,
     blocked: bool,
+    watch: WatchStamp,
+    playback: InitialPlayback,
+    audio_epoch: Option<AudioEpoch>,
+    last_audio_epoch: u64,
+    audio_stamp: Option<WatchStamp>,
+    audio_retired: bool,
+    audio_detaching: bool,
+    audio_attempted: Option<WatchStamp>,
+    choice: Option<SelectionToken>,
 }
 
 pub struct ApplyCoordinator<V, R>
@@ -36,8 +49,11 @@ where
     validation: Option<ValidationRequest>,
     prepared: Option<(ValidationRequest, V::Prepared)>,
     lease: Option<Lease>,
-    audio: Option<AudioDiagnostic>,
+    audio: Option<AudioAvailability>,
     validator_shutdown: bool,
+    installed_watch: Option<RecoveryWatchTarget>,
+    pending_validation: Option<ValidationRequest>,
+    deferred_ready: Option<(AttemptKey, OpenReceipt)>,
 }
 impl<V, R> ApplyCoordinator<V, R>
 where
@@ -55,6 +71,9 @@ where
             lease: None,
             audio: None,
             validator_shutdown: false,
+            installed_watch: None,
+            pending_validation: None,
+            deferred_ready: None,
         }
     }
     pub fn model(&self) -> &ProductModel {
@@ -69,7 +88,7 @@ where
     pub fn gain(&self) -> PlaybackGain {
         self.gain
     }
-    pub fn audio_diagnostic(&self) -> Option<&AudioDiagnostic> {
+    pub fn audio_availability(&self) -> Option<&AudioAvailability> {
         self.audio.as_ref()
     }
     pub fn edit_draft(
@@ -107,11 +126,22 @@ where
     pub fn reconnect(
         &mut self,
         expected_state: StateIdentity,
-    ) -> Result<ApplyId, CommandRejection> {
+    ) -> Result<ReconnectAdmission, CommandRejection> {
+        if self.validator_shutdown {
+            return Err(CommandRejection::ShuttingDown);
+        }
+        let (admission, effect) = self.model.reconnect(expected_state)?;
+        self.drive(effect)?;
+        Ok(admission)
+    }
+    pub fn choose_recovery(
+        &mut self,
+        expected_state: StateIdentity,
+        token: SelectionToken,
+    ) -> Result<(), CommandRejection> {
         self.check_drain()?;
-        let (id, effect) = self.model.reconnect(expected_state)?;
-        self.drive(Some(effect))?;
-        Ok(id)
+        let effect = self.model.choose_recovery(expected_state, token)?;
+        self.drive(effect)
     }
     /// Decide the toggle from confirmed product state, never from queued media work.
     pub fn toggle_pause(&mut self, attempt: AttemptId) -> Result<SubmitStatus, CommandRejection> {
@@ -153,14 +183,12 @@ where
         Ok(id)
     }
     fn check_playback(&self) -> Result<(), CommandRejection> {
-        self.check_drain()?;
-        if matches!(self.audio, Some(AudioDiagnostic::RestartRequired(_))) {
-            return Err(CommandRejection::PlaybackUnavailable);
-        }
-        Ok(())
+        self.check_drain()
     }
     pub fn close(&mut self, expected_state: StateIdentity) -> Result<(), CommandRejection> {
         let effect = self.model.close(expected_state)?;
+        self.validator.clear_watch();
+        self.installed_watch = None;
         self.cancel_validation();
         self.drive(effect)?;
         self.finish_drain();
@@ -168,6 +196,8 @@ where
     }
     pub fn quit(&mut self) {
         let effect = self.model.quit();
+        self.validator.clear_watch();
+        self.installed_watch = None;
         self.cancel_validation();
         if !self.validator_shutdown {
             self.validator_shutdown = true;
@@ -178,6 +208,8 @@ where
     }
     fn cancel_validation(&mut self) {
         self.prepared = None;
+        self.pending_validation = None;
+        self.deferred_ready = None;
         if let Some(request) = &self.validation {
             self.validator.cancel_validation(request.key);
         }
@@ -196,32 +228,260 @@ where
             diagnostic,
         )
     }
+    fn submit_pending_validation(&mut self) -> Result<(), CommandRejection> {
+        if self.validation.is_some() || self.validator_shutdown {
+            return Ok(());
+        }
+        let Some(request) = self.pending_validation.as_ref() else {
+            return Ok(());
+        };
+        if self.model.validation_request() != Some(request) {
+            self.pending_validation = None;
+            return Ok(());
+        }
+        let Some(target) = self.model.watch_target().cloned() else {
+            return Err(CommandRejection::Disconnected);
+        };
+        if self.installed_watch.as_ref() != Some(&target) {
+            if let Err(error) = self.validator.watch(target.clone()) {
+                let request = self
+                    .pending_validation
+                    .take()
+                    .ok_or(CommandRejection::Disconnected)?;
+                let failure = ApplyFailure::new(
+                    FailureCategory::Validation(ValidationLayer::Discovery),
+                    Stage::Prevalidation,
+                    Cause::Generic,
+                    request.settings.clone(),
+                    "watch_capture",
+                    error.to_string(),
+                );
+                self.model.validation_failed(request, failure);
+                return Err(match error {
+                    SubmitFailure::CapacityUnavailable => CommandRejection::CapacityUnavailable,
+                    SubmitFailure::Disconnected => CommandRejection::Disconnected,
+                });
+            }
+            self.installed_watch = Some(target);
+        }
+        self.poll_observation();
+        let Some(stamp) = self
+            .model
+            .observation()
+            .map(|observation| observation.stamp)
+        else {
+            // Worker creation is not subscription or initial-scan readiness.
+            return Ok(());
+        };
+        let Some(request) = self.model.refresh_validation_stamp(stamp) else {
+            self.pending_validation = None;
+            return Ok(());
+        };
+        self.pending_validation = None;
+        if let Some(RecoveryObservation {
+            video: crate::domain::capture::VideoPresence::Unknown(failure),
+            ..
+        }) = self.model.observation()
+        {
+            let failure = failure.clone();
+            self.model.validation_failed(request, failure);
+            return Ok(());
+        }
+        match self.validator.begin_validate(request.clone()) {
+            Ok(()) => self.validation = Some(request),
+            Err(error) => {
+                let failure = ApplyFailure::new(
+                    FailureCategory::Validation(ValidationLayer::Discovery),
+                    Stage::Prevalidation,
+                    Cause::Generic,
+                    request.settings.clone(),
+                    "submit_validation",
+                    error.to_string(),
+                );
+                self.model.validation_failed(request, failure);
+                return Err(match error {
+                    SubmitFailure::CapacityUnavailable => CommandRejection::CapacityUnavailable,
+                    SubmitFailure::Disconnected => CommandRejection::Disconnected,
+                });
+            }
+        }
+        Ok(())
+    }
+    fn poll_observation(&mut self) {
+        let Some(observation) = self.validator.poll_recovery() else {
+            return;
+        };
+        let effect = self.model.recovery_observed(&observation);
+        if self
+            .validation
+            .as_ref()
+            .is_some_and(|request| self.model.validation_request() != Some(request))
+        {
+            if let Some(request) = &self.validation {
+                self.validator.cancel_validation(request.key);
+            }
+            self.prepared = None;
+        }
+        let _ = self.drive(effect);
+    }
+    fn accept_audio_status(&mut self, attempt: AttemptId, status: AudioAvailability) {
+        let Some(lease) = self.lease.as_mut().filter(|lease| {
+            lease.key.attempt == attempt && !lease.stopping && !lease.owner_stopped
+        }) else {
+            return;
+        };
+        let epoch = match &status {
+            AudioAvailability::Opening { epoch }
+            | AudioAvailability::Detaching { epoch }
+            | AudioAvailability::Blocked { epoch, .. } => Some(*epoch),
+            AudioAvailability::Active { route, .. } => Some(route.epoch),
+            AudioAvailability::Disabled | AudioAvailability::Silent { .. } => None,
+        };
+        if let Some(epoch) = epoch
+            && lease.audio_epoch != Some(epoch)
+        {
+            // The only owner-created transaction is the initial epoch.
+            // Every later epoch must have been admitted by this coordinator.
+            if lease.last_audio_epoch != 0 || epoch.get() != 1 || !lease.audio_retired {
+                return;
+            }
+            lease.audio_epoch = Some(epoch);
+            lease.last_audio_epoch = epoch.get();
+            lease.audio_stamp = Some(lease.watch);
+            lease.audio_retired = false;
+            lease.audio_attempted = Some(lease.watch);
+        }
+        if lease.audio_detaching
+            && matches!(
+                status,
+                AudioAvailability::Active { .. } | AudioAvailability::Opening { .. }
+            )
+        {
+            return;
+        }
+        match &status {
+            AudioAvailability::Disabled if lease.settings.audio.enabled() => return,
+            AudioAvailability::Active { source, route }
+                if !matches!(&lease.settings.audio, AudioSelection::Enabled { source: desired } if desired == source)
+                    || lease.audio_epoch != Some(route.epoch)
+                    || lease.audio_stamp != Some(route.stamp)
+                    || route.source_index == u32::MAX
+                    || route.source_output_index == u32::MAX
+                    || route.client_index == u32::MAX
+                    || self.model.observation().is_some_and(|observation| {
+                        matches!(
+                            observation.audio,
+                            SourcePresence::Absent(_) | SourcePresence::Unknown(_)
+                        )
+                    }) =>
+            {
+                return;
+            }
+            _ => {}
+        }
+        if matches!(
+            status,
+            AudioAvailability::Detaching { .. } | AudioAvailability::Blocked { .. }
+        ) {
+            lease.audio_detaching = true;
+        }
+        self.audio = Some(status);
+    }
+    fn reconcile_audio(&mut self) {
+        let active = self.model.active();
+        let opening = self.model.opening().map(|(key, _)| key);
+        let Some((stamp, audio)) = self
+            .model
+            .observation()
+            .map(|observation| (observation.stamp, observation.audio.clone()))
+        else {
+            return;
+        };
+        let Some(lease) = self.lease.as_mut().filter(|lease| {
+            !lease.stopping
+                && !lease.blocked
+                && !lease.owner_stopped
+                && (active.is_some_and(|active| active.attempt() == lease.key.attempt)
+                    || opening == Some(lease.key))
+        }) else {
+            return;
+        };
+        let attempt = lease.key.attempt;
+        let paused = active.map_or(lease.playback == InitialPlayback::Paused, |active| {
+            active.playback() != PlaybackState::Live
+        });
+        let AudioSelection::Enabled { source } = &lease.settings.audio else {
+            return;
+        };
+        match audio {
+            SourcePresence::Absent(error) | SourcePresence::Unknown(error) => {
+                if let Some(epoch) = lease.audio_epoch {
+                    if !lease.audio_detaching
+                        && self
+                            .runner
+                            .submit_immediate(attempt, ImmediateIntent::DetachAudio { epoch })
+                            == SubmitStatus::Accepted
+                    {
+                        lease.audio_detaching = true;
+                        self.audio = Some(AudioAvailability::Detaching { epoch });
+                    }
+                } else if lease.audio_retired {
+                    self.audio = Some(AudioAvailability::Silent {
+                        reason: AudioSilence::WaitingForSource(error),
+                    });
+                }
+            }
+            SourcePresence::Present
+                if lease.verified
+                    && !paused
+                    && lease.audio_retired
+                    && lease.audio_epoch.is_none()
+                    && lease.audio_attempted != Some(stamp) =>
+            {
+                let Some(value) = lease.last_audio_epoch.checked_add(1) else {
+                    return;
+                };
+                let Some(epoch) = AudioEpoch::new(value) else {
+                    return;
+                };
+                lease.audio_attempted = Some(stamp);
+                if self.runner.submit_immediate(
+                    attempt,
+                    ImmediateIntent::AttachAudio {
+                        epoch,
+                        source: source.clone(),
+                        stamp,
+                    },
+                ) == SubmitStatus::Accepted
+                {
+                    lease.audio_epoch = Some(epoch);
+                    lease.last_audio_epoch = value;
+                    lease.audio_stamp = Some(stamp);
+                    lease.audio_retired = false;
+                    self.audio = Some(AudioAvailability::Opening { epoch });
+                }
+            }
+            _ => {}
+        }
+    }
+    fn retire_lease_selection(&mut self) {
+        if let Some(token) = self.lease.as_mut().and_then(|lease| lease.choice.take()) {
+            self.validator.retire_selection(token);
+        }
+    }
     fn drive(&mut self, mut effect: Option<ModelEffect>) -> Result<(), CommandRejection> {
         // Each event has at most one next effect. Synchronous no-resource failure
         // can advance through the single rollback, never create an unbounded retry.
         while let Some(next) = effect.take() {
             match next {
                 ModelEffect::Validate(request) => {
-                    match self.validator.begin_validate(request.clone()) {
-                        Ok(()) => self.validation = Some(request),
-                        Err(error) => {
-                            let failure = ApplyFailure::new(
-                                FailureCategory::Validation(ValidationLayer::Discovery),
-                                Stage::Prevalidation,
-                                Cause::Generic,
-                                request.settings.clone(),
-                                "submit_validation",
-                                error.to_string(),
-                            );
-                            self.model.validation_failed(request, failure);
-                            return Err(match error {
-                                SubmitFailure::CapacityUnavailable => {
-                                    CommandRejection::CapacityUnavailable
-                                }
-                                SubmitFailure::Disconnected => CommandRejection::Disconnected,
-                            });
-                        }
+                    if let Some(old) = &self.validation
+                        && old != &request
+                    {
+                        self.validator.cancel_validation(old.key);
                     }
+                    self.pending_validation = Some(request);
+                    self.submit_pending_validation()?;
                 }
                 ModelEffect::Open { key, request } => {
                     if self.lease.is_some() {
@@ -231,6 +491,15 @@ where
                             "previous physical lease still owned",
                         );
                         self.model.cleanup_blocked(key.attempt, failure);
+                        continue;
+                    }
+                    if let Some(next) = self.model.cutover_validation(key) {
+                        self.prepared = None;
+                        effect = Some(next);
+                        continue;
+                    }
+                    if self.model.opening().map(|(current, _)| current) != Some(key) {
+                        self.prepared = None;
                         continue;
                     }
                     let prepared = self
@@ -244,6 +513,9 @@ where
                             "matching prepared value unavailable",
                         );
                         let _ = self.model.open_failed(key, failure);
+                        if let Some(token) = request.choice {
+                            self.validator.retire_selection(token);
+                        }
                         effect = self.model.barrier_complete(key.attempt);
                         continue;
                     };
@@ -255,11 +527,24 @@ where
                         stopping: false,
                         verified: false,
                         blocked: false,
+                        watch: request.watch,
+                        playback: request.playback,
+                        audio_epoch: None,
+                        last_audio_epoch: 0,
+                        audio_stamp: None,
+                        audio_retired: true,
+                        audio_detaching: false,
+                        audio_attempted: None,
+                        choice: request.choice,
                     });
-                    match self.runner.begin_open(key, prepared, self.gain) {
+                    match self
+                        .runner
+                        .begin_open(key, prepared, self.gain, request.playback)
+                    {
                         Ok(()) => {}
                         Err(StartFailure::NoResourcesCreated(failure)) => {
                             let _ = self.model.open_failed(key, failure);
+                            self.retire_lease_selection();
                             self.lease = None;
                             effect = self.model.barrier_complete(key.attempt);
                         }
@@ -296,6 +581,10 @@ where
                     match self.runner.stop(attempt, reason) {
                         StopSubmission::Accepted | StopSubmission::AlreadyStopping => {}
                         StopSubmission::NoResourcesCreated if !lease.verified => {
+                            let choice = lease.choice.take();
+                            if let Some(token) = choice {
+                                self.validator.retire_selection(token);
+                            }
                             self.lease = None;
                             effect = self.model.barrier_complete(attempt);
                         }
@@ -343,7 +632,11 @@ where
                 let effect = self.model.session_failed(attempt, failure);
                 let _ = self.drive(effect);
             }
-            SessionEvent::SessionEnded { attempt } => {
+            SessionEvent::StreamEnded {
+                attempt,
+                reason,
+                error,
+            } => {
                 let Some(lease) = self
                     .lease
                     .as_ref()
@@ -356,10 +649,14 @@ where
                     Stage::Unknown,
                     Cause::Generic,
                     lease.settings.clone(),
-                    "session_ended",
-                    "capture session ended",
+                    "stream_ended",
+                    format!("capture stream ended: reason={reason}, error={error}"),
                 );
-                let effect = self.model.session_failed(attempt, failure);
+                let effect = self.model.video_lost(
+                    attempt,
+                    LossEvidence::StreamEnded { reason, error },
+                    failure,
+                );
                 let _ = self.drive(effect);
             }
             SessionEvent::PauseObserved {
@@ -403,6 +700,9 @@ where
                     self.model.cleanup_error(attempt, failure);
                 }
                 if let Some(lease) = &mut self.lease {
+                    // The matching destruction acknowledgement retires audio
+                    // even while the native parent still awaits release.
+                    self.audio = None;
                     lease.owner_stopped = true;
                     lease.stopping = true;
                 }
@@ -415,6 +715,7 @@ where
                 {
                     return;
                 }
+                self.retire_lease_selection();
                 self.lease = None;
                 self.audio = None;
                 let effect = self.model.barrier_complete(attempt);
@@ -435,38 +736,126 @@ where
                 lease.blocked = true;
                 self.model.cleanup_blocked(attempt, failure);
             }
-            SessionEvent::AudioDiagnostic { attempt, status } => {
-                if !self.known_attempt(attempt)
-                    || self.lease.as_ref().is_some_and(|lease| lease.stopping)
+            SessionEvent::AudioAvailability { attempt, status } => {
+                self.accept_audio_status(attempt, status);
+            }
+            SessionEvent::AudioDetached {
+                attempt,
+                epoch,
+                outcome,
+            } => {
+                let Some(lease) = self.lease.as_mut().filter(|lease| {
+                    lease.key.attempt == attempt && !lease.stopping && !lease.owner_stopped
+                }) else {
+                    return;
+                };
+                if lease.audio_epoch.is_none()
+                    && lease.audio_retired
+                    && lease.last_audio_epoch == 0
+                    && epoch.get() == 1
+                    && lease.settings.audio.enabled()
                 {
+                    // The initial Add and its real retirement can coalesce before
+                    // any Opening snapshot is consumed. The genuine detached
+                    // receipt itself carries that consumed epoch high-water.
+                    lease.audio_epoch = Some(epoch);
+                    lease.last_audio_epoch = epoch.get();
+                    lease.audio_retired = false;
+                    lease.audio_stamp = Some(lease.watch);
+                    lease.audio_attempted = Some(lease.watch);
+                }
+                if lease.audio_epoch != Some(epoch) || lease.audio_retired {
                     return;
                 }
-                if let AudioDiagnostic::RestartRequired(error) = &status
-                    && let Some((key, settings)) = self.model.opening()
-                {
-                    let failure = ApplyFailure::new(
-                        FailureCategory::Session,
-                        Stage::Open,
-                        Cause::Generic,
-                        settings.clone(),
-                        "audio_open",
-                        error.to_string(),
-                    );
-                    let effect = self.model.open_failed(key, failure);
-                    let _ = self.drive(effect);
+                match outcome {
+                    Ok(()) => {
+                        lease.audio_epoch = None;
+                        lease.audio_retired = true;
+                        lease.audio_detaching = false;
+                        lease.audio_stamp = None;
+                        if matches!(self.audio, Some(AudioAvailability::Detaching { .. })) {
+                            self.audio = Some(AudioAvailability::Silent {
+                                reason: AudioSilence::PendingRoute,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        self.audio = Some(AudioAvailability::Blocked {
+                            epoch,
+                            error: error.clone(),
+                        });
+                        let failure = ApplyFailure::new(
+                            FailureCategory::Lifecycle(LifecycleFailure::Protocol),
+                            Stage::Open,
+                            Cause::Generic,
+                            lease.settings.clone(),
+                            "audio_detach",
+                            error.to_string(),
+                        );
+                        // Reuse is unsafe only when real retirement failed.
+                        let effect = self.model.session_failed(attempt, failure);
+                        let _ = self.drive(effect);
+                    }
                 }
-                self.audio = Some(status);
             }
         }
     }
-    fn commit_receipt(&mut self, key: AttemptKey, receipt: OpenReceipt) {
+    fn commit_receipt(&mut self, key: AttemptKey, mut receipt: OpenReceipt) {
         if !self.known_key(key) || self.model.opening().map(|(current, _)| current) != Some(key) {
             return;
         }
         let Some((_, settings)) = self.model.opening() else {
             return;
         };
-        if !receipt.matches(settings) {
+        if let AudioOutcome::Active { source, route } = &receipt.audio
+            && receipt.matches(settings)
+            && self.lease.as_ref().is_some_and(|lease| {
+                route.stamp == lease.watch
+                    && route.epoch.get() == lease.last_audio_epoch
+                    && route.source_index != u32::MAX
+                    && route.source_output_index != u32::MAX
+                    && route.client_index != u32::MAX
+            })
+        {
+            match &self.audio {
+                Some(AudioAvailability::Silent { reason }) => {
+                    // Video proof survives an independently observed, genuinely
+                    // silent audio retirement. This is never an Active receipt.
+                    receipt.audio = AudioOutcome::Silent {
+                        source: source.clone(),
+                        reason: reason.clone(),
+                    };
+                }
+                Some(AudioAvailability::Detaching { .. }) => {
+                    // Retain one bounded readiness proof while the genuine
+                    // audio-only barrier completes; do not destroy video.
+                    self.deferred_ready = Some((key, receipt));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let readiness_matches = self.model.opening_request().is_some_and(|request| {
+            matches!(
+                (request.playback, receipt.readiness),
+                (InitialPlayback::Live, OpenReadiness::Live)
+                    | (InitialPlayback::Paused, OpenReadiness::PausedPrepared)
+            )
+        });
+        let audio_matches = match &receipt.audio {
+            AudioOutcome::Active { source, route } => self.lease.as_ref().is_some_and(|lease| {
+                lease.audio_epoch == Some(route.epoch)
+                    && lease.audio_stamp == Some(route.stamp)
+                    && route.stamp == lease.watch
+                    && route.source_index != u32::MAX
+                    && route.source_output_index != u32::MAX
+                    && route.client_index != u32::MAX
+                    && matches!(&self.audio, Some(AudioAvailability::Active { source: active, route: observed })
+                        if active == source && observed == route)
+            }),
+            AudioOutcome::Silent { .. } | AudioOutcome::Disabled => true,
+        };
+        if !receipt.matches(settings) || !readiness_matches || !audio_matches {
             let failure = Self::protocol_failure(
                 settings.clone(),
                 "open_receipt",
@@ -480,14 +869,48 @@ where
         if let Some(lease) = &mut self.lease {
             lease.verified = true;
         }
-        self.audio = Some(if receipt.settings.audio.enabled() {
-            AudioDiagnostic::Active
-        } else {
-            AudioDiagnostic::Disabled
+        if !matches!(
+            self.audio,
+            Some(AudioAvailability::Detaching { .. } | AudioAvailability::Blocked { .. })
+        ) {
+            self.audio = Some(match receipt.audio {
+                AudioOutcome::Disabled => AudioAvailability::Disabled,
+                AudioOutcome::Silent { reason, .. } => AudioAvailability::Silent { reason },
+                AudioOutcome::Active { source, route } => {
+                    AudioAvailability::Active { source, route }
+                }
+            });
+        }
+        // A physical choice is authorized for this one opening only, including
+        // the case where its complete identity equals the saved target.
+        self.retire_lease_selection();
+        let watch_result = self.model.committed_watch().and_then(|target| {
+            if let Some(target) = target {
+                self.validator
+                    .watch(target.clone())
+                    .map_err(|error| match error {
+                        SubmitFailure::CapacityUnavailable => CommandRejection::CapacityUnavailable,
+                        SubmitFailure::Disconnected => CommandRejection::Disconnected,
+                    })?;
+                self.installed_watch = Some(target);
+            }
+            Ok(())
         });
+        if let Err(error) = watch_result {
+            let settings = self.lease.as_ref().map(|lease| lease.settings.clone());
+            if let Some(settings) = settings {
+                let failure =
+                    Self::protocol_failure(settings, "committed_watch", &error.to_string());
+                let effect = self.model.session_failed(key.attempt, failure);
+                let _ = self.drive(effect);
+            }
+        }
     }
     pub fn poll(&mut self) {
-        let mut ready = None;
+        // Subscribe/observe health first; positive removals invalidate even a
+        // coalesced Present before any cached media readiness can be committed.
+        self.poll_observation();
+        let mut ready = self.deferred_ready.take();
         // One bounded batch. Terminal resource/health events beat readiness even
         // if a faulty adapter presents a cached Ready before its acknowledgement.
         for _ in 0..16 {
@@ -503,6 +926,8 @@ where
                 other => self.handle_event(other),
             }
         }
+        self.poll_observation();
+        self.reconcile_audio();
         if let Some((key, receipt)) = ready {
             self.commit_receipt(key, receipt);
         }
@@ -516,31 +941,100 @@ where
                 return;
             };
             if self.model.validation_request() == Some(&request) {
-                if result.request != request {
+                if result.request != request
+                    || result.stamp.watch != request.watch.watch
+                    || result.stamp.epoch.get() < request.watch.epoch.get()
+                {
                     let failure = Self::protocol_failure(
                         request.settings.clone(),
                         "validation_result",
-                        "terminal validation identity mismatch",
+                        "terminal validation identity or fresh stamp mismatch",
                     );
+                    if let Some(token) = request.choice {
+                        self.validator.retire_selection(token);
+                    }
                     self.model.validation_failed(request, failure);
+                } else if let Some(stamp) = self
+                    .model
+                    .observation()
+                    .map(|observation| observation.stamp)
+                    && stamp.watch == result.stamp.watch
+                    && stamp.epoch.get() > result.stamp.epoch.get()
+                {
+                    // A fresher authoritative observation supersedes this completed
+                    // snapshot without turning invalidation into a real open failure.
+                    if let Some(refreshed) = self.model.refresh_validation_stamp(stamp) {
+                        let _ = self.drive(Some(ModelEffect::Validate(refreshed)));
+                    }
                 } else {
                     match result.result {
-                        Ok(prepared) => {
-                            self.prepared = Some((request.clone(), prepared));
-                            let effect = self.model.validation_succeeded(&request);
-                            let _ = self.drive(effect);
+                        ValidationOutcome::Prepared(prepared) => {
+                            let settings = V::prepared_settings(&prepared).clone();
+                            let stamp = V::prepared_stamp(&prepared);
+                            if stamp != result.stamp {
+                                let failure = Self::protocol_failure(
+                                    request.settings.clone(),
+                                    "validation_result",
+                                    "prepared evidence and completed observation disagree",
+                                );
+                                if let Some(token) = request.choice {
+                                    self.validator.retire_selection(token);
+                                }
+                                self.model.validation_failed(request, failure);
+                            } else if let Some(accepted) =
+                                self.model.accept_prepared(&request, settings, stamp)
+                            {
+                                self.prepared = Some((accepted.clone(), prepared));
+                                let effect = self.model.validation_succeeded(&accepted);
+                                let _ = self.drive(effect);
+                            } else {
+                                let failure = Self::protocol_failure(
+                                    request.settings.clone(),
+                                    "validation_result",
+                                    "prepared settings do not preserve the requested tuple and audio",
+                                );
+                                if let Some(token) = request.choice {
+                                    self.validator.retire_selection(token);
+                                }
+                                self.model.validation_failed(request, failure);
+                            }
                         }
-                        Err(failure) => self.model.validation_failed(request, failure),
+                        ValidationOutcome::SelectionRequired(candidates) => {
+                            self.model.selection_required(&request, candidates);
+                            if let Some(token) = request.choice {
+                                self.validator.retire_selection(token);
+                            }
+                        }
+                        ValidationOutcome::Failed(failure) => {
+                            // Failed results also carry a genuinely completed
+                            // scan stamp; latch that reality, not the old request.
+                            let completed = self
+                                .model
+                                .refresh_validation_stamp(result.stamp)
+                                .unwrap_or(request);
+                            if let Some(token) = completed.choice {
+                                self.validator.retire_selection(token);
+                            }
+                            self.model.validation_failed(completed, failure);
+                        }
                     }
                 }
             }
         }
+        let _ = self.submit_pending_validation();
+        if self.validation.is_none() && self.pending_validation.is_none() {
+            let effect = self.model.continue_recovery();
+            let _ = self.drive(effect);
+        }
+        self.reconcile_audio();
         self.finish_drain();
     }
     fn finish_drain(&mut self) {
         let retired = self.validator_shutdown && self.validator.shutdown_complete();
-        self.model
-            .drain_complete(self.validation.is_none(), retired);
+        self.model.drain_complete(
+            self.validation.is_none() && self.pending_validation.is_none(),
+            retired,
+        );
     }
     /// Retain an admitted application preference, including owner-free replacement
     /// gaps. A healthy Opening/Ready owner must admit it before it is retained.
@@ -639,29 +1133,59 @@ mod tests {
                 nominal_rate: FactStatus::Approximate,
             },
             audio: AudioOutcome::Disabled,
+            readiness: OpenReadiness::Live,
         }
+    }
+    #[derive(Clone)]
+    struct TestPrepared {
+        settings: DraftSettings,
+        stamp: WatchStamp,
     }
     #[derive(Default)]
     struct Validator {
         request: Option<ValidationRequest>,
-        result: Option<ValidationResult<DraftSettings>>,
+        result: Option<ValidationResult<TestPrepared>>,
         requests: Vec<ValidationRequest>,
         cancelled: bool,
         shutdown: bool,
         retired: bool,
         reject: Option<SubmitFailure>,
+        target: Option<RecoveryWatchTarget>,
+        observation: Option<RecoveryObservation>,
+        watches: Vec<RecoveryWatchTarget>,
+        observed: Option<WatchStamp>,
+        cutovers: Vec<ValidationRequest>,
+        delay_initial: bool,
+        defer_cutover: bool,
+        watcher_join_pending: bool,
+        grant: Option<SelectionToken>,
+        retired_choices: Vec<SelectionToken>,
     }
     impl Validator {
         fn finish(&mut self, result: Result<(), ApplyFailure>) {
             let request = self.request.take().unwrap();
+            let stamp = self.observed.unwrap_or(request.watch);
             self.result = Some(ValidationResult {
-                result: result.map(|()| request.settings.clone()),
+                stamp,
+                result: match result {
+                    Ok(()) => ValidationOutcome::Prepared(TestPrepared {
+                        settings: request.settings.clone(),
+                        stamp,
+                    }),
+                    Err(failure) => ValidationOutcome::Failed(failure),
+                },
                 request,
             });
         }
     }
     impl DraftValidator for Validator {
-        type Prepared = DraftSettings;
+        type Prepared = TestPrepared;
+        fn prepared_settings(prepared: &Self::Prepared) -> &DraftSettings {
+            &prepared.settings
+        }
+        fn prepared_stamp(prepared: &Self::Prepared) -> WatchStamp {
+            prepared.stamp
+        }
         fn begin_validate(&mut self, request: ValidationRequest) -> Result<(), SubmitFailure> {
             if let Some(rejection) = self.reject.take() {
                 return Err(rejection);
@@ -669,8 +1193,22 @@ mod tests {
             if self.request.is_some() || self.result.is_some() {
                 return Err(SubmitFailure::CapacityUnavailable);
             }
-            self.requests.push(request.clone());
+            let cutover = self
+                .requests
+                .iter()
+                .any(|prior| prior.key == request.key && prior.watch.watch != request.watch.watch);
+            if cutover {
+                self.cutovers.push(request.clone());
+            } else {
+                self.requests.push(request.clone());
+            }
+            if let Some(token) = request.choice {
+                self.grant = Some(token);
+            }
             self.request = Some(request);
+            if cutover && !self.defer_cutover {
+                self.finish(Ok(()));
+            }
             Ok(())
         }
         fn poll_validation(&mut self) -> Option<ValidationResult<Self::Prepared>> {
@@ -679,11 +1217,55 @@ mod tests {
         fn cancel_validation(&mut self, _: ValidationKey) {
             self.cancelled = true;
         }
+        fn watch(&mut self, target: RecoveryWatchTarget) -> Result<(), SubmitFailure> {
+            if !self.delay_initial {
+                self.observation = Some(RecoveryObservation {
+                    stamp: WatchStamp {
+                        watch: target.watch,
+                        epoch: crate::domain::capture::ObservationEpoch::new(1).unwrap(),
+                    },
+                    video: crate::domain::capture::VideoPresence::Present,
+                    audio: if target.audio.enabled() {
+                        SourcePresence::Present
+                    } else {
+                        SourcePresence::Disabled
+                    },
+                    last_video_removal: None,
+                });
+            }
+            self.watches.push(target.clone());
+            self.target = Some(target);
+            Ok(())
+        }
+        fn poll_recovery(&mut self) -> Option<RecoveryObservation> {
+            let observation = self.observation.take();
+            if let Some(observation) = &observation
+                && self.target.as_ref().map(|target| target.watch) == Some(observation.stamp.watch)
+                && self.observed.is_none_or(|old| {
+                    old.watch != observation.stamp.watch
+                        || old.epoch.get() <= observation.stamp.epoch.get()
+                })
+            {
+                self.observed = Some(observation.stamp);
+            }
+            observation
+        }
+        fn clear_watch(&mut self) {
+            self.target = None;
+            self.observation = None;
+            self.grant = None;
+        }
+        fn retire_selection(&mut self, token: SelectionToken) {
+            if self.grant == Some(token) {
+                self.grant = None;
+                self.retired_choices.push(token);
+            }
+        }
         fn shutdown(&mut self) {
             self.shutdown = true;
         }
         fn shutdown_complete(&mut self) -> bool {
-            self.retired
+            self.retired && !self.watcher_join_pending
         }
     }
     #[derive(Default)]
@@ -695,14 +1277,18 @@ mod tests {
         intents: Vec<(AttemptId, ImmediateIntent)>,
         start_failure: Option<StartFailure>,
         stop_failure: Option<StopSubmission>,
+        playback: Vec<InitialPlayback>,
     }
     impl Runner {
         fn verified(&mut self) {
             let (key, settings, _) = self.opens.last().unwrap();
-            self.events.push_back(SessionEvent::OpenVerified {
-                key: *key,
-                receipt: receipt(settings.clone()),
-            });
+            let mut receipt = receipt(settings.clone());
+            receipt.readiness = match self.playback.last().unwrap() {
+                InitialPlayback::Live => OpenReadiness::Live,
+                InitialPlayback::Paused => OpenReadiness::PausedPrepared,
+            };
+            self.events
+                .push_back(SessionEvent::OpenVerified { key: *key, receipt });
         }
         fn fail(&mut self, detail: &str) {
             let (key, settings, _) = self.opens.last().unwrap();
@@ -721,14 +1307,16 @@ mod tests {
         }
     }
     impl SessionRunner for Runner {
-        type Prepared = DraftSettings;
+        type Prepared = TestPrepared;
         fn begin_open(
             &mut self,
             key: AttemptKey,
-            prepared: DraftSettings,
+            prepared: TestPrepared,
             gain: PlaybackGain,
+            playback: InitialPlayback,
         ) -> Result<(), StartFailure> {
-            self.opens.push((key, prepared, gain));
+            self.opens.push((key, prepared.settings, gain));
+            self.playback.push(playback);
             self.start_failure.take().map_or(Ok(()), Err)
         }
         fn stop(&mut self, attempt: AttemptId, reason: StopReason) -> StopSubmission {
@@ -1191,16 +1779,13 @@ mod tests {
         assert_eq!(engine.model().state_identity(), paused);
         assert!(engine.model().validation_request().is_none());
         assert_eq!(engine.runner_mut().intents.len(), submissions);
-        engine.audio = Some(AudioDiagnostic::RestartRequired(
-            crate::domain::capture::AudioError::Cancelled,
-        ));
-        assert_eq!(
-            engine.pause(stale),
-            Err(CommandRejection::PlaybackUnavailable)
-        );
+        engine.audio = Some(AudioAvailability::Silent {
+            reason: AudioSilence::WaitingForSource(crate::domain::capture::AudioError::Cancelled),
+        });
+        assert_eq!(engine.pause(stale), Err(CommandRejection::StaleState));
         assert_eq!(
             engine.resume(paused, stale),
-            Err(CommandRejection::PlaybackUnavailable)
+            Err(CommandRejection::StaleState)
         );
         assert_eq!(engine.model().state_identity(), paused);
         engine.quit();
@@ -1340,62 +1925,32 @@ mod tests {
     }
 
     #[test]
-    fn audio_restart_required_rejects_pause_without_submitting_or_changing_playback() {
+    fn audio_only_silence_keeps_pause_available_and_video_owner() {
         let mut engine = engine();
         let attempt = initial(&mut engine);
-        engine.audio = Some(AudioDiagnostic::RestartRequired(
-            crate::domain::capture::AudioError::Backend {
-                operation: "audio".into(),
-                code: None,
-                detail: "source lost".into(),
-            },
-        ));
-        assert_eq!(
-            engine.toggle_pause(attempt),
-            Err(CommandRejection::PlaybackUnavailable)
-        );
-        assert_eq!(
+        engine.audio = Some(AudioAvailability::Silent {
+            reason: AudioSilence::WaitingForSource(crate::domain::capture::AudioError::Cancelled),
+        });
+        assert_eq!(engine.toggle_pause(attempt), Ok(SubmitStatus::Accepted));
+        assert!(matches!(
             engine.model().active().unwrap().playback(),
-            PlaybackState::Live
-        );
-        assert!(engine.model().can_restart());
-        assert!(engine.runner_mut().intents.is_empty());
+            PlaybackState::PausePending { .. }
+        ));
+        assert!(engine.runner_mut().stops.is_empty());
+        assert_eq!(engine.runner_mut().opens.len(), 1);
     }
 
     #[test]
-    fn audio_restart_required_rejects_paused_resume_but_explicit_restart_remains_available() {
+    fn audio_only_silence_keeps_fresh_paused_resume_available() {
         let mut engine = engine();
         let attempt = initial(&mut engine);
         confirm_pause(&mut engine, attempt);
-        engine.audio = Some(AudioDiagnostic::RestartRequired(
-            crate::domain::capture::AudioError::Backend {
-                operation: "audio".into(),
-                code: None,
-                detail: "source lost".into(),
-            },
-        ));
-        let expected = engine.model().state_identity();
-        assert_eq!(
-            engine.toggle_pause(attempt),
-            Err(CommandRejection::PlaybackUnavailable)
-        );
-        assert_eq!(
-            engine.resume(expected, attempt),
-            Err(CommandRejection::PlaybackUnavailable)
-        );
-        assert_eq!(
-            engine.model().active().unwrap().playback(),
-            PlaybackState::Paused
-        );
-        assert!(matches!(
-            engine.audio_diagnostic(),
-            Some(AudioDiagnostic::RestartRequired(_))
-        ));
-        engine.restart(expected).unwrap();
-        assert_eq!(
-            engine.validator.requests.last().unwrap().key.purpose,
-            AttemptPurpose::Candidate
-        );
+        engine.audio = Some(AudioAvailability::Silent {
+            reason: AudioSilence::WaitingForSource(crate::domain::capture::AudioError::Cancelled),
+        });
+        engine
+            .resume(engine.model().state_identity(), attempt)
+            .unwrap();
         validate(&mut engine);
         engine.runner_mut().barrier(attempt);
         engine.poll();
@@ -1405,7 +1960,10 @@ mod tests {
             engine.model().active().unwrap().playback(),
             PlaybackState::Live
         );
-        assert_eq!(engine.audio_diagnostic(), Some(&AudioDiagnostic::Disabled));
+        assert_eq!(
+            engine.audio_availability(),
+            Some(&AudioAvailability::Disabled)
+        );
     }
 
     #[test]
@@ -1955,7 +2513,11 @@ mod tests {
                         outcome: Ok(()),
                     }
                 } else {
-                    SessionEvent::SessionEnded { attempt: old }
+                    SessionEvent::StreamEnded {
+                        attempt: old,
+                        reason: 0,
+                        error: 0,
+                    }
                 });
                 engine.poll();
                 assert!(engine.model().active().is_none());
@@ -2030,13 +2592,31 @@ mod tests {
             validate(&mut engine);
             let key = engine.runner_mut().opens[0].0;
             let mut opened = receipt(selected);
+            let route = crate::domain::capture::AudioRouteReceipt {
+                epoch: AudioEpoch::new(1).unwrap(),
+                stamp: engine.lease.as_ref().unwrap().watch,
+                source_index: 7,
+                source_output_index: 8,
+                client_index: 9,
+            };
             opened.audio = match outcome {
                 0 => AudioOutcome::Disabled,
                 1 => AudioOutcome::Active {
                     source: AudioSourceIdentity::new("wrong".into(), vec![]).unwrap(),
+                    route: route.clone(),
                 },
-                _ => AudioOutcome::Active { source },
+                _ => AudioOutcome::Active {
+                    source: source.clone(),
+                    route: route.clone(),
+                },
             };
+            engine
+                .runner_mut()
+                .events
+                .push_back(SessionEvent::AudioAvailability {
+                    attempt: key.attempt,
+                    status: AudioAvailability::Active { source, route },
+                });
             engine
                 .runner_mut()
                 .events
@@ -2051,7 +2631,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_restart_required_before_receipt_fails_candidate_but_missing_video_observations_remain_unverified()
+    fn unsafe_audio_retirement_before_receipt_fails_candidate_but_missing_video_observations_remain_unverified()
      {
         let mut engine = engine();
         apply(&mut engine);
@@ -2061,12 +2641,12 @@ mod tests {
         engine
             .runner_mut()
             .events
-            .push_back(SessionEvent::AudioDiagnostic {
+            .push_back(SessionEvent::SessionFailed {
                 attempt: key.attempt,
-                status: AudioDiagnostic::RestartRequired(
-                    crate::domain::capture::AudioError::RecordingLost {
-                        detail: "transport".into(),
-                    },
+                failure: failure(
+                    settings(60),
+                    FailureCategory::Lifecycle(LifecycleFailure::Protocol),
+                    "audio demux retirement could not be proven",
                 ),
             });
         engine.poll();
@@ -2119,8 +2699,12 @@ mod tests {
         let mut request = engine.validator_mut().request.take().unwrap();
         request.settings = settings(30);
         engine.validator_mut().result = Some(ValidationResult {
+            stamp: request.watch,
+            result: ValidationOutcome::Prepared(TestPrepared {
+                settings: settings(30),
+                stamp: request.watch,
+            }),
             request,
-            result: Ok(settings(30)),
         });
         engine.poll();
         assert_eq!(engine.model().active().unwrap().attempt(), old);
@@ -2281,14 +2865,19 @@ mod tests {
         engine
             .runner_mut()
             .events
-            .push_back(SessionEvent::AudioDiagnostic {
+            .push_back(SessionEvent::AudioAvailability {
                 attempt: old,
-                status: AudioDiagnostic::RestartRequired(
-                    crate::domain::capture::AudioError::Cancelled,
-                ),
+                status: AudioAvailability::Silent {
+                    reason: AudioSilence::WaitingForSource(
+                        crate::domain::capture::AudioError::Cancelled,
+                    ),
+                },
             });
         engine.poll();
-        assert_eq!(engine.audio_diagnostic(), Some(&AudioDiagnostic::Disabled));
+        assert_eq!(
+            engine.audio_availability(),
+            Some(&AudioAvailability::Disabled)
+        );
         assert_eq!(engine.model().active().unwrap().attempt(), current);
     }
     #[test]
@@ -2556,5 +3145,1423 @@ mod tests {
         assert!(report.incumbent.is_some());
         assert!(!engine.model().can_reconnect());
         assert_eq!(engine.runner_mut().opens.len(), 1);
+    }
+    fn observation(
+        engine: &Engine,
+        epoch: u64,
+        video: crate::domain::capture::VideoPresence,
+        audio: SourcePresence,
+        removal: Option<u64>,
+    ) -> RecoveryObservation {
+        RecoveryObservation {
+            stamp: WatchStamp {
+                watch: engine.model().watch_target().unwrap().watch,
+                epoch: crate::domain::capture::ObservationEpoch::new(epoch).unwrap(),
+            },
+            video,
+            audio,
+            last_video_removal: removal
+                .map(|value| crate::domain::capture::ObservationEpoch::new(value).unwrap()),
+        }
+    }
+    fn observe(engine: &mut Engine, observation: RecoveryObservation) {
+        engine.validator.observation = Some(observation);
+        engine.poll();
+    }
+    fn eof(engine: &mut Engine, attempt: AttemptId) {
+        engine.runner.events.push_back(SessionEvent::StreamEnded {
+            attempt,
+            reason: 0,
+            error: 0,
+        });
+        engine.poll();
+    }
+    fn recovered(engine: &mut Engine, old: AttemptId) -> AttemptId {
+        engine.runner.barrier(old);
+        engine.poll();
+        validate(engine);
+        engine.runner.verified();
+        engine.poll();
+        engine.model().active().unwrap().attempt()
+    }
+    #[test]
+    fn initial_open_waits_for_authoritative_subscription_scan() {
+        let mut engine = engine();
+        engine.validator.delay_initial = true;
+        apply(&mut engine);
+        assert_eq!(engine.model().phase(), ProductPhase::Validating);
+        assert!(engine.validator.requests.is_empty());
+        assert!(engine.runner.opens.is_empty());
+        engine.poll();
+        assert!(engine.validator.requests.is_empty());
+        let current = observation(
+            &engine,
+            1,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Disabled,
+            None,
+        );
+        observe(&mut engine, current);
+        assert_eq!(engine.validator.requests.len(), 1);
+        validate(&mut engine);
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::Active);
+    }
+    #[test]
+    fn eof_alone_freezes_saved_state_and_removal_upgrades_without_duplicate_stop() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        engine
+            .edit_draft(engine.model().draft().revision, settings(30))
+            .unwrap();
+        eof(&mut engine, old);
+        assert_eq!(engine.model().phase(), ProductPhase::Disconnected);
+        let loss = engine.model().recovery().unwrap();
+        assert_eq!(loss.applied.settings(), &settings(60));
+        assert_eq!(
+            loss.evidence,
+            LossEvidence::StreamEnded {
+                reason: 0,
+                error: 0
+            }
+        );
+        let pending = engine.model().state_identity().operation().unwrap();
+        assert_eq!(
+            engine.reconnect(engine.model().state_identity()),
+            Ok(ReconnectAdmission::Joined(pending))
+        );
+        let real_failure = ApplyFailure::new(
+            FailureCategory::Session,
+            Stage::StreamStart,
+            Cause::Generic,
+            settings(60),
+            "backend_end",
+            "genuine structured media termination",
+        );
+        engine.runner.events.push_back(SessionEvent::SessionFailed {
+            attempt: old,
+            failure: real_failure.clone(),
+        });
+        let removed = observation(
+            &engine,
+            2,
+            crate::domain::capture::VideoPresence::Absent,
+            SourcePresence::Disabled,
+            Some(2),
+        );
+        observe(&mut engine, removed.clone());
+        assert_eq!(engine.model().recovery().unwrap().failure, real_failure);
+        assert_eq!(
+            engine.model().recovery().unwrap().evidence,
+            LossEvidence::Removed {
+                stamp: removed.stamp
+            }
+        );
+        assert_eq!(engine.runner.stops.len(), 1);
+        engine.runner.barrier(old);
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::Disconnected);
+        assert_eq!(engine.runner.opens.len(), 1);
+        let returned = observation(
+            &engine,
+            3,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Disabled,
+            Some(2),
+        );
+        observe(&mut engine, returned.clone());
+        assert_eq!(
+            engine.validator.request.as_ref().unwrap().settings,
+            settings(60)
+        );
+        assert_eq!(
+            engine.validator.request.as_ref().unwrap().key.apply,
+            pending
+        );
+        observe(&mut engine, returned);
+        assert_eq!(engine.validator.requests.len(), 2);
+        validate(&mut engine);
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(
+            engine.model().last_valid().unwrap().settings(),
+            &settings(60)
+        );
+        assert_eq!(engine.model().draft().settings, settings(30));
+        assert_eq!(
+            engine.reconnect(engine.model().state_identity()),
+            Ok(ReconnectAdmission::HealthyNoop)
+        );
+        assert_eq!(engine.runner.opens.len(), 2);
+    }
+    #[test]
+    fn removal_alone_with_coalesced_return_revokes_live_and_requires_both_barriers() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        let returned = observation(
+            &engine,
+            3,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Disabled,
+            Some(2),
+        );
+        observe(&mut engine, returned);
+        assert!(engine.model().active().is_none());
+        assert!(matches!(
+            engine.model().recovery().unwrap().evidence,
+            LossEvidence::Removed { .. }
+        ));
+        assert_eq!(engine.runner.stops.len(), 1);
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::NativeReleased { attempt: old });
+        engine.poll();
+        assert_eq!(engine.validator.requests.len(), 1);
+        engine.runner.events.push_back(SessionEvent::OwnerStopped {
+            attempt: old,
+            outcome: Ok(()),
+        });
+        engine.poll();
+        assert_eq!(engine.validator.requests.len(), 1);
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::NativeReleased { attempt: old });
+        engine.poll();
+        assert_eq!(engine.validator.requests.len(), 2);
+        validate(&mut engine);
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::Active);
+        assert_eq!(engine.runner.opens.len(), 2);
+    }
+    #[test]
+    fn coalesced_removal_invalidates_validation_and_drains_its_old_terminal_result() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        eof(&mut engine, old);
+        engine.runner.barrier(old);
+        engine.poll();
+        let invalidated = engine.validator.request.as_ref().unwrap().clone();
+        let returned = observation(
+            &engine,
+            3,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Disabled,
+            Some(2),
+        );
+        observe(&mut engine, returned);
+        assert!(engine.validator.cancelled);
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert_eq!(engine.validator.requests.len(), 2);
+        engine.validator.finish(Ok(()));
+        engine.poll();
+        assert_eq!(engine.runner.opens.len(), 1);
+        let replacement = engine.validator.request.as_ref().unwrap();
+        assert_eq!(replacement.key.apply, invalidated.key.apply);
+        assert_eq!(replacement.watch.epoch.get(), 3);
+        assert_eq!(engine.validator.requests.len(), 3);
+        validate(&mut engine);
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.runner.opens.len(), 2);
+        assert_eq!(engine.model().phase(), ProductPhase::Active);
+    }
+    #[test]
+    fn removal_beats_cached_open_readiness_and_retired_attempts_cannot_resurrect() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        eof(&mut engine, old);
+        engine.runner.barrier(old);
+        engine.poll();
+        validate(&mut engine);
+        let first = engine.runner.opens.last().unwrap().0;
+        engine.runner.verified();
+        let returned = observation(
+            &engine,
+            3,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Disabled,
+            Some(2),
+        );
+        observe(&mut engine, returned);
+        assert!(engine.model().active().is_none());
+        assert_eq!(engine.runner.stops.len(), 2);
+        let next = recovered(&mut engine, first.attempt);
+        assert_ne!(next, first.attempt);
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key: first,
+            receipt: receipt(settings(60)),
+        });
+        engine.runner.events.push_back(SessionEvent::StreamEnded {
+            attempt: old,
+            reason: 0,
+            error: 0,
+        });
+        engine.runner.barrier(first.attempt);
+        engine.poll();
+        assert_eq!(engine.model().active().unwrap().attempt(), next);
+        assert_eq!(engine.runner.opens.len(), 3);
+    }
+    #[test]
+    fn obsolete_watch_and_epoch_cannot_invalidate_current_video() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        let wrong = RecoveryObservation {
+            stamp: WatchStamp {
+                watch: crate::domain::capture::WatchId::new(99).unwrap(),
+                epoch: crate::domain::capture::ObservationEpoch::new(99).unwrap(),
+            },
+            video: crate::domain::capture::VideoPresence::Absent,
+            audio: SourcePresence::Disabled,
+            last_video_removal: Some(crate::domain::capture::ObservationEpoch::new(99).unwrap()),
+        };
+        observe(&mut engine, wrong);
+        let current = observation(
+            &engine,
+            4,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Disabled,
+            None,
+        );
+        observe(&mut engine, current);
+        let stale = observation(
+            &engine,
+            2,
+            crate::domain::capture::VideoPresence::Absent,
+            SourcePresence::Disabled,
+            Some(2),
+        );
+        observe(&mut engine, stale);
+        assert_eq!(engine.model().active().unwrap().attempt(), old);
+        assert!(engine.runner.stops.is_empty());
+    }
+    #[test]
+    fn explicit_current_choice_is_one_use_and_commits_only_fresh_validated_complete_identity() {
+        use crate::domain::capture::{CandidateId, RecoveryCandidate, VideoPresence};
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        eof(&mut engine, old);
+        let mut ambiguous = observation(
+            &engine,
+            2,
+            VideoPresence::Absent,
+            SourcePresence::Disabled,
+            None,
+        );
+        let token = SelectionToken {
+            stamp: ambiguous.stamp,
+            candidate: CandidateId::new(1).unwrap(),
+        };
+        let identity = DeviceIdentity::new(
+            0x32ed,
+            0x3701,
+            UsbTopology::new(
+                "controller".into(),
+                vec![std::num::NonZeroU8::new(2).unwrap()],
+            )
+            .unwrap(),
+            Some("serial".into()),
+        )
+        .unwrap();
+        ambiguous.video = VideoPresence::Ambiguous(vec![RecoveryCandidate {
+            token,
+            identity: identity.clone(),
+            description: "physical candidate".into(),
+        }]);
+        observe(&mut engine, ambiguous);
+        engine.runner.barrier(old);
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::SelectionRequired);
+        let stale = SelectionToken {
+            stamp: WatchStamp {
+                watch: token.stamp.watch,
+                epoch: crate::domain::capture::ObservationEpoch::new(1).unwrap(),
+            },
+            candidate: token.candidate,
+        };
+        assert_eq!(
+            engine.choose_recovery(engine.model().state_identity(), stale),
+            Err(CommandRejection::SelectionUnavailable)
+        );
+        engine
+            .choose_recovery(engine.model().state_identity(), token)
+            .unwrap();
+        assert_eq!(
+            engine.choose_recovery(engine.model().state_identity(), token),
+            Err(CommandRejection::ApplyInProgress)
+        );
+        assert_eq!(
+            engine.model().last_valid().unwrap().settings(),
+            &settings(60)
+        );
+        let mut fresh = observation(
+            &engine,
+            3,
+            VideoPresence::Absent,
+            SourcePresence::Disabled,
+            None,
+        );
+        fresh.video = VideoPresence::Ambiguous(vec![RecoveryCandidate {
+            token: SelectionToken {
+                stamp: fresh.stamp,
+                candidate: token.candidate,
+            },
+            identity: identity.clone(),
+            description: "physical candidate".into(),
+        }]);
+        observe(&mut engine, fresh.clone());
+        assert_eq!(engine.model().phase(), ProductPhase::Recovering);
+        assert!(!engine.validator.cancelled);
+        let request = engine.validator.request.take().unwrap();
+        let mut selected = request.settings.clone();
+        selected.video.identity = identity.clone();
+        engine.validator.result = Some(ValidationResult {
+            stamp: fresh.stamp,
+            result: ValidationOutcome::Prepared(TestPrepared {
+                settings: selected.clone(),
+                stamp: fresh.stamp,
+            }),
+            request,
+        });
+        engine.poll();
+        assert_eq!(
+            engine.model().last_valid().unwrap().settings(),
+            &settings(60)
+        );
+        let mut after_open = observation(
+            &engine,
+            4,
+            VideoPresence::Absent,
+            SourcePresence::Disabled,
+            None,
+        );
+        after_open.video = VideoPresence::Ambiguous(vec![RecoveryCandidate {
+            token: SelectionToken {
+                stamp: after_open.stamp,
+                candidate: token.candidate,
+            },
+            identity: identity.clone(),
+            description: "physical candidate".into(),
+        }]);
+        observe(&mut engine, after_open);
+        assert!(engine.model().opening().is_some());
+        assert_eq!(engine.runner.stops.len(), 1);
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.model().last_valid().unwrap().settings(), &selected);
+        assert_eq!(engine.model().draft().settings, settings(60));
+        assert_eq!(
+            engine.model().watch_target().unwrap().video.identity,
+            identity
+        );
+        assert_ne!(
+            engine.model().watch_target().unwrap().watch,
+            token.stamp.watch
+        );
+    }
+    #[test]
+    fn admitted_and_confirmed_pause_restore_paused_but_unadmitted_reservation_does_not() {
+        for admission in 0..3 {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            if admission == 0 {
+                engine.model.prepare_pause(old).unwrap();
+            } else if admission == 1 {
+                assert_eq!(engine.pause(old), Ok(SubmitStatus::Accepted));
+            } else {
+                confirm_pause(&mut engine, old);
+            }
+            eof(&mut engine, old);
+            let expected = if admission == 0 {
+                InitialPlayback::Live
+            } else {
+                InitialPlayback::Paused
+            };
+            assert_eq!(engine.model().recovery().unwrap().playback, expected);
+            let current = recovered(&mut engine, old);
+            assert_eq!(*engine.runner.playback.last().unwrap(), expected);
+            assert_eq!(
+                engine.model().active().unwrap().playback(),
+                if admission == 0 {
+                    PlaybackState::Live
+                } else {
+                    PlaybackState::Paused
+                }
+            );
+            if admission != 0 {
+                engine
+                    .resume(engine.model().state_identity(), current)
+                    .unwrap();
+                validate(&mut engine);
+                engine.runner.barrier(current);
+                engine.poll();
+                engine.runner.verified();
+                engine.poll();
+                assert_eq!(
+                    engine.model().active().unwrap().playback(),
+                    PlaybackState::Live
+                );
+            }
+        }
+    }
+    #[test]
+    fn paused_recovery_cannot_commit_live_readiness() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        confirm_pause(&mut engine, old);
+        eof(&mut engine, old);
+        engine.runner.barrier(old);
+        engine.poll();
+        validate(&mut engine);
+        let key = engine.runner.opens.last().unwrap().0;
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key,
+            receipt: receipt(settings(60)),
+        });
+        engine.poll();
+        assert!(engine.model().active().is_none());
+        assert_eq!(engine.model().phase(), ProductPhase::Recovering);
+        assert_eq!(
+            engine
+                .model()
+                .failures()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .operation,
+            "open_receipt"
+        );
+    }
+    #[test]
+    fn genuine_automatic_failure_remains_actionable_without_same_epoch_retry() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        engine
+            .edit_draft(engine.model().draft().revision, settings(30))
+            .unwrap();
+        eof(&mut engine, old);
+        engine.runner.barrier(old);
+        engine.poll();
+        validate(&mut engine);
+        let failed = engine.runner.opens.last().unwrap().0;
+        let failure = ApplyFailure::new(
+            FailureCategory::Session,
+            Stage::Negotiation,
+            Cause::RequestedModeRefused,
+            settings(60),
+            "genuine_open",
+            "mode refused",
+        );
+        engine.runner.events.push_back(SessionEvent::OpenFailed {
+            key: failed,
+            failure: failure.clone(),
+        });
+        engine.poll();
+        engine.runner.barrier(failed.attempt);
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+        assert_eq!(engine.model().failures().unwrap().candidate, Some(failure));
+        let same = engine.model().observation().unwrap().clone();
+        for _ in 0..3 {
+            observe(&mut engine, same.clone());
+        }
+        assert_eq!(engine.validator.requests.len(), 2);
+        assert_eq!(engine.runner.opens.len(), 2);
+        let admission = engine.reconnect(engine.model().state_identity()).unwrap();
+        let ReconnectAdmission::Started(operation) = admission else {
+            panic!("manual restore not admitted")
+        };
+        assert_eq!(
+            engine.reconnect(engine.model().state_identity()),
+            Ok(ReconnectAdmission::Joined(operation))
+        );
+        assert_eq!(
+            engine.validator.request.as_ref().unwrap().settings,
+            settings(60)
+        );
+        validate(&mut engine);
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::Active);
+        assert_eq!(engine.model().draft().settings, settings(30));
+    }
+    #[test]
+    fn explicit_successful_apply_supersedes_loss_target_but_failed_apply_does_not() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        eof(&mut engine, old);
+        let absent = observation(
+            &engine,
+            2,
+            crate::domain::capture::VideoPresence::Absent,
+            SourcePresence::Disabled,
+            None,
+        );
+        observe(&mut engine, absent);
+        engine.runner.barrier(old);
+        engine.poll();
+        engine
+            .edit_draft(engine.model().draft().revision, settings(30))
+            .unwrap();
+        apply(&mut engine);
+        let request = engine.validator.request.as_ref().unwrap().clone();
+        engine.validator.finish(Err(failure(
+            request.settings,
+            FailureCategory::Validation(ValidationLayer::Mode),
+            "rejected candidate",
+        )));
+        engine.poll();
+        assert_eq!(
+            engine.model().recovery().unwrap().applied.settings(),
+            &settings(60)
+        );
+        assert_eq!(
+            engine.model().last_valid().unwrap().settings(),
+            &settings(60)
+        );
+        apply(&mut engine);
+        validate(&mut engine);
+        engine.runner.verified();
+        engine.poll();
+        assert!(engine.model().recovery().is_none());
+        assert_eq!(
+            engine.model().last_valid().unwrap().settings(),
+            &settings(30)
+        );
+    }
+    #[test]
+    fn close_and_quit_suppress_return_and_wait_for_validation_owner_native_and_worker_retirement() {
+        for quit in [false, true] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            eof(&mut engine, old);
+            engine.runner.barrier(old);
+            engine.poll();
+            let request = engine.validator.request.as_ref().unwrap().clone();
+            if quit {
+                engine.quit();
+            } else {
+                engine.close(engine.model().state_identity()).unwrap();
+            }
+            let late = RecoveryObservation {
+                stamp: request.watch,
+                video: crate::domain::capture::VideoPresence::Present,
+                audio: SourcePresence::Disabled,
+                last_video_removal: None,
+            };
+            observe(&mut engine, late);
+            assert_eq!(engine.model().phase(), ProductPhase::Stopping);
+            assert!(engine.validator.cancelled);
+            assert!(engine.validator.target.is_none());
+            engine.validator.finish(Ok(()));
+            engine.poll();
+            assert_eq!(engine.runner.opens.len(), 1);
+            if quit {
+                assert!(!engine.model().shutdown_ready());
+                engine.validator.retired = true;
+                engine.poll();
+                assert!(engine.model().shutdown_ready());
+                assert_eq!(
+                    engine.reconnect(engine.model().state_identity()),
+                    Err(CommandRejection::ShuttingDown)
+                );
+            } else {
+                assert_eq!(engine.model().phase(), ProductPhase::Stopped);
+            }
+        }
+    }
+    fn silent_audio_engine() -> (
+        Engine,
+        AttemptId,
+        crate::domain::capture::AudioSourceIdentity,
+    ) {
+        let source =
+            crate::domain::capture::AudioSourceIdentity::new("exact.capture".into(), vec![])
+                .unwrap();
+        let mut desired = settings(60);
+        desired.audio = AudioSelection::Enabled {
+            source: source.clone(),
+        };
+        let mut engine = ApplyCoordinator::new(
+            desired.clone(),
+            PlaybackGain::default(),
+            Validator::default(),
+            Runner::default(),
+        );
+        apply(&mut engine);
+        let absent = observation(
+            &engine,
+            2,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Absent(crate::domain::capture::AudioError::Cancelled),
+            None,
+        );
+        observe(&mut engine, absent);
+        validate(&mut engine);
+        let key = engine.runner.opens.last().unwrap().0;
+        let mut receipt = receipt(desired);
+        receipt.audio = AudioOutcome::Silent {
+            source: source.clone(),
+            reason: AudioSilence::WaitingForSource(crate::domain::capture::AudioError::Cancelled),
+        };
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::OpenVerified { key, receipt });
+        engine.poll();
+        (engine, key.attempt, source)
+    }
+
+    #[test]
+    fn matching_owner_stop_clears_audio_before_native_release_and_ignores_late_status() {
+        for failed_cleanup in [false, true] {
+            let (mut engine, attempt, _) = silent_audio_engine();
+            let status = engine.audio_availability().unwrap().clone();
+            engine.close(engine.model().state_identity()).unwrap();
+            let foreign = AttemptId::new(attempt.get() + 1).unwrap();
+            engine.runner.events.push_back(SessionEvent::OwnerStopped {
+                attempt: foreign,
+                outcome: Ok(()),
+            });
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::NativeReleased { attempt: foreign });
+            engine.poll();
+            assert_eq!(engine.audio_availability(), Some(&status));
+            let cleanup = failure(
+                settings(60),
+                FailureCategory::Lifecycle(LifecycleFailure::Acknowledgement),
+                "owned cleanup diagnostic",
+            );
+            engine.runner.events.push_back(SessionEvent::OwnerStopped {
+                attempt,
+                outcome: if failed_cleanup {
+                    Err(cleanup.clone())
+                } else {
+                    Ok(())
+                },
+            });
+            engine.poll();
+            assert!(engine.audio_availability().is_none());
+            assert_eq!(engine.model().phase(), ProductPhase::Stopping);
+            assert_eq!(engine.model().cleanup(), &CleanupStatus::Draining);
+            if failed_cleanup {
+                assert!(
+                    engine
+                        .model()
+                        .failures()
+                        .unwrap()
+                        .cleanup
+                        .contains(&cleanup)
+                );
+            }
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::AudioAvailability { attempt, status });
+            engine.runner.events.push_back(SessionEvent::OwnerStopped {
+                attempt,
+                outcome: Ok(()),
+            });
+            engine.poll();
+            assert!(engine.audio_availability().is_none());
+            assert_eq!(engine.model().phase(), ProductPhase::Stopping);
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::NativeReleased { attempt });
+            engine.poll();
+            assert!(engine.audio_availability().is_none());
+            assert_eq!(engine.model().phase(), ProductPhase::Stopped);
+            assert_eq!(engine.runner.opens.len(), 1);
+        }
+    }
+    #[test]
+    fn enabled_absent_source_commits_silent_video_and_return_serializes_detach_before_reattach() {
+        use crate::domain::capture::{AudioRouteReceipt, VideoPresence};
+        let (mut engine, attempt, source) = silent_audio_engine();
+        assert!(
+            engine
+                .model()
+                .active()
+                .unwrap()
+                .applied()
+                .settings()
+                .audio
+                .enabled()
+        );
+        assert!(matches!(
+            engine.audio_availability(),
+            Some(AudioAvailability::Silent { .. })
+        ));
+        let present = observation(
+            &engine,
+            3,
+            VideoPresence::Present,
+            SourcePresence::Present,
+            None,
+        );
+        observe(&mut engine, present.clone());
+        let first = AudioEpoch::new(1).unwrap();
+        assert!(
+            matches!(engine.runner.intents.last(), Some((current, ImmediateIntent::AttachAudio { epoch, source: selected, stamp }))
+            if *current == attempt && *epoch == first && selected == &source && *stamp == present.stamp)
+        );
+        let route = AudioRouteReceipt {
+            epoch: first,
+            stamp: present.stamp,
+            source_index: 7,
+            source_output_index: 8,
+            client_index: 9,
+        };
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Active {
+                    source: source.clone(),
+                    route,
+                },
+            });
+        engine.poll();
+        assert!(matches!(
+            engine.audio_availability(),
+            Some(AudioAvailability::Active { .. })
+        ));
+        let missing = observation(
+            &engine,
+            4,
+            VideoPresence::Present,
+            SourcePresence::Absent(crate::domain::capture::AudioError::Cancelled),
+            None,
+        );
+        observe(&mut engine, missing);
+        assert!(
+            matches!(engine.audio_availability(), Some(AudioAvailability::Detaching { epoch }) if *epoch == first)
+        );
+        let returned = observation(
+            &engine,
+            5,
+            VideoPresence::Present,
+            SourcePresence::Present,
+            None,
+        );
+        observe(&mut engine, returned.clone());
+        assert_eq!(
+            engine
+                .runner
+                .intents
+                .iter()
+                .filter(|(_, intent)| matches!(intent, ImmediateIntent::AttachAudio { .. }))
+                .count(),
+            1
+        );
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Active {
+                    source: source.clone(),
+                    route: AudioRouteReceipt {
+                        epoch: first,
+                        stamp: present.stamp,
+                        source_index: 7,
+                        source_output_index: 8,
+                        client_index: 9,
+                    },
+                },
+            });
+        engine.poll();
+        assert!(
+            matches!(engine.audio_availability(), Some(AudioAvailability::Detaching { epoch }) if *epoch == first)
+        );
+        engine.runner.events.push_back(SessionEvent::AudioDetached {
+            attempt,
+            epoch: first,
+            outcome: Ok(()),
+        });
+        engine.poll();
+        let second = AudioEpoch::new(2).unwrap();
+        assert!(
+            matches!(engine.audio_availability(), Some(AudioAvailability::Opening { epoch }) if *epoch == second)
+        );
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+        engine.runner.events.push_back(SessionEvent::AudioDetached {
+            attempt,
+            epoch: first,
+            outcome: Ok(()),
+        });
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Active {
+                    source: source.clone(),
+                    route: AudioRouteReceipt {
+                        epoch: first,
+                        stamp: present.stamp,
+                        source_index: 7,
+                        source_output_index: 8,
+                        client_index: 9,
+                    },
+                },
+            });
+        engine.poll();
+        assert!(
+            matches!(engine.audio_availability(), Some(AudioAvailability::Opening { epoch }) if *epoch == second)
+        );
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Active {
+                    source,
+                    route: AudioRouteReceipt {
+                        epoch: second,
+                        stamp: returned.stamp,
+                        source_index: 17,
+                        source_output_index: 18,
+                        client_index: 19,
+                    },
+                },
+            });
+        engine.poll();
+        assert!(
+            matches!(engine.audio_availability(), Some(AudioAvailability::Active { route, .. }) if route.epoch == second && route.source_index == 17)
+        );
+        assert_eq!(engine.model().active().unwrap().attempt(), attempt);
+        assert_eq!(
+            engine
+                .runner
+                .intents
+                .iter()
+                .filter(|(_, intent)| matches!(intent, ImmediateIntent::AttachAudio { .. }))
+                .count(),
+            2
+        );
+    }
+    #[test]
+    fn pending_wrong_source_wrong_stamp_and_unassigned_routes_never_become_active() {
+        use crate::domain::capture::{AudioRouteReceipt, AudioSourceIdentity, VideoPresence};
+        for wrong in 0..4 {
+            let (mut engine, attempt, source) = silent_audio_engine();
+            let present = observation(
+                &engine,
+                3,
+                VideoPresence::Present,
+                SourcePresence::Present,
+                None,
+            );
+            observe(&mut engine, present.clone());
+            let epoch = AudioEpoch::new(1).unwrap();
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::AudioAvailability {
+                    attempt,
+                    status: AudioAvailability::Silent {
+                        reason: AudioSilence::PendingRoute,
+                    },
+                });
+            engine.poll();
+            assert!(!matches!(
+                engine.audio_availability(),
+                Some(AudioAvailability::Active { .. })
+            ));
+            let mut route = AudioRouteReceipt {
+                epoch,
+                stamp: present.stamp,
+                source_index: 7,
+                source_output_index: 8,
+                client_index: 9,
+            };
+            let mut selected = source;
+            match wrong {
+                0 => route.source_index = u32::MAX,
+                1 => selected = AudioSourceIdentity::new("microphone".into(), vec![]).unwrap(),
+                2 => route.stamp.epoch = crate::domain::capture::ObservationEpoch::new(2).unwrap(),
+                _ => route.epoch = AudioEpoch::new(2).unwrap(),
+            }
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::AudioAvailability {
+                    attempt,
+                    status: AudioAvailability::Active {
+                        source: selected,
+                        route,
+                    },
+                });
+            engine.poll();
+            assert!(!matches!(
+                engine.audio_availability(),
+                Some(AudioAvailability::Active { .. })
+            ));
+            assert_eq!(engine.model().active().unwrap().attempt(), attempt);
+            assert!(engine.runner.stops.is_empty());
+        }
+    }
+    #[test]
+    fn unsafe_audio_detach_failure_is_not_a_synthetic_retirement_or_new_attachment() {
+        let (mut engine, attempt, _) = silent_audio_engine();
+        let present = observation(
+            &engine,
+            3,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Present,
+            None,
+        );
+        observe(&mut engine, present);
+        engine.runner.events.push_back(SessionEvent::AudioDetached {
+            attempt,
+            epoch: AudioEpoch::new(1).unwrap(),
+            outcome: Err(crate::domain::capture::AudioError::Cancelled),
+        });
+        engine.poll();
+        assert!(engine.model().active().is_none());
+        assert_eq!(engine.runner.stops.len(), 1);
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert_eq!(
+            engine
+                .model()
+                .failures()
+                .unwrap()
+                .incumbent
+                .as_ref()
+                .unwrap()
+                .operation,
+            "audio_detach"
+        );
+    }
+    #[test]
+    fn explicit_target_cutover_waits_for_actual_retirement_and_fresh_full_validation() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        let original_watch = engine.model().watch_target().unwrap().watch;
+        engine.validator.defer_cutover = true;
+        engine
+            .edit_draft(engine.model().draft().revision, settings(30))
+            .unwrap();
+        apply(&mut engine);
+        validate(&mut engine);
+        assert_eq!(engine.model().watch_target().unwrap().watch, original_watch);
+        assert_eq!(engine.runner.opens.len(), 1);
+        engine.runner.events.push_back(SessionEvent::OwnerStopped {
+            attempt: old,
+            outcome: Ok(()),
+        });
+        engine.poll();
+        assert_eq!(engine.model().watch_target().unwrap().watch, original_watch);
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::NativeReleased { attempt: old });
+        engine.poll();
+        assert_ne!(engine.model().watch_target().unwrap().watch, original_watch);
+        assert_eq!(engine.runner.opens.len(), 1);
+        let request = engine.validator.request.as_ref().unwrap().clone();
+        assert_eq!(request.settings, settings(30));
+        assert_eq!(
+            request.watch.watch,
+            engine.model().watch_target().unwrap().watch
+        );
+        assert_eq!(engine.validator.cutovers.len(), 1);
+        engine.validator.finish(Err(failure(
+            settings(30),
+            FailureCategory::Validation(ValidationLayer::Mode),
+            "fresh cutover tuple rejected",
+        )));
+        engine.poll();
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert_eq!(
+            engine.model().last_valid().unwrap().settings(),
+            &settings(60)
+        );
+    }
+    #[test]
+    fn no_history_reconnect_is_actionable_and_quit_requires_both_worker_joins() {
+        let mut engine = engine();
+        assert_eq!(
+            engine.reconnect(engine.model().state_identity()),
+            Err(CommandRejection::ReconnectUnavailable)
+        );
+        engine.validator.watcher_join_pending = true;
+        engine.quit();
+        engine.validator.retired = true;
+        engine.poll();
+        assert!(!engine.model().shutdown_ready());
+        engine.validator.watcher_join_pending = false;
+        engine.poll();
+        assert!(engine.model().shutdown_ready());
+    }
+    #[test]
+    fn audio_only_loss_during_initial_readiness_keeps_video_and_waits_for_real_detachment() {
+        use crate::domain::capture::{AudioRouteReceipt, AudioSourceIdentity, VideoPresence};
+        let source = AudioSourceIdentity::new("capture".into(), vec![]).unwrap();
+        let mut desired = settings(60);
+        desired.audio = AudioSelection::Enabled {
+            source: source.clone(),
+        };
+        let mut engine = ApplyCoordinator::new(
+            desired.clone(),
+            PlaybackGain::default(),
+            Validator::default(),
+            Runner::default(),
+        );
+        apply(&mut engine);
+        validate(&mut engine);
+        let key = engine.runner.opens.last().unwrap().0;
+        let epoch = AudioEpoch::new(1).unwrap();
+        let route = AudioRouteReceipt {
+            epoch,
+            stamp: engine.lease.as_ref().unwrap().watch,
+            source_index: 7,
+            source_output_index: 8,
+            client_index: 9,
+        };
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt: key.attempt,
+                status: AudioAvailability::Active {
+                    source: source.clone(),
+                    route: route.clone(),
+                },
+            });
+        let mut ready = receipt(desired);
+        ready.audio = AudioOutcome::Active { source, route };
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key,
+            receipt: ready,
+        });
+        let absent = observation(
+            &engine,
+            2,
+            VideoPresence::Present,
+            SourcePresence::Absent(crate::domain::capture::AudioError::Cancelled),
+            None,
+        );
+        observe(&mut engine, absent);
+        assert!(engine.model().active().is_none());
+        assert!(engine.runner.stops.is_empty());
+        assert!(engine.deferred_ready.is_some());
+        engine.runner.events.push_back(SessionEvent::AudioDetached {
+            attempt: key.attempt,
+            epoch,
+            outcome: Ok(()),
+        });
+        engine.poll();
+        assert_eq!(engine.model().active().unwrap().attempt(), key.attempt);
+        assert!(matches!(
+            engine.audio_availability(),
+            Some(AudioAvailability::Silent { .. })
+        ));
+        assert!(engine.runner.stops.is_empty());
+        assert_eq!(engine.runner.opens.len(), 1);
+    }
+    #[test]
+    fn completed_validation_older_than_latest_observation_revalidates_without_opening_twice() {
+        let mut engine = engine();
+        apply(&mut engine);
+        let stale = engine.validator.request.take().unwrap();
+        let newer = observation(
+            &engine,
+            2,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Disabled,
+            None,
+        );
+        observe(&mut engine, newer);
+        engine.validator.result = Some(ValidationResult {
+            stamp: stale.watch,
+            result: ValidationOutcome::Prepared(TestPrepared {
+                settings: stale.settings.clone(),
+                stamp: stale.watch,
+            }),
+            request: stale,
+        });
+        engine.poll();
+        assert!(engine.runner.opens.is_empty());
+        assert_eq!(
+            engine.validator.request.as_ref().unwrap().watch.epoch.get(),
+            2
+        );
+        validate(&mut engine);
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::Active);
+        assert_eq!(engine.runner.opens.len(), 1);
+    }
+    #[test]
+    fn fresh_validation_scan_does_not_turn_real_automatic_failure_into_retry_loop() {
+        for fail_validation in [false, true] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            eof(&mut engine, old);
+            engine.runner.barrier(old);
+            engine.poll();
+            let fresh = observation(
+                &engine,
+                2,
+                crate::domain::capture::VideoPresence::Present,
+                SourcePresence::Disabled,
+                None,
+            );
+            observe(&mut engine, fresh.clone());
+            let actual = failure(
+                settings(60),
+                FailureCategory::Session,
+                "persistent actual failure",
+            );
+            if fail_validation {
+                engine.validator.finish(Err(actual.clone()));
+                engine.poll();
+            } else {
+                validate(&mut engine);
+                let key = engine.runner.opens.last().unwrap().0;
+                engine.runner.events.push_back(SessionEvent::OpenFailed {
+                    key,
+                    failure: actual.clone(),
+                });
+                engine.poll();
+                engine.runner.barrier(key.attempt);
+                engine.poll();
+            }
+            assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+            assert_eq!(engine.model().failures().unwrap().candidate, Some(actual));
+            let requests = engine.validator.requests.len();
+            let opens = engine.runner.opens.len();
+            for _ in 0..3 {
+                observe(&mut engine, fresh.clone());
+            }
+            assert_eq!(engine.validator.requests.len(), requests);
+            assert_eq!(engine.runner.opens.len(), opens);
+            assert!(engine.validator.request.is_none());
+            assert!(matches!(
+                engine.reconnect(engine.model().state_identity()),
+                Ok(ReconnectAdmission::Started(_))
+            ));
+        }
+    }
+    #[test]
+    fn coalesced_initial_detached_receipt_consumes_epoch_without_prior_opening_snapshot() {
+        let source =
+            crate::domain::capture::AudioSourceIdentity::new("exact.capture".into(), vec![])
+                .unwrap();
+        let mut desired = settings(60);
+        desired.audio = AudioSelection::Enabled {
+            source: source.clone(),
+        };
+        let mut engine = ApplyCoordinator::new(
+            desired.clone(),
+            PlaybackGain::default(),
+            Validator::default(),
+            Runner::default(),
+        );
+        apply(&mut engine);
+        validate(&mut engine);
+        let key = engine.runner.opens.last().unwrap().0;
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt: key.attempt,
+                status: AudioAvailability::Silent {
+                    reason: AudioSilence::WaitingForSource(
+                        crate::domain::capture::AudioError::Cancelled,
+                    ),
+                },
+            });
+        engine.runner.events.push_back(SessionEvent::AudioDetached {
+            attempt: key.attempt,
+            epoch: AudioEpoch::new(1).unwrap(),
+            outcome: Ok(()),
+        });
+        let mut ready = receipt(desired);
+        ready.audio = AudioOutcome::Silent {
+            source: source.clone(),
+            reason: AudioSilence::WaitingForSource(crate::domain::capture::AudioError::Cancelled),
+        };
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key,
+            receipt: ready,
+        });
+        engine.poll();
+        assert_eq!(engine.model().active().unwrap().attempt(), key.attempt);
+        assert!(engine.runner.intents.is_empty());
+        let returned = observation(
+            &engine,
+            2,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Present,
+            None,
+        );
+        observe(&mut engine, returned.clone());
+        assert!(
+            matches!(engine.runner.intents.last(), Some((attempt, ImmediateIntent::AttachAudio { epoch, source: selected, stamp }))
+            if *attempt == key.attempt && epoch.get() == 2 && selected == &source && *stamp == returned.stamp)
+        );
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+    }
+    fn opening_choice(engine: &mut Engine, choose_other: bool) -> (AttemptKey, SelectionToken) {
+        use crate::domain::capture::{CandidateId, RecoveryCandidate, VideoPresence};
+        let old = initial(engine);
+        eof(engine, old);
+        let other = DeviceIdentity::new(
+            0x32ed,
+            0x3701,
+            UsbTopology::new(
+                "controller".into(),
+                vec![std::num::NonZeroU8::new(2).unwrap()],
+            )
+            .unwrap(),
+            Some("serial".into()),
+        )
+        .unwrap();
+        let mut ambiguous = observation(
+            engine,
+            2,
+            VideoPresence::Absent,
+            SourcePresence::Disabled,
+            None,
+        );
+        let saved = SelectionToken {
+            stamp: ambiguous.stamp,
+            candidate: CandidateId::new(1).unwrap(),
+        };
+        let different = SelectionToken {
+            stamp: ambiguous.stamp,
+            candidate: CandidateId::new(2).unwrap(),
+        };
+        ambiguous.video = VideoPresence::Ambiguous(vec![
+            RecoveryCandidate {
+                token: saved,
+                identity: settings(60).video.identity,
+                description: "saved A".into(),
+            },
+            RecoveryCandidate {
+                token: different,
+                identity: other.clone(),
+                description: "selected B".into(),
+            },
+        ]);
+        observe(engine, ambiguous);
+        engine.runner.barrier(old);
+        engine.poll();
+        let token = if choose_other { different } else { saved };
+        engine
+            .choose_recovery(engine.model().state_identity(), token)
+            .unwrap();
+        let request = engine.validator.request.take().unwrap();
+        let mut selected = request.settings.clone();
+        if choose_other {
+            selected.video.identity = other;
+        }
+        engine.validator.result = Some(ValidationResult {
+            stamp: request.watch,
+            result: ValidationOutcome::Prepared(TestPrepared {
+                settings: selected,
+                stamp: request.watch,
+            }),
+            request,
+        });
+        engine.poll();
+        (engine.runner.opens.last().unwrap().0, token)
+    }
+    #[test]
+    fn failed_chosen_open_retires_grant_only_at_real_barrier_and_restores_returned_saved_identity()
+    {
+        let mut engine = engine();
+        let (chosen, token) = opening_choice(&mut engine, true);
+        assert_eq!(engine.validator.grant, Some(token));
+        engine.runner.fail("genuine selected B open failure");
+        engine.poll();
+        assert_eq!(engine.validator.grant, Some(token));
+        let returned = observation(
+            &engine,
+            3,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Disabled,
+            None,
+        );
+        observe(&mut engine, returned);
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::NativeReleased {
+                attempt: chosen.attempt,
+            });
+        engine.poll();
+        assert_eq!(engine.validator.grant, Some(token));
+        assert_eq!(engine.runner.opens.len(), 2);
+        engine.runner.events.push_back(SessionEvent::OwnerStopped {
+            attempt: chosen.attempt,
+            outcome: Ok(()),
+        });
+        engine.poll();
+        assert_eq!(engine.validator.grant, Some(token));
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::NativeReleased {
+                attempt: chosen.attempt,
+            });
+        engine.poll();
+        assert!(engine.validator.grant.is_none());
+        assert_eq!(engine.validator.retired_choices, vec![token]);
+        let automatic = engine.validator.request.as_ref().unwrap();
+        assert_eq!(automatic.settings, settings(60));
+        assert!(automatic.choice.is_none());
+        validate(&mut engine);
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(
+            engine.model().active().unwrap().applied().settings(),
+            &settings(60)
+        );
+        assert_eq!(engine.model().draft().settings, settings(60));
+        assert_eq!(engine.runner.opens.len(), 3);
+    }
+    #[test]
+    fn verified_choice_equal_to_saved_tuple_retires_ephemeral_grant_without_watch_replacement() {
+        let mut engine = engine();
+        let (chosen, token) = opening_choice(&mut engine, false);
+        let watch = engine.model().watch_target().unwrap().watch;
+        assert_eq!(engine.validator.grant, Some(token));
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.model().active().unwrap().attempt(), chosen.attempt);
+        assert_eq!(engine.model().watch_target().unwrap().watch, watch);
+        assert!(engine.validator.grant.is_none());
+        assert_eq!(engine.validator.retired_choices, vec![token]);
+        eof(&mut engine, chosen.attempt);
+        let returned = observation(
+            &engine,
+            3,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Disabled,
+            None,
+        );
+        observe(&mut engine, returned);
+        let resumed = recovered(&mut engine, chosen.attempt);
+        assert_ne!(resumed, chosen.attempt);
+        assert_eq!(
+            engine.model().last_valid().unwrap().settings(),
+            &settings(60)
+        );
+        assert!(engine.validator.requests.last().unwrap().choice.is_none());
+        assert_eq!(engine.runner.opens.len(), 3);
     }
 }

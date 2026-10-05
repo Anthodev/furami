@@ -16,7 +16,8 @@ use furami::{
     domain::capture::{AudioError, AudioSelection, AudioSourceIdentity, PlaybackGain},
     domain::state::DraftSettings,
 };
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::process::CommandExt;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, thiserror::Error)]
@@ -55,9 +56,42 @@ enum StartupError {
     },
     #[error(transparent)]
     Audio(#[from] AudioError),
+    #[error(
+        "capture audio needs PULSE_PROP_node.dont-fallback=true in this process: re-exec failed: {0}"
+    )]
+    NoFallbackExec(#[source] std::io::Error),
+}
+
+/// The capture process must run with the process-local PulseAudio client
+/// property `PULSE_PROP_node.dont-fallback=true`, otherwise libpulse routes a
+/// captured stream to the default source when the requested source disappears.
+/// The property must already be present in the process environment *before*
+/// any logging, Qt, libpulse or worker setup, so the very first action re-execs
+/// this exact executable with the same arguments plus the variable set. The
+/// replacement is `exec`, not a child process: there is no supervisor and no
+/// shell. Only the exact value `true` short-circuits; any other value is
+/// replaced with `true`. The variable is process-local and is deliberately not
+/// written back to any parent shell, and no default audio device/output
+/// variable is set.
+fn ensure_capture_no_fallback_environment() -> Result<(), StartupError> {
+    if no_fallback_already_set(std::env::var_os("PULSE_PROP_node.dont-fallback").as_deref()) {
+        return Ok(());
+    }
+    let executable = std::env::current_exe().map_err(StartupError::NoFallbackExec)?;
+    let error = std::process::Command::new(executable)
+        .args(std::env::args_os().skip(1))
+        .env("PULSE_PROP_node.dont-fallback", "true")
+        .exec();
+    // `exec` only returns on failure; the process image was not replaced.
+    Err(StartupError::NoFallbackExec(error))
+}
+
+fn no_fallback_already_set(value: Option<&OsStr>) -> bool {
+    value == Some(OsStr::new("true"))
 }
 
 fn main() -> anyhow::Result<()> {
+    ensure_capture_no_fallback_environment()?;
     initialize_logging()?;
     run()?;
     Ok(())

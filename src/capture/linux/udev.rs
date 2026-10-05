@@ -39,6 +39,23 @@ struct UdevListEntry {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct UdevMonitor {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, count: usize, timeout: c_int) -> c_int;
+    fn __errno_location() -> *mut c_int;
+}
+
 // Signatures follow libudev.h. Link the runtime SONAME directly, so compilation
 // needs neither libudev's header nor its unversioned development linker symlink.
 #[link(name = "libudev.so.1", kind = "dylib", modifiers = "+verbatim")]
@@ -68,6 +85,17 @@ unsafe extern "C" {
     fn udev_device_get_syspath(device: *mut UdevDevice) -> *const c_char;
     fn udev_device_get_devnode(device: *mut UdevDevice) -> *const c_char;
     fn udev_device_get_driver(device: *mut UdevDevice) -> *const c_char;
+    fn udev_device_get_action(device: *mut UdevDevice) -> *const c_char;
+    fn udev_monitor_new_from_netlink(udev: *mut Udev, name: *const c_char) -> *mut UdevMonitor;
+    fn udev_monitor_unref(monitor: *mut UdevMonitor) -> *mut UdevMonitor;
+    fn udev_monitor_filter_add_match_subsystem_devtype(
+        monitor: *mut UdevMonitor,
+        subsystem: *const c_char,
+        devtype: *const c_char,
+    ) -> c_int;
+    fn udev_monitor_enable_receiving(monitor: *mut UdevMonitor) -> c_int;
+    fn udev_monitor_get_fd(monitor: *mut UdevMonitor) -> c_int;
+    fn udev_monitor_receive_device(monitor: *mut UdevMonitor) -> *mut UdevDevice;
 }
 
 struct Context {
@@ -280,6 +308,150 @@ fn udev_result(result: c_int) -> Result<(), CaptureError> {
         })
     } else {
         Ok(())
+    }
+}
+/// Owned event copied before libudev releases it. Removal attribution uses
+/// cached physical syspaths, never attributes re-read from vanished sysfs.
+#[derive(Clone, Debug)]
+pub(crate) struct TopologyEvent {
+    pub syspath: PathBuf,
+    pub removed: bool,
+}
+
+pub(crate) struct Monitor {
+    raw: NonNull<UdevMonitor>,
+    context: Context,
+    fd: c_int,
+}
+
+impl Monitor {
+    /// Filters are an OR of USB and video4linux. Enable receiving is completed
+    /// before the caller is allowed to perform its authoritative first scan.
+    pub(crate) fn subscribe() -> Result<Self, CaptureError> {
+        let context = Context::new()?;
+        // SAFETY: Live context; official constructor returns an owned reference.
+        let raw = NonNull::new(unsafe {
+            udev_monitor_new_from_netlink(context.raw.as_ptr(), c"udev".as_ptr())
+        })
+        .ok_or(CaptureError::UdevFailure {
+            operation: "udev_monitor_new",
+        })?;
+        let mut monitor = Self {
+            raw,
+            context,
+            fd: -1,
+        };
+        for subsystem in [c"video4linux", c"usb"] {
+            // SAFETY: Owned live monitor and static strings; NULL accepts all devtypes.
+            monitor_result(
+                unsafe {
+                    udev_monitor_filter_add_match_subsystem_devtype(
+                        monitor.raw.as_ptr(),
+                        subsystem.as_ptr(),
+                        std::ptr::null(),
+                    )
+                },
+                "udev_monitor_filter",
+            )?;
+        }
+        // SAFETY: Configured live monitor; enable creates its nonblocking socket.
+        monitor_result(
+            unsafe { udev_monitor_enable_receiving(monitor.raw.as_ptr()) },
+            "udev_monitor_enable",
+        )?;
+        // SAFETY: Enabled live monitor retains its socket until Drop.
+        monitor.fd = unsafe { udev_monitor_get_fd(monitor.raw.as_ptr()) };
+        if monitor.fd < 0 {
+            return Err(CaptureError::UdevFailure {
+                operation: "udev_monitor_get_fd",
+            });
+        }
+        Ok(monitor)
+    }
+
+    pub(crate) fn next_event(&mut self) -> Result<Option<TopologyEvent>, CaptureError> {
+        // SAFETY: errno is thread-local; resetting it distinguishes a drained
+        // nonblocking socket from a real receive failure/overflow.
+        unsafe { *__errno_location() = 0 };
+        // SAFETY: Live monitor; non-NULL received device is one owned reference.
+        let Some(raw) = NonNull::new(unsafe { udev_monitor_receive_device(self.raw.as_ptr()) })
+        else {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(0 | 11) => Ok(None),
+                _ => Err(CaptureError::Udev {
+                    operation: "udev_monitor_receive",
+                    source: error,
+                }),
+            };
+        };
+        let device = Device {
+            raw,
+            _context: PhantomData::<&Context>,
+        };
+        // Keep context explicitly borrowed throughout the received device scope.
+        let _context = &self.context;
+        let syspath = device.borrow().syspath()?;
+        // SAFETY: Property borrowed from received device, copied to bool before Drop.
+        let removed =
+            unsafe { borrowed_string(udev_device_get_action(raw.as_ptr())) } == Some(c"remove");
+        Ok(Some(TopologyEvent { syspath, removed }))
+    }
+
+    /// Wake descriptor makes shutdown/target changes interrupt the OS poll.
+    /// The finite timeout only services the libpulse mainloop, never rescans.
+    pub(crate) fn wait(&self, wake_fd: c_int) -> Result<(), CaptureError> {
+        let mut fds = [
+            PollFd {
+                fd: self.fd,
+                events: 1,
+                revents: 0,
+            },
+            PollFd {
+                fd: wake_fd,
+                events: 1,
+                revents: 0,
+            },
+        ];
+        // SAFETY: Both descriptors are live and writable POD array spans count.
+        let result = unsafe { poll(fds.as_mut_ptr(), fds.len(), 50) };
+        if result < 0 {
+            let source = io::Error::last_os_error();
+            if source.kind() == io::ErrorKind::Interrupted {
+                return Ok(());
+            }
+            return Err(CaptureError::Udev {
+                operation: "udev_monitor_poll",
+                source,
+            });
+        }
+        if fds.iter().any(|fd| fd.revents & (8 | 16 | 32) != 0) {
+            return Err(CaptureError::UdevFailure {
+                operation: "udev_monitor_poll_disconnected",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        // SAFETY: Release monitor's one reference before its context is dropped.
+        unsafe { udev_monitor_unref(self.raw.as_ptr()) };
+    }
+}
+
+fn monitor_result(result: c_int, operation: &'static str) -> Result<(), CaptureError> {
+    if result >= 0 {
+        Ok(())
+    } else {
+        let errno = result
+            .checked_neg()
+            .ok_or(CaptureError::UdevFailure { operation })?;
+        Err(CaptureError::Udev {
+            operation,
+            source: io::Error::from_raw_os_error(errno),
+        })
     }
 }
 

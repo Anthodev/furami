@@ -1,5 +1,6 @@
 //! Private libpulse ABI and independent, fail-closed recording cancellation.
 
+use parking_lot::Mutex;
 use std::{
     cell::{Cell, RefCell},
     ffi::{CStr, c_char, c_int, c_void},
@@ -9,7 +10,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -17,7 +18,7 @@ use std::{
 
 use crate::{
     capture::audio::{AudioEvent, AudioSource},
-    domain::capture::{AudioError, AudioSourceIdentity},
+    domain::capture::{AudioEpoch, AudioError, AudioRouteReceipt, AudioSourceIdentity, WatchStamp},
 };
 
 const INVALID_INDEX: u32 = u32::MAX;
@@ -26,7 +27,6 @@ const FAILED: c_int = 5;
 const TERMINATED: c_int = 6;
 const NO_ENTITY: c_int = 5;
 const SOURCE_EVENT: c_int = 1;
-const SINK_INPUT_EVENT: c_int = 2;
 const SOURCE_OUTPUT_EVENT: c_int = 3;
 const CLIENT_EVENT: c_int = 5;
 const REMOVE_EVENT: c_int = 0x20;
@@ -216,6 +216,7 @@ struct Notifications {
     source_dirty: Cell<bool>,
     recording_dirty: Cell<bool>,
     selected_index: Cell<u32>,
+    inventory: Cell<bool>,
     selected_removed: Cell<bool>,
     owned_output: Cell<Option<u32>>,
     owned_client: Cell<Option<u32>>,
@@ -296,6 +297,25 @@ impl Connection {
             {
                 return Err(self.error("mainloop"));
             }
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Result<(), AudioError> {
+        if !self.ready() {
+            return Err(self.error("subscription connection"));
+        }
+        // SAFETY: Exclusive owner and zero-timeout prepare/poll/dispatch.
+        unsafe {
+            if pa_mainloop_prepare(self.mainloop.as_ptr(), 0) < 0
+                || pa_mainloop_poll(self.mainloop.as_ptr()) < 0
+                || pa_mainloop_dispatch(self.mainloop.as_ptr()) < 0
+            {
+                return Err(self.error("subscription drain"));
+            }
+        }
+        if !self.ready() {
+            return Err(self.error("subscription connection"));
         }
         Ok(())
     }
@@ -618,7 +638,7 @@ unsafe extern "C" fn subscription_callback(
     let notifications = unsafe { &*userdata.cast::<Notifications>() };
     match event & FACILITY_MASK {
         SOURCE_EVENT => {
-            if index == notifications.selected_index.get() {
+            if notifications.inventory.get() || index == notifications.selected_index.get() {
                 notifications.source_dirty.set(true);
             }
             if index == notifications.selected_index.get() && event & TYPE_MASK == REMOVE_EVENT {
@@ -626,7 +646,20 @@ unsafe extern "C" fn subscription_callback(
             }
         }
         SOURCE_OUTPUT_EVENT | CLIENT_EVENT => {
-            notifications.recording_dirty.set(true);
+            let relevant = match event & FACILITY_MASK {
+                SOURCE_OUTPUT_EVENT => notifications
+                    .owned_output
+                    .get()
+                    .is_none_or(|own| own == index),
+                CLIENT_EVENT => notifications
+                    .owned_client
+                    .get()
+                    .is_none_or(|own| own == index),
+                _ => false,
+            };
+            if relevant {
+                notifications.recording_dirty.set(true);
+            }
             if event & TYPE_MASK == REMOVE_EVENT && notifications.owned_removed.get().is_none() {
                 let owned = match event & FACILITY_MASK {
                     SOURCE_OUTPUT_EVENT => notifications.owned_output.get() == Some(index),
@@ -644,7 +677,6 @@ unsafe extern "C" fn subscription_callback(
                 }
             }
         }
-        SINK_INPUT_EVENT => notifications.recording_dirty.set(true),
         _ => {}
     }
 }
@@ -693,42 +725,6 @@ fn cache_owned_recording(notifications: &Notifications, target: &Target) {
         }
         Target::Client(client) => notifications.owned_client.set(Some(client.index)),
     }
-}
-
-fn refresh_owned_recording(
-    connection: &mut Connection,
-    tag: &str,
-    pid: &str,
-    opening: &AtomicBool,
-    shutdown: &AtomicBool,
-) -> Result<(), AudioError> {
-    let clients = connection.clients(None, shutdown)?;
-    let outputs = connection.outputs(None, shutdown)?;
-    // A removal can arrive while initial introspection is completing, before
-    // cached indices exist. A subsequent complete inventory proves absence of
-    // previously attributed objects without inventing a physical-source error.
-    latch_missing_owned(&connection.notifications, &clients, &outputs);
-    // Partial/foreign/ambiguous attribution does not establish an owned record
-    // and cannot be promoted into source loss. Cancellation separately rejects
-    // it; an actual inventory/connection failure remains an owned error result.
-    match choose_target(
-        tag,
-        pid,
-        &clients,
-        &outputs,
-        opening.load(Ordering::Acquire),
-    ) {
-        Ok(Some(target @ Target::Output(_, _))) => {
-            cache_owned_recording(&connection.notifications, &target);
-        }
-        Ok(Some(Target::Client(client))) => {
-            if recording_only_client(&client, &connection.playback_clients(shutdown)?).is_ok() {
-                cache_owned_recording(&connection.notifications, &Target::Client(client));
-            }
-        }
-        Ok(None) | Err(_) => {}
-    }
-    Ok(())
 }
 
 unsafe fn context_error(context: *mut c_void, operation: &str) -> AudioError {
@@ -848,6 +844,7 @@ struct Client {
 struct SourceOutput {
     index: u32,
     client: u32,
+    source: u32,
     name: String,
     app: Option<String>,
     media: Option<String>,
@@ -914,6 +911,7 @@ unsafe extern "C" fn output_callback(
         Ok(Some(SourceOutput {
             index: info.index,
             client: info.client,
+            source: info.source,
             name: unsafe { copied_string(info.name) }?.unwrap_or_default(),
             app: unsafe { property(info.proplist, c"application.name") }?,
             media: unsafe { property(info.proplist, c"media.name") }?,
@@ -1020,15 +1018,23 @@ fn choose_target(
                 "stream ownership does not match tag, PID and client".into(),
             ));
         }
-        // Routed source can be EasyEffects; requested-source index is not an
-        // ownership condition. Kill only this uniquely attributed source-output.
+        // Attribution authorizes cancellation only. Route acceptance separately
+        // requires the actual source index to equal fresh selected inventory.
         return Ok(Some(Target::Output(output.clone(), client.clone())));
     }
     Ok(opening.then(|| Target::Client(client.clone())))
 }
 
 fn same_output(previous: &SourceOutput, fresh: &SourceOutput) -> bool {
-    previous == fresh
+    // Routing can change between list inventory and the targeted fresh lookup
+    // without replacing the recording. Keep cancellation ownership separate:
+    // checked_route must validate the freshly observed source, never this cache.
+    previous.index == fresh.index
+        && previous.client == fresh.client
+        && previous.name == fresh.name
+        && previous.app == fresh.app
+        && previous.media == fresh.media
+        && previous.pid == fresh.pid
 }
 
 pub(crate) fn discover() -> Result<Vec<AudioSource>, AudioError> {
@@ -1040,11 +1046,50 @@ pub(crate) fn discover() -> Result<Vec<AudioSource>, AudioError> {
         .collect())
 }
 
+/// Lifetime watcher adapter; its context never crosses the observation worker.
+pub(crate) struct SourceInventorySubscription {
+    connection: Connection,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl SourceInventorySubscription {
+    pub(crate) fn connect(shutdown: Arc<AtomicBool>) -> Result<Self, AudioError> {
+        let mut connection = Connection::connect(Some(&shutdown))?;
+        connection.notifications.inventory.set(true);
+        connection.subscribe(INVALID_INDEX, &shutdown)?;
+        connection.notifications.source_dirty.set(true);
+        Ok(Self {
+            connection,
+            shutdown,
+        })
+    }
+
+    pub(crate) fn poll_dirty(&mut self) -> Result<bool, AudioError> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(AudioError::Cancelled);
+        }
+        self.connection.drain()?;
+        Ok(self.connection.notifications.source_dirty.replace(false))
+    }
+
+    pub(crate) fn snapshot(&mut self) -> Result<Vec<AudioSource>, AudioError> {
+        Ok(self
+            .connection
+            .sources(Some(&self.shutdown))?
+            .into_iter()
+            .map(|row| row.source)
+            .collect())
+    }
+}
+
 pub(crate) struct GuardWorker {
     tag: String,
     opening: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    events: Receiver<AudioEvent>,
+    demux_retired: Arc<AtomicBool>,
+    events: Arc<Mutex<Option<AudioEvent>>>,
+    ready: mpsc::Receiver<Result<(), AudioError>>,
+    ready_received: bool,
     thread: Option<JoinHandle<Result<(), AudioError>>>,
 }
 
@@ -1052,9 +1097,12 @@ impl GuardWorker {
     pub(crate) fn start(
         source: AudioSourceIdentity,
         generation: u64,
+        epoch: AudioEpoch,
+        stamp: WatchStamp,
         cancel: Arc<AtomicBool>,
+        owner_cancel: Arc<AtomicBool>,
     ) -> Result<Self, AudioError> {
-        if cancel.load(Ordering::Acquire) {
+        if cancel.load(Ordering::Acquire) || owner_cancel.load(Ordering::Acquire) {
             return Err(AudioError::Cancelled);
         }
         let mut nonce = [0u8; 16];
@@ -1062,14 +1110,18 @@ impl GuardWorker {
             .and_then(|mut file| file.read_exact(&mut nonce))
             .map_err(|error| AudioError::Unavailable(format!("opening tag entropy: {error}")))?;
         let tag = format!(
-            "Furami-{}-{generation}-{:032x}",
+            "Furami-{}-{generation}-{}-{:032x}",
             std::process::id(),
+            epoch.get(),
             u128::from_ne_bytes(nonce)
         );
         let worker_tag = tag.clone();
         let opening = Arc::new(AtomicBool::new(true));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let (events_tx, events) = mpsc::channel();
+        let demux_retired = Arc::new(AtomicBool::new(false));
+        let worker_demux_retired = Arc::clone(&demux_retired);
+        let events = Arc::new(Mutex::new(None));
+        let events_tx = Arc::clone(&events);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker_opening = Arc::clone(&opening);
         let worker_shutdown = Arc::clone(&shutdown);
@@ -1077,14 +1129,14 @@ impl GuardWorker {
             .name(format!("audio-guard-{generation}"))
             .spawn(move || {
                 let initialized = (|| {
-                    let mut connection = Connection::connect(Some(&cancel))?;
-                    let sources = connection.sources(Some(&cancel))?;
+                    let mut connection = Connection::connect(Some(&owner_cancel))?;
+                    let sources = connection.sources(Some(&owner_cancel))?;
                     let selected = validated_source_index(&source, &sources)?;
-                    connection.subscribe(selected, &cancel)?;
+                    connection.subscribe(selected, &owner_cancel)?;
                     // Recheck after subscription ACK closes enumeration/subscribe
                     // loss gap. Subsequent exact removals remain latched.
-                    validated_source_index(&source, &connection.sources(Some(&cancel))?).and_then(
-                        |index| {
+                    validated_source_index(&source, &connection.sources(Some(&owner_cancel))?)
+                        .and_then(|index| {
                             if index != selected || connection.notifications.selected_removed.get()
                             {
                                 Err(AudioError::SourceMissing {
@@ -1093,8 +1145,7 @@ impl GuardWorker {
                             } else {
                                 Ok(())
                             }
-                        },
-                    )?;
+                        })?;
                     Ok::<_, AudioError>(connection)
                 })();
                 let mut connection = match initialized {
@@ -1105,8 +1156,10 @@ impl GuardWorker {
                         connection
                     }
                     Err(error) => {
-                        let _ = ready_tx.send(Err(error.clone()));
-                        return Err(error);
+                        let _ = ready_tx.send(Err(error));
+                        // Failed prevalidation created no recording/Add. Its
+                        // connection has already dropped; joining is still real.
+                        return Ok(());
                     }
                 };
                 run_guard(
@@ -1114,30 +1167,43 @@ impl GuardWorker {
                     &source,
                     &worker_tag,
                     &cancel,
+                    epoch,
+                    stamp,
                     &worker_opening,
+                    &owner_cancel,
                     &worker_shutdown,
                     &events_tx,
+                    &worker_demux_retired,
                 )
             })
             .map_err(|error| AudioError::Unavailable(format!("audio guard thread: {error}")))?;
-        let mut worker = Self {
+        Ok(Self {
             tag,
             opening,
             shutdown,
+            demux_retired,
             events,
+            ready: ready_rx,
+            ready_received: false,
             thread: Some(thread),
-        };
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(worker),
-            Ok(Err(error)) => {
-                let _ = worker.join();
-                Err(error)
+        })
+    }
+
+    pub(crate) fn poll_ready(&mut self) -> Option<Result<(), AudioError>> {
+        if self.ready_received {
+            return None;
+        }
+        match self.ready.try_recv() {
+            Ok(result) => {
+                self.ready_received = true;
+                Some(result)
             }
-            Err(_) => {
-                let _ = worker.join();
-                Err(AudioError::Unavailable(
-                    "audio guard initialization ended without result".into(),
-                ))
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.ready_received = true;
+                Some(Err(AudioError::Control(
+                    "guard initialization ended without readiness".into(),
+                )))
             }
         }
     }
@@ -1151,7 +1217,15 @@ impl GuardWorker {
     }
 
     pub(crate) fn poll_event(&self) -> Option<AudioEvent> {
-        self.events.try_recv().ok()
+        self.events.lock().take()
+    }
+
+    pub(crate) fn mark_demux_retired(&self) {
+        self.demux_retired.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     fn join(&mut self) -> Result<(), AudioError> {
@@ -1271,121 +1345,241 @@ fn checked_cancel_target(
     choose_target(tag, pid, clients, outputs, opening)
 }
 
+fn publish_guard_event(events: &Mutex<Option<AudioEvent>>, event: AudioEvent) -> bool {
+    let mut slot = events.lock();
+    let terminal = |event: &AudioEvent| {
+        matches!(
+            event,
+            AudioEvent::SourceLost { .. } | AudioEvent::CancelFailed { .. }
+        )
+    };
+    if matches!(slot.as_ref(), Some(AudioEvent::RoutePending { .. }))
+        && matches!(event, AudioEvent::RouteVerified { .. })
+    {
+        return false;
+    }
+    if slot.as_ref().is_none_or(|old| !terminal(old)) || terminal(&event) {
+        *slot = Some(event);
+        true
+    } else {
+        false
+    }
+}
+
+fn checked_route(
+    source_index: u32,
+    target: Option<&Target>,
+    epoch: AudioEpoch,
+    stamp: WatchStamp,
+) -> Result<Option<AudioRouteReceipt>, AudioError> {
+    let Some(Target::Output(output, client)) = target else {
+        return Ok(None);
+    };
+    if output.source == INVALID_INDEX {
+        return Ok(None);
+    }
+    if output.source != source_index {
+        return Err(AudioError::Control(format!(
+            "owned recording routed to source {}, selected fresh source is {source_index}",
+            output.source,
+        )));
+    }
+    Ok(Some(AudioRouteReceipt {
+        epoch,
+        stamp,
+        source_index,
+        source_output_index: output.index,
+        client_index: client.index,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_guard(
     connection: &mut Connection,
     source: &AudioSourceIdentity,
     tag: &str,
     cancel: &AtomicBool,
+    epoch: AudioEpoch,
+    stamp: WatchStamp,
     opening: &AtomicBool,
+    owner_cancel: &AtomicBool,
     shutdown: &AtomicBool,
-    events: &Sender<AudioEvent>,
+    events: &Mutex<Option<AudioEvent>>,
+    demux_retired: &AtomicBool,
 ) -> Result<(), AudioError> {
     let pid = std::process::id().to_string();
     let mut source_failed = false;
-    let mut control_error = None;
     let mut cancelled = false;
-    let mut cancel_seen = false;
+    let mut last_route = None;
+    let mut route_deadline = Instant::now() + CONTROL_TIMEOUT;
+    let mut retirement_deadline = None;
+    connection.notifications.recording_dirty.set(true);
     while !shutdown.load(Ordering::Acquire) {
+        if owner_cancel.load(Ordering::Acquire) {
+            cancel.store(true, Ordering::Release);
+        }
         if !connection.ready() {
             let error = connection.error("guard connection lost");
-            if cancel.load(Ordering::Acquire) {
-                let _ = events.send(AudioEvent::CancelFailed(error.clone()));
-            } else if !source_failed {
-                let _ = events.send(AudioEvent::SourceLost(error.clone()));
-            }
+            publish_guard_event(
+                events,
+                AudioEvent::CancelFailed {
+                    epoch,
+                    error: error.clone(),
+                },
+            );
             return Err(error);
         }
-        if !cancel.load(Ordering::Acquire)
-            && !source_failed
-            && (connection.notifications.selected_removed.get()
-                || connection.notifications.source_dirty.replace(false))
-        {
-            let checked = if connection.notifications.selected_removed.get() {
-                Err(AudioError::SourceMissing {
-                    name: source.name().into(),
-                })
-            } else {
-                connection.sources(Some(shutdown)).and_then(|rows| {
-                    let index = validated_source_index(source, &rows)?;
-                    if index != connection.notifications.selected_index.get() {
-                        Err(AudioError::SourceChanged {
-                            name: source.name().into(),
-                        })
-                    } else {
-                        Ok(())
-                    }
-                })
-            };
-            if let Err(error) = checked {
-                if shutdown.load(Ordering::Acquire) {
-                    break;
+        let dirty = connection.notifications.recording_dirty.replace(false)
+            | connection.notifications.source_dirty.replace(false);
+        if !cancel.load(Ordering::Acquire) && !source_failed && (dirty || last_route.is_none()) {
+            if dirty && last_route.take().is_some() {
+                publish_guard_event(events, AudioEvent::RoutePending { epoch });
+                route_deadline = Instant::now() + CONTROL_TIMEOUT;
+            }
+            let checked = (|| {
+                if connection.notifications.selected_removed.get() {
+                    return Err(AudioError::SourceMissing {
+                        name: source.name().into(),
+                    });
                 }
-                if !cancel.load(Ordering::Acquire) {
-                    source_failed = true;
-                    let _ = events.send(AudioEvent::SourceLost(error));
+                let sources = connection.sources(Some(shutdown))?;
+                let index = validated_source_index(source, &sources)?;
+                if index != connection.notifications.selected_index.get() {
+                    return Err(AudioError::SourceChanged {
+                        name: source.name().into(),
+                    });
                 }
-            }
-        }
-        let stop = cancel.load(Ordering::Acquire);
-        let dirty = connection.notifications.recording_dirty.replace(false);
-        if !stop
-            && !source_failed
-            && dirty
-            && let Err(error) = refresh_owned_recording(connection, tag, &pid, opening, shutdown)
-        {
-            if shutdown.load(Ordering::Acquire) {
-                break;
-            }
-            if !cancel.load(Ordering::Acquire) {
-                source_failed = true;
-                let _ = events.send(AudioEvent::SourceLost(error));
-            }
-        }
-        if !source_failed
-            && let Some(error) =
-                owned_recording_loss(&connection.notifications, cancel.load(Ordering::Acquire))
-        {
-            source_failed = true;
-            let _ = events.send(AudioEvent::SourceLost(error));
-        }
-        if stop && !cancelled && control_error.is_none() && (!cancel_seen || dirty) {
-            cancel_seen = true;
-            let attempt = (|| {
                 let clients = connection.clients(None, shutdown)?;
                 let outputs = connection.outputs(None, shutdown)?;
-                let Some(target) = choose_target(
+                latch_missing_owned(&connection.notifications, &clients, &outputs);
+                if let Some(error) = owned_recording_loss(&connection.notifications, false) {
+                    return Err(error);
+                }
+                let target = choose_target(
                     tag,
                     &pid,
                     &clients,
                     &outputs,
                     opening.load(Ordering::Acquire),
-                )?
-                else {
-                    // Stop-before-open is level-triggered. Subscription continues
-                    // waiting for its dedicated client/output until native destroy.
-                    return Ok(CancelOutcome::StillArmed);
-                };
-                let Some(target) = fresh_target(connection, &target, tag, &pid, opening, shutdown)?
-                else {
-                    return Ok(CancelOutcome::StillArmed);
-                };
-                if matches!(target, Target::Client(_)) && !opening.load(Ordering::Acquire) {
-                    return Ok(CancelOutcome::StillArmed);
+                )?;
+                if let Some(target) = &target {
+                    if let Target::Client(client) = target {
+                        recording_only_client(client, &connection.playback_clients(shutdown)?)?;
+                    }
+                    cache_owned_recording(&connection.notifications, target);
                 }
-                connection.kill(&target, shutdown)
+                let index_again =
+                    validated_source_index(source, &connection.sources(Some(shutdown))?)?;
+                let fresh = match &target {
+                    Some(target) => fresh_target(connection, target, tag, &pid, opening, shutdown)?,
+                    None => None,
+                };
+                connection.drain()?;
+                if index_again != index
+                    || connection.notifications.selected_removed.get()
+                    || connection.notifications.source_dirty.get()
+                    || connection.notifications.recording_dirty.get()
+                {
+                    return Ok(None);
+                }
+                checked_route(index, fresh.as_ref(), epoch, stamp)
             })();
-            match attempt {
-                Ok(CancelOutcome::Acknowledged) => {
-                    cancelled = true;
-                    let _ = events.send(AudioEvent::Cancelled);
+            match checked {
+                Ok(Some(receipt)) => {
+                    if last_route.as_ref() == Some(&receipt)
+                        || publish_guard_event(
+                            events,
+                            AudioEvent::RouteVerified {
+                                receipt: receipt.clone(),
+                            },
+                        )
+                    {
+                        last_route = Some(receipt);
+                    }
                 }
-                Ok(CancelOutcome::StillArmed) => {}
+                Ok(None) if Instant::now() < route_deadline => {}
+                Ok(None) => {
+                    source_failed = true;
+                    cancel.store(true, Ordering::Release);
+                    publish_guard_event(
+                        events,
+                        AudioEvent::SourceLost {
+                            epoch,
+                            error: AudioError::Control(
+                                "recording route remained unassigned or unverifiable".into(),
+                            ),
+                        },
+                    );
+                }
                 Err(error) => {
                     if shutdown.load(Ordering::Acquire) {
                         break;
                     }
-                    let _ = events.send(AudioEvent::CancelFailed(error.clone()));
-                    control_error = Some(error);
+                    source_failed = true;
+                    cancel.store(true, Ordering::Release);
+                    publish_guard_event(events, AudioEvent::SourceLost { epoch, error });
+                }
+            }
+        }
+        if cancel.load(Ordering::Acquire) {
+            let attempt = (|| {
+                let clients = connection.clients(None, shutdown)?;
+                let outputs = connection.outputs(None, shutdown)?;
+                let target = choose_target(
+                    tag,
+                    &pid,
+                    &clients,
+                    &outputs,
+                    opening.load(Ordering::Acquire) || demux_retired.load(Ordering::Acquire),
+                )?;
+                if demux_retired.load(Ordering::Acquire) && target.is_none() {
+                    return Ok(None);
+                }
+                let Some(target) = target else {
+                    return Ok(Some(CancelOutcome::StillArmed));
+                };
+                let Some(target) = fresh_target(connection, &target, tag, &pid, opening, shutdown)?
+                else {
+                    return Ok(Some(CancelOutcome::StillArmed));
+                };
+                connection.kill(&target, shutdown).map(Some)
+            })();
+            match attempt {
+                Ok(None) => return Ok(()),
+                Ok(Some(CancelOutcome::Acknowledged)) if !cancelled => {
+                    cancelled = true;
+                    publish_guard_event(events, AudioEvent::Cancelled { epoch });
+                }
+                Ok(Some(_)) => {}
+                Err(error) => {
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    publish_guard_event(
+                        events,
+                        AudioEvent::CancelFailed {
+                            epoch,
+                            error: error.clone(),
+                        },
+                    );
+                    return Err(error);
+                }
+            }
+            if demux_retired.load(Ordering::Acquire) {
+                let deadline =
+                    *retirement_deadline.get_or_insert_with(|| Instant::now() + CONTROL_TIMEOUT);
+                if Instant::now() >= deadline {
+                    let error = AudioError::Control(
+                        "owned recording did not retire after demux removal".into(),
+                    );
+                    publish_guard_event(
+                        events,
+                        AudioEvent::CancelFailed {
+                            epoch,
+                            error: error.clone(),
+                        },
+                    );
+                    return Err(error);
                 }
             }
         }
@@ -1393,23 +1587,200 @@ fn run_guard(
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
-            if cancel.load(Ordering::Acquire) {
-                let _ = events.send(AudioEvent::CancelFailed(error.clone()));
-            } else if !source_failed {
-                let _ = events.send(AudioEvent::SourceLost(error.clone()));
-            }
+            publish_guard_event(
+                events,
+                AudioEvent::CancelFailed {
+                    epoch,
+                    error: error.clone(),
+                },
+            );
             return Err(error);
         }
     }
-    match control_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_readiness_is_nonblocking_one_shot_and_preserves_actual_error() {
+        let (ready_tx, ready) = mpsc::sync_channel(1);
+        let mut worker = GuardWorker {
+            tag: "fixture".into(),
+            opening: Arc::new(AtomicBool::new(true)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            demux_retired: Arc::new(AtomicBool::new(false)),
+            events: Arc::new(Mutex::new(None)),
+            ready,
+            ready_received: false,
+            thread: None,
+        };
+        assert_eq!(worker.poll_ready(), None);
+        let error = AudioError::SourceMissing {
+            name: "selected".into(),
+        };
+        ready_tx.send(Err(error.clone())).unwrap();
+        assert_eq!(worker.poll_ready(), Some(Err(error)));
+        assert_eq!(worker.poll_ready(), None);
+    }
+
+    #[test]
+    fn route_acceptance_requires_actual_fresh_source_not_just_ownership() {
+        let epoch = AudioEpoch::new(1).unwrap();
+        let stamp = WatchStamp {
+            watch: crate::domain::capture::WatchId::new(1).unwrap(),
+            epoch: crate::domain::capture::ObservationEpoch::new(1).unwrap(),
+        };
+        let clients = [client(7, "tag", "42")];
+        let mut output = output(8, 7, "tag", "42");
+        output.source = INVALID_INDEX;
+        let target = Target::Output(output.clone(), clients[0].clone());
+        assert_eq!(
+            checked_route(55, Some(&target), epoch, stamp).unwrap(),
+            None
+        );
+        output.source = 12;
+        let target = Target::Output(output.clone(), clients[0].clone());
+        assert!(checked_route(55, Some(&target), epoch, stamp).is_err());
+        output.source = 55;
+        let target = Target::Output(output, clients[0].clone());
+        let route = checked_route(55, Some(&target), epoch, stamp)
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.source_index, 55);
+        assert_eq!(route.source_output_index, 8);
+        assert_eq!(route.client_index, 7);
+        assert!(checked_route(56, Some(&target), epoch, stamp).is_err());
+    }
+
+    #[test]
+    fn fresh_route_assignment_preserves_owned_recording_and_uses_current_source() {
+        let epoch = AudioEpoch::new(1).unwrap();
+        let stamp = WatchStamp {
+            watch: crate::domain::capture::WatchId::new(1).unwrap(),
+            epoch: crate::domain::capture::ObservationEpoch::new(1).unwrap(),
+        };
+        let clients = [client(7, "tag", "42")];
+        let mut pending = output(8, 7, "tag", "42");
+        pending.source = INVALID_INDEX;
+        let previous = choose_target("tag", "42", &clients, std::slice::from_ref(&pending), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            checked_route(55, Some(&previous), epoch, stamp).unwrap(),
+            None
+        );
+        // The recording is assigned between the guard's list inventory and
+        // its targeted fresh lookup. Ownership is unchanged, routing is not.
+        let mut assigned = pending;
+        assigned.source = 55;
+        let fresh = checked_cancel_target(
+            &previous,
+            &clients,
+            std::slice::from_ref(&assigned),
+            "tag",
+            "42",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fresh, Target::Output(assigned, clients[0].clone()));
+        assert_eq!(
+            checked_route(55, Some(&fresh), epoch, stamp).unwrap(),
+            Some(AudioRouteReceipt {
+                epoch,
+                stamp,
+                source_index: 55,
+                source_output_index: 8,
+                client_index: 7,
+            })
+        );
+        assert!(checked_route(56, Some(&fresh), epoch, stamp).is_err());
+    }
+
+    #[test]
+    fn fresh_route_movement_is_cancellable_but_never_verifies_selected_source() {
+        let epoch = AudioEpoch::new(1).unwrap();
+        let stamp = WatchStamp {
+            watch: crate::domain::capture::WatchId::new(1).unwrap(),
+            epoch: crate::domain::capture::ObservationEpoch::new(1).unwrap(),
+        };
+        let clients = [client(7, "tag", "42")];
+        let previous = choose_target("tag", "42", &clients, &[output(8, 7, "tag", "42")], false)
+            .unwrap()
+            .unwrap();
+        for source in [INVALID_INDEX, 12] {
+            let mut moved = output(8, 7, "tag", "42");
+            moved.source = source;
+            let fresh = checked_cancel_target(
+                &previous,
+                &clients,
+                std::slice::from_ref(&moved),
+                "tag",
+                "42",
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(fresh, Target::Output(moved, clients[0].clone()));
+            let route = checked_route(55, Some(&fresh), epoch, stamp);
+            if source == INVALID_INDEX {
+                assert_eq!(route.unwrap(), None);
+            } else {
+                assert!(route.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn pending_route_and_terminal_loss_cannot_be_overwritten_by_late_verified() {
+        let epoch = AudioEpoch::new(1).unwrap();
+        let stamp = WatchStamp {
+            watch: crate::domain::capture::WatchId::new(1).unwrap(),
+            epoch: crate::domain::capture::ObservationEpoch::new(1).unwrap(),
+        };
+        let receipt = AudioRouteReceipt {
+            epoch,
+            stamp,
+            source_index: 55,
+            source_output_index: 8,
+            client_index: 7,
+        };
+        let slot = Mutex::new(None);
+        assert!(publish_guard_event(
+            &slot,
+            AudioEvent::RoutePending { epoch }
+        ));
+        assert!(!publish_guard_event(
+            &slot,
+            AudioEvent::RouteVerified {
+                receipt: receipt.clone()
+            }
+        ));
+        assert!(matches!(
+            slot.lock().take(),
+            Some(AudioEvent::RoutePending { .. })
+        ));
+        assert!(publish_guard_event(
+            &slot,
+            AudioEvent::SourceLost {
+                epoch,
+                error: AudioError::SourceMissing {
+                    name: "capture".into()
+                }
+            }
+        ));
+        assert!(!publish_guard_event(
+            &slot,
+            AudioEvent::RouteVerified { receipt }
+        ));
+        assert!(matches!(
+            slot.lock().as_ref(),
+            Some(AudioEvent::SourceLost { .. })
+        ));
+    }
     #[test]
     fn native_destroy_winning_fresh_recheck_leaves_cancellation_armed() {
         let client = client(7, "tag", "42");
@@ -1639,6 +2010,7 @@ mod tests {
         SourceOutput {
             index,
             client,
+            source: 55,
             name: tag.into(),
             app: Some(tag.into()),
             media: Some(tag.into()),
@@ -1688,16 +2060,34 @@ mod tests {
 
     #[test]
     fn stale_index_or_changed_client_fails_fresh_recheck() {
+        let clients = [client(7, "tag", "42")];
         let old = output(8, 7, "tag", "42");
-        let mut changed = old.clone();
-        changed.client = 9;
-        assert!(!same_output(&old, &changed));
-        changed = old.clone();
-        changed.index = 12;
-        assert!(!same_output(&old, &changed));
-        changed = old.clone();
-        changed.app = Some("foreign".into());
-        assert!(!same_output(&old, &changed));
-        assert_ne!(client(7, "tag", "42"), client(7, "foreign", "42"));
+        let previous = Target::Output(old.clone(), clients[0].clone());
+        let changes: [fn(&mut SourceOutput); 6] = [
+            |row| row.index = 12,
+            |row| row.client = 9,
+            |row| row.name = "foreign".into(),
+            |row| row.app = Some("foreign".into()),
+            |row| row.media = Some("foreign".into()),
+            |row| row.pid = Some("99".into()),
+        ];
+        for change in changes {
+            let mut changed = old.clone();
+            change(&mut changed);
+            assert!(
+                checked_cancel_target(&previous, &clients, &[changed], "tag", "42", false).is_err()
+            );
+        }
+        assert!(
+            checked_cancel_target(
+                &previous,
+                &[client(7, "tag", "99")],
+                &[old],
+                "tag",
+                "42",
+                false,
+            )
+            .is_err()
+        );
     }
 }

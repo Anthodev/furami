@@ -1,10 +1,15 @@
 //! Nonblocking, bounded ports. Prepared routes remain opaque to product state.
 
 use crate::domain::{
-    capture::{AudioError, AudioSourceIdentity, PlaybackGain},
+    capture::{
+        AudioAvailability, AudioEpoch, AudioError, AudioRouteReceipt, AudioSilence,
+        AudioSourceIdentity, PlaybackGain, RecoveryCandidate, RecoveryObservation,
+        RecoveryWatchTarget, SelectionToken, WatchStamp,
+    },
     failure::ApplyFailure,
     state::{
-        AttemptId, AttemptKey, DraftSettings, PauseRequestId, ValidationKey, ValidationRequest,
+        AttemptId, AttemptKey, DraftSettings, InitialPlayback, PauseRequestId, ValidationKey,
+        ValidationRequest,
     },
 };
 
@@ -16,19 +21,36 @@ pub enum SubmitFailure {
     Disconnected,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValidationOutcome<P> {
+    Prepared(P),
+    SelectionRequired(Vec<RecoveryCandidate>),
+    Failed(ApplyFailure),
+}
 pub struct ValidationResult<P> {
     pub request: ValidationRequest,
-    pub result: Result<P, ApplyFailure>,
+    /// Fresh completed worker observation, not the request's old epoch.
+    pub stamp: WatchStamp,
+    pub result: ValidationOutcome<P>,
 }
 
 pub trait DraftValidator {
     type Prepared;
+    /// Successful adapter evidence, including a freshly selected complete identity.
+    fn prepared_settings(prepared: &Self::Prepared) -> &DraftSettings;
+    fn prepared_stamp(prepared: &Self::Prepared) -> WatchStamp;
     fn begin_validate(&mut self, request: ValidationRequest) -> Result<(), SubmitFailure>;
     fn poll_validation(&mut self) -> Option<ValidationResult<Self::Prepared>>;
     /// Cancellation never discards the terminal result: consuming it drains work.
     fn cancel_validation(&mut self, key: ValidationKey);
+    fn watch(&mut self, target: RecoveryWatchTarget) -> Result<(), SubmitFailure>;
+    fn poll_recovery(&mut self) -> Option<RecoveryObservation>;
+    fn clear_watch(&mut self);
+    /// Retire one-opening physical authorization after verified commit or actual
+    /// failed/cancelled attempt retirement; never replace the saved identity.
+    fn retire_selection(&mut self, token: SelectionToken);
     fn shutdown(&mut self);
-    /// True only after worker retirement, not merely a cancellation request.
+    /// True only after validation and observation workers have actually joined.
     fn shutdown_complete(&mut self) -> bool;
 }
 
@@ -51,13 +73,21 @@ pub enum StopReason {
     Close,
     Quit,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImmediateIntent {
     SetPaused {
         request: PauseRequestId,
         paused: bool,
     },
     SetGain(PlaybackGain),
+    DetachAudio {
+        epoch: AudioEpoch,
+    },
+    AttachAudio {
+        epoch: AudioEpoch,
+        source: AudioSourceIdentity,
+        stamp: WatchStamp,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmitStatus {
@@ -75,6 +105,7 @@ pub trait SessionRunner {
         key: AttemptKey,
         prepared: Self::Prepared,
         gain: PlaybackGain,
+        playback: InitialPlayback,
     ) -> Result<(), StartFailure>;
     fn stop(&mut self, attempt: AttemptId, reason: StopReason) -> StopSubmission;
     /// Terminal acknowledgement/failure must precede coalesced readiness.
@@ -94,16 +125,29 @@ pub struct VerificationSummary {
     pub decoded_size: FactStatus,
     pub nominal_rate: FactStatus,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenReadiness {
+    Live,
+    PausedPrepared,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AudioOutcome {
     Disabled,
-    Active { source: AudioSourceIdentity },
+    Silent {
+        source: AudioSourceIdentity,
+        reason: AudioSilence,
+    },
+    Active {
+        source: AudioSourceIdentity,
+        route: AudioRouteReceipt,
+    },
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenReceipt {
     pub settings: DraftSettings,
     pub verification: VerificationSummary,
     pub audio: AudioOutcome,
+    pub readiness: OpenReadiness,
 }
 impl OpenReceipt {
     pub fn matches(&self, settings: &DraftSettings) -> bool {
@@ -116,20 +160,13 @@ impl OpenReceipt {
             }
             (
                 crate::domain::capture::AudioSelection::Enabled { source: selected },
-                AudioOutcome::Active { source },
+                AudioOutcome::Active { source, .. } | AudioOutcome::Silent { source, .. },
             ) => selected == source,
             _ => false,
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AudioDiagnostic {
-    Disabled,
-    Opening,
-    Active,
-    RestartRequired(AudioError),
-}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
     OpenVerified {
@@ -144,8 +181,10 @@ pub enum SessionEvent {
         attempt: AttemptId,
         failure: ApplyFailure,
     },
-    SessionEnded {
+    StreamEnded {
         attempt: AttemptId,
+        reason: i32,
+        error: i32,
     },
     PauseObserved {
         attempt: AttemptId,
@@ -163,8 +202,13 @@ pub enum SessionEvent {
         attempt: AttemptId,
         failure: ApplyFailure,
     },
-    AudioDiagnostic {
+    AudioAvailability {
         attempt: AttemptId,
-        status: AudioDiagnostic,
+        status: AudioAvailability,
+    },
+    AudioDetached {
+        attempt: AttemptId,
+        epoch: AudioEpoch,
+        outcome: Result<(), AudioError>,
     },
 }
