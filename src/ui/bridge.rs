@@ -41,19 +41,23 @@ pub(crate) mod ffi {
         restart_generation: u64,
         can_open: bool,
         can_restart: bool,
+        product_phase: String,
         audio_status: String,
         audio_diagnostic: String,
         audio_source: String,
-        audio_enabled: bool,
+        audio_desired: String,
         failed: bool,
         diagnostic: String,
+        recovery_evidence: String,
+        recovery_stage: String,
+        candidates: String,
         paused: bool,
+        prepared_paused: bool,
         volume_percent: i32,
         muted: bool,
         can_toggle_pause: bool,
         can_set_gain: bool,
         playback_status: String,
-        ended: bool,
         create_native: bool,
         release_native: bool,
         quit: bool,
@@ -73,6 +77,14 @@ pub(crate) mod ffi {
         fn gate_capture_selected(gate: &RuntimeCoordinator) -> bool;
         fn gate_open(gate: &mut RuntimeCoordinator) -> UiUpdate;
         fn gate_restart(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
+        fn gate_reconnect(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
+        fn gate_choose_recovery(
+            gate: &mut RuntimeCoordinator,
+            generation: u64,
+            watch: u64,
+            epoch: u64,
+            candidate: u64,
+        ) -> UiUpdate;
         fn gate_qualification_command(gate: &mut RuntimeCoordinator, line: &str) -> UiUpdate;
         fn gate_surface_ready(gate: &mut RuntimeCoordinator, generation: u64, xid: u64)
         -> UiUpdate;
@@ -111,19 +123,26 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
             restart_generation: update.restart_generation,
             can_open: update.can_open,
             can_restart: update.can_restart,
+            product_phase: update.product_phase,
             audio_status: update.audio_status,
             audio_diagnostic: update.audio_diagnostic,
             audio_source: update.audio_source,
-            audio_enabled: update.audio_enabled,
+            audio_desired: update.audio_desired,
             failed: update.failed,
             diagnostic: update.diagnostic,
+            recovery_evidence: update.recovery_evidence,
+            recovery_stage: update.recovery_stage,
+            // Candidate entries are newline-joined; C++ splits for the
+            // choice surface. Entry layout is pipe-separated technical
+            // identity plus description.
+            candidates: update.candidates.join("\n"),
             paused: update.paused,
+            prepared_paused: update.prepared_paused,
             volume_percent: update.volume_percent,
             muted: update.muted,
             can_toggle_pause: update.can_toggle_pause,
             can_set_gain: update.can_set_gain,
             playback_status: update.playback_status,
-            ended: update.ended,
             create_native: update.create_native,
             release_native: update.release_native,
             quit: update.quit,
@@ -138,6 +157,20 @@ fn gate_open(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
 }
 fn gate_restart(gate: &mut RuntimeCoordinator, generation: u64) -> ffi::UiUpdate {
     gate.restart(generation).into()
+}
+fn gate_reconnect(gate: &mut RuntimeCoordinator, generation: u64) -> ffi::UiUpdate {
+    gate.reconnect(generation).into()
+}
+#[allow(clippy::too_many_arguments)]
+fn gate_choose_recovery(
+    gate: &mut RuntimeCoordinator,
+    generation: u64,
+    watch: u64,
+    epoch: u64,
+    candidate: u64,
+) -> ffi::UiUpdate {
+    gate.choose_recovery(generation, watch, epoch, candidate)
+        .into()
 }
 fn gate_qualification_command(gate: &mut RuntimeCoordinator, line: &str) -> ffi::UiUpdate {
     gate.qualification_command(line).into()

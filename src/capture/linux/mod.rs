@@ -26,7 +26,7 @@ use crate::domain::capture::{
 
 mod ffi;
 pub(crate) mod pulse;
-mod udev;
+pub(crate) mod udev;
 mod v4l2;
 
 /// Keep malformed device data, unavailable descriptors, unsupported tuples and
@@ -101,7 +101,7 @@ pub enum CaptureError {
 }
 
 /// Read-only observations from one discovery pass, not an atomic hotplug view.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CaptureSnapshot {
     devices: Vec<CaptureDevice>,
 }
@@ -112,9 +112,15 @@ impl CaptureSnapshot {
     }
 }
 
+pub(crate) fn empty_snapshot() -> CaptureSnapshot {
+    CaptureSnapshot {
+        devices: Vec::new(),
+    }
+}
+
 /// One physical USB adapter. Its technical identity is stored once, separate
 /// from the session paths and human-readable information of its capture nodes.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CaptureDevice {
     identity: DeviceIdentity,
     nodes: Vec<CaptureNode>,
@@ -131,7 +137,7 @@ impl CaptureDevice {
 }
 
 /// One eligible V4L2 node, with only the capture queues it actually advertises.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CaptureNode {
     devnode: PathBuf,
     syspath: PathBuf,
@@ -418,7 +424,7 @@ pub(crate) fn validate_with_injected_query<'a>(
 fn validate_with_query<'a>(
     snapshot: &'a CaptureSnapshot,
     request: &ModeRequest,
-    mut query: impl FnMut(
+    query: impl FnMut(
         &CaptureDevice,
         &CaptureNode,
         CapturedFourCc,
@@ -429,7 +435,59 @@ fn validate_with_query<'a>(
         &request.identity,
         snapshot.devices.iter().map(|device| &device.identity),
     )?;
-    let device = &snapshot.devices[index];
+    validate_device_with_query(&snapshot.devices[index], request.mode, query)
+}
+
+/// Explicit one-open authorization, not a relaxation of resolve_identity.
+/// Both physical locators and the complete observed technical identity must
+/// still match; the ordinary tuple proof is shared with automatic resolution.
+pub(crate) fn validate_authorized_with_query<'a>(
+    snapshot: &'a CaptureSnapshot,
+    request: &ModeRequest,
+    authorization: &crate::domain::capture::SelectedRouteAuthorization,
+    query: impl FnMut(
+        &CaptureDevice,
+        &CaptureNode,
+        CapturedFourCc,
+        FrameSize,
+    ) -> Result<ExactSizeIntervals, CaptureError>,
+) -> Result<ValidatedCapture<'a>, CaptureError> {
+    let requested = &request.identity;
+    let selected = &authorization.identity;
+    if requested.vendor_id() != selected.vendor_id()
+        || requested.product_id() != selected.product_id()
+        || requested.serial() != selected.serial()
+    {
+        return Err(CaptureError::Identity(IdentityError::NotFound));
+    }
+    let mut matches = snapshot.devices.iter().filter(|device| {
+        device.identity == *selected
+            && device.nodes.iter().any(|node| {
+                node.usb_syspath == authorization.usb_syspath
+                    && node.syspath == authorization.node_syspath
+            })
+    });
+    let device = matches.next().ok_or_else(|| CaptureError::StaleSnapshot {
+        path: authorization.node_syspath.clone(),
+    })?;
+    if matches.next().is_some() {
+        return Err(CaptureError::StaleSnapshot {
+            path: authorization.node_syspath.clone(),
+        });
+    }
+    validate_device_with_query(device, request.mode, query)
+}
+
+pub(crate) fn validate_device_with_query(
+    device: &CaptureDevice,
+    mode: CaptureMode,
+    mut query: impl FnMut(
+        &CaptureDevice,
+        &CaptureNode,
+        CapturedFourCc,
+        FrameSize,
+    ) -> Result<ExactSizeIntervals, CaptureError>,
+) -> Result<ValidatedCapture<'_>, CaptureError> {
     let mut routes = Vec::new();
     let mut unsupported = UnsupportedReason::FourCc;
     let mut unavailable = None;
@@ -438,11 +496,11 @@ fn validate_with_query<'a>(
             .capabilities
             .formats()
             .iter()
-            .find(|format| format.captured_fourcc == request.mode.captured_fourcc)
+            .find(|format| format.captured_fourcc == mode.captured_fourcc)
         else {
             continue;
         };
-        let supported = match node.capabilities.assess(first.buffer_type, request.mode) {
+        let supported = match node.capabilities.assess(first.buffer_type, mode) {
             SupportVerdict::Supported => true,
             SupportVerdict::Unsupported(reason) => {
                 if unsupported_rank(reason) > unsupported_rank(unsupported) {
@@ -461,19 +519,14 @@ fn validate_with_query<'a>(
             SupportVerdict::NeedsExactIntervals => {
                 // Descriptors are shared between queues of this node only.
                 // Query this exact size once, never a range endpoint.
-                let exact = query(
-                    device,
-                    node,
-                    request.mode.captured_fourcc,
-                    request.mode.size,
-                )?;
+                let exact = query(device, node, mode.captured_fourcc, mode.size)?;
                 match exact.intervals {
                     Descriptor::NotReported => {
                         unavailable = Some(UnknownReason::FrameIntervalsNotReported);
                         false
                     }
                     Descriptor::Available(intervals) => {
-                        if intervals.supports(request.mode.rate) {
+                        if intervals.supports(mode.rate) {
                             true
                         } else {
                             unsupported = UnsupportedReason::FrameRate;
@@ -488,7 +541,7 @@ fn validate_with_query<'a>(
                 .capabilities
                 .formats()
                 .iter()
-                .filter(|format| format.captured_fourcc == request.mode.captured_fourcc)
+                .filter(|format| format.captured_fourcc == mode.captured_fourcc)
             {
                 routes.push(ValidatedRoute {
                     node,
@@ -500,7 +553,7 @@ fn validate_with_query<'a>(
     if !routes.is_empty() {
         Ok(ValidatedCapture {
             identity: &device.identity,
-            mode: request.mode,
+            mode,
             routes,
         })
     } else if let Some(reason) = unavailable {
@@ -516,6 +569,24 @@ fn unsupported_rank(reason: UnsupportedReason) -> u8 {
         UnsupportedReason::FrameSize => 1,
         UnsupportedReason::FrameRate => 2,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn physical_fixture(
+    devices: &[(DeviceIdentity, &str, &str, &str, CaptureMode)],
+) -> CaptureSnapshot {
+    let devices = devices
+        .iter()
+        .map(|(identity, devnode, usb, node, mode)| {
+            let mut snapshot = session_fixture(&[devnode], *mode);
+            let mut device = snapshot.devices.remove(0);
+            device.identity = identity.clone();
+            device.nodes[0].usb_syspath = (*usb).into();
+            device.nodes[0].syspath = (*node).into();
+            device
+        })
+        .collect();
+    CaptureSnapshot { devices }
 }
 
 #[cfg(test)]

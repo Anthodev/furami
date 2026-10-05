@@ -66,18 +66,42 @@ ApplicationWindow {
         anchors.fill: parent
         spacing: 0
 
-        WindowContainer {
-            id: videoContainer
-            objectName: "videoContainer"
+        Item {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            window: root.bridge.hostWindow
-            activeFocusOnTab: true
 
+            WindowContainer {
+                id: videoContainer
+                objectName: "videoContainer"
+                anchors.fill: parent
+                window: root.bridge.hostWindow
+                activeFocusOnTab: true
+                // Native windows stack above Qt Quick Items: a Rectangle
+                // cannot conceal them. Visibility hides without releasing
+                // the permanent container or its owner's native surface.
+                visible: !root.bridge.presentationSuppressed
+                    && root.bridge.productPhase !== "Disconnected"
+            }
             Label {
                 anchors.centerIn: parent
                 visible: root.bridge.hostWindow === null
                 text: root.bridge.phase === "Idle" ? (root.bridge.captureSelected ? "Open capture to start" : "Select capture mode on command line") : root.bridge.phase
+            }
+            Rectangle {
+                anchors.fill: parent
+                visible: root.bridge.productPhase === "Disconnected"
+                    || (root.bridge.presentationSuppressed && root.bridge.hostWindow !== null)
+                color: palette.window
+                Label {
+                    anchors.centerIn: parent
+                    width: Math.min(parent.width - 32, 420)
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    text: root.bridge.productPhase === "Disconnected"
+                        ? "Capture disconnected"
+                            + (root.bridge.recoveryEvidence.length > 0 ? "\n" + root.bridge.recoveryEvidence : "")
+                        : "Capture hidden until Resume"
+                }
             }
         }
 
@@ -122,6 +146,16 @@ ApplicationWindow {
                         enabled: root.bridge.canRestart
                         onClicked: root.bridge.restartCapture(root.bridge.restartGeneration)
                     }
+                    // Reconnect stays visible in every session state: a healthy
+                    // session no-ops, a pending loss joins, and a shutdown is
+                    // rejected with the coordinator's actionable reason.
+                    Button {
+                        objectName: "reconnectCapture"
+                        text: "Reconnect capture"
+                        Layout.fillWidth: true
+                        enabled: root.bridge.phase !== "QuitReady"
+                        onClicked: root.bridge.reconnectCapture(root.bridge.restartGeneration)
+                    }
                     Button {
                         objectName: "closeProof"
                         text: "Close session"
@@ -143,6 +177,61 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         enabled: root.bridge.phase === "Ready"
                         onClicked: root.bridge.forceSurfaceLossForProof()
+                    }
+                    Label {
+                        text: "Session: " + root.bridge.productPhase
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                    Label {
+                        objectName: "recoveryStatus"
+                        visible: root.bridge.recoveryEvidence.length > 0
+                            || root.bridge.recoveryStage.length > 0
+                        text: (root.bridge.recoveryEvidence.length > 0
+                                ? root.bridge.recoveryEvidence + "\n" : "")
+                            + root.bridge.recoveryStage
+                        wrapMode: Text.WrapAnywhere
+                        Layout.fillWidth: true
+                        Accessible.name: "Capture recovery status"
+                    }
+                    Repeater {
+                        model: root.bridge.recoveryCandidates.length > 0
+                            ? root.bridge.recoveryCandidates.split("\n") : 0
+                        ColumnLayout {
+                            id: recoveryChoice
+                            required property string modelData
+                            readonly property var fields: modelData.split("|")
+                            Layout.fillWidth: true
+                            spacing: 2
+                            Label {
+                                text: (recoveryChoice.fields.length > 1
+                                        ? recoveryChoice.fields[1] : recoveryChoice.modelData)
+                                    + (recoveryChoice.fields.length > 2
+                                        ? "  " + recoveryChoice.fields[2] : "")
+                                wrapMode: Text.WrapAnywhere
+                                Layout.fillWidth: true
+                            }
+                            Label {
+                                visible: recoveryChoice.fields.length > 4
+                                text: "bus " + recoveryChoice.fields[3]
+                                    + " ports " + recoveryChoice.fields[4]
+                                    + (recoveryChoice.fields.length > 5
+                                        && recoveryChoice.fields[5] !== "-"
+                                        ? " serial " + recoveryChoice.fields[5] : "")
+                                wrapMode: Text.WrapAnywhere
+                                Layout.fillWidth: true
+                            }
+                            Button {
+                                objectName: "chooseRecovery"
+                                text: "Use this source"
+                                Layout.fillWidth: true
+                                enabled: root.bridge.captureSelected
+                                Accessible.name: "Reconnect with this capture source"
+                                onClicked: root.bridge.chooseRecovery(
+                                    root.bridge.restartGeneration,
+                                    recoveryChoice.modelData)
+                            }
+                        }
                     }
                     Label {
                         text: "Playback: " + root.bridge.playbackStatus
@@ -194,7 +283,8 @@ ApplicationWindow {
                     Label {
                         text: "Audio: " + root.bridge.audioStatus
                             + (root.bridge.audioSource.length > 0 ? "\n" + root.bridge.audioSource : "")
-                            + (!root.bridge.audioEnabled && root.bridge.audioSource.length > 0 ? "\nSelected source retained" : "")
+                            + (root.bridge.audioStatus === "Disabled" && root.bridge.audioDesired.length > 0
+                                ? "\nAudio off — selected source retained: " + root.bridge.audioDesired : "")
                             + (root.bridge.audioDiagnostic.length > 0 ? "\n" + root.bridge.audioDiagnostic : "")
                         wrapMode: Text.WrapAnywhere
                         Layout.fillWidth: true

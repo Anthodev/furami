@@ -218,23 +218,6 @@ impl CaptureSelection {
         let validated = linux::validate(snapshot, &self.request)?;
         Ok(InputSpec::from_validated(&validated, Some(&self.node))?)
     }
-
-    /// Run only on the media owner worker, before constructing the backend.
-    pub(crate) fn revalidate(&self) -> Result<InputSpec, SelectionError> {
-        let snapshot = linux::discover()?;
-        let validated = linux::validate(&snapshot, &self.request)?;
-        let input = InputSpec::from_validated(&validated, Some(&self.node))?;
-        let route = validated
-            .routes()
-            .iter()
-            .find(|route| {
-                route.node().devnode() == self.node
-                    && route.buffer_type() == input.requested.buffer_type
-            })
-            .ok_or_else(|| InputError::RouteNotProven(self.node.clone()))?;
-        linux::revalidate_route(validated.identity(), route)?;
-        Ok(input)
-    }
 }
 
 #[derive(Debug)]

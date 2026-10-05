@@ -2,12 +2,130 @@
 //! audio source identity, selection and playback gain.
 //!
 //! Allowed dependencies: `std`, `serde` (Serialize only), `thiserror`. No Qt, no
-//! native pointers, no node paths, no Linux access. Fraction arithmetic is exact
+//! native pointers or Linux access. Ephemeral route authorizations carry physical
+//! locators, never persisted identities. Fraction arithmetic is exact
 //! (`u128` intermediates); no floats, no sampling, no cartesian products.
 
-use std::num::{NonZeroU8, NonZeroU32};
+use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 
 use serde::Serialize;
+
+use super::failure::ApplyFailure;
+
+macro_rules! recovery_id {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+        pub struct $name(NonZeroU64);
+        impl $name {
+            pub fn new(value: u64) -> Option<Self> {
+                NonZeroU64::new(value).map(Self)
+            }
+            pub fn get(self) -> u64 {
+                self.0.get()
+            }
+        }
+    };
+}
+recovery_id!(WatchId);
+recovery_id!(ObservationEpoch);
+recovery_id!(CandidateId);
+recovery_id!(AudioEpoch);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct WatchStamp {
+    pub watch: WatchId,
+    pub epoch: ObservationEpoch,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecoveryWatchTarget {
+    pub watch: WatchId,
+    pub video: ModeRequest,
+    pub audio: AudioSelection,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct SelectionToken {
+    pub stamp: WatchStamp,
+    pub candidate: CandidateId,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecoveryCandidate {
+    pub token: SelectionToken,
+    pub identity: DeviceIdentity,
+    /// Display only; never an identity match key.
+    pub description: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum VideoPresence {
+    Present,
+    Absent,
+    Ambiguous(Vec<RecoveryCandidate>),
+    Unknown(ApplyFailure),
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum SourcePresence {
+    Disabled,
+    Present,
+    Absent(AudioError),
+    Unknown(AudioError),
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecoveryObservation {
+    pub stamp: WatchStamp,
+    pub video: VideoPresence,
+    pub audio: SourcePresence,
+    /// Monotonic removal high-water mark, retained across coalesced replug scans.
+    pub last_video_removal: Option<ObservationEpoch>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum LossEvidence {
+    StreamEnded { reason: i32, error: i32 },
+    Removed { stamp: WatchStamp },
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum AudioSilence {
+    WaitingForSource(AudioError),
+    PendingRoute,
+    Paused,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AudioRouteReceipt {
+    pub epoch: AudioEpoch,
+    pub stamp: WatchStamp,
+    pub source_index: u32,
+    pub source_output_index: u32,
+    pub client_index: u32,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum AudioAvailability {
+    Disabled,
+    Silent {
+        reason: AudioSilence,
+    },
+    Opening {
+        epoch: AudioEpoch,
+    },
+    Active {
+        source: AudioSourceIdentity,
+        route: AudioRouteReceipt,
+    },
+    Detaching {
+        epoch: AudioEpoch,
+    },
+    Blocked {
+        epoch: AudioEpoch,
+        error: AudioError,
+    },
+}
+
+/// One-open authorization produced only by successful fresh capture validation.
+/// Physical syspaths are locators, never persisted device identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedRouteAuthorization {
+    pub token: SelectionToken,
+    pub identity: DeviceIdentity,
+    pub usb_syspath: std::path::PathBuf,
+    pub node_syspath: std::path::PathBuf,
+}
 
 // ---------------------------------------------------------------------------
 // Errors

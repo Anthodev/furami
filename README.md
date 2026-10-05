@@ -20,6 +20,8 @@ View a console connected through a USB capture card, with playback controls besi
 - **Immediate volume and mute.** The panel's slider and mute button change Furami's playback output right away — never the capture device or system mixer.
 - **Fullscreen.** `F11` toggles fullscreen and restores your previous window size and focus.
 - **Collapsible controls.** Hide the panel when you want more space for the picture.
+- **Capture recovery.** Reconnects the last applied selection when the same card returns; paused playback stays paused, and ambiguous matches require your choice.
+- **Audio-only recovery.** Keeps video running silently while waiting for the selected audio source, without choosing a different input.
 
 ## First use
 
@@ -41,7 +43,7 @@ Audio is optional. List the available PulseAudio/PipeWire sources, then replace 
 
 ## Using it
 
-Click **Open capture** to start playback. Pause or resume with `Space` or the panel button, adjust volume and mute in the panel, toggle fullscreen with `F11`. **Close session** returns to idle; **Restart capture** fully reopens the capture; quitting closes everything cleanly.
+Click **Open capture** to start playback. Pause or resume with `Space` or the panel button, adjust volume and mute in the panel, toggle fullscreen with `F11`. **Close session** returns to idle; **Restart capture** fully reopens the capture. **Reconnect** retries the last valid selection after a failure and leaves a healthy session unchanged.
 
 Resuming briefly reconnects: the panel shows `Resuming` for a moment, then the console's current scene.
 
@@ -56,14 +58,15 @@ Resuming briefly reconnects: the panel shows `Resuming` for a moment, then the c
 | **Pause / Resume** button | Same as `Space`, from the panel |
 | **Volume slider** | Furami's playback volume, 0–100, immediate |
 | **Mute / Unmute** button | Furami's playback output only |
+| **Reconnect** button | Retry the last valid selection; join recovery already in progress |
 
 Focused controls keep their keys: `Space` types a space or activates the focused control instead of pausing. No global shortcuts; fullscreen and focus stay local to the window.
 
 ## Limitations
 
-- **Selection is command-line only.** No in-app device, mode or audio-source picker.
+- **Initial selection is command-line only.** Recovery can ask you to choose between matching cards; there is no general device, mode or audio-source picker.
 - **Settings are not persisted.** Every launch restates the capture selection; no profiles.
-- **Audio loss needs a full restart.** A failed audio transport shows `RestartRequired`; a full capture restart is the only way back.
+- **Recovery qualification is pending.** Physical unplug/replug, recovery while paused, audio-only loss and post-recovery A/V still need live hardware verification.
 - **Narrowly tested.** Fedora 44 / KDE Plasma Wayland with an AMD RX 7900 XTX is the exercised setup; Ubuntu and Arch are untested. See the [portability notes](packaging/appimage/PORTABILITY.md).
 - **Hardware Vulkan is required.** Wayland sessions also need XWayland; software rendering is not supported.
 - **Low latency is the goal, not a claim.** Latency has not been measured or tuned.

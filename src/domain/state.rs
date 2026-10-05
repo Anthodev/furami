@@ -5,7 +5,11 @@ use std::num::NonZeroU64;
 use serde::Serialize;
 
 use super::{
-    capture::{AudioSelection, ModeRequest},
+    capture::{
+        AudioSelection, LossEvidence, ModeRequest, ObservationEpoch, RecoveryCandidate,
+        RecoveryObservation, RecoveryWatchTarget, SelectionToken, VideoPresence, WatchId,
+        WatchStamp,
+    },
     failure::ApplyFailure,
 };
 
@@ -42,6 +46,17 @@ nonzero_id!(ApplyId);
 nonzero_id!(AttemptId);
 nonzero_id!(PauseRequestId);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum InitialPlayback {
+    Live,
+    Paused,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum ReconnectAdmission {
+    HealthyNoop,
+    Joined(ApplyId),
+    Started(ApplyId),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum PlaybackState {
     Live,
     PausePending { request: PauseRequestId },
@@ -53,6 +68,7 @@ pub enum AttemptPurpose {
     Restore,
     Reconnect,
     Resume,
+    Recovery,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct AttemptKey {
@@ -70,6 +86,9 @@ pub struct ValidationRequest {
     pub key: ValidationKey,
     pub revision: DraftRevision,
     pub settings: DraftSettings,
+    pub playback: InitialPlayback,
+    pub watch: WatchStamp,
+    pub choice: Option<SelectionToken>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Draft {
@@ -85,11 +104,21 @@ impl AppliedSettings {
         &self.settings
     }
 }
+/// Frozen last-successful state and real loss facts; never derived from the draft.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecoveryLoss {
+    pub applied: AppliedSettings,
+    pub playback: InitialPlayback,
+    pub evidence: LossEvidence,
+    pub failure: ApplyFailure,
+    pub stamp: WatchStamp,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Active {
     applied: AppliedSettings,
     key: AttemptKey,
     playback: PlaybackState,
+    initial_playback: InitialPlayback,
 }
 impl Active {
     pub fn applied(&self) -> &AppliedSettings {
@@ -100,6 +129,10 @@ impl Active {
     }
     pub fn playback(&self) -> PlaybackState {
         self.playback
+    }
+    /// Verified initial readiness, distinct from an ordinary live-origin pause.
+    pub fn initial_playback(&self) -> InitialPlayback {
+        self.initial_playback
     }
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -135,6 +168,9 @@ pub enum ProductPhase {
     CleaningFailedResume,
     ErrorWithActiveRestored,
     ErrorWithoutActive,
+    Disconnected,
+    Recovering,
+    SelectionRequired,
     Stopping,
     ShutdownReady,
 }
@@ -145,6 +181,7 @@ pub struct StateIdentity {
     attempt: Option<AttemptId>,
     cleanup: u8,
     playback: Option<PlaybackState>,
+    observation: Option<WatchStamp>,
 }
 impl StateIdentity {
     pub fn phase(self) -> ProductPhase {
@@ -207,6 +244,8 @@ pub enum CommandRejection {
     CapacityUnavailable,
     #[error("adapter disconnected")]
     Disconnected,
+    #[error("recovery selection is stale or unavailable")]
+    SelectionUnavailable,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Origin {
@@ -230,6 +269,7 @@ enum Step {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transition {
     request: ValidationRequest,
+    requested_target: DraftSettings,
     prior: Option<AppliedSettings>,
     origin: Origin,
     step: Step,
@@ -249,6 +289,8 @@ pub enum ProductState {
     ErrorWithoutActive {
         failures: FailureReport,
     },
+    Disconnected,
+    SelectionRequired,
     Stopping {
         target: StopTarget,
     },
@@ -264,6 +306,9 @@ impl ProductState {
                 PlaybackState::Paused => ProductPhase::Paused,
             },
             Self::Applying(transition) | Self::Recovering(transition) => {
+                if transition.request.key.purpose == AttemptPurpose::Recovery {
+                    return ProductPhase::Recovering;
+                }
                 match (&transition.step, transition.request.key.purpose) {
                     (Step::Validating { .. }, AttemptPurpose::Restore) => {
                         ProductPhase::ValidatingPrior
@@ -288,6 +333,8 @@ impl ProductState {
             }
             Self::ErrorWithActiveRestored { .. } => ProductPhase::ErrorWithActiveRestored,
             Self::ErrorWithoutActive { .. } => ProductPhase::ErrorWithoutActive,
+            Self::Disconnected => ProductPhase::Disconnected,
+            Self::SelectionRequired => ProductPhase::SelectionRequired,
             Self::Stopping { .. } => ProductPhase::Stopping,
             Self::ShutdownReady => ProductPhase::ShutdownReady,
         }
@@ -310,6 +357,18 @@ pub struct ProductModel {
     quitting: bool,
     validation_rejection: Option<ValidationRejection>,
     completed_failures: Option<FailureReport>,
+    watch_target: Option<RecoveryWatchTarget>,
+    observation: Option<RecoveryObservation>,
+    next_watch: u64,
+    consumed_removal: Option<ObservationEpoch>,
+    recovery: Option<RecoveryLoss>,
+    recovery_candidates: Vec<RecoveryCandidate>,
+    loss_attempt: Option<AttemptId>,
+    recovery_attempted: Option<WatchStamp>,
+    recovery_apply: Option<ApplyId>,
+    // Fallback reconnect intent when no frozen RecoveryLoss exists. Pause
+    // admission retains Paused; a validated fresh Resume open replaces it.
+    last_playback: InitialPlayback,
 }
 impl ProductModel {
     pub fn new(settings: DraftSettings) -> Self {
@@ -330,6 +389,16 @@ impl ProductModel {
             quitting: false,
             validation_rejection: None,
             completed_failures: None,
+            watch_target: None,
+            observation: None,
+            next_watch: 0,
+            consumed_removal: None,
+            recovery: None,
+            recovery_candidates: Vec::new(),
+            loss_attempt: None,
+            recovery_attempted: None,
+            recovery_apply: None,
+            last_playback: InitialPlayback::Live,
         }
     }
     pub fn draft(&self) -> &Draft {
@@ -369,7 +438,9 @@ impl ProductModel {
             }
             ProductState::ErrorWithActiveRestored { failures, .. }
             | ProductState::ErrorWithoutActive { failures } => Some(failures),
-            ProductState::Active(_)
+            ProductState::Disconnected
+            | ProductState::SelectionRequired
+            | ProductState::Active(_)
             | ProductState::Stopped
             | ProductState::Stopping { .. }
             | ProductState::ShutdownReady => self.completed_failures.as_ref(),
@@ -386,6 +457,10 @@ impl ProductModel {
                 CleanupStatus::Blocked { .. } => 2,
             },
             playback: self.active().map(Active::playback),
+            observation: self
+                .observation
+                .as_ref()
+                .map(|observation| observation.stamp),
         }
     }
     pub fn can_apply(&self) -> bool {
@@ -400,10 +475,19 @@ impl ProductModel {
                     | ProductState::Active(_)
                     | ProductState::ErrorWithActiveRestored { .. }
                     | ProductState::ErrorWithoutActive { .. }
+                    | ProductState::Disconnected
+                    | ProductState::SelectionRequired
             )
     }
     pub fn can_reconnect(&self) -> bool {
-        self.can_apply() && self.active().is_none() && self.last_valid.is_some()
+        !self.quitting
+            && !matches!(
+                self.state,
+                ProductState::Stopping { .. } | ProductState::ShutdownReady
+            )
+            && !matches!(self.cleanup, CleanupStatus::Blocked { .. })
+            && self.last_valid.is_some()
+            && (matches!(self.cleanup, CleanupStatus::Complete) || self.recovery.is_some())
     }
     pub fn can_restart(&self) -> bool {
         self.can_apply() && self.last_valid.is_some()
@@ -431,6 +515,549 @@ impl ProductModel {
             }
             _ => None,
         }
+    }
+    pub fn recovery(&self) -> Option<&RecoveryLoss> {
+        self.recovery.as_ref()
+    }
+    pub fn recovery_candidates(&self) -> &[RecoveryCandidate] {
+        &self.recovery_candidates
+    }
+    pub fn watch_target(&self) -> Option<&RecoveryWatchTarget> {
+        self.watch_target.as_ref()
+    }
+    pub fn observation(&self) -> Option<&RecoveryObservation> {
+        self.observation.as_ref()
+    }
+    pub fn opening_request(&self) -> Option<&ValidationRequest> {
+        match &self.state {
+            ProductState::Applying(transition) | ProductState::Recovering(transition)
+                if matches!(transition.step, Step::Opening { .. }) =>
+            {
+                Some(&transition.request)
+            }
+            _ => None,
+        }
+    }
+    fn ensure_watch(&mut self, settings: &DraftSettings) -> Result<WatchStamp, CommandRejection> {
+        let replace = self.watch_target.as_ref().is_none_or(|target| {
+            self.owned_attempt.is_none()
+                && (target.video != settings.video || target.audio != settings.audio)
+        });
+        if replace {
+            let next = self
+                .next_watch
+                .checked_add(1)
+                .ok_or(CommandRejection::CounterExhausted)?;
+            let watch = WatchId::new(next).ok_or(CommandRejection::CounterExhausted)?;
+            self.next_watch = next;
+            self.watch_target = Some(RecoveryWatchTarget {
+                watch,
+                video: settings.video.clone(),
+                audio: settings.audio.clone(),
+            });
+            self.observation = None;
+            self.consumed_removal = None;
+        }
+        let watch = self
+            .watch_target
+            .as_ref()
+            .ok_or(CommandRejection::Disconnected)?
+            .watch;
+        // This first epoch identifies the requested scan, not subscription readiness.
+        // The coordinator cannot submit it until the authoritative observation arrives.
+        Ok(self.observation.as_ref().map_or(
+            WatchStamp {
+                watch,
+                epoch: ObservationEpoch::new(1).ok_or(CommandRejection::CounterExhausted)?,
+            },
+            |observation| observation.stamp,
+        ))
+    }
+    /// A selected complete identity becomes the logical target only after verified open.
+    pub fn committed_watch(&mut self) -> Result<Option<RecoveryWatchTarget>, CommandRejection> {
+        let Some(settings) = self.last_valid.as_ref().map(|applied| &applied.settings) else {
+            return Ok(None);
+        };
+        if self
+            .watch_target
+            .as_ref()
+            .is_some_and(|target| target.video == settings.video && target.audio == settings.audio)
+        {
+            return Ok(None);
+        }
+        let settings = settings.clone();
+        let next = self
+            .next_watch
+            .checked_add(1)
+            .ok_or(CommandRejection::CounterExhausted)?;
+        let watch = WatchId::new(next).ok_or(CommandRejection::CounterExhausted)?;
+        self.next_watch = next;
+        let target = RecoveryWatchTarget {
+            watch,
+            video: settings.video,
+            audio: settings.audio,
+        };
+        self.watch_target = Some(target.clone());
+        self.observation = None;
+        self.consumed_removal = None;
+        Ok(Some(target))
+    }
+    /// Refresh only a still-current validation from real completed watcher evidence.
+    pub fn refresh_validation_stamp(&mut self, stamp: WatchStamp) -> Option<ValidationRequest> {
+        if self.watch_target.as_ref()?.watch != stamp.watch {
+            return None;
+        }
+        let request = match &mut self.state {
+            ProductState::Applying(transition) | ProductState::Recovering(transition)
+                if matches!(transition.step, Step::Validating { .. }) =>
+            {
+                &mut transition.request
+            }
+            _ => return None,
+        };
+        request.watch = stamp;
+        Some(request.clone())
+    }
+    /// Only successful opaque adapter evidence may replace the complete identity.
+    pub fn accept_prepared(
+        &mut self,
+        request: &ValidationRequest,
+        settings: DraftSettings,
+        stamp: WatchStamp,
+    ) -> Option<ValidationRequest> {
+        if self.validation_request() != Some(request)
+            || stamp.watch != request.watch.watch
+            || stamp.epoch.get() < request.watch.epoch.get()
+            || settings.video.mode != request.settings.video.mode
+            || settings.audio != request.settings.audio
+        {
+            return None;
+        }
+        let transition = match &mut self.state {
+            ProductState::Applying(transition) | ProductState::Recovering(transition) => transition,
+            _ => return None,
+        };
+        transition.request.settings = settings;
+        transition.request.watch = stamp;
+        if matches!(
+            transition.request.key.purpose,
+            AttemptPurpose::Recovery | AttemptPurpose::Reconnect
+        ) {
+            self.recovery_attempted = Some(stamp);
+        }
+        Some(transition.request.clone())
+    }
+    /// A different explicit candidate must acquire its watch after incumbent retirement.
+    /// The already-running subscription then produces an authoritative cutover scan.
+    pub fn cutover_validation(&mut self, key: AttemptKey) -> Option<ModelEffect> {
+        if self.opening().map(|(current, _)| current) != Some(key)
+            || self.owned_attempt != Some(key.attempt)
+            || matches!(
+                key.purpose,
+                AttemptPurpose::Recovery | AttemptPurpose::Reconnect
+            )
+        {
+            return None;
+        }
+        let settings = match &self.state {
+            ProductState::Applying(transition) | ProductState::Recovering(transition) => {
+                &transition.requested_target
+            }
+            _ => return None,
+        };
+        let target = self.watch_target.as_ref()?;
+        if target.video == settings.video && target.audio == settings.audio {
+            return None;
+        }
+        let settings = settings.clone();
+        let (mut transition, recovering) = self.take_transition()?;
+        // No physical resources for this reserved attempt have been created.
+        self.owned_attempt = None;
+        match self.ensure_watch(&settings) {
+            Ok(stamp) => transition.request.watch = stamp,
+            Err(_) => {
+                let failure = ApplyFailure::new(
+                    crate::domain::failure::FailureCategory::Lifecycle(
+                        crate::domain::failure::LifecycleFailure::Protocol,
+                    ),
+                    crate::domain::failure::Stage::Unknown,
+                    crate::domain::failure::Cause::Generic,
+                    settings,
+                    "watch_cutover",
+                    "watch counter exhausted",
+                );
+                transition.failures.candidate = Some(failure);
+                self.state = ProductState::ErrorWithoutActive {
+                    failures: transition.failures,
+                };
+                return None;
+            }
+        }
+        transition.request.settings = settings;
+        transition.step = Step::Validating { incumbent: None };
+        let effect = ModelEffect::Validate(transition.request.clone());
+        self.put_transition(transition, recovering);
+        Some(effect)
+    }
+    pub fn video_lost(
+        &mut self,
+        attempt: AttemptId,
+        evidence: LossEvidence,
+        failure: ApplyFailure,
+    ) -> Option<ModelEffect> {
+        if self.quitting
+            || matches!(
+                self.state,
+                ProductState::Stopping { .. } | ProductState::ShutdownReady
+            )
+        {
+            return None;
+        }
+        if self.loss_attempt == Some(attempt) {
+            if let LossEvidence::Removed { stamp } = evidence
+                && let Some(loss) = &mut self.recovery
+                && loss.stamp.watch == stamp.watch
+            {
+                loss.evidence = LossEvidence::Removed { stamp };
+                loss.stamp = stamp;
+            }
+            return None;
+        }
+        if self.owned_attempt != Some(attempt) {
+            return None;
+        }
+        if let Some(active) = self.active().cloned() {
+            let stamp = self
+                .observation
+                .as_ref()
+                .map(|observation| observation.stamp)
+                .or_else(|| {
+                    self.watch_target.as_ref().and_then(|target| {
+                        ObservationEpoch::new(1).map(|epoch| WatchStamp {
+                            watch: target.watch,
+                            epoch,
+                        })
+                    })
+                })?;
+            let playback = match active.playback {
+                PlaybackState::Live => InitialPlayback::Live,
+                PlaybackState::Paused | PlaybackState::PausePending { .. } => {
+                    InitialPlayback::Paused
+                }
+            };
+            self.last_playback = playback;
+            self.recovery = Some(RecoveryLoss {
+                applied: active.applied,
+                playback,
+                evidence,
+                failure: failure.clone(),
+                stamp,
+            });
+            self.loss_attempt = Some(attempt);
+            self.recovery_attempted = None;
+            if let Some(value) = self.next_apply.checked_add(1)
+                && let Some(apply) = ApplyId::new(value)
+            {
+                self.next_apply = value;
+                self.recovery_apply = Some(apply);
+                if !matches!(self.state, ProductState::Applying(_)) {
+                    self.last_operation = Some(apply);
+                }
+            }
+            self.recovery_candidates.clear();
+            self.prepared_pause = None;
+            self.cleanup = CleanupStatus::Draining;
+            if let Some((mut transition, restoring)) = self.take_transition() {
+                if let Step::Validating { incumbent } = &mut transition.step {
+                    *incumbent = None;
+                }
+                transition.failures.incumbent = Some(failure);
+                self.put_transition(transition, restoring);
+            } else {
+                let mut report = self.failures().cloned().unwrap_or_default();
+                report.incumbent = Some(failure);
+                self.completed_failures = Some(report);
+                self.state = ProductState::Disconnected;
+            }
+            return Some(ModelEffect::Stop {
+                attempt,
+                reason: StopIntent::Failed,
+            });
+        }
+        if let Some((key, _)) = self.opening() {
+            // EOF during an unverified open is a real open failure, not a new
+            // successfully applied value and not an automatic same-epoch retry.
+            return self.open_failed(key, failure);
+        }
+        None
+    }
+    pub fn recovery_observed(&mut self, observation: &RecoveryObservation) -> Option<ModelEffect> {
+        if self.quitting
+            || matches!(
+                self.state,
+                ProductState::Stopping { .. } | ProductState::ShutdownReady
+            )
+            || self.watch_target.as_ref().map(|target| target.watch)
+                != Some(observation.stamp.watch)
+            || self
+                .observation
+                .as_ref()
+                .is_some_and(|old| observation.stamp.epoch.get() < old.stamp.epoch.get())
+        {
+            return None;
+        }
+        if self
+            .observation
+            .as_ref()
+            .is_some_and(|old| old.stamp.epoch == observation.stamp.epoch)
+        {
+            return None;
+        }
+        let removal = observation.last_video_removal.filter(|epoch| {
+            epoch.get() <= observation.stamp.epoch.get()
+                && self
+                    .consumed_removal
+                    .is_none_or(|old| epoch.get() > old.get())
+        });
+        self.observation = Some(observation.clone());
+        if let Some(loss) = &mut self.recovery
+            && self.watch_target.as_ref().is_some_and(|target| {
+                target.video == loss.applied.settings.video
+                    && target.audio == loss.applied.settings.audio
+            })
+        {
+            loss.stamp = observation.stamp;
+        }
+        if let Some(epoch) = removal {
+            self.consumed_removal = Some(epoch);
+            let stamp = WatchStamp {
+                watch: observation.stamp.watch,
+                epoch,
+            };
+            if let Some(loss) = &mut self.recovery
+                && self.watch_target.as_ref().is_some_and(|target| {
+                    target.video == loss.applied.settings.video
+                        && target.audio == loss.applied.settings.audio
+                })
+            {
+                loss.evidence = LossEvidence::Removed { stamp };
+                loss.stamp = observation.stamp;
+            }
+            if let Some(attempt) = self.active().map(Active::attempt) {
+                let settings = self.active()?.applied.settings.clone();
+                let failure = ApplyFailure::new(
+                    crate::domain::failure::FailureCategory::Session,
+                    crate::domain::failure::Stage::Unknown,
+                    crate::domain::failure::Cause::Generic,
+                    settings,
+                    "video_removed",
+                    "matching capture device removal observed",
+                );
+                return self.video_lost(attempt, LossEvidence::Removed { stamp }, failure);
+            }
+            // Removal high-water invalidates an opening/validation even when
+            // the coalesced latest inventory is already Present again.
+            if let Some((mut transition, restoring)) = self.take_transition() {
+                if transition.request.watch.watch == stamp.watch
+                    && epoch.get() >= transition.request.watch.epoch.get()
+                {
+                    self.recovery_attempted = None;
+                    if let Step::Opening { key } = transition.step {
+                        self.cleanup = CleanupStatus::Draining;
+                        self.completed_failures = Some(transition.failures);
+                        self.state = if self.recovery.is_some() {
+                            ProductState::Disconnected
+                        } else {
+                            ProductState::ErrorWithoutActive {
+                                failures: self.completed_failures.clone().unwrap_or_default(),
+                            }
+                        };
+                        return Some(ModelEffect::Stop {
+                            attempt: key.attempt,
+                            reason: StopIntent::Failed,
+                        });
+                    }
+                    if self.recovery.is_some() {
+                        self.completed_failures = Some(transition.failures);
+                        self.state = ProductState::Disconnected;
+                    } else {
+                        let failure = ApplyFailure::new(
+                            crate::domain::failure::FailureCategory::Validation(
+                                crate::domain::failure::ValidationLayer::Discovery,
+                            ),
+                            crate::domain::failure::Stage::Prevalidation,
+                            crate::domain::failure::Cause::Generic,
+                            transition.request.settings.clone(),
+                            "validation_removed",
+                            "matching removal invalidated validation",
+                        );
+                        transition.failures.candidate = Some(failure);
+                        self.state = ProductState::ErrorWithoutActive {
+                            failures: transition.failures,
+                        };
+                    }
+                } else {
+                    self.put_transition(transition, restoring);
+                }
+            }
+        }
+        let admitted_choice = self
+            .validation_request()
+            .or_else(|| self.opening_request())
+            .is_some_and(|request| request.choice.is_some());
+        // A fresh scan may remain ambiguous because automatic resolution is
+        // deliberately strict. It does not revoke an already admitted physical
+        // authorization; the worker/owner still fresh-checks that exact route.
+        // Positive removal, Absent, and Unknown have already won or still win.
+        if admitted_choice && matches!(observation.video, VideoPresence::Ambiguous(_)) {
+            return None;
+        }
+        if !matches!(observation.video, VideoPresence::Present) {
+            if let Some((key, settings)) = self.opening() {
+                let failure = match &observation.video {
+                    VideoPresence::Unknown(failure) => failure.clone(),
+                    _ => ApplyFailure::new(
+                        crate::domain::failure::FailureCategory::Validation(
+                            crate::domain::failure::ValidationLayer::Discovery,
+                        ),
+                        crate::domain::failure::Stage::Prevalidation,
+                        crate::domain::failure::Cause::Generic,
+                        settings.clone(),
+                        "opening_presence",
+                        "fresh capture inventory no longer admits this open",
+                    ),
+                };
+                return self.open_failed(key, failure);
+            }
+            if let Some(request) = self.validation_request().cloned()
+                && matches!(
+                    request.key.purpose,
+                    AttemptPurpose::Recovery | AttemptPurpose::Reconnect
+                )
+            {
+                match &observation.video {
+                    VideoPresence::Unknown(failure) => {
+                        self.validation_failed(request, failure.clone())
+                    }
+                    VideoPresence::Ambiguous(candidates) => {
+                        self.selection_required(&request, candidates.clone())
+                    }
+                    VideoPresence::Absent => {
+                        self.completed_failures = self.failures().cloned();
+                        self.state = ProductState::Disconnected;
+                    }
+                    VideoPresence::Present => {}
+                }
+            }
+        }
+        self.continue_recovery()
+    }
+    /// Called after accepted validation results and actual physical barriers drain.
+    pub fn continue_recovery(&mut self) -> Option<ModelEffect> {
+        if self.quitting
+            || self.owned_attempt.is_some()
+            || !matches!(self.cleanup, CleanupStatus::Complete)
+            || !matches!(
+                self.state,
+                ProductState::Disconnected
+                    | ProductState::SelectionRequired
+                    | ProductState::ErrorWithoutActive { .. }
+            )
+        {
+            return None;
+        }
+        let loss = self.recovery.as_ref()?;
+        let observation = self.observation.as_ref()?;
+        if self.recovery_attempted == Some(observation.stamp) {
+            return None;
+        }
+        match &observation.video {
+            VideoPresence::Absent => {
+                self.recovery_candidates.clear();
+                self.state = ProductState::Disconnected;
+                None
+            }
+            VideoPresence::Ambiguous(candidates) => {
+                self.recovery_candidates = candidates.clone();
+                self.state = ProductState::SelectionRequired;
+                None
+            }
+            VideoPresence::Unknown(failure) => {
+                let mut report = self.completed_failures.clone().unwrap_or_default();
+                report.candidate = Some(failure.clone());
+                self.state = ProductState::ErrorWithoutActive { failures: report };
+                self.recovery_attempted = Some(observation.stamp);
+                None
+            }
+            VideoPresence::Present => {
+                let settings = loss.applied.settings.clone();
+                let stamp = observation.stamp;
+                match self.begin(settings, AttemptPurpose::Recovery) {
+                    Ok((_, effect)) => {
+                        self.recovery_attempted = Some(stamp);
+                        Some(effect)
+                    }
+                    Err(_) => None,
+                }
+            }
+        }
+    }
+    pub fn choose_recovery(
+        &mut self,
+        expected: StateIdentity,
+        token: SelectionToken,
+    ) -> Result<Option<ModelEffect>, CommandRejection> {
+        self.check_command(expected)?;
+        if !matches!(self.state, ProductState::SelectionRequired)
+            || self
+                .observation
+                .as_ref()
+                .map(|observation| observation.stamp)
+                != Some(token.stamp)
+            || !self
+                .recovery_candidates
+                .iter()
+                .any(|candidate| candidate.token == token)
+        {
+            return Err(CommandRejection::SelectionUnavailable);
+        }
+        let settings = self
+            .recovery
+            .as_ref()
+            .ok_or(CommandRejection::SelectionUnavailable)?
+            .applied
+            .settings
+            .clone();
+        let (_, _) = self.begin(settings, AttemptPurpose::Recovery)?;
+        let transition = match &mut self.state {
+            ProductState::Recovering(transition) => transition,
+            _ => return Err(CommandRejection::SelectionUnavailable),
+        };
+        transition.request.choice = Some(token);
+        self.recovery_attempted = Some(token.stamp);
+        self.recovery_candidates.clear();
+        Ok(Some(ModelEffect::Validate(transition.request.clone())))
+    }
+    pub fn selection_required(
+        &mut self,
+        request: &ValidationRequest,
+        candidates: Vec<RecoveryCandidate>,
+    ) {
+        if self.validation_request() != Some(request) {
+            return;
+        }
+        let report = self.failures().cloned().unwrap_or_default();
+        if let Some(stamp) = candidates.first().map(|candidate| candidate.token.stamp)
+            && let Some(observation) = &mut self.observation
+            && observation.stamp.watch == stamp.watch
+            && observation.stamp.epoch.get() <= stamp.epoch.get()
+        {
+            observation.stamp = stamp;
+            observation.video = VideoPresence::Ambiguous(candidates.clone());
+        }
+        self.completed_failures = Some(report);
+        self.recovery_candidates = candidates;
+        self.state = ProductState::SelectionRequired;
     }
     pub fn edit_draft(
         &mut self,
@@ -497,18 +1124,45 @@ impl ProductModel {
     pub fn reconnect(
         &mut self,
         expected: StateIdentity,
-    ) -> Result<(ApplyId, ModelEffect), CommandRejection> {
-        self.check_command(expected)?;
-        if !self.can_reconnect() {
-            return Err(CommandRejection::ReconnectUnavailable);
+    ) -> Result<(ReconnectAdmission, Option<ModelEffect>), CommandRejection> {
+        if self.quitting {
+            return Err(CommandRejection::ShuttingDown);
         }
+        if expected != self.state_identity() {
+            return Err(CommandRejection::StaleState);
+        }
+        if let ProductState::Applying(transition) | ProductState::Recovering(transition) =
+            &self.state
+            && matches!(
+                transition.request.key.purpose,
+                AttemptPurpose::Recovery | AttemptPurpose::Reconnect
+            )
+        {
+            return Ok((
+                ReconnectAdmission::Joined(transition.request.key.apply),
+                None,
+            ));
+        }
+        if self.recovery.is_some() && self.owned_attempt.is_some() {
+            let apply = self
+                .last_operation
+                .ok_or(CommandRejection::ReconnectUnavailable)?;
+            return Ok((ReconnectAdmission::Joined(apply), None));
+        }
+        if self.active().is_some() {
+            return Ok((ReconnectAdmission::HealthyNoop, None));
+        }
+        self.check_command(expected)?;
         let target = self
             .last_valid
             .as_ref()
             .ok_or(CommandRejection::ReconnectUnavailable)?
             .settings
             .clone();
-        self.begin(target, AttemptPurpose::Reconnect)
+        self.recovery_attempted = None;
+        self.recovery_apply = None;
+        let (apply, effect) = self.begin(target, AttemptPurpose::Reconnect)?;
+        Ok((ReconnectAdmission::Started(apply), Some(effect)))
     }
     pub fn restart(
         &mut self,
@@ -516,7 +1170,14 @@ impl ProductModel {
     ) -> Result<(ApplyId, ModelEffect), CommandRejection> {
         self.check_command(expected)?;
         if self.active().is_none() {
-            return self.reconnect(expected);
+            self.check_command(expected)?;
+            let target = self
+                .last_valid
+                .as_ref()
+                .ok_or(CommandRejection::ReconnectUnavailable)?
+                .settings
+                .clone();
+            return self.begin(target, AttemptPurpose::Reconnect);
         }
         let settings = self
             .active()
@@ -573,6 +1234,7 @@ impl ProductModel {
             _ => return false,
         }
         self.prepared_pause = None;
+        self.last_playback = InitialPlayback::Paused;
         true
     }
     /// Only a true correlated readback can confirm the admitted pause.
@@ -619,21 +1281,54 @@ impl ProductModel {
         settings: DraftSettings,
         purpose: AttemptPurpose,
     ) -> Result<(ApplyId, ModelEffect), CommandRejection> {
-        let value = self
-            .next_apply
-            .checked_add(1)
-            .ok_or(CommandRejection::CounterExhausted)?;
+        let value = if purpose == AttemptPurpose::Recovery {
+            self.recovery_apply
+                .map(ApplyId::get)
+                .or_else(|| self.next_apply.checked_add(1))
+                .ok_or(CommandRejection::CounterExhausted)?
+        } else {
+            self.next_apply
+                .checked_add(1)
+                .ok_or(CommandRejection::CounterExhausted)?
+        };
         // Reserve capacity for the only possible rollback before touching resources.
         let required = if purpose == AttemptPurpose::Candidate && self.last_valid.is_some() {
-            2
-        } else {
+            // Candidate and rollback may each reserve a no-resource attempt
+            // before the fresh target-cutover validation.
+            4
+        } else if purpose == AttemptPurpose::Resume
+            && self.watch_target.as_ref().is_some_and(|target| {
+                target.video == settings.video && target.audio == settings.audio
+            })
+        {
+            // The immutable Resume target already has the incumbent watch,
+            // so no no-resource target cutover can consume another attempt.
             1
+        } else {
+            2
         };
         self.next_attempt
             .checked_add(required)
             .ok_or(CommandRejection::CounterExhausted)?;
-        let apply = ApplyId::new(value).ok_or(CommandRejection::CounterExhausted)?;
+        let apply = if purpose == AttemptPurpose::Recovery {
+            self.recovery_apply
+                .or_else(|| ApplyId::new(value))
+                .ok_or(CommandRejection::CounterExhausted)?
+        } else {
+            ApplyId::new(value).ok_or(CommandRejection::CounterExhausted)?
+        };
         let incumbent = self.active().cloned();
+        let watch = self.ensure_watch(&settings)?;
+        let playback = if matches!(
+            purpose,
+            AttemptPurpose::Recovery | AttemptPurpose::Reconnect
+        ) {
+            self.recovery
+                .as_ref()
+                .map_or(self.last_playback, |loss| loss.playback)
+        } else {
+            InitialPlayback::Live
+        };
         let origin = match &self.state {
             ProductState::Active(_) => Origin::Active,
             ProductState::ErrorWithActiveRestored {
@@ -653,18 +1348,31 @@ impl ProductModel {
             key: ValidationKey { apply, purpose },
             revision: self.draft.revision,
             settings,
+            playback,
+            watch,
+            choice: None,
         };
-        self.next_apply = value;
+        if purpose != AttemptPurpose::Recovery || self.recovery_apply.is_none() {
+            self.next_apply = value;
+        }
         self.last_operation = Some(apply);
         self.validation_rejection = None;
         self.prepared_pause = None;
-        self.state = ProductState::Applying(Transition {
+        let transition = Transition {
             request: request.clone(),
+            requested_target: request.settings.clone(),
             prior: self.last_valid.clone(),
             origin,
             step: Step::Validating { incumbent },
-            failures: FailureReport::default(),
-        });
+            failures: self
+                .recovery
+                .as_ref()
+                .map_or_else(FailureReport::default, |loss| FailureReport {
+                    incumbent: Some(loss.failure.clone()),
+                    ..FailureReport::default()
+                }),
+        };
+        self.put_transition(transition, purpose == AttemptPurpose::Recovery);
         Ok((apply, ModelEffect::Validate(request)))
     }
     fn take_transition(&mut self) -> Option<(Transition, bool)> {
@@ -731,6 +1439,47 @@ impl ProductModel {
             };
             return;
         }
+        if matches!(
+            transition.request.key.purpose,
+            AttemptPurpose::Recovery | AttemptPurpose::Reconnect
+        ) {
+            transition.failures.candidate = Some(failure);
+            self.recovery_attempted = Some(self.observation.as_ref().map_or(
+                transition.request.watch,
+                |observation| {
+                    if observation.stamp.watch == transition.request.watch.watch
+                        && observation.stamp.epoch.get() > transition.request.watch.epoch.get()
+                    {
+                        observation.stamp
+                    } else {
+                        transition.request.watch
+                    }
+                },
+            ));
+            self.state = ProductState::ErrorWithoutActive {
+                failures: transition.failures,
+            };
+            return;
+        }
+        if self.recovery.is_some() {
+            transition.failures.candidate = Some(failure);
+            self.recovery_attempted = Some(self.observation.as_ref().map_or(
+                transition.request.watch,
+                |observation| {
+                    if observation.stamp.watch == transition.request.watch.watch
+                        && observation.stamp.epoch.get() > transition.request.watch.epoch.get()
+                    {
+                        observation.stamp
+                    } else {
+                        transition.request.watch
+                    }
+                },
+            ));
+            self.state = ProductState::ErrorWithoutActive {
+                failures: transition.failures,
+            };
+            return;
+        }
         let incumbent = match transition.step {
             Step::Validating { incumbent } => incumbent,
             _ => None,
@@ -775,6 +1524,12 @@ impl ProductModel {
         };
         transition.step = Step::Opening { key };
         let request = transition.request.clone();
+        if key.purpose == AttemptPurpose::Resume {
+            // Only the fresh open, after incumbent retirement, commits the
+            // explicit live intent. Prevalidation refusal remains paused, and
+            // a frozen loss still wins over this fallback during recovery.
+            self.last_playback = request.playback;
+        }
         self.owned_attempt = Some(attempt);
         self.put_transition(transition, recovering);
         Some(ModelEffect::Open { key, request })
@@ -792,11 +1547,21 @@ impl ProductModel {
         let active = Active {
             applied: applied.clone(),
             key,
-            playback: PlaybackState::Live,
+            playback: match transition.request.playback {
+                InitialPlayback::Live => PlaybackState::Live,
+                InitialPlayback::Paused => PlaybackState::Paused,
+            },
+            initial_playback: transition.request.playback,
         };
         self.last_valid = Some(applied);
+        self.last_playback = transition.request.playback;
+        self.recovery_apply = None;
+        self.recovery = None;
+        self.recovery_candidates.clear();
+        self.loss_attempt = None;
+        self.recovery_attempted = None;
         self.cleanup = CleanupStatus::Complete;
-        self.state = if recovering {
+        self.state = if recovering && key.purpose == AttemptPurpose::Restore {
             // Candidate diagnostic remains attached to the submitted (still unapplied) draft.
             let failed_candidate = transition.failures.candidate.as_ref().map_or_else(
                 || self.draft.settings.clone(),
@@ -818,15 +1583,44 @@ impl ProductModel {
     }
     pub fn open_failed(&mut self, key: AttemptKey, failure: ApplyFailure) -> Option<ModelEffect> {
         if self.opening().map(|(current, _)| current) != Some(key) {
+            // A real backend failure may follow EOF in the same terminal batch.
+            // Upgrade its stage without issuing a second stop.
+            if let ProductState::Applying(transition) | ProductState::Recovering(transition) =
+                &mut self.state
+                && matches!(transition.step, Step::Cleaning { key: current } if current == key)
+            {
+                match key.purpose {
+                    AttemptPurpose::Restore => transition.failures.restore = Some(failure),
+                    AttemptPurpose::Resume => transition.failures.resume = Some(failure),
+                    _ => transition.failures.candidate = Some(failure),
+                }
+            }
             return None;
         }
         let (mut transition, recovering) = self.take_transition()?;
         match key.purpose {
             AttemptPurpose::Restore => transition.failures.restore = Some(failure),
             AttemptPurpose::Resume => transition.failures.resume = Some(failure),
-            AttemptPurpose::Candidate | AttemptPurpose::Reconnect => {
+            AttemptPurpose::Candidate | AttemptPurpose::Reconnect | AttemptPurpose::Recovery => {
                 transition.failures.candidate = Some(failure);
             }
+        }
+        if matches!(
+            key.purpose,
+            AttemptPurpose::Recovery | AttemptPurpose::Reconnect
+        ) {
+            self.recovery_attempted = Some(self.observation.as_ref().map_or(
+                transition.request.watch,
+                |observation| {
+                    if observation.stamp.watch == transition.request.watch.watch
+                        && observation.stamp.epoch.get() > transition.request.watch.epoch.get()
+                    {
+                        observation.stamp
+                    } else {
+                        transition.request.watch
+                    }
+                },
+            ));
         }
         transition.step = Step::Cleaning { key };
         self.cleanup = CleanupStatus::Draining;
@@ -841,6 +1635,22 @@ impl ProductModel {
         attempt: AttemptId,
         failure: ApplyFailure,
     ) -> Option<ModelEffect> {
+        if self.loss_attempt == Some(attempt) {
+            if let Some(loss) = &mut self.recovery {
+                loss.failure = failure.clone();
+            }
+            match &mut self.state {
+                ProductState::Applying(transition) | ProductState::Recovering(transition) => {
+                    transition.failures.incumbent = Some(failure);
+                }
+                _ => {
+                    self.completed_failures
+                        .get_or_insert_with(FailureReport::default)
+                        .incumbent = Some(failure);
+                }
+            }
+            return None;
+        }
         if self.owned_attempt != Some(attempt) {
             return None;
         }
@@ -877,7 +1687,9 @@ impl ProductModel {
                 Some(&mut transition.failures)
             }
             ProductState::ErrorWithoutActive { failures } => Some(failures),
-            ProductState::Stopping { .. } => Some(
+            ProductState::Disconnected
+            | ProductState::SelectionRequired
+            | ProductState::Stopping { .. } => Some(
                 self.completed_failures
                     .get_or_insert_with(FailureReport::default),
             ),
@@ -926,14 +1738,41 @@ impl ProductModel {
                     };
                     return None;
                 };
+                let settings = prior.settings.clone();
+                let watch = match self.ensure_watch(&settings) {
+                    Ok(watch) => watch,
+                    Err(error) => {
+                        transition.failures.restore = Some(ApplyFailure::new(
+                            crate::domain::failure::FailureCategory::Lifecycle(
+                                crate::domain::failure::LifecycleFailure::Protocol,
+                            ),
+                            crate::domain::failure::Stage::Unknown,
+                            crate::domain::failure::Cause::Generic,
+                            settings,
+                            "restore_watch",
+                            error.to_string(),
+                        ));
+                        self.state = ProductState::ErrorWithoutActive {
+                            failures: transition.failures,
+                        };
+                        return None;
+                    }
+                };
                 transition.request = ValidationRequest {
                     key: ValidationKey {
                         apply: transition.request.key.apply,
                         purpose: AttemptPurpose::Restore,
                     },
                     revision: transition.request.revision,
-                    settings: prior.settings.clone(),
+                    settings,
+                    playback: self
+                        .recovery
+                        .as_ref()
+                        .map_or(self.last_playback, |loss| loss.playback),
+                    watch,
+                    choice: None,
                 };
+                transition.requested_target = transition.request.settings.clone();
                 transition.step = Step::Validating { incumbent: None };
                 let effect = ModelEffect::Validate(transition.request.clone());
                 self.put_transition(transition, true);
@@ -972,6 +1811,14 @@ impl ProductModel {
     }
     fn stop(&mut self, target: StopTarget) -> Option<ModelEffect> {
         self.prepared_pause = None;
+        self.recovery_apply = None;
+        self.recovery = None;
+        self.recovery_candidates.clear();
+        self.recovery_attempted = None;
+        self.loss_attempt = None;
+        self.watch_target = None;
+        self.observation = None;
+        self.consumed_removal = None;
         if matches!(
             self.state,
             ProductState::Applying(_)
@@ -1533,6 +2380,21 @@ mod tests {
             assert!(!model.can_reconnect());
             assert_eq!(model.barrier_complete(key.attempt), None);
             assert!(model.can_reconnect());
+            let (_, effect) = model.reconnect(model.state_identity()).unwrap();
+            let Some(ModelEffect::Validate(validation)) = effect else {
+                panic!("paused reconnect validation missing");
+            };
+            assert_eq!(validation.playback, InitialPlayback::Paused);
+            let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&validation)
+            else {
+                panic!("paused reconnect open missing");
+            };
+            model.open_verified(key);
+            assert_eq!(model.active().unwrap().playback(), PlaybackState::Paused);
+            assert_eq!(
+                model.active().unwrap().initial_playback(),
+                InitialPlayback::Paused
+            );
         }
     }
 
@@ -1587,6 +2449,10 @@ mod tests {
         let mut model = ProductModel::new(settings(60));
         let old = paused_active(&mut model);
         let key = resume_open(&mut model, old.attempt);
+        assert_eq!(
+            model.opening_request().unwrap().playback,
+            InitialPlayback::Live
+        );
         let failure = playback_failure(crate::domain::failure::FailureCategory::Session);
         assert_eq!(
             model.open_failed(key, failure.clone()),
@@ -1613,16 +2479,69 @@ mod tests {
         assert!(model.opening().is_none());
         assert!(model.can_reconnect());
         let (_, effect) = model.reconnect(model.state_identity()).unwrap();
-        let ModelEffect::Validate(request) = effect else {
+        let Some(ModelEffect::Validate(request)) = effect else {
             panic!("explicit reconnect validation missing");
         };
         assert_eq!(request.key.purpose, AttemptPurpose::Reconnect);
+        assert_eq!(request.playback, InitialPlayback::Live);
         let Some(ModelEffect::Open { key: reconnect, .. }) = model.validation_succeeded(&request)
         else {
             panic!("explicit reconnect open missing");
         };
         model.open_verified(reconnect);
         assert_eq!(model.active().unwrap().playback(), PlaybackState::Live);
+    }
+
+    #[test]
+    fn loss_during_resume_validation_keeps_frozen_pause_after_failed_live_open() {
+        let mut model = ProductModel::new(settings(60));
+        let old = paused_active(&mut model);
+        model.resume(model.state_identity(), old.attempt).unwrap();
+        let request = model.validation_request().unwrap().clone();
+        assert_eq!(request.playback, InitialPlayback::Live);
+        let failure = playback_failure(crate::domain::failure::FailureCategory::Session);
+        assert_eq!(
+            model.video_lost(
+                old.attempt,
+                LossEvidence::StreamEnded {
+                    reason: 0,
+                    error: 0
+                },
+                failure.clone(),
+            ),
+            Some(ModelEffect::Stop {
+                attempt: old.attempt,
+                reason: StopIntent::Failed,
+            })
+        );
+        let loss = model.recovery().unwrap().clone();
+        assert_eq!(loss.playback, InitialPlayback::Paused);
+        assert_eq!(model.validation_succeeded(&request), None);
+        let Some(ModelEffect::Open { key, request }) = model.barrier_complete(old.attempt) else {
+            panic!("validated resume open missing after loss retirement");
+        };
+        assert_eq!(request.playback, InitialPlayback::Live);
+        assert_eq!(
+            model.open_failed(key, failure),
+            Some(ModelEffect::Stop {
+                attempt: key.attempt,
+                reason: StopIntent::Failed,
+            })
+        );
+        assert_eq!(model.barrier_complete(key.attempt), None);
+        assert_eq!(model.recovery(), Some(&loss));
+        assert!(model.validation_request().is_none());
+        let (_, effect) = model.reconnect(model.state_identity()).unwrap();
+        let Some(ModelEffect::Validate(request)) = effect else {
+            panic!("loss reconnect validation missing");
+        };
+        assert_eq!(request.settings, settings(60));
+        assert_eq!(request.playback, InitialPlayback::Paused);
+        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+            panic!("loss reconnect open missing");
+        };
+        model.open_verified(key);
+        assert_eq!(model.active().unwrap().playback(), PlaybackState::Paused);
     }
 
     #[test]
@@ -1790,6 +2709,8 @@ mod tests {
             model.resume(paused, old.attempt),
             Err(CommandRejection::CounterExhausted)
         );
+        assert_eq!(model.state_identity(), paused);
+        assert!(model.validation_request().is_none());
         model.next_apply = old.apply.get();
         model.next_attempt = u64::MAX;
         assert_eq!(
@@ -1802,9 +2723,86 @@ mod tests {
             model.restart(paused),
             Err(CommandRejection::CounterExhausted)
         );
+        assert_eq!(model.state_identity(), paused);
+        assert!(model.validation_request().is_none());
         let key = resume_open(&mut model, old.attempt);
         assert_eq!(key.attempt.get(), u64::MAX);
+        assert_eq!(model.cutover_validation(key), None);
         model.open_verified(key);
+        assert_eq!(model.active().unwrap().playback(), PlaybackState::Live);
+        let request = model.prepare_pause(key.attempt).unwrap();
+        assert!(model.pause_admitted(key.attempt, request));
+        assert!(model.pause_observed(key.attempt, request, true));
+        let paused = model.state_identity();
+        assert_eq!(
+            model.resume(paused, key.attempt),
+            Err(CommandRejection::CounterExhausted)
+        );
+        assert_eq!(model.state_identity(), paused);
+        assert_eq!(model.active().unwrap().attempt(), key.attempt);
+        assert!(model.validation_request().is_none());
+    }
+
+    #[test]
+    fn resume_with_different_watch_reserves_cutover_and_physical_open_before_retirement() {
+        let mut model = ProductModel::new(settings(60));
+        model
+            .apply(model.state_identity(), model.draft().revision)
+            .unwrap();
+        let request = model.validation_request().unwrap().clone();
+        let mut relocated = settings(60);
+        relocated.video.identity = DeviceIdentity::new(
+            0x32ed,
+            0x3701,
+            UsbTopology::new(
+                "controller".into(),
+                vec![std::num::NonZeroU8::new(2).unwrap()],
+            )
+            .unwrap(),
+            Some("serial".into()),
+        )
+        .unwrap();
+        let request = model
+            .accept_prepared(&request, relocated.clone(), request.watch)
+            .unwrap();
+        let Some(ModelEffect::Open { key: old, .. }) = model.validation_succeeded(&request) else {
+            panic!("relocated initial open missing");
+        };
+        model.open_verified(old);
+        // Before the consumer installs committed_watch, the saved complete
+        // identity differs from the watch that validated the original request.
+        let pause = model.prepare_pause(old.attempt).unwrap();
+        assert!(model.pause_admitted(old.attempt, pause));
+        assert!(model.pause_observed(old.attempt, pause, true));
+        let paused = model.state_identity();
+        model.next_attempt = u64::MAX - 1;
+        assert_eq!(
+            model.resume(paused, old.attempt),
+            Err(CommandRejection::CounterExhausted)
+        );
+        assert_eq!(model.state_identity(), paused);
+        assert_eq!(model.active().unwrap().attempt(), old.attempt);
+        assert!(model.validation_request().is_none());
+        model.next_attempt = u64::MAX - 2;
+        let reserved = resume_open(&mut model, old.attempt);
+        assert_eq!(reserved.attempt.get(), u64::MAX - 1);
+        let Some(ModelEffect::Validate(request)) = model.cutover_validation(reserved) else {
+            panic!("fresh cutover validation missing");
+        };
+        assert_eq!(request.settings, relocated);
+        assert_eq!(request.playback, InitialPlayback::Live);
+        assert_eq!(model.barrier_complete(reserved.attempt), None);
+        assert!(model.opening().is_none());
+        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+            panic!("physical resume open missing after cutover");
+        };
+        assert_eq!(key.attempt.get(), u64::MAX);
+        assert_eq!(key.apply, reserved.apply);
+        model.open_verified(reserved);
+        assert_eq!(model.phase(), ProductPhase::OpeningResume);
+        model.open_verified(key);
+        assert_eq!(model.active().unwrap().attempt(), key.attempt);
+        assert_eq!(model.active().unwrap().applied().settings(), &relocated);
         assert_eq!(model.active().unwrap().playback(), PlaybackState::Live);
     }
 

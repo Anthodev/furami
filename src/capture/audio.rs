@@ -4,6 +4,7 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 use serde::Serialize;
 
+use crate::domain::capture::{AudioEpoch, AudioRouteReceipt, WatchStamp};
 pub use crate::domain::capture::{AudioError, AudioSelection, AudioSourceIdentity, PlaybackGain};
 
 use super::linux::pulse;
@@ -17,9 +18,23 @@ pub struct AudioSource {
 /// Owned worker events. A kill acknowledgement is not native teardown proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioEvent {
-    SourceLost(AudioError),
-    CancelFailed(AudioError),
-    Cancelled,
+    RoutePending {
+        epoch: AudioEpoch,
+    },
+    RouteVerified {
+        receipt: AudioRouteReceipt,
+    },
+    SourceLost {
+        epoch: AudioEpoch,
+        error: AudioError,
+    },
+    CancelFailed {
+        epoch: AudioEpoch,
+        error: AudioError,
+    },
+    Cancelled {
+        epoch: AudioEpoch,
+    },
 }
 
 pub fn discover() -> Result<Vec<AudioSource>, AudioError> {
@@ -59,8 +74,8 @@ pub(crate) fn validate_snapshot(
     Ok(())
 }
 
-/// Owns an independent libpulse connection and control thread, never an mpv
-/// pointer. Start before audio-add; quiesce only after the mpv handle is destroyed.
+/// Independent control worker. Quiesce only after the exact external demux and
+/// recording retire, or after whole-handle destruction on owner shutdown.
 pub struct RecordingGuard {
     worker: pulse::GuardWorker,
 }
@@ -69,11 +84,27 @@ impl RecordingGuard {
     pub fn start(
         source: &AudioSourceIdentity,
         generation: u64,
+        epoch: AudioEpoch,
+        stamp: WatchStamp,
         cancel: Arc<AtomicBool>,
+        owner_cancel: Arc<AtomicBool>,
     ) -> Result<Self, AudioError> {
         Ok(Self {
-            worker: pulse::GuardWorker::start(source.clone(), generation, cancel)?,
+            worker: pulse::GuardWorker::start(
+                source.clone(),
+                generation,
+                epoch,
+                stamp,
+                cancel,
+                owner_cancel,
+            )?,
         })
+    }
+
+    /// Nonblocking subscription/fresh-source prevalidation acknowledgment.
+    /// The owner must not submit its audio option window before success.
+    pub fn poll_ready(&mut self) -> Option<Result<(), AudioError>> {
+        self.worker.poll_ready()
     }
 
     /// Set both FFmpeg Pulse `name` and `stream_name` to this exact value.
@@ -81,13 +112,21 @@ impl RecordingGuard {
         self.worker.tag()
     }
 
-    /// Called only after the initial audio-add command's successful reply.
+    /// Called only after the initial audio-add command's genuine terminal reply.
     pub fn mark_open_complete(&self) {
         self.worker.mark_open_complete();
     }
 
     pub fn poll_event(&self) -> Option<AudioEvent> {
         self.worker.poll_event()
+    }
+
+    pub fn mark_demux_retired(&self) {
+        self.worker.mark_demux_retired();
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.worker.is_finished()
     }
 
     pub fn quiesce(self) -> Result<(), AudioError> {
@@ -103,7 +142,17 @@ mod tests {
     fn stop_before_guard_start_never_connects_or_creates_recording() {
         let selected = AudioSourceIdentity::new("capture".into(), vec![]).unwrap();
         assert!(matches!(
-            RecordingGuard::start(&selected, 7, Arc::new(AtomicBool::new(true))),
+            RecordingGuard::start(
+                &selected,
+                7,
+                AudioEpoch::new(1).unwrap(),
+                WatchStamp {
+                    watch: crate::domain::capture::WatchId::new(1).unwrap(),
+                    epoch: crate::domain::capture::ObservationEpoch::new(1).unwrap()
+                },
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+            ),
             Err(AudioError::Cancelled)
         ));
     }

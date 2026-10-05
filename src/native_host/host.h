@@ -34,12 +34,16 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(QString phase READ phase NOTIFY stateChanged)
     Q_PROPERTY(QString diagnostic READ diagnostic NOTIFY stateChanged)
     Q_PROPERTY(bool paused READ paused NOTIFY stateChanged)
+    Q_PROPERTY(bool presentationSuppressed READ presentationSuppressed NOTIFY stateChanged)
     Q_PROPERTY(int volumePercent READ volumePercent NOTIFY stateChanged)
     Q_PROPERTY(bool muted READ muted NOTIFY stateChanged)
     Q_PROPERTY(bool canTogglePause READ canTogglePause NOTIFY stateChanged)
     Q_PROPERTY(bool canSetGain READ canSetGain NOTIFY stateChanged)
     Q_PROPERTY(QString playbackStatus READ playbackStatus NOTIFY stateChanged)
-    Q_PROPERTY(bool ended READ ended NOTIFY stateChanged)
+    Q_PROPERTY(QString productPhase READ productPhase NOTIFY stateChanged)
+    Q_PROPERTY(QString recoveryEvidence READ recoveryEvidence NOTIFY stateChanged)
+    Q_PROPERTY(QString recoveryStage READ recoveryStage NOTIFY stateChanged)
+    Q_PROPERTY(QString recoveryCandidates READ recoveryCandidates NOTIFY stateChanged)
     Q_PROPERTY(bool textEntryActive READ textEntryActive WRITE setTextEntryActive NOTIFY textEntryActiveChanged)
     Q_PROPERTY(bool panelVisible READ panelVisible WRITE setPanelVisible NOTIFY panelVisibleChanged)
     Q_PROPERTY(bool popupOpen READ popupOpen WRITE setPopupOpen NOTIFY popupOpenChanged)
@@ -50,7 +54,7 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(QString audioStatus READ audioStatus NOTIFY stateChanged)
     Q_PROPERTY(QString audioDiagnostic READ audioDiagnostic NOTIFY stateChanged)
     Q_PROPERTY(QString audioSource READ audioSource NOTIFY stateChanged)
-    Q_PROPERTY(bool audioEnabled READ audioEnabled NOTIFY stateChanged)
+    Q_PROPERTY(QString audioDesired READ audioDesired NOTIFY stateChanged)
 
 public:
     explicit FuramiBridge(rust::Box<RuntimeCoordinator> gate);
@@ -60,12 +64,16 @@ public:
     QString phase() const;
     QString diagnostic() const;
     bool paused() const;
+    bool presentationSuppressed() const;
     int volumePercent() const;
     bool muted() const;
     bool canTogglePause() const;
     bool canSetGain() const;
     QString playbackStatus() const;
-    bool ended() const;
+    QString productPhase() const;
+    QString recoveryEvidence() const;
+    QString recoveryStage() const;
+    QString recoveryCandidates() const;
     bool textEntryActive() const;
     bool panelVisible() const;
     bool popupOpen() const;
@@ -76,7 +84,7 @@ public:
     QString audioStatus() const;
     QString audioDiagnostic() const;
     QString audioSource() const;
-    bool audioEnabled() const;
+    QString audioDesired() const;
     void setTextEntryActive(bool active);
     void setPanelVisible(bool visible);
     void setPopupOpen(bool open);
@@ -88,6 +96,8 @@ public:
 
     Q_INVOKABLE void openCapture();
     Q_INVOKABLE void restartCapture(const QString &expectedGeneration);
+    Q_INVOKABLE void reconnectCapture(const QString &expectedGeneration);
+    Q_INVOKABLE void chooseRecovery(const QString &expectedGeneration, const QString &token);
     Q_INVOKABLE void closeCapture();
     Q_INVOKABLE void togglePause();
     Q_INVOKABLE void setVolume(int percent);
@@ -154,7 +164,11 @@ private:
     QString m_audioStatus = QStringLiteral("Disabled");
     QString m_audioDiagnostic;
     QString m_audioSource;
-    bool m_audioEnabled = false;
+    QString m_audioDesired;
+    QString m_productPhase = QStringLiteral("Stopped");
+    QString m_recoveryEvidence;
+    QString m_recoveryStage;
+    QString m_recoveryCandidates;
     std::uint64_t m_nativeGeneration = 0;
     std::uint64_t m_rootXid = 0;
     std::uint64_t m_lastHostXid = 0;
@@ -164,12 +178,14 @@ private:
     bool m_captureSelected = false;
     bool m_bootstrapFailed = false;
     bool m_paused = false;
+    // Per-host latch: a prepared-paused owner is never shown, even during
+    // Resume validation/teardown. Only its fresh Live successor may present.
+    bool m_presentationSuppressed = false;
     int m_volumePercent = 100;
     bool m_muted = false;
     bool m_canTogglePause = false;
     bool m_canSetGain = false;
     QString m_playbackStatus = QStringLiteral("Unavailable");
-    bool m_ended = false;
     bool m_textEntryActive = false;
     bool m_panelVisible = true;
     bool m_popupOpen = false;

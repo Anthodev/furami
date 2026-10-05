@@ -224,12 +224,17 @@ QWindow *FuramiBridge::hostWindow() const { assertGuiThread(); return m_host.dat
 QString FuramiBridge::phase() const { assertGuiThread(); return m_failed ? QStringLiteral("Failed") : m_actualPhase; }
 QString FuramiBridge::diagnostic() const { assertGuiThread(); return m_diagnostic; }
 bool FuramiBridge::paused() const { assertGuiThread(); return m_paused; }
+bool FuramiBridge::presentationSuppressed() const { assertGuiThread(); return m_presentationSuppressed; }
 int FuramiBridge::volumePercent() const { assertGuiThread(); return m_volumePercent; }
 bool FuramiBridge::muted() const { assertGuiThread(); return m_muted; }
 bool FuramiBridge::canTogglePause() const { assertGuiThread(); return m_canTogglePause; }
 bool FuramiBridge::canSetGain() const { assertGuiThread(); return m_canSetGain; }
 QString FuramiBridge::playbackStatus() const { assertGuiThread(); return m_playbackStatus; }
-bool FuramiBridge::ended() const { assertGuiThread(); return m_ended; }
+QString FuramiBridge::productPhase() const { assertGuiThread(); return m_productPhase; }
+QString FuramiBridge::recoveryEvidence() const { assertGuiThread(); return m_recoveryEvidence; }
+QString FuramiBridge::recoveryStage() const { assertGuiThread(); return m_recoveryStage; }
+QString FuramiBridge::recoveryCandidates() const { assertGuiThread(); return m_recoveryCandidates; }
+QString FuramiBridge::audioDesired() const { assertGuiThread(); return m_audioDesired; }
 bool FuramiBridge::captureSelected() const { assertGuiThread(); return m_captureSelected; }
 bool FuramiBridge::canOpen() const { assertGuiThread(); return m_canOpen; }
 bool FuramiBridge::canRestart() const { assertGuiThread(); return m_canRestart; }
@@ -237,7 +242,6 @@ QString FuramiBridge::restartGeneration() const { assertGuiThread(); return QStr
 QString FuramiBridge::audioStatus() const { assertGuiThread(); return m_audioStatus; }
 QString FuramiBridge::audioDiagnostic() const { assertGuiThread(); return m_audioDiagnostic; }
 QString FuramiBridge::audioSource() const { assertGuiThread(); return m_audioSource; }
-bool FuramiBridge::audioEnabled() const { assertGuiThread(); return m_audioEnabled; }
 bool FuramiBridge::textEntryActive() const { assertGuiThread(); return m_textEntryActive; }
 bool FuramiBridge::panelVisible() const { assertGuiThread(); return m_panelVisible; }
 bool FuramiBridge::popupOpen() const { assertGuiThread(); return m_popupOpen; }
@@ -414,6 +418,39 @@ void FuramiBridge::restartCapture(const QString &expectedGeneration)
     qInfo().noquote() << QStringLiteral("input_intent action=RestartCapture source=panel generation=%1 current_attempt=%2 can_restart=%3")
         .arg(generation).arg(m_restartGeneration).arg(boolean(m_canRestart));
     applyUpdate(gate_restart(*m_gate, generation));
+}
+
+void FuramiBridge::reconnectCapture(const QString &expectedGeneration)
+{
+    assertGuiThread();
+    bool valid = false;
+    const auto generation = expectedGeneration.toULongLong(&valid);
+    if (!valid || m_bootstrapFailed)
+        return;
+    qInfo().noquote() << QStringLiteral("input_intent action=ReconnectCapture source=panel generation=%1 current_attempt=%2")
+        .arg(generation).arg(m_restartGeneration);
+    applyUpdate(gate_reconnect(*m_gate, generation));
+}
+
+void FuramiBridge::chooseRecovery(const QString &expectedGeneration, const QString &token)
+{
+    assertGuiThread();
+    bool validGeneration = false;
+    const auto generation = expectedGeneration.toULongLong(&validGeneration);
+    // Token layout mirrors the candidate entries published through
+    // m_recoveryCandidates: "watch:epoch:candidate|description|...".
+    const QStringList identity = token.section(QLatin1Char('|'), 0, 0).split(QLatin1Char(':'));
+    bool validWatch = false;
+    bool validEpoch = false;
+    bool validCandidate = false;
+    const auto watch = identity.value(0).toULongLong(&validWatch);
+    const auto epoch = identity.value(1).toULongLong(&validEpoch);
+    const auto candidate = identity.value(2).toULongLong(&validCandidate);
+    if (!validGeneration || !validWatch || !validEpoch || !validCandidate || m_bootstrapFailed)
+        return;
+    qInfo().noquote() << QStringLiteral("input_intent action=ChooseRecovery source=panel generation=%1 watch=%2 epoch=%3 candidate=%4")
+        .arg(generation).arg(watch).arg(epoch).arg(candidate);
+    applyUpdate(gate_choose_recovery(*m_gate, generation, watch, epoch, candidate));
 }
 
 void FuramiBridge::closeCapture()
@@ -717,25 +754,38 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     m_audioStatus = fromRust(update.audio_status);
     m_audioDiagnostic = fromRust(update.audio_diagnostic);
     m_audioSource = fromRust(update.audio_source);
-    m_audioEnabled = update.audio_enabled;
+    m_audioDesired = fromRust(update.audio_desired);
+    m_productPhase = fromRust(update.product_phase);
+    m_recoveryEvidence = fromRust(update.recovery_evidence);
+    m_recoveryStage = fromRust(update.recovery_stage);
+    m_recoveryCandidates = fromRust(update.candidates);
     m_failed = update.failed || m_bootstrapFailed;
     m_paused = update.paused;
+    if (update.create_native && !m_nativeGeneration && !m_host) {
+        // Creation is already correlated with the new physical attempt.
+        // Set this before QML receives its hostWindow, not after readiness.
+        m_presentationSuppressed = update.prepared_paused;
+    } else if (update.generation == m_nativeGeneration && update.prepared_paused) {
+        m_presentationSuppressed = true;
+    }
+    if (m_host && (m_presentationSuppressed || m_productPhase == QStringLiteral("Disconnected")))
+        m_host->hide();
     m_volumePercent = update.volume_percent;
     m_muted = update.muted;
     m_canTogglePause = update.can_toggle_pause && !m_bootstrapFailed;
     m_canSetGain = update.can_set_gain && !m_bootstrapFailed;
     m_playbackStatus = fromRust(update.playback_status);
-    m_ended = update.ended;
     m_diagnostic = fromRust(update.diagnostic);
     if (m_failed && !m_nativeDiagnostic.isEmpty()) {
         m_diagnostic = m_diagnostic.isEmpty() ? m_nativeDiagnostic
             : m_nativeDiagnostic + QStringLiteral("; ") + m_diagnostic;
     }
-    qInfo().noquote() << QStringLiteral("ui_phase phase=%1 visible_phase=%2 generation=%3 failed=%4 paused=%5 ended=%6 restart_generation=%7 can_restart=%8 audio_status=%9 audio_enabled=%10 audio_source=%11 audio_diagnostic=%12 diagnostic=%13 playback_status=%14 volume=%15 muted=%16 can_toggle_pause=%17 can_set_gain=%18")
-        .arg(m_actualPhase, phase()).arg(m_generation).arg(boolean(m_failed))
-        .arg(boolean(m_paused)).arg(boolean(m_ended))
+    qInfo().noquote() << QStringLiteral("ui_phase phase=%1 visible_phase=%2 product_phase=%3 generation=%4 failed=%5 paused=%6 restart_generation=%7 can_restart=%8 audio_status=%9 audio_source=%10 audio_desired=%11 audio_diagnostic=%12 recovery_evidence=%13 recovery_stage=%14 diagnostic=%15 playback_status=%16 volume=%17 muted=%18 can_toggle_pause=%19 can_set_gain=%20")
+        .arg(m_actualPhase, phase(), m_productPhase).arg(m_generation).arg(boolean(m_failed))
+        .arg(boolean(m_paused))
         .arg(m_restartGeneration).arg(boolean(m_canRestart)).arg(m_audioStatus)
-        .arg(boolean(m_audioEnabled)).arg(m_audioSource, m_audioDiagnostic, m_diagnostic)
+        .arg(m_audioSource, m_audioDesired, m_audioDiagnostic)
+        .arg(m_recoveryEvidence, m_recoveryStage, m_diagnostic)
         .arg(m_playbackStatus).arg(m_volumePercent).arg(boolean(m_muted))
         .arg(boolean(m_canTogglePause)).arg(boolean(m_canSetGain));
     emit stateChanged();
@@ -795,6 +845,18 @@ void FuramiBridge::createNative(std::uint64_t generation)
     qInfo().noquote() << QStringLiteral("native_create generation=%1 root=%2")
         .arg(generation).arg(m_rootXid);
     emit hostWindowChanged();
+    if (m_presentationSuppressed) {
+        // A hidden WindowContainer still owns parent/geometry, but does not
+        // create the QWindow by showing it. Polish that same binding and
+        // explicitly create its UNMAPPED native surface for the owner.
+        // Never clear/rebind the container or recreate a published surface.
+        m_container->ensurePolished();
+        if (m_container->isVisible() || host->isVisible() || host->parent() != m_root.data()) {
+            failNative(generation, QStringLiteral("prepared-paused host must remain hidden beneath its permanent root"));
+            return;
+        }
+        host->create();
+    }
     schedulePublication(generation);
 }
 
