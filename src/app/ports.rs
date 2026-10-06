@@ -2,11 +2,11 @@
 
 use crate::domain::{
     capture::{
-        AudioAvailability, AudioEpoch, AudioError, AudioRouteReceipt, AudioSilence,
-        AudioSourceIdentity, PlaybackGain, RecoveryCandidate, RecoveryObservation,
-        RecoveryWatchTarget, SelectionToken, WatchStamp,
+        AudioAvailability, AudioEpoch, AudioError, AudioSilence, AudioSourceIdentity, PlaybackGain,
+        RecoveryCandidate, RecoveryObservation, RecoveryWatchTarget, SelectionToken, WatchStamp,
     },
     failure::ApplyFailure,
+    output::OutputPlan,
     state::{
         AttemptId, AttemptKey, DraftSettings, InitialPlayback, PauseRequestId, ValidationKey,
         ValidationRequest,
@@ -80,6 +80,7 @@ pub enum ImmediateIntent {
         paused: bool,
     },
     SetGain(PlaybackGain),
+    SetOutput(OutputPlan),
     DetachAudio {
         epoch: AudioEpoch,
     },
@@ -106,6 +107,7 @@ pub trait SessionRunner {
         prepared: Self::Prepared,
         gain: PlaybackGain,
         playback: InitialPlayback,
+        output: OutputPlan,
     ) -> Result<(), StartFailure>;
     fn stop(&mut self, attempt: AttemptId, reason: StopReason) -> StopSubmission;
     /// Terminal acknowledgement/failure must precede coalesced readiness.
@@ -118,6 +120,8 @@ pub enum FactStatus {
     Unverified,
     ObservedCompatible,
     Approximate,
+    /// Application-configured playback timing, not capture certification.
+    Configured,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerificationSummary {
@@ -138,8 +142,7 @@ pub enum AudioOutcome {
         reason: AudioSilence,
     },
     Active {
-        source: AudioSourceIdentity,
-        route: AudioRouteReceipt,
+        route: crate::media::loopback::LoopbackReceipt,
     },
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,7 +163,11 @@ impl OpenReceipt {
             }
             (
                 crate::domain::capture::AudioSelection::Enabled { source: selected },
-                AudioOutcome::Active { source, .. } | AudioOutcome::Silent { source, .. },
+                AudioOutcome::Active { route },
+            ) => selected == route.source(),
+            (
+                crate::domain::capture::AudioSelection::Enabled { source: selected },
+                AudioOutcome::Silent { source, .. },
             ) => selected == source,
             _ => false,
         }
@@ -171,7 +178,7 @@ impl OpenReceipt {
 pub enum SessionEvent {
     OpenVerified {
         key: AttemptKey,
-        receipt: OpenReceipt,
+        receipt: Box<OpenReceipt>,
     },
     OpenFailed {
         key: AttemptKey,

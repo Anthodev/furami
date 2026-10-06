@@ -18,4 +18,27 @@ Use new output directories for each command. `build.py` downloads every named me
 
 CXX-Qt's source archive and SHA256 are locked as a Cargo bridge input; neither Qt's prebuilt kit nor this media recipe installs its Rust crate closure. The application Cargo.lock and native bridge build must consume precisely 0.10.0. The named Ubuntu packages are build-environment provenance, **not** a list of redistributed AppImage components; static glslang/SPIRV-Tools archives named by the libplacebo link are separately covered in the [core license audit](LICENSE-AUDIT.md). Three completed local build manifests matched at SHA256 `dca703670e034de71fc45db2f79c1490ad454fb9131b93da1c99a5cb989d791a`, and hardware probe transcripts are kept outside this tracked recipe directory. This qualifies the media source build, **not** the legal closure of a release AppImage: after FUR-003, FUR-005 must inventory the actual package and deliver applicable source access, notices and GPL/LGPL conditions before publication.
 
-Sources: [mpv tag](https://github.com/mpv-player/mpv/tree/v0.41.0), [libplacebo tag](https://github.com/haasn/libplacebo/tree/v7.360.1), [FFmpeg release](https://ffmpeg.org/releases/), [Qt 6.11.2 official binary repository](https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_6112/qt6_6112/), [CXX-Qt tag](https://github.com/KDAB/cxx-qt/tree/v0.10.0), [Ubuntu snapshot service](https://ubuntu.com/server/docs/how-to/software/snapshot-service/). The Qt archive SHA256 values were calculated from actual bytes after each official `.sha1` sidecar matched; the recipe verifies both again at download and extraction.
+## Building the application against this prefix with the pinned toolchain
+
+The application is built separately from this media recipe (see the [AppImage documentation](../appimage/README.md)); when it is built natively against `OUTPUT/prefix`, the pinned Rust 1.97.1 selects `rust-lld` for `x86_64-unknown-linux-gnu`, which rejects the GNU-only `-Wl,--require-defined=cxx_qt_init_crate_furami` that `build.rs` emits to force the CXX-Qt QML init root out of the archives. Keep that flag and select the GNU BFD linker for the build instead of weakening the flag:
+
+```sh
+RUSTC=/absolute/path/to/1.97.1/bin/rustc \
+RUSTDOC=/absolute/path/to/1.97.1/bin/rustdoc \
+CARGO_ENCODED_RUSTFLAGS=$'-Clinker-features=-lld\x1f-Clink-arg=-fuse-ld=bfd' \
+cargo +1.97.1 build --locked
+```
+
+`cargo` must be the rustup proxy (the toolchain's own binary rejects the `+1.97.1` directive), `RUSTC`/`RUSTDOC` point at the same pinned toolchain, and the `\x1f` between the two encoded flags is a literal unit separator. This documents a per-campaign host workaround for reproducing the qualified binaries; it changes no tracked source or build script. CI selects the same GNU BFD linker for every Cargo step through a job-scope `RUSTFLAGS: "-Clinker-features=-lld -Clink-arg=-fuse-ld=bfd"` and installs `binutils` explicitly, so the emitted `-Wl,--require-defined=cxx_qt_init_crate_furami` init-root flag is left intact and Build, Test and Clippy all link with GNU BFD.
+
+## Host audio helpers (runtime requirement, audio enabled only)
+
+When audio output is enabled, Furami drives a single owned `pw-loopback` child for the capture→output transport and uses `pw-metadata` to validate the loopback node's ownership before launch. Both helpers must already be present on the host at `/usr/bin/pw-loopback` and `/usr/bin/pw-metadata`; Furami never ships, installs, downloads, or launches a PipeWire daemon, session manager, or WirePlumber — the normal user session must already provide them.
+
+- Supported helper environment: the qualified target is PipeWire 1.6.9 with WirePlumber 0.5.18; other combinations are unsupported. A missing or unusable helper is a typed runtime failure reported to the user, never a silent fallback to another audio path and never an automatic install.
+- This is a host dependency contract plus the recorded mechanical-gate result (the same helper child and capture route were exercised across EasyEffects/default/quality-mode sink loss and recreation, control, and cleanup). It is not a certification of which library paths the helper resolves at runtime; host installations may differ.
+- Without audio enabled, none of these helpers are required or launched.
+
+The AppImage qualification (FUR-005) does not bundle these helpers and does not certify audio, A/V, or release clearance.
+
+Sources: [mpv tag](https://github.com/mpv-player/mpv/tree/v0.41.0), [libplacebo tag](https://github.com/haasn/libplacebo/tree/v7.360.1), [FFmpeg release](https://ffmpeg.org/releases/), [Qt 6.11.2 official binary repository](https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_6112/qt6_6112/), [CXX-Qt tag](https://github.com/KDAB/cxx-qt/tree/v0.10.0), [Ubuntu snapshot service](https://ubuntu.com/server/docs/how-to/software/snapshot-service/).

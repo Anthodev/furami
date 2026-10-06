@@ -15,6 +15,13 @@ jobs:
   linux:
     name: Build, test and lint (Avrea Ubuntu 24.04 x86_64)
     runs-on: avrea-ubuntu-24.04-2-vcpu
+    # The pinned toolchain selects rust-lld for x86_64-unknown-linux-gnu, which
+    # rejects the GNU-only -Wl,--require-defined=cxx_qt_init_crate_furami that
+    # build.rs emits to force the CXX-Qt QML init root out of the archives.
+    # Keep that flag (never weaken it to -u) and select the GNU BFD linker for
+    # every Cargo step instead.
+    env:
+      RUSTFLAGS: "-Clinker-features=-lld -Clink-arg=-fuse-ld=bfd"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -24,6 +31,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential \
+            binutils \
             lld \
             libgl1-mesa-dev \
             libx11-dev \

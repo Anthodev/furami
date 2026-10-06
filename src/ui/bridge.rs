@@ -72,6 +72,13 @@ pub(crate) mod ffi {
         reset_token: u64,
         fullscreen: bool,
         closing: bool,
+        output_rows: String,
+        output_catalog_revision: u64,
+        output_selected: String,
+        output_selected_key: String,
+        output_effective: String,
+        output_status: String,
+        output_needs_action: bool,
     }
     // SAFETY: host.h declares this exact ABI. Rust owns only values and adapters;
     // C++ owns Qt lifetime through authorized event-loop exit.
@@ -120,6 +127,11 @@ pub(crate) mod ffi {
         fn gate_pause(gate: &mut RuntimeCoordinator, generation: u64) -> SubmitStatus;
         fn gate_set_volume(gate: &mut RuntimeCoordinator, percent: i32) -> SubmitStatus;
         fn gate_set_muted(gate: &mut RuntimeCoordinator, muted: bool) -> SubmitStatus;
+        fn gate_select_output(
+            gate: &mut RuntimeCoordinator,
+            row_key: &str,
+            catalog_revision: u64,
+        ) -> SubmitStatus;
         fn gate_close(
             gate: &mut RuntimeCoordinator,
             generation: u64,
@@ -184,6 +196,13 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
             reset_token: update.reset_token,
             fullscreen: update.fullscreen,
             closing: update.closing,
+            output_rows: update.output_rows,
+            output_catalog_revision: update.output_catalog_revision,
+            output_selected: update.output_selected,
+            output_selected_key: update.output_selected_key,
+            output_effective: update.output_effective,
+            output_status: update.output_status,
+            output_needs_action: update.output_needs_action,
         }
     }
 }
@@ -277,6 +296,13 @@ fn gate_set_volume(gate: &mut RuntimeCoordinator, percent: i32) -> ffi::SubmitSt
 }
 fn gate_set_muted(gate: &mut RuntimeCoordinator, muted: bool) -> ffi::SubmitStatus {
     submit_status(gate.set_muted(muted))
+}
+fn gate_select_output(
+    gate: &mut RuntimeCoordinator,
+    row_key: &str,
+    catalog_revision: u64,
+) -> ffi::SubmitStatus {
+    submit_status(gate.select_output(row_key, catalog_revision))
 }
 fn gate_close(gate: &mut RuntimeCoordinator, generation: u64, application: bool) -> ffi::UiUpdate {
     if application {

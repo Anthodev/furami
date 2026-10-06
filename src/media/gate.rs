@@ -21,6 +21,7 @@ use crate::{
             AudioAvailability, AudioEpoch, AudioSelection, AudioSilence, PlaybackGain, WatchStamp,
         },
         failure::{ApplyFailure, Cause, FailureCategory, LifecycleFailure, Stage},
+        output::OutputPlan,
         state::{AttemptId, AttemptKey, DraftSettings, InitialPlayback, PauseRequestId},
     },
 };
@@ -392,7 +393,10 @@ impl GateRunner {
                 Ok(Some(receipt)) => {
                     self.opening_result_sent = true;
                     self.verified = true;
-                    return Some(SessionEvent::OpenVerified { key, receipt });
+                    return Some(SessionEvent::OpenVerified {
+                        key,
+                        receipt: Box::new(receipt),
+                    });
                 }
                 Ok(None) => {}
                 Err(failure) => {
@@ -429,6 +433,7 @@ impl SessionRunner for GateRunner {
         prepared: PreparedCapture,
         gain: PlaybackGain,
         playback: InitialPlayback,
+        output: OutputPlan,
     ) -> Result<(), StartFailure> {
         let requested = prepared.settings().clone();
         if self.endpoint.is_some() || self.key.is_some() || self.state.blocked() {
@@ -473,6 +478,7 @@ impl SessionRunner for GateRunner {
             audio: requested.audio.clone(),
             gain,
             playback,
+            output,
             watch,
             selected_route,
         };
@@ -753,7 +759,7 @@ impl SessionRunner for GateRunner {
             {
                 return SubmitStatus::NotReady;
             }
-            ImmediateIntent::SetGain(_)
+            ImmediateIntent::SetGain(_) | ImmediateIntent::SetOutput(_)
                 if !matches!(
                     self.state.phase(),
                     GatePhase::WaitingSurface | GatePhase::Opening | GatePhase::Ready
@@ -779,6 +785,7 @@ impl SessionRunner for GateRunner {
                 PlaybackIntent::SetPaused { request, paused }
             }
             ImmediateIntent::SetGain(gain) => PlaybackIntent::SetGain(gain),
+            ImmediateIntent::SetOutput(output) => PlaybackIntent::SetOutput(output),
             ImmediateIntent::DetachAudio { epoch } => PlaybackIntent::DetachAudio { epoch },
             ImmediateIntent::AttachAudio {
                 epoch,
@@ -841,6 +848,7 @@ fn fact_status(status: VerificationStatus) -> FactStatus {
         VerificationStatus::Unverified => FactStatus::Unverified,
         VerificationStatus::ObservedCompatible => FactStatus::ObservedCompatible,
         VerificationStatus::Approximate => FactStatus::Approximate,
+        VerificationStatus::Configured => FactStatus::Configured,
     }
 }
 /// Uses existing verifier, never weakens replay predicate or invents missing facts.
@@ -880,20 +888,14 @@ fn verified_receipt(
         })?;
     let audio = match (&settings.audio, &snapshot.audio) {
         (AudioSelection::Disabled { .. }, AudioAvailability::Disabled) => AudioOutcome::Disabled,
-        (
-            AudioSelection::Enabled { source },
-            AudioAvailability::Active {
-                source: actual,
-                route,
-            },
-        ) if source == actual
-            && snapshot.audio_epoch == Some(route.epoch)
-            && route.source_index != u32::MAX
-            && route.source_output_index != u32::MAX
-            && route.client_index != u32::MAX =>
+        (AudioSelection::Enabled { source }, AudioAvailability::Active { route })
+            if source == route.source()
+                && snapshot.audio_epoch == Some(route.epoch())
+                && route.generation() == snapshot.generation
+                && route.attempt().get() == snapshot.generation.get()
+                && route.destination().is_some() =>
         {
             AudioOutcome::Active {
-                source: source.clone(),
                 route: route.clone(),
             }
         }
@@ -906,6 +908,7 @@ fn verified_receipt(
         (
             _,
             AudioAvailability::Opening { .. }
+            | AudioAvailability::Switching { .. }
             | AudioAvailability::Detaching { .. }
             | AudioAvailability::Blocked { .. },
         ) => return Ok(None),
@@ -969,7 +972,7 @@ fn log_session_event(
             },
             "audio": match &receipt.audio {
                 AudioOutcome::Disabled => serde_json::json!("Disabled"),
-                AudioOutcome::Active { source, route } => serde_json::json!({"Active": {"source": source, "route": route}}),
+                AudioOutcome::Active { route } => serde_json::json!({"Active": {"source": route.source(), "route": route}}),
                 AudioOutcome::Silent { source, reason } => serde_json::json!({"Silent": {"source": source, "reason": reason}}),
             },
         })),
@@ -1386,6 +1389,12 @@ mod tests {
         });
         (runner, rx)
     }
+    fn output_fixture_plan() -> OutputPlan {
+        OutputPlan::Silent {
+            revision: crate::domain::output::OutputRevision::first(),
+            reason: crate::domain::output::OutputSilence::NoAvailableOutput,
+        }
+    }
     fn open(runner: &mut GateRunner, value: u64) {
         runner
             .begin_open(
@@ -1393,6 +1402,7 @@ mod tests {
                 fixture_prepared(settings()).unwrap(),
                 PlaybackGain::default(),
                 InitialPlayback::Live,
+                output_fixture_plan(),
             )
             .unwrap();
         assert!(runner.take_native_update().create_native);
@@ -1666,6 +1676,7 @@ mod tests {
                     fixture_prepared(settings()).unwrap(),
                     PlaybackGain::default(),
                     InitialPlayback::Live,
+                    output_fixture_plan(),
                 )
                 .is_err()
         );
@@ -1773,6 +1784,7 @@ mod tests {
                 fixture_prepared(settings()).unwrap(),
                 PlaybackGain::default(),
                 InitialPlayback::Live,
+                output_fixture_plan(),
             ),
             Err(StartFailure::NoResourcesCreated(_))
         ));
@@ -1786,7 +1798,7 @@ mod tests {
         );
     }
     #[test]
-    fn actual_quiescence_completion_required_after_native_destroy() {
+    fn actual_audio_quiescence_precedes_video_destroy_and_native_release() {
         let (mut runner, drivers) = runner(Config {
             hold_quiesce: true,
             creates_handle: true,
@@ -1796,8 +1808,8 @@ mod tests {
         let driver = drivers.recv().unwrap();
         ready(&mut runner, &driver, 1);
         runner.stop(key(1).attempt, StopReason::Replace);
-        driver.destroyed.recv().unwrap();
         driver.quiesce_started.recv().unwrap();
+        assert!(driver.destroyed.try_recv().is_err());
         assert!(!runner.take_native_update().release_native);
         assert!(runner.poll().is_none());
         assert!(
@@ -1807,10 +1819,12 @@ mod tests {
                     fixture_prepared(settings()).unwrap(),
                     PlaybackGain::default(),
                     InitialPlayback::Live,
+                    output_fixture_plan(),
                 )
                 .is_err()
         );
         driver.quiesce_release.send(()).unwrap();
+        driver.destroyed.recv().unwrap();
         stopped(&mut runner);
         assert!(runner.take_native_update().release_native);
     }
@@ -1909,6 +1923,7 @@ mod tests {
                     fixture_prepared(settings()).unwrap(),
                     PlaybackGain::default(),
                     InitialPlayback::Live,
+                    output_fixture_plan(),
                 )
                 .is_err()
         );
@@ -1978,19 +1993,38 @@ mod tests {
             epoch: AudioEpoch::new(1).unwrap(),
         };
         assert!(verified_receipt(&enabled, &snapshot).unwrap().is_none());
-        let route = crate::domain::capture::AudioRouteReceipt {
-            epoch: AudioEpoch::new(1).unwrap(),
-            stamp: crate::domain::capture::WatchStamp {
+        let route = super::super::loopback::LoopbackReceipt::for_test(
+            snapshot.generation,
+            AttemptId::new(snapshot.generation.get()).unwrap(),
+            AudioEpoch::new(1).unwrap(),
+            crate::domain::capture::WatchStamp {
                 watch: crate::domain::capture::WatchId::new(1).unwrap(),
                 epoch: crate::domain::capture::ObservationEpoch::new(1).unwrap(),
             },
-            source_index: 3,
-            source_output_index: 4,
-            client_index: 5,
-        };
-        snapshot.audio_epoch = Some(route.epoch);
+            source.clone(),
+            crate::domain::output::LiveSinkTarget::new(
+                crate::domain::output::SinkIdentity::new("fixture.output".into(), vec![]).unwrap(),
+                std::num::NonZeroU64::new(20).unwrap(),
+                10,
+            )
+            .unwrap(),
+            crate::domain::output::OutputRevision::first(),
+        );
+        snapshot.audio_epoch = Some(route.epoch());
+        let wrong_source = super::super::loopback::LoopbackReceipt::for_test(
+            route.generation(),
+            route.attempt(),
+            route.epoch(),
+            route.watch(),
+            crate::domain::capture::AudioSourceIdentity::new("wrong".into(), vec![]).unwrap(),
+            route.destination().unwrap().clone(),
+            route.output_revision(),
+        );
         snapshot.audio = AudioAvailability::Active {
-            source: source.clone(),
+            route: wrong_source,
+        };
+        assert!(verified_receipt(&enabled, &snapshot).is_err());
+        snapshot.audio = AudioAvailability::Active {
             route: route.clone(),
         };
         assert_eq!(
@@ -1998,7 +2032,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .audio,
-            AudioOutcome::Active { source, route }
+            AudioOutcome::Active { route }
         );
         snapshot.session = None;
         assert!(verified_receipt(&enabled, &snapshot).unwrap().is_none());
@@ -2007,6 +2041,11 @@ mod tests {
     fn contradictions_and_wrong_prepared_settings_never_get_receipt() {
         let settings = settings();
         let mut snapshot = snapshot(&settings, AudioAvailability::Disabled);
+        snapshot.session.as_mut().unwrap().observed.nominal_rate =
+            Some(super::super::session::Observation {
+                value: 60.0,
+                source: super::super::session::Source::MpvConfiguredContainerFps,
+            });
         snapshot.session.as_mut().unwrap().observed.decoded_size =
             Some(super::super::session::Observation {
                 value: FrameSize::new(1920, 1080).unwrap(),
@@ -2040,6 +2079,26 @@ mod tests {
                 .nominal_rate,
             FactStatus::Approximate
         );
+    }
+
+    #[test]
+    fn configured_fractional_rate_receipt_keeps_exact_requested_settings() {
+        for numerator in [60_000, 30_000] {
+            let mut settings = settings();
+            settings.video.mode.rate = FrameRate::new(numerator, 1001).unwrap();
+            let mut snapshot = snapshot(&settings, AudioAvailability::Disabled);
+            snapshot.session.as_mut().unwrap().observed.nominal_rate =
+                Some(super::super::session::Observation {
+                    value: f64::from(numerator) / 1001.0,
+                    source: super::super::session::Source::MpvConfiguredContainerFps,
+                });
+            let receipt = verified_receipt(&settings, &snapshot).unwrap().unwrap();
+            assert!(receipt.matches(&settings));
+            assert_eq!(receipt.settings.video.mode.rate.numerator(), numerator);
+            assert_eq!(receipt.settings.video.mode.rate.denominator(), 1001);
+            assert_eq!(receipt.verification.nominal_rate, FactStatus::Configured);
+            assert_eq!(receipt.verification.captured_fourcc, FactStatus::Unverified);
+        }
     }
 
     #[test]

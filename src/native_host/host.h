@@ -55,6 +55,13 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(QString audioDiagnostic READ audioDiagnostic NOTIFY stateChanged)
     Q_PROPERTY(QString audioSource READ audioSource NOTIFY stateChanged)
     Q_PROPERTY(QString audioDesired READ audioDesired NOTIFY stateChanged)
+    Q_PROPERTY(QString outputRows READ outputRows NOTIFY stateChanged)
+    Q_PROPERTY(QString outputCatalogRevision READ outputCatalogRevision NOTIFY stateChanged)
+    Q_PROPERTY(QString outputSelected READ outputSelected NOTIFY stateChanged)
+    Q_PROPERTY(QString outputSelectedKey READ outputSelectedKey NOTIFY stateChanged)
+    Q_PROPERTY(QString outputEffective READ outputEffective NOTIFY stateChanged)
+    Q_PROPERTY(QString outputStatus READ outputStatus NOTIFY stateChanged)
+    Q_PROPERTY(bool outputNeedsAction READ outputNeedsAction NOTIFY stateChanged)
     Q_PROPERTY(QString settingsStatus READ settingsStatus NOTIFY stateChanged)
     Q_PROPERTY(QString settingsPath READ settingsPath NOTIFY stateChanged)
     Q_PROPERTY(bool settingsRefused READ settingsRefused NOTIFY stateChanged)
@@ -98,6 +105,13 @@ public:
     QString audioDiagnostic() const;
     QString audioSource() const;
     QString audioDesired() const;
+    QString outputRows() const;
+    QString outputCatalogRevision() const;
+    QString outputSelected() const;
+    QString outputSelectedKey() const;
+    QString outputEffective() const;
+    QString outputStatus() const;
+    bool outputNeedsAction() const;
     QString settingsStatus() const;
     QString settingsPath() const;
     bool settingsRefused() const;
@@ -128,6 +142,7 @@ public:
     Q_INVOKABLE void togglePause();
     Q_INVOKABLE void setVolume(int percent);
     Q_INVOKABLE void setMuted(bool muted);
+    Q_INVOKABLE void selectOutput(const QString &rowKey, const QString &catalogRevision);
     Q_INVOKABLE void openAndCloseDuringOpeningForProof();
     Q_INVOKABLE void forceSurfaceLossForProof();
     Q_INVOKABLE void requestApplicationClose();
@@ -224,6 +239,13 @@ private:
     bool m_presentationSuppressed = false;
     int m_volumePercent = 100;
     bool m_muted = false;
+    QString m_outputRows;
+    std::uint64_t m_outputCatalogRevision = 0;
+    QString m_outputSelected = QStringLiteral("auto");
+    QString m_outputSelectedKey = QStringLiteral("auto");
+    QString m_outputEffective;
+    QString m_outputStatus;
+    bool m_outputNeedsAction = false;
     bool m_canTogglePause = false;
     bool m_canSetGain = false;
     QString m_playbackStatus = QStringLiteral("Unavailable");

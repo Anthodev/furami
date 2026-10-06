@@ -12,6 +12,7 @@ use furami::domain::capture::{
     AudioSelection, AudioSourceIdentity, CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate,
     FrameSize, ModeRequest, PlaybackGain, UsbTopology,
 };
+use furami::domain::output::{PersistentOutputChoice, SinkIdentity};
 use furami::domain::state::{AppliedSettings, DraftSettings, ModelEffect, ProductModel};
 use furami::settings::{
     Durability, LoadOutcome, LocalPreferences, SettingsLoadError, SettingsStore,
@@ -100,6 +101,7 @@ fn preferences() -> LocalPreferences {
     LocalPreferences {
         gain: PlaybackGain::new(73, false).unwrap(),
         fullscreen: true,
+        output: PersistentOutputChoice::Auto,
     }
 }
 
@@ -741,8 +743,9 @@ fn preferences_only_save_preserves_published_applied() {
     let new_preferences = LocalPreferences {
         gain: PlaybackGain::new(42, true).unwrap(),
         fullscreen: false,
+        output: PersistentOutputChoice::Auto,
     };
-    store.save_preferences(new_preferences).unwrap();
+    store.save_preferences(new_preferences.clone()).unwrap();
 
     assert_eq!(store.snapshot().unwrap().applied, applied_before);
     assert_eq!(store.snapshot().unwrap().preferences, new_preferences);
@@ -768,6 +771,215 @@ fn preferences_only_save_on_missing_file_writes_null_applied() {
     assert!(bytes.contains(r#""applied":null"#), "bytes: {bytes}");
     assert_eq!(store.snapshot().unwrap().applied, None);
     assert_eq!(store.snapshot().unwrap().preferences, preferences());
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Output choice preference
+// ---------------------------------------------------------------------------
+
+fn manual_sink_identity() -> SinkIdentity {
+    SinkIdentity::new(
+        "easyeffects_sink".to_owned(),
+        vec![("device.api".to_owned(), "pipewire".to_owned())],
+    )
+    .unwrap()
+}
+
+fn manual_output_preferences() -> LocalPreferences {
+    LocalPreferences {
+        gain: PlaybackGain::new(73, false).unwrap(),
+        fullscreen: true,
+        output: PersistentOutputChoice::Manual(manual_sink_identity()),
+    }
+}
+
+fn refused_output_document(directory: &Path, label: &str, preferences_json: &str) {
+    let document =
+        format!(r#"{{"schema_version":1,"applied":null,"preferences":{preferences_json}}}"#);
+    let (store, outcome) = refused_schema(directory, label, &document);
+    assert!(matches!(outcome, LoadOutcome::Refused(_)), "{label}");
+    assert!(store.is_refused(), "{label}");
+}
+
+#[test]
+fn manual_output_choice_round_trips_exactly() {
+    let directory = temp_dir("manual-output-roundtrip");
+    let path = settings_path(&directory);
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    assert!(matches!(outcome, LoadOutcome::Missing));
+
+    let manual = manual_output_preferences();
+    store.save_preferences(manual.clone()).unwrap();
+
+    // Parsed shape, not serializer byte layout: the manual choice is a
+    // kind-tagged sink object next to the legacy preference fields.
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let preferences = &document["preferences"];
+    assert_eq!(preferences["output"]["kind"], "manual");
+    assert_eq!(preferences["output"]["sink"]["name"], "easyeffects_sink");
+    assert_eq!(
+        preferences["output"]["sink"]["stable_properties"],
+        serde_json::json!([{ "key": "device.api", "value": "pipewire" }])
+    );
+
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("manual output document must reload");
+    };
+    assert_eq!(document.preferences, manual);
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn auto_output_choice_omits_the_output_key_and_defaults_from_missing() {
+    let directory = temp_dir("auto-output-omits-key");
+    let path = settings_path(&directory);
+    let (mut store, _) = SettingsStore::load(path.clone());
+
+    store.save_preferences(preferences()).unwrap();
+    // Parsed shape: Auto omits the `output` key entirely.
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        document["preferences"].get("output").is_none(),
+        "Auto must not persist an output key: {document}"
+    );
+
+    // The literal pre-output v1 document (no `output` key) decodes to Auto.
+    let legacy = format!(r#"{{"schema_version":1,"applied":null,"preferences":{PREFS}}}"#);
+    fs::write(&path, legacy.as_bytes()).unwrap();
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("legacy v1 document must reload");
+    };
+    assert_eq!(document.preferences.output, PersistentOutputChoice::Auto);
+    assert_eq!(document.preferences, preferences());
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn strict_output_choice_schema_violations_are_refused_individually() {
+    let directory = temp_dir("output-schema-refusals");
+    let volume = r#""volume_percent":73,"muted":false,"fullscreen":true"#;
+    let sink = r#""name":"easyeffects_sink","stable_properties":[{"key":"device.api","value":"pipewire"}]"#;
+
+    let cases: &[(&str, String)] = &[
+        // Unknown/future field anywhere in the output subtree.
+        (
+            "unknown future field in output",
+            format!(r#"{{{volume},"output":{{"kind":"auto","future":true}}}}"#),
+        ),
+        (
+            "unknown future field in sink",
+            format!(r#"{{{volume},"output":{{"kind":"manual","sink":{{"future":1,{sink}}}}}}}"#),
+        ),
+        // Incomplete manual choice.
+        (
+            "manual without sink",
+            format!(r#"{{{volume},"output":{{"kind":"manual"}}}}"#),
+        ),
+        (
+            "manual with null sink",
+            format!(r#"{{{volume},"output":{{"kind":"manual","sink":null}}}}"#),
+        ),
+        (
+            "output without kind",
+            format!(r#"{{{volume},"output":{{}}}}"#),
+        ),
+        // Legal sibling fields on the wrong variant.
+        (
+            "auto with sink",
+            format!(r#"{{{volume},"output":{{"kind":"auto","sink":{{{sink}}}}}}}"#),
+        ),
+        // Unknown kind: a future variant, not Auto.
+        (
+            "unknown future kind",
+            format!(r#"{{{volume},"output":{{"kind":"spatial","sink":{{{sink}}}}}}}"#),
+        ),
+        // Duplicate and invalid shapes.
+        (
+            "duplicate output key",
+            format!(r#"{{{volume},"output":{{"kind":"auto"}},"output":{{"kind":"auto"}}}}"#),
+        ),
+        ("null output", format!(r#"{{{volume},"output":null}}"#)),
+        (
+            "sequence output",
+            format!(r#"{{{volume},"output":["auto"]}}"#),
+        ),
+        // Identity-level invalid values: refused after the schema pass.
+        (
+            "sink property outside whitelist",
+            format!(
+                r#"{{{volume},"output":{{"kind":"manual","sink":{{"name":"easyeffects_sink","stable_properties":[{{"key":"node.cpu_time","value":"9"}}]}}}}}}"#
+            ),
+        ),
+        (
+            "duplicate sink property key",
+            format!(
+                r#"{{{volume},"output":{{"kind":"manual","sink":{{"name":"easyeffects_sink","stable_properties":[{{"key":"device.api","value":"pipewire"}},{{"key":"device.api","value":"alsa"}}]}}}}}}"#
+            ),
+        ),
+        (
+            "empty sink name",
+            format!(
+                r#"{{{volume},"output":{{"kind":"manual","sink":{{"name":"","stable_properties":[]}}}}}}"#
+            ),
+        ),
+    ];
+
+    for (label, preferences_json) in cases {
+        refused_output_document(&directory, label, preferences_json);
+    }
+
+    // A refusal blocks the automatic preference save and preserves the bytes.
+    let path = settings_path(&directory);
+    let original = fs::read(&path).unwrap();
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    assert!(matches!(outcome, LoadOutcome::Refused(_)));
+    assert!(matches!(
+        store.save_preferences(manual_output_preferences()),
+        Err(SettingsWriteError::RefusedOriginal { .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_no_temp_files(&directory);
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn manual_output_preference_save_preserves_applied_and_unrelated_preferences() {
+    let directory = temp_dir("manual-output-preserves-applied");
+    let path = settings_path(&directory);
+    fs::write(&path, canonical_document().as_bytes()).unwrap();
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(previous) = outcome else {
+        panic!("expected valid original");
+    };
+    let applied_before = previous.applied.clone();
+
+    // Only the output choice changes; gain/fullscreen and the published
+    // applied document are preserved through a preferences-only save.
+    let mut switched = previous.preferences.clone();
+    switched.output = PersistentOutputChoice::Manual(manual_sink_identity());
+    store.save_preferences(switched.clone()).unwrap();
+    assert_eq!(store.snapshot().unwrap().applied, applied_before);
+    assert_eq!(store.snapshot().unwrap().preferences, switched);
+
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("manual output document must reload");
+    };
+    assert_eq!(document.applied, applied_before);
+    assert_eq!(
+        document.preferences.gain, previous.preferences.gain,
+        "unrelated preference value preserved"
+    );
+    assert_eq!(
+        document.preferences.fullscreen,
+        previous.preferences.fullscreen
+    );
+    assert_eq!(document.preferences.output, switched.output);
     fs::remove_dir_all(&directory).unwrap();
 }
 
@@ -819,12 +1031,13 @@ fn invalid_in_memory_preferences_preserve_file_and_published_snapshot() {
             muted: true,
         },
         fullscreen: false,
+        output: PersistentOutputChoice::Auto,
     };
     for operation in ["applied", "preferences", "reset"] {
         let result = match operation {
-            "applied" => store.save_applied(&applied, invalid),
-            "preferences" => store.save_preferences(invalid),
-            "reset" => store.reset(invalid),
+            "applied" => store.save_applied(&applied, invalid.clone()),
+            "preferences" => store.save_preferences(invalid.clone()),
+            "reset" => store.reset(invalid.clone()),
             _ => unreachable!(),
         };
         assert!(
@@ -853,6 +1066,7 @@ fn failed_reset_preserves_refusal_original_and_blocks_automatic_saves() {
             muted: true,
         },
         fullscreen: false,
+        output: PersistentOutputChoice::Auto,
     };
     assert!(matches!(
         store.reset(invalid),
@@ -918,8 +1132,9 @@ fn precommit_faults_leave_original_file_intact_and_loadable() {
         let attempted_preferences = LocalPreferences {
             gain: PlaybackGain::new(42, true).unwrap(),
             fullscreen: false,
+            output: PersistentOutputChoice::Auto,
         };
-        let result = store.save_applied(&applied, attempted_preferences);
+        let result = store.save_applied(&applied, attempted_preferences.clone());
         let expected_error = match point {
             WriteFaultPoint::BeforeWrite | WriteFaultPoint::PartialWrite => {
                 matches!(result, Err(SettingsWriteError::WriteTemporary { .. }))
@@ -947,7 +1162,9 @@ fn precommit_faults_leave_original_file_intact_and_loadable() {
         assert_eq!(reloaded, previous, "{point:?}");
 
         // The fault fires once: the next write is a normal committed write.
-        let outcome = store.save_preferences(attempted_preferences).unwrap();
+        let outcome = store
+            .save_preferences(attempted_preferences.clone())
+            .unwrap();
         assert!(outcome.is_confirmed(), "{point:?}");
         let (_, outcome) = SettingsStore::load(path);
         let LoadOutcome::Loaded(document) = outcome else {
@@ -974,6 +1191,7 @@ fn partial_write_never_leaves_half_content_in_place() {
     let attempted_preferences = LocalPreferences {
         gain: PlaybackGain::new(42, true).unwrap(),
         fullscreen: false,
+        output: PersistentOutputChoice::Auto,
     };
     assert!(matches!(
         store.save_applied(&applied, attempted_preferences),
@@ -1024,8 +1242,9 @@ fn explicit_reset_clears_refusal_and_writes_null_applied() {
     let later = LocalPreferences {
         gain: PlaybackGain::new(15, true).unwrap(),
         fullscreen: false,
+        output: PersistentOutputChoice::Auto,
     };
-    reloaded.save_preferences(later).unwrap();
+    reloaded.save_preferences(later.clone()).unwrap();
     let (_, outcome) = SettingsStore::load(path);
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("expected loaded document after later save");

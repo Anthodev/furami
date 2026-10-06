@@ -244,6 +244,17 @@ QString FuramiBridge::recoveryEvidence() const { assertGuiThread(); return m_rec
 QString FuramiBridge::recoveryStage() const { assertGuiThread(); return m_recoveryStage; }
 QString FuramiBridge::recoveryCandidates() const { assertGuiThread(); return m_recoveryCandidates; }
 QString FuramiBridge::audioDesired() const { assertGuiThread(); return m_audioDesired; }
+QString FuramiBridge::outputRows() const { assertGuiThread(); return m_outputRows; }
+QString FuramiBridge::outputCatalogRevision() const
+{
+    assertGuiThread();
+    return QString::number(m_outputCatalogRevision);
+}
+QString FuramiBridge::outputSelected() const { assertGuiThread(); return m_outputSelected; }
+QString FuramiBridge::outputSelectedKey() const { assertGuiThread(); return m_outputSelectedKey; }
+QString FuramiBridge::outputEffective() const { assertGuiThread(); return m_outputEffective; }
+QString FuramiBridge::outputStatus() const { assertGuiThread(); return m_outputStatus; }
+bool FuramiBridge::outputNeedsAction() const { assertGuiThread(); return m_outputNeedsAction; }
 bool FuramiBridge::captureSelected() const { assertGuiThread(); return m_captureSelected; }
 bool FuramiBridge::canOpen() const { assertGuiThread(); return m_canOpen; }
 bool FuramiBridge::canRestart() const { assertGuiThread(); return m_canRestart; }
@@ -551,6 +562,24 @@ void FuramiBridge::setMuted(bool muted)
     const auto status = gate_set_muted(*m_gate, muted);
     qInfo().noquote() << QStringLiteral("input_intent action=SetMuted muted=%1 status=%2")
         .arg(boolean(muted)).arg(statusName(status));
+    applyUpdate(gate_poll(*m_gate));
+}
+
+void FuramiBridge::selectOutput(const QString &rowKey, const QString &catalogRevision)
+{
+    assertGuiThread();
+    bool revisionValid = false;
+    const auto revision = catalogRevision.toULongLong(&revisionValid);
+    if (!revisionValid) {
+        qInfo().noquote() << QStringLiteral("input_intent action=SelectOutput row=%1 status=RejectedRevision")
+            .arg(rowKey);
+        return;
+    }
+    const auto status = gate_select_output(*m_gate, asRust(rowKey.toUtf8()), revision);
+    qInfo().noquote() << QStringLiteral("input_intent action=SelectOutput row=%1 revision=%2 status=%3")
+        .arg(rowKey).arg(revision).arg(statusName(status));
+    // Every admission outcome republishes the authoritative projection,
+    // including the unchanged selection after a stale/failed attempt.
     applyUpdate(gate_poll(*m_gate));
 }
 
@@ -972,6 +1001,13 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     m_resetToken = update.reset_token;
     m_fullscreenPreference = update.fullscreen;
     m_closing = update.closing;
+    m_outputRows = fromRust(update.output_rows);
+    m_outputCatalogRevision = update.output_catalog_revision;
+    m_outputSelected = fromRust(update.output_selected);
+    m_outputSelectedKey = fromRust(update.output_selected_key);
+    m_outputEffective = fromRust(update.output_effective);
+    m_outputStatus = fromRust(update.output_status);
+    m_outputNeedsAction = update.output_needs_action;
     if (m_closing)
         cancelFullscreenChoice("application-close");
     m_diagnostic = fromRust(update.diagnostic);

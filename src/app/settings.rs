@@ -5,7 +5,7 @@ use std::{ffi::OsStr, path::PathBuf};
 use crate::{
     app::apply::VerifiedOpen,
     domain::{
-        capture::AudioSourceIdentity,
+        capture::{AudioSourceIdentity, PlaybackGain},
         state::{
             AppliedSettings, ApplyId, AttemptKey, AttemptPurpose, Draft, DraftRevision,
             DraftSettings,
@@ -145,11 +145,23 @@ impl PersistenceSession {
         }
         session
     }
-    pub fn preferences(&self) -> LocalPreferences {
-        self.preferences
+    /// Borrowed view of the local preferences. The output choice is not
+    /// `Copy`: callers reading a single preference field read through this
+    /// reference instead of cloning an identity.
+    pub fn preferences(&self) -> &LocalPreferences {
+        &self.preferences
     }
     pub fn set_preferences(&mut self, preferences: LocalPreferences) {
         self.preferences = preferences;
+    }
+    /// Replaces the gain preference in place, leaving the output choice
+    /// untouched and un-cloned on hot volume/mute paths.
+    pub fn set_gain_preference(&mut self, gain: PlaybackGain) {
+        self.preferences.gain = gain;
+    }
+    /// Replaces the fullscreen preference in place.
+    pub fn set_fullscreen_preference(&mut self, fullscreen: bool) {
+        self.preferences.fullscreen = fullscreen;
     }
     pub fn saved_selection(&self) -> Option<DraftSettings> {
         self.store
@@ -230,8 +242,8 @@ impl PersistenceSession {
             return false;
         };
         let outcome = match &self.pending_applied {
-            Some(applied) => store.save_applied(applied, self.preferences),
-            None => store.save_preferences(self.preferences),
+            Some(applied) => store.save_applied(applied, self.preferences.clone()),
+            None => store.save_preferences(self.preferences.clone()),
         };
         match outcome {
             Err(error) => {
@@ -379,7 +391,7 @@ impl PersistenceSession {
         let Some(store) = &mut self.store else {
             return;
         };
-        match store.reset(self.preferences) {
+        match store.reset(self.preferences.clone()) {
             Err(error) => {
                 self.write_status = format!(
                     "Reset failed at {}: {error}. Original and refusal preserved.",
@@ -503,6 +515,7 @@ mod tests {
         LocalPreferences {
             gain: PlaybackGain::new(percent, true).unwrap(),
             fullscreen: true,
+            ..LocalPreferences::default()
         }
     }
 
@@ -696,7 +709,7 @@ mod tests {
         session.drained();
         assert!(session.quit_allowed());
         let reloaded = PersistenceSession::load(Ok(temp.file()));
-        assert_eq!(reloaded.preferences(), preferences(41));
+        assert_eq!(reloaded.preferences(), &preferences(41));
         assert!(reloaded.saved_selection().is_none());
     }
     #[test]
@@ -739,7 +752,7 @@ mod tests {
         session.decide_reset(token, true);
         assert!(!session.refused());
         assert_eq!(session.baseline, baseline);
-        assert_eq!(session.preferences(), preferences(12));
+        assert_eq!(session.preferences(), &preferences(12));
         assert_eq!(load_document(temp.file()).applied, None);
         session.decide_reset(token, true);
         session.request_close(Some((&selection(60000), DraftRevision::new(0))));

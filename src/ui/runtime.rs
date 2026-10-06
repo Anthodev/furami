@@ -5,6 +5,7 @@ use crate::{
         apply::ApplyCoordinator,
         control::{self, Command, ExpectedCleanup, ExpectedState},
         gate::GatePhase,
+        output::OutputPolicy,
         ports::SubmitStatus,
         settings::{PersistenceSession, StartupSelection},
     },
@@ -15,12 +16,16 @@ use crate::{
             LossEvidence, ObservationEpoch, PlaybackGain, RecoveryCandidate, SelectionToken,
             WatchId, WatchStamp,
         },
+        output::{
+            LiveSinkTarget, OutputRevision, OutputSilence, PersistentOutputChoice, SinkCatalog,
+            SinkIdentity,
+        },
         state::{
             AttemptId, CleanupStatus, CommandRejection, DraftRevision, DraftSettings,
             InitialPlayback, PlaybackState, ProductModel, ProductPhase, StateIdentity,
         },
     },
-    media::{controller::SurfaceToken, gate::GateRunner},
+    media::{controller::SurfaceToken, gate::GateRunner, output_catalog::OutputCatalogWatch},
 };
 
 type Engine = ApplyCoordinator<CaptureValidator, GateRunner>;
@@ -68,6 +73,23 @@ pub(crate) struct UiUpdate {
     pub reset_token: u64,
     pub fullscreen: bool,
     pub closing: bool,
+    /// Audio output selector projection: pipe-separated `key|label|eligible`
+    /// rows (the reserved `auto` row first), the catalog revision the rows
+    /// were built from, the user's selected key ("auto" or sink name), the
+    /// confirmed routed sink name, the typed silence reason text and whether
+    /// the runtime needs an explicit reselection. Plain text only; empty
+    /// fields mean unchanged since the last published update.
+    pub output_rows: String,
+    pub output_catalog_revision: u64,
+    pub output_selected: String,
+    /// Opaque action key of the current choice: "auto" for the reserved row,
+    /// the unique compatible catalog row key for a manual choice, empty when
+    /// the manual choice matches no observed sink (unavailable). Actions
+    /// echo keys, never names.
+    pub output_selected_key: String,
+    pub output_effective: String,
+    pub output_status: String,
+    pub output_needs_action: bool,
 }
 
 pub(crate) struct RuntimeCoordinator {
@@ -85,7 +107,79 @@ pub(crate) struct RuntimeCoordinator {
     persistence: PersistenceSession,
     auto_open: bool,
     startup_apply: Option<crate::domain::state::ApplyId>,
+    /// Application-owned desired-output policy fed by the catalog watch.
+    output: OutputPolicy,
+    /// Application-lifetime catalog supervisor; Pulse waits stay on its worker.
+    catalog: Option<OutputCatalogWatch>,
+    /// The initial watch spawn failed and cannot recover on this host.
+    catalog_start_failed: bool,
+    /// Last live target registered with the watch; an unchanged target is
+    /// never re-registered outside an explicit selection.
+    registered_target: Option<LiveSinkTarget>,
+    /// Last desired revision fed to the engine, so a new revision is never
+    /// dropped between polls.
+    fed_plan_revision: Option<OutputRevision>,
+    /// Last successfully observed catalog, kept for explicit selection
+    /// resolution and UI rows.
+    last_catalog: Option<SinkCatalog>,
+    /// Row descriptors behind the serialized projection rows: opaque
+    /// revision-scoped keys mapped to their exact observed identities.
+    last_rows: Vec<OutputRow>,
+    last_output: Option<OutputProjection>,
+    /// Shutdown requested for the catalog worker; a stopped watch is never
+    /// restarted and only its completion closes the quit barrier.
+    catalog_stopping: bool,
+    /// Terminal join failure of the catalog worker, reported once.
+    catalog_join_error: Option<String>,
 }
+
+/// Reserved key of the reserved Auto row. Never derivable from a sink name:
+/// catalogued sinks always get opaque revision-scoped keys.
+const AUTO_ROW_KEY: &str = "auto";
+
+/// One selector row. `identity` stays runtime-side (never serialized): the
+/// opaque `key` is the only thing the UI echoes back for actions. `name` is
+/// serialized so the UI can match a saved manual choice against observed
+/// sinks for display and reconnection, never as an action key.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct OutputRow {
+    key: String,
+    label: String,
+    name: String,
+    eligible: bool,
+    #[serde(skip)]
+    identity: Option<SinkIdentity>,
+}
+
+/// Presentation projection of the output selector, compared whole between
+/// polls so an unchanged selector never republishes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OutputProjection {
+    rows: String,
+    catalog_revision: u64,
+    selected: String,
+    selected_key: String,
+    effective: String,
+    status: String,
+    needs_action: bool,
+}
+/// Plain status text for a typed output silence. Shared by the selector
+/// projection and the audio-availability diagnostic so both surfaces word
+/// the same reason identically.
+fn output_silence_text(reason: &OutputSilence) -> String {
+    match reason {
+        OutputSilence::CatalogUnavailable(error) => {
+            format!("Output catalog unavailable: {error}")
+        }
+        OutputSilence::NoAvailableOutput => "No available output".to_owned(),
+        OutputSilence::ManualUnavailable => "Selected output is unavailable".to_owned(),
+        OutputSilence::ManualRequiresAction => {
+            "Select this output again to reconnect it".to_owned()
+        }
+        OutputSilence::RoutingConflict(error) => format!("Routing conflict: {error}"),
+    }
+}
+
 impl RuntimeCoordinator {
     pub(crate) fn new(
         prefix: String,
@@ -94,6 +188,14 @@ impl RuntimeCoordinator {
         sources: Vec<AudioSourceIdentity>,
     ) -> Self {
         let gain = persistence.preferences().gain;
+        let output = OutputPolicy::new(persistence.preferences().output.clone());
+        let (catalog, catalog_start_failed) = match OutputCatalogWatch::start() {
+            Ok(watch) => (Some(watch), false),
+            Err(error) => {
+                tracing::warn!(error = %error, "output catalog watch unavailable");
+                (None, true)
+            }
+        };
         Self {
             engine: startup.draft.map(|settings| {
                 ApplyCoordinator::new(
@@ -111,6 +213,16 @@ impl RuntimeCoordinator {
             auto_open: startup.auto_open,
             startup_apply: None,
             persistence,
+            output,
+            catalog,
+            catalog_start_failed,
+            registered_target: None,
+            fed_plan_revision: None,
+            last_catalog: None,
+            last_rows: Vec::new(),
+            last_output: None,
+            catalog_stopping: false,
+            catalog_join_error: None,
         }
     }
     pub(crate) fn capture_selected(&self) -> bool {
@@ -147,12 +259,49 @@ impl RuntimeCoordinator {
         self.poll()
     }
     fn begin_shutdown(&mut self) {
+        // The catalog worker must stop before the Qt loop exits: request the
+        // stop here, then let poll() drain its non-blocking try_join until
+        // the worker is actually complete. Drop only guarantees the final
+        // join fallback after Qt exit, never the quit barrier itself.
+        self.catalog_stopping = true;
+        if let Some(watch) = &mut self.catalog {
+            watch.stop();
+        }
         if let Some(engine) = &mut self.engine {
             engine.quit();
         } else {
             self.quit_empty = true;
         }
         self.dirty = true;
+    }
+    /// Shuts the catalog worker down toward completion without blocking the
+    /// GUI thread. Returns true only once the worker is fully joined (or
+    /// never started / failed to start); a terminal join failure is recorded
+    /// and clears the watch so the barrier still opens.
+    fn drain_catalog(&mut self) -> bool {
+        if self.catalog.is_none() {
+            return true;
+        }
+        if !self.catalog_stopping {
+            self.catalog_stopping = true;
+            if let Some(watch) = &mut self.catalog {
+                watch.stop();
+            }
+        }
+        let mut joined = false;
+        if let Some(watch) = &mut self.catalog
+            && let Some(result) = watch.try_join()
+        {
+            if let Err(error) = result {
+                self.catalog_join_error = Some(error.to_string());
+                self.rejection(format!("output catalog watch failed to stop: {error}"));
+            }
+            joined = true;
+        }
+        if joined {
+            self.catalog = None;
+        }
+        joined
     }
     pub(crate) fn request_application_close(&mut self) -> UiUpdate {
         let draft = self.engine.as_ref().map(|engine| {
@@ -205,9 +354,7 @@ impl RuntimeCoordinator {
     }
     pub(crate) fn set_fullscreen(&mut self, fullscreen: bool) -> UiUpdate {
         if self.persistence.mutations_open() {
-            let mut preferences = self.persistence.preferences();
-            preferences.fullscreen = fullscreen;
-            self.persistence.set_preferences(preferences);
+            self.persistence.set_fullscreen_preference(fullscreen);
         }
         self.dirty = true;
         self.poll()
@@ -471,14 +618,235 @@ impl RuntimeCoordinator {
             None => SubmitStatus::Accepted,
         };
         if status == SubmitStatus::Accepted {
-            let mut preferences = self.persistence.preferences();
-            preferences.gain = gain;
-            self.persistence.set_preferences(preferences);
+            self.persistence.set_gain_preference(gain);
             self.command_error.clear();
         } else {
             self.rejection(format!("gain submission {status:?}"));
         }
         status
+    }
+    /// Advances the application-owned output routing: consumes catalog
+    /// observations into the policy, feeds a changed desired plan to the
+    /// engine and registers a changed live target with the watch. The last
+    /// registered target is retained through silence and catalog errors; only
+    /// an actual target change (or an explicit selection in
+    /// [`Self::select_output`]) re-registers and resets removal evidence.
+    fn pump_output(&mut self) {
+        if self.catalog.is_none() && !self.catalog_start_failed && !self.catalog_stopping {
+            match OutputCatalogWatch::start() {
+                Ok(watch) => self.catalog = Some(watch),
+                Err(error) => {
+                    self.catalog_start_failed = true;
+                    self.rejection(format!("output catalog watch unavailable: {error}"));
+                    return;
+                }
+            }
+        }
+        let mut observed = false;
+        if let Some(watch) = &self.catalog {
+            while let Some(observation) = watch.poll() {
+                if let Ok(catalog) = &observation.catalog {
+                    self.last_catalog = Some(catalog.clone());
+                }
+                self.output
+                    .observe(observation.catalog, observation.selected_target_removed);
+                observed = true;
+            }
+        }
+        if observed || self.fed_plan_revision != Some(self.output.revision()) {
+            let plan = self.output.plan().clone();
+            if let Some(engine) = &mut self.engine {
+                match engine.set_output_plan(plan.clone()) {
+                    Ok(SubmitStatus::Accepted) => {}
+                    Ok(status) => self.rejection(format!("output plan submission {status:?}")),
+                    Err(error) => self.rejection(error),
+                }
+            }
+            if let Some(target) = plan.target()
+                && self.registered_target.as_ref() != Some(target)
+            {
+                if let Some(watch) = &self.catalog {
+                    watch.set_selected_target(Some(target.clone()));
+                }
+                self.registered_target = Some(target.clone());
+            }
+            self.fed_plan_revision = Some(self.output.revision());
+            self.dirty = true;
+        }
+    }
+
+    /// Explicit output choice from the selector. `row_key` is the reserved
+    /// auto key or an opaque revision-scoped row key from the currently
+    /// displayed rows; `expected_catalog_revision` must still match the rows
+    /// the user chose from, so a stale dialog can never apply a decision
+    /// about a catalog that has since changed. The candidate policy is
+    /// staged on a clone and committed only on engine acceptance: a rejected
+    /// selection leaves the latch, choice and desired revision untouched.
+    pub(crate) fn select_output(
+        &mut self,
+        row_key: &str,
+        expected_catalog_revision: u64,
+    ) -> SubmitStatus {
+        self.dirty = true;
+        if !self.persistence.mutations_open() {
+            self.rejection("output selection while closing");
+            return SubmitStatus::Closing;
+        }
+        let catalog_revision = self.last_catalog.as_ref().map(|c| c.revision).unwrap_or(0);
+        if catalog_revision != expected_catalog_revision {
+            self.rejection("stale output selection: the catalog changed; choose again");
+            return SubmitStatus::StaleGeneration;
+        }
+        let identity = if row_key == AUTO_ROW_KEY {
+            None
+        } else {
+            match self
+                .last_rows
+                .iter()
+                .find(|row| row.key == row_key)
+                .and_then(|row| row.identity.clone())
+            {
+                Some(identity) => Some(identity),
+                None => {
+                    self.rejection("selected output is not in the current catalog");
+                    return SubmitStatus::NotReady;
+                }
+            }
+        };
+        let choice = match identity {
+            None => PersistentOutputChoice::Auto,
+            Some(identity) => PersistentOutputChoice::Manual(identity),
+        };
+        // Stage on a clone: nothing observable changes until the engine
+        // accepts the candidate plan.
+        let mut candidate = self.output.clone();
+        candidate.select(choice.clone());
+        let plan = candidate.plan().clone();
+        let status = match self.engine.as_mut() {
+            Some(engine) => match engine.set_output_plan(plan.clone()) {
+                Ok(status) => status,
+                Err(error) => {
+                    // The engine's actual diagnosis is preserved; only the
+                    // coarse SubmitStatus is mapped for the caller.
+                    self.rejection(error);
+                    return SubmitStatus::NotReady;
+                }
+            },
+            None => SubmitStatus::Accepted,
+        };
+        if status != SubmitStatus::Accepted {
+            self.rejection(format!("output selection {status:?}"));
+            return status;
+        }
+        self.output = candidate;
+        self.command_error.clear();
+        let mut preferences = self.persistence.preferences().clone();
+        preferences.output = choice;
+        self.persistence.set_preferences(preferences);
+        // An explicit selection always re-registers, including the same
+        // target: fresh selection must not inherit stale removal evidence.
+        if let Some(watch) = &self.catalog {
+            watch.set_selected_target(plan.target().cloned());
+        }
+        self.registered_target = plan.target().cloned();
+        self.fed_plan_revision = Some(self.output.revision());
+        status
+    }
+
+    /// Whole-projection presentation of the selector. Rows are plain
+    /// `key|label|eligible` text (the reserved auto row first, then every
+    /// catalogued sink) built from the last observed catalog; an absent
+    /// catalog still shows the auto row with an empty revision.
+    fn output_projection(&mut self) -> OutputProjection {
+        let plan = self.output.plan();
+        let catalog_revision = self.last_catalog.as_ref().map(|c| c.revision).unwrap_or(0);
+        let (selected, selected_key) = match self.output.choice() {
+            PersistentOutputChoice::Auto => ("auto".to_owned(), AUTO_ROW_KEY.to_owned()),
+            PersistentOutputChoice::Manual(identity) => {
+                // Display keeps the chosen name; the action key is the key of
+                // the UNIQUE compatible observed sink, and stays empty when
+                // the choice is absent, renamed or ambiguous.
+                let key = self.last_catalog.as_ref().and_then(|catalog| {
+                    let matches: Vec<usize> = catalog
+                        .sinks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, observation)| {
+                            identity.compatible_with(&observation.target.identity)
+                        })
+                        .map(|(index, _)| index)
+                        .collect();
+                    match matches[..] {
+                        [index] => Some(format!("sink:{catalog_revision}:{index}")),
+                        _ => None,
+                    }
+                });
+                (identity.name().to_owned(), key.unwrap_or_default())
+            }
+        };
+        // The effective output and its confirmation status come from the
+        // media-confirmed availability (the Active receipt's actual
+        // destination), never from the desired plan.
+        let availability = self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.audio_availability().cloned());
+        let effective = match &availability {
+            Some(AudioAvailability::Active { route, .. }) => route
+                .destination()
+                .map(|target| target.identity.name().to_owned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let status = match &availability {
+            Some(AudioAvailability::Silent {
+                reason: AudioSilence::Output(reason),
+            }) => output_silence_text(reason),
+            Some(AudioAvailability::Switching { .. }) => "Switching output route".to_owned(),
+            _ => match plan.silence() {
+                None => String::new(),
+                Some(reason) => output_silence_text(reason),
+            },
+        };
+        // Rows are serialized as a JSON array of objects: sink names and
+        // descriptions are external strings and must never ride as raw
+        // newline/pipe text. Keys are opaque and revision-scoped; the
+        // reserved Auto key can never collide with a catalogued sink.
+        let mut rows = vec![OutputRow {
+            key: AUTO_ROW_KEY.to_owned(),
+            label: "Auto (default)".to_owned(),
+            name: AUTO_ROW_KEY.to_owned(),
+            eligible: true,
+            identity: None,
+        }];
+        if let Some(catalog) = &self.last_catalog {
+            for (index, sink) in catalog.sinks.iter().enumerate() {
+                let name = sink.target.identity.name().to_owned();
+                let label = if sink.description.is_empty() {
+                    name.clone()
+                } else {
+                    sink.description.clone()
+                };
+                rows.push(OutputRow {
+                    key: format!("sink:{catalog_revision}:{index}"),
+                    label,
+                    name,
+                    eligible: sink.eligible,
+                    identity: Some(sink.target.identity.clone()),
+                });
+            }
+        }
+        self.last_rows = rows.clone();
+        let serialized = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_owned());
+        OutputProjection {
+            catalog_revision,
+            rows: serialized,
+            selected,
+            selected_key,
+            effective,
+            status,
+            needs_action: matches!(plan.silence(), Some(OutputSilence::ManualRequiresAction)),
+        }
     }
     fn checked_state(
         engine: &Engine,
@@ -662,9 +1030,7 @@ impl RuntimeCoordinator {
                     if status != SubmitStatus::Accepted {
                         return Err(format!("volume submission {status:?}"));
                     }
-                    let mut preferences = self.persistence.preferences();
-                    preferences.gain = gain;
-                    self.persistence.set_preferences(preferences);
+                    self.persistence.set_gain_preference(gain);
                 }
                 Command::Mute(attempt, muted) => {
                     if engine.model().state_identity().attempt() != Some(attempt) {
@@ -679,9 +1045,7 @@ impl RuntimeCoordinator {
                     if status != SubmitStatus::Accepted {
                         return Err(format!("mute submission {status:?}"));
                     }
-                    let mut preferences = self.persistence.preferences();
-                    preferences.gain = gain;
-                    self.persistence.set_preferences(preferences);
+                    self.persistence.set_gain_preference(gain);
                 }
                 Command::Pause(attempt) => {
                     let status = engine.pause(attempt).map_err(|error| error.to_string())?;
@@ -709,6 +1073,7 @@ impl RuntimeCoordinator {
         self.poll()
     }
     pub(crate) fn poll(&mut self) -> UiUpdate {
+        self.pump_output();
         if let Some(engine) = &mut self.engine {
             if let Some((key, _)) = engine.model().opening() {
                 self.persistence.observe_opening(key);
@@ -749,11 +1114,12 @@ impl RuntimeCoordinator {
             }
         }
         let mut update = self.poll_media();
-        let drained = self.quit_empty
+        let base_drained = self.quit_empty
             || self
                 .engine
                 .as_ref()
                 .is_some_and(|engine| engine.model().shutdown_ready());
+        let drained = base_drained && self.drain_catalog();
         let previous_dialog = self.persistence.close_dialog();
         if drained {
             self.persistence.drained();
@@ -761,8 +1127,26 @@ impl RuntimeCoordinator {
         if previous_dialog != self.persistence.close_dialog() {
             update.changed = true;
         }
+        let projection = self.output_projection();
+        if self.last_output.as_ref() != Some(&projection) {
+            self.last_output = Some(projection.clone());
+            update.changed = true;
+        }
         update.quit = drained && self.persistence.quit_allowed();
+        if update.quit {
+            // The host ignores unchanged updates; a quit authorization that
+            // changes no other published field must still be applied or the
+            // GUI never leaves the event loop.
+            update.changed = true;
+        }
         if update.changed {
+            update.output_rows = projection.rows;
+            update.output_catalog_revision = projection.catalog_revision;
+            update.output_selected = projection.selected;
+            update.output_selected_key = projection.selected_key;
+            update.output_effective = projection.effective;
+            update.output_status = projection.status;
+            update.output_needs_action = projection.needs_action;
             update.settings_status = self.persistence.status();
             update.settings_path = self.persistence.path();
             update.settings_refused = self.persistence.refused();
@@ -852,6 +1236,13 @@ impl RuntimeCoordinator {
                 reset_token: 0,
                 fullscreen: false,
                 closing: false,
+                output_rows: String::new(),
+                output_catalog_revision: 0,
+                output_selected: String::new(),
+                output_selected_key: String::new(),
+                output_effective: String::new(),
+                output_status: String::new(),
+                output_needs_action: false,
             };
         };
         let native = engine.runner_mut().take_native_update();
@@ -989,6 +1380,8 @@ impl RuntimeCoordinator {
                         }
                         AudioSilence::PendingRoute => "waiting for audio route".to_owned(),
                         AudioSilence::Paused => "audio paused with live video".to_owned(),
+                        AudioSilence::Output(reason) => output_silence_text(reason),
+                        AudioSilence::Failed(error) => format!("audio route failed: {error}"),
                     };
                     ("Silent".to_owned(), String::new(), reason)
                 }
@@ -997,9 +1390,20 @@ impl RuntimeCoordinator {
                     String::new(),
                     format!("opening audio route (epoch {})", epoch.get()),
                 ),
-                Some(AudioAvailability::Active { source, .. }) => {
-                    ("Active".to_owned(), source.name().to_owned(), String::new())
-                }
+                Some(AudioAvailability::Switching { epoch, revision }) => (
+                    "Switching".to_owned(),
+                    String::new(),
+                    format!(
+                        "switching output route (epoch {}, output revision {})",
+                        epoch.get(),
+                        revision.get()
+                    ),
+                ),
+                Some(AudioAvailability::Active { route }) => (
+                    "Active".to_owned(),
+                    route.source().name().to_owned(),
+                    String::new(),
+                ),
                 Some(AudioAvailability::Detaching { epoch }) => (
                     "Detaching".to_owned(),
                     String::new(),
@@ -1098,6 +1502,13 @@ impl RuntimeCoordinator {
             reset_token: 0,
             fullscreen: false,
             closing: false,
+            output_rows: String::new(),
+            output_catalog_revision: 0,
+            output_selected: String::new(),
+            output_selected_key: String::new(),
+            output_effective: String::new(),
+            output_status: String::new(),
+            output_needs_action: false,
         }
     }
     pub(crate) fn unchanged(&mut self) -> UiUpdate {
@@ -1255,10 +1666,7 @@ mod tests {
     use crate::{
         capture::{PreparedCapture, apply::fixture_prepared, linux::session_fixture},
         domain::{
-            capture::{
-                AudioEpoch, AudioError, AudioRouteReceipt, CaptureMode, CapturedFourCc, FrameRate,
-                FrameSize,
-            },
+            capture::{AudioEpoch, AudioError, CaptureMode, CapturedFourCc, FrameRate, FrameSize},
             failure::ApplyFailure,
             state::{ProductPhase, ValidationRequest},
         },
@@ -1356,6 +1764,17 @@ mod tests {
                 },
                 auto_open: false,
                 startup_apply: None,
+                output: OutputPolicy::new(PersistentOutputChoice::default()),
+                catalog: None,
+                // Tests never touch a real Pulse connection.
+                catalog_start_failed: true,
+                registered_target: None,
+                fed_plan_revision: None,
+                last_catalog: None,
+                last_rows: Vec::new(),
+                last_output: None,
+                catalog_stopping: false,
+                catalog_join_error: None,
             },
             rx,
         )
@@ -2338,6 +2757,17 @@ mod tests {
             },
             auto_open: false,
             startup_apply: None,
+            output: OutputPolicy::new(PersistentOutputChoice::default()),
+            catalog: None,
+            // Tests never touch a real Pulse connection.
+            catalog_start_failed: true,
+            registered_target: None,
+            fed_plan_revision: None,
+            last_catalog: None,
+            last_rows: Vec::new(),
+            last_output: None,
+            catalog_stopping: false,
+            catalog_join_error: None,
         };
         let initial = runtime.qualification_command("open Stopped 0 0 Complete 0");
         let opening = if initial.create_native {
@@ -2356,8 +2786,9 @@ mod tests {
             Some(&crate::domain::capture::SourcePresence::Present)
         );
         let (driver, watch) = rx.recv().unwrap();
+        let generation = Generation::new(opening.generation).unwrap();
         runtime.surface_ready(SurfaceToken {
-            generation: Generation::new(opening.generation).unwrap(),
+            generation,
             xid: X11WindowId::new(71).unwrap(),
         });
         driver.initialized.recv().unwrap();
@@ -2377,15 +2808,74 @@ mod tests {
         assert_eq!(audio_opening.playback_status, "Unavailable");
         assert!(!audio_opening.can_toggle_pause);
         assert!(runtime.engine.as_ref().unwrap().model().active().is_none());
-        let route = AudioRouteReceipt {
+        let attempt = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .state_identity()
+            .attempt()
+            .expect("open attempt exists");
+        // M3 loopback receipt test constructor: the legacy Pulse route receipt
+        // is gone; Active audio carries the owned-loopback receipt with a
+        // confirmed actual destination target from the desired plan.
+        let identity = crate::domain::output::SinkIdentity::new(
+            "test-output".to_owned(),
+            vec![("device.api".to_owned(), "pipewire".to_owned())],
+        )
+        .unwrap();
+        let live_target = crate::domain::output::LiveSinkTarget::new(
+            identity,
+            std::num::NonZeroU64::new(4242).unwrap(),
+            17,
+        )
+        .unwrap();
+        // The runtime has already fed its policy plan, so the fixture must
+        // advance past the engine's actual current output revision; a stale
+        // first() revision is rejected as StaleState.
+        let revision = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .output_plan()
+            .revision()
+            .next();
+        runtime
+            .engine
+            .as_mut()
+            .unwrap()
+            .set_output_plan(crate::domain::output::OutputPlan::Target {
+                revision,
+                target: live_target.clone(),
+            })
+            .unwrap();
+        // Drain the output change before the helper expects the pause transaction.
+        let (_, command) = driver
+            .submitted
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("accepted output change reaches the backend");
+        assert!(matches!(
+            command,
+            crate::media::controller::BackendCommand::SetOutput(_)
+        ));
+        let destination = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .output_plan()
+            .target()
+            .cloned()
+            .expect("desired plan carries the live target");
+        let route = crate::media::loopback::LoopbackReceipt::for_test(
+            generation,
+            attempt,
             epoch,
-            stamp: watch,
-            source_index: 0,
-            source_output_index: 0,
-            client_index: 0,
-        };
+            watch,
+            source_a.clone(),
+            destination,
+            revision,
+        );
         driver.send(BackendEvent::AudioAvailability(AudioAvailability::Active {
-            source: source_a.clone(),
             route: route.clone(),
         }));
         driver.send(BackendEvent::FileLoaded);
@@ -2395,7 +2885,6 @@ mod tests {
         assert_eq!(
             runtime.engine.as_ref().unwrap().audio_availability(),
             Some(&AudioAvailability::Active {
-                source: source_a.clone(),
                 route: route.clone(),
             })
         );
@@ -2593,7 +3082,16 @@ mod tests {
         assert_eq!(runtime.set_volume(101), SubmitStatus::NotReady);
         assert_eq!(runtime.poll().volume_percent, 27);
         let close = runtime.request_application_close();
-        assert!(close.quit && !close.release_native);
+        assert!(!close.release_native);
+        // begin_shutdown stops the application-lifetime catalog worker; quit is
+        // only authorized after that worker actually joins, so poll until the
+        // real barrier opens instead of assuming an immediate quit.
+        let final_update = if close.quit {
+            close
+        } else {
+            await_update(&mut runtime, |update| update.quit)
+        };
+        assert!(final_update.quit);
         let reloaded = PersistenceSession::load(Ok(path));
         assert_eq!(
             reloaded.preferences().gain,
@@ -2670,5 +3168,189 @@ mod tests {
         assert!(!runtime.persistence.status().contains("Save"));
         assert!(!runtime.ui_ready().create_native && drivers.try_recv().is_err());
         cleanup(&mut runtime);
+    }
+
+    fn observed_sink(
+        name: &str,
+        serial: u64,
+        index: u32,
+    ) -> crate::domain::output::SinkObservation {
+        let identity = crate::domain::output::SinkIdentity::new(name.to_owned(), vec![]).unwrap();
+        crate::domain::output::SinkObservation {
+            target: crate::domain::output::LiveSinkTarget::new(
+                identity,
+                serial.try_into().unwrap(),
+                index,
+            )
+            .unwrap(),
+            description: format!("{name} description"),
+            eligible: true,
+        }
+    }
+
+    #[test]
+    fn output_rows_are_json_objects_with_reserved_auto_key_and_scoped_sink_keys() {
+        let (mut runtime, _drivers) = runtime();
+        runtime.last_catalog = Some(crate::domain::output::SinkCatalog {
+            revision: 7,
+            sinks: vec![
+                observed_sink("auto", 10, 3),
+                observed_sink("speakers", 11, 4),
+            ],
+            default_sink: None,
+        });
+        let projection = runtime.output_projection();
+        let parsed: serde_json::Value = serde_json::from_str(&projection.rows).unwrap();
+        let rows = parsed.as_array().expect("rows are a JSON array");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["key"], "auto");
+        assert_eq!(rows[0]["label"], "Auto (default)");
+        // Sink keys are revision-scoped and opaque: a sink literally named
+        // "auto" can never collide with the reserved Auto row.
+        assert_eq!(rows[1]["key"], "sink:7:0");
+        assert_eq!(rows[2]["key"], "sink:7:1");
+        assert_ne!(rows[1]["key"], "auto");
+        // The runtime-side identity is never serialized into the projection.
+        assert_eq!(rows[1].as_object().unwrap().len(), 4);
+        // Selecting the reserved Auto key resolves to the Auto choice and
+        // commits only through the accepted engine path. Every action must
+        // echo the projected catalog revision: a stale revision is refused
+        // with its actual diagnosis.
+        let before = runtime.output.revision();
+        assert_eq!(
+            runtime.select_output("sink:7:9", 7),
+            SubmitStatus::NotReady,
+            "unknown keys never resolve to a choice"
+        );
+        assert!(runtime.command_error.contains("not in the current catalog"));
+        assert_eq!(runtime.output.revision(), before);
+        assert_eq!(runtime.select_output("auto", 7), SubmitStatus::Accepted);
+        assert!(runtime.command_error.is_empty());
+        assert!(runtime.output.revision().get() > before.get());
+        assert_eq!(
+            runtime.persistence.preferences().output,
+            PersistentOutputChoice::Auto
+        );
+    }
+
+    #[test]
+    fn stale_output_selection_is_rejected_without_policy_mutation() {
+        let (mut runtime, _drivers) = runtime();
+        runtime.last_catalog = Some(crate::domain::output::SinkCatalog {
+            revision: 3,
+            sinks: vec![observed_sink("speakers", 5, 1)],
+            default_sink: None,
+        });
+        runtime.output_projection();
+        let before_revision = runtime.output.revision();
+        let before_choice = runtime.output.choice().clone();
+        // The user picked from rows that have since been replaced: the
+        // decision is refused and the desired policy stays untouched.
+        assert_eq!(
+            runtime.select_output("sink:3:0", 2),
+            SubmitStatus::StaleGeneration
+        );
+        assert!(runtime.command_error.contains("stale output selection"));
+        assert_eq!(runtime.output.revision(), before_revision);
+        assert_eq!(runtime.output.choice(), &before_choice);
+        // The fresh projection is not shifted onto stale row indexes: the
+        // new revision-scoped key of the same sink resolves cleanly.
+        runtime.last_catalog.as_mut().unwrap().revision = 4;
+        runtime.output_projection();
+        assert_eq!(runtime.select_output("sink:4:0", 4), SubmitStatus::Accepted);
+        match runtime.output.choice() {
+            PersistentOutputChoice::Manual(identity) => {
+                assert_eq!(identity.name(), "speakers");
+            }
+            other => panic!("expected manual choice, got {other:?}"),
+        }
+        match &runtime.persistence.preferences().output {
+            PersistentOutputChoice::Manual(identity) => {
+                assert_eq!(identity.name(), "speakers");
+            }
+            other => panic!("expected persisted manual choice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_manual_choice_stays_selected_and_visible_without_auto_fallback() {
+        let (mut runtime, _drivers) = runtime();
+        let ghost = crate::domain::output::SinkIdentity::new("ghost".to_owned(), vec![]).unwrap();
+        runtime.output = OutputPolicy::new(PersistentOutputChoice::Manual(ghost));
+        runtime.last_catalog = Some(crate::domain::output::SinkCatalog {
+            revision: 2,
+            sinks: vec![observed_sink("speakers", 5, 1)],
+            default_sink: None,
+        });
+        let projection = runtime.output_projection();
+        assert_eq!(projection.selected, "ghost");
+        // No unique compatible row: the action key stays empty, which the UI
+        // renders as selected-but-unavailable (index -1, never Auto).
+        assert_eq!(projection.selected_key, "");
+        let parsed: serde_json::Value = serde_json::from_str(&projection.rows).unwrap();
+        // The unavailable saved choice is absent from the rows, so the UI
+        // keeps it selected-but-unavailable instead of silently mapping it
+        // onto the Auto row.
+        assert!(
+            parsed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["name"] != "ghost")
+        );
+        // A unique compatible observed row projects its revision-scoped key;
+        // after a catalog change the key is re-scoped, never a shifted index.
+        let speakers =
+            crate::domain::output::SinkIdentity::new("speakers".to_owned(), vec![]).unwrap();
+        runtime.output = OutputPolicy::new(PersistentOutputChoice::Manual(speakers));
+        let projection = runtime.output_projection();
+        assert_eq!(projection.selected_key, "sink:2:0");
+        runtime.last_catalog.as_mut().unwrap().revision = 3;
+        let projection = runtime.output_projection();
+        assert_eq!(projection.selected_key, "sink:3:0");
+    }
+
+    #[test]
+    fn close_awaits_catalog_retirement_and_authorizes_quit_with_changed_update() {
+        let (mut runtime, _drivers) = runtime();
+        runtime.engine = None;
+        // A real catalog worker held behind a delayed-release barrier (M3
+        // test constructor): the first try_join calls find the worker still
+        // running, then the actual retirement joins. No exact poll count is
+        // asserted; the barrier release is awaited.
+        runtime.catalog = Some(OutputCatalogWatch::for_test_delayed_releases(2));
+        runtime.catalog_start_failed = false;
+        runtime.last_catalog = Some(crate::domain::output::SinkCatalog {
+            revision: 1,
+            sinks: vec![observed_sink("speakers", 5, 1)],
+            default_sink: None,
+        });
+        runtime.output_projection();
+        let first = runtime.request_application_close();
+        assert!(
+            !first.quit,
+            "a still-running worker never opens the barrier"
+        );
+        let intermediate = runtime.poll();
+        assert!(
+            !intermediate.quit,
+            "the catalog worker is still held behind its release barrier"
+        );
+        let drained = await_update(&mut runtime, |update| {
+            update.quit || update.close_dialog == "save"
+        });
+        let quitting = if drained.quit {
+            drained
+        } else {
+            let discarded = runtime.close_without_save();
+            if discarded.quit {
+                discarded
+            } else {
+                await_update(&mut runtime, |update| update.quit)
+            }
+        };
+        assert!(quitting.quit, "catalog retirement must authorize quit");
+        assert!(quitting.changed, "quit authorization must set changed");
+        assert!(runtime.catalog_join_error.is_none());
     }
 }

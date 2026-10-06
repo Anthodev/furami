@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::domain::capture::PlaybackGain;
+use crate::domain::output::PersistentOutputChoice;
 use crate::domain::state::{AppliedSettings, DraftSettings};
 
 use super::schema::{self, EncodeError, SchemaError};
@@ -29,10 +30,18 @@ use super::schema::{self, EncodeError, SchemaError};
 
 /// Local operator preferences. Session preferences apply immediately but are
 /// only written when an authorized persistence event occurs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// The output choice is the user's persisted preference alone (`Auto` or a
+/// manual sink identity); live resolution never becomes part of the persisted
+/// value. The field is optional on disk: a strict v1 document without the
+/// `output` key decodes to [`PersistentOutputChoice::Auto`]. Downgrade limit:
+/// a document written with a manual choice carries that key and is refused by
+/// builds that predate it; by design there is no migration path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalPreferences {
     pub gain: PlaybackGain,
     pub fullscreen: bool,
+    pub output: PersistentOutputChoice,
 }
 
 /// The complete persisted document: last verified applied settings, if any,
