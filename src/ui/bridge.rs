@@ -61,6 +61,17 @@ pub(crate) mod ffi {
         create_native: bool,
         release_native: bool,
         quit: bool,
+        settings_status: String,
+        settings_path: String,
+        settings_refused: bool,
+        saved_selection: String,
+        startup_reason: String,
+        draft_dirty: bool,
+        close_dialog: String,
+        close_revision: u64,
+        reset_token: u64,
+        fullscreen: bool,
+        closing: bool,
     }
     // SAFETY: host.h declares this exact ABI. Rust owns only values and adapters;
     // C++ owns Qt lifetime through authorized event-loop exit.
@@ -75,6 +86,22 @@ pub(crate) mod ffi {
     extern "Rust" {
         type RuntimeCoordinator;
         fn gate_capture_selected(gate: &RuntimeCoordinator) -> bool;
+        fn gate_ui_ready(gate: &mut RuntimeCoordinator) -> UiUpdate;
+        fn gate_request_application_close(gate: &mut RuntimeCoordinator) -> UiUpdate;
+        fn gate_decide_close(
+            gate: &mut RuntimeCoordinator,
+            discard: bool,
+            revision: u64,
+        ) -> UiUpdate;
+        fn gate_retry_save(gate: &mut RuntimeCoordinator) -> UiUpdate;
+        fn gate_close_without_save(gate: &mut RuntimeCoordinator) -> UiUpdate;
+        fn gate_request_reset(gate: &mut RuntimeCoordinator) -> UiUpdate;
+        fn gate_decide_reset(
+            gate: &mut RuntimeCoordinator,
+            token: u64,
+            confirmed: bool,
+        ) -> UiUpdate;
+        fn gate_set_fullscreen(gate: &mut RuntimeCoordinator, fullscreen: bool) -> UiUpdate;
         fn gate_open(gate: &mut RuntimeCoordinator) -> UiUpdate;
         fn gate_restart(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
         fn gate_reconnect(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
@@ -146,11 +173,46 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
             create_native: update.create_native,
             release_native: update.release_native,
             quit: update.quit,
+            settings_status: update.settings_status,
+            settings_path: update.settings_path,
+            settings_refused: update.settings_refused,
+            saved_selection: update.saved_selection,
+            startup_reason: update.startup_reason,
+            draft_dirty: update.draft_dirty,
+            close_dialog: update.close_dialog,
+            close_revision: update.close_revision,
+            reset_token: update.reset_token,
+            fullscreen: update.fullscreen,
+            closing: update.closing,
         }
     }
 }
 fn gate_capture_selected(gate: &RuntimeCoordinator) -> bool {
     gate.capture_selected()
+}
+fn gate_ui_ready(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
+    gate.ui_ready().into()
+}
+fn gate_request_application_close(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
+    gate.request_application_close().into()
+}
+fn gate_decide_close(gate: &mut RuntimeCoordinator, discard: bool, revision: u64) -> ffi::UiUpdate {
+    gate.decide_close(discard, revision).into()
+}
+fn gate_retry_save(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
+    gate.retry_save().into()
+}
+fn gate_close_without_save(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
+    gate.close_without_save().into()
+}
+fn gate_request_reset(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
+    gate.request_reset().into()
+}
+fn gate_decide_reset(gate: &mut RuntimeCoordinator, token: u64, confirmed: bool) -> ffi::UiUpdate {
+    gate.decide_reset(token, confirmed).into()
+}
+fn gate_set_fullscreen(gate: &mut RuntimeCoordinator, fullscreen: bool) -> ffi::UiUpdate {
+    gate.set_fullscreen(fullscreen).into()
 }
 fn gate_open(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
     gate.open().into()
@@ -218,7 +280,7 @@ fn gate_set_muted(gate: &mut RuntimeCoordinator, muted: bool) -> ffi::SubmitStat
 }
 fn gate_close(gate: &mut RuntimeCoordinator, generation: u64, application: bool) -> ffi::UiUpdate {
     if application {
-        gate.quit()
+        gate.request_application_close()
     } else {
         gate.close(generation)
     }

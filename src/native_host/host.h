@@ -55,6 +55,19 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(QString audioDiagnostic READ audioDiagnostic NOTIFY stateChanged)
     Q_PROPERTY(QString audioSource READ audioSource NOTIFY stateChanged)
     Q_PROPERTY(QString audioDesired READ audioDesired NOTIFY stateChanged)
+    Q_PROPERTY(QString settingsStatus READ settingsStatus NOTIFY stateChanged)
+    Q_PROPERTY(QString settingsPath READ settingsPath NOTIFY stateChanged)
+    Q_PROPERTY(bool settingsRefused READ settingsRefused NOTIFY stateChanged)
+    Q_PROPERTY(QString savedSelection READ savedSelection NOTIFY stateChanged)
+    Q_PROPERTY(QString startupReason READ startupReason NOTIFY stateChanged)
+    Q_PROPERTY(bool draftDirty READ draftDirty NOTIFY stateChanged)
+    Q_PROPERTY(QString closeDialog READ closeDialog NOTIFY stateChanged)
+    Q_PROPERTY(QString closeRevision READ closeRevision NOTIFY stateChanged)
+    Q_PROPERTY(QString resetToken READ resetToken NOTIFY stateChanged)
+    Q_PROPERTY(bool fullscreenPreference READ fullscreenPreference NOTIFY stateChanged)
+    Q_PROPERTY(bool closing READ closing NOTIFY stateChanged)
+    Q_PROPERTY(int screenAvailableWidth READ screenAvailableWidth NOTIFY screenGeometryChanged)
+    Q_PROPERTY(int screenAvailableHeight READ screenAvailableHeight NOTIFY screenGeometryChanged)
 
 public:
     explicit FuramiBridge(rust::Box<RuntimeCoordinator> gate);
@@ -85,6 +98,19 @@ public:
     QString audioDiagnostic() const;
     QString audioSource() const;
     QString audioDesired() const;
+    QString settingsStatus() const;
+    QString settingsPath() const;
+    bool settingsRefused() const;
+    QString savedSelection() const;
+    QString startupReason() const;
+    bool draftDirty() const;
+    QString closeDialog() const;
+    QString closeRevision() const;
+    QString resetToken() const;
+    bool fullscreenPreference() const;
+    bool closing() const;
+    int screenAvailableWidth() const;
+    int screenAvailableHeight() const;
     void setTextEntryActive(bool active);
     void setPanelVisible(bool visible);
     void setPopupOpen(bool open);
@@ -105,6 +131,11 @@ public:
     Q_INVOKABLE void openAndCloseDuringOpeningForProof();
     Q_INVOKABLE void forceSurfaceLossForProof();
     Q_INVOKABLE void requestApplicationClose();
+    Q_INVOKABLE void decideClose(bool discard, const QString &revision);
+    Q_INVOKABLE void retrySave();
+    Q_INVOKABLE void closeWithoutSave();
+    Q_INVOKABLE void requestSettingsReset();
+    Q_INVOKABLE void decideSettingsReset(const QString &token, bool confirmed);
     Q_INVOKABLE void togglePanel();
     Q_INVOKABLE void toggleFullscreen();
     Q_INVOKABLE void focusVideo();
@@ -120,6 +151,7 @@ signals:
     void textEntryActiveChanged();
     void panelVisibleChanged();
     void popupOpenChanged();
+    void screenGeometryChanged();
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -135,6 +167,10 @@ private:
     void restoreFullscreenFocus();
     void logGeometry();
     void readQualificationInput();
+    void observeFullscreenChoice();
+    void synchronizeFullscreenChoice();
+    void cancelFullscreenChoice(const char *reason);
+    void watchScreenGeometry();
 
     rust::Box<RuntimeCoordinator> m_gate;
     QTimer m_pollTimer;
@@ -152,6 +188,10 @@ private:
     bool m_fullscreenNativeFocus = false;
     bool m_fullscreenFocusRestorePending = false;
     bool m_fullscreenNativeTransitionObserved = false;
+    bool m_fullscreenObserved = false;
+    bool m_fullscreenRequested = false;
+    bool m_fullscreenChoiceSynchronized = false;
+    QTimer m_fullscreenChoiceDeadline;
     std::uint64_t m_fullscreenTransition = 0;
     QMetaObject::Connection m_fullscreenSyncConnection;
     QMetaObject::Connection m_fullscreenSwapConnection;
@@ -169,6 +209,7 @@ private:
     QString m_recoveryEvidence;
     QString m_recoveryStage;
     QString m_recoveryCandidates;
+    QMetaObject::Connection m_screenGeometryConnection;
     std::uint64_t m_nativeGeneration = 0;
     std::uint64_t m_rootXid = 0;
     std::uint64_t m_lastHostXid = 0;
@@ -186,6 +227,18 @@ private:
     bool m_canTogglePause = false;
     bool m_canSetGain = false;
     QString m_playbackStatus = QStringLiteral("Unavailable");
+    QString m_settingsStatus;
+    QString m_settingsPath;
+    bool m_settingsRefused = false;
+    QString m_savedSelection;
+    QString m_startupReason;
+    bool m_draftDirty = false;
+    QString m_closeDialog;
+    std::uint64_t m_closeRevision = 0;
+    std::uint64_t m_resetToken = 0;
+    bool m_fullscreenPreference = false;
+    bool m_fullscreenChoicePending = false;
+    bool m_closing = false;
     bool m_textEntryActive = false;
     bool m_panelVisible = true;
     bool m_popupOpen = false;

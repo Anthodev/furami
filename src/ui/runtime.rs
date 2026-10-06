@@ -6,6 +6,7 @@ use crate::{
         control::{self, Command, ExpectedCleanup, ExpectedState},
         gate::GatePhase,
         ports::SubmitStatus,
+        settings::{PersistenceSession, StartupSelection},
     },
     capture::CaptureValidator,
     domain::{
@@ -56,6 +57,17 @@ pub(crate) struct UiUpdate {
     pub create_native: bool,
     pub release_native: bool,
     pub quit: bool,
+    pub settings_status: String,
+    pub settings_path: String,
+    pub settings_refused: bool,
+    pub saved_selection: String,
+    pub startup_reason: String,
+    pub draft_dirty: bool,
+    pub close_dialog: String,
+    pub close_revision: u64,
+    pub reset_token: u64,
+    pub fullscreen: bool,
+    pub closing: bool,
 }
 
 pub(crate) struct RuntimeCoordinator {
@@ -70,16 +82,20 @@ pub(crate) struct RuntimeCoordinator {
     )>,
     command_error: String,
     quit_empty: bool,
+    persistence: PersistenceSession,
+    auto_open: bool,
+    startup_apply: Option<crate::domain::state::ApplyId>,
 }
 impl RuntimeCoordinator {
     pub(crate) fn new(
         prefix: String,
-        settings: Option<DraftSettings>,
-        gain: PlaybackGain,
+        startup: StartupSelection,
+        persistence: PersistenceSession,
         sources: Vec<AudioSourceIdentity>,
     ) -> Self {
+        let gain = persistence.preferences().gain;
         Self {
-            engine: settings.map(|settings| {
+            engine: startup.draft.map(|settings| {
                 ApplyCoordinator::new(
                     settings,
                     gain,
@@ -92,10 +108,109 @@ impl RuntimeCoordinator {
             last_state: None,
             command_error: String::new(),
             quit_empty: false,
+            auto_open: startup.auto_open,
+            startup_apply: None,
+            persistence,
         }
     }
     pub(crate) fn capture_selected(&self) -> bool {
         self.engine.is_some()
+    }
+    pub(crate) fn ui_ready(&mut self) -> UiUpdate {
+        if std::mem::take(&mut self.auto_open)
+            && self.persistence.mutations_open()
+            && let Some(engine) = &mut self.engine
+        {
+            match engine.apply(
+                engine.model().state_identity(),
+                engine.model().draft().revision,
+            ) {
+                Ok(apply) => {
+                    self.startup_apply = Some(apply);
+                    if let Err(error) = engine.require_startup_restore_audio(apply) {
+                        let mut reason = format!("Initial restoration guard failed: {error}");
+                        if let Err(close_error) = engine.close(engine.model().state_identity()) {
+                            reason.push_str(&format!("; cleanup admission failed: {close_error}"));
+                            engine.quit();
+                        }
+                        self.persistence.startup_failed(reason.clone());
+                        self.rejection(reason);
+                    }
+                }
+                Err(error) => {
+                    self.persistence.startup_failed(error.to_string());
+                    self.rejection(error);
+                }
+            }
+        }
+        self.dirty = true;
+        self.poll()
+    }
+    fn begin_shutdown(&mut self) {
+        if let Some(engine) = &mut self.engine {
+            engine.quit();
+        } else {
+            self.quit_empty = true;
+        }
+        self.dirty = true;
+    }
+    pub(crate) fn request_application_close(&mut self) -> UiUpdate {
+        let draft = self.engine.as_ref().map(|engine| {
+            (
+                &engine.model().draft().settings,
+                engine.model().draft().revision,
+            )
+        });
+        if self.persistence.request_close(draft) {
+            self.begin_shutdown();
+        }
+        self.dirty = true;
+        self.poll()
+    }
+    pub(crate) fn decide_close(&mut self, discard: bool, revision: u64) -> UiUpdate {
+        let draft = self.engine.as_ref().map(|engine| {
+            (
+                &engine.model().draft().settings,
+                engine.model().draft().revision,
+            )
+        });
+        if self
+            .persistence
+            .decide_dirty_close(discard, DraftRevision::new(revision), draft)
+        {
+            self.begin_shutdown();
+        }
+        self.dirty = true;
+        self.poll()
+    }
+    pub(crate) fn retry_save(&mut self) -> UiUpdate {
+        self.persistence.retry_close_save();
+        self.dirty = true;
+        self.poll()
+    }
+    pub(crate) fn close_without_save(&mut self) -> UiUpdate {
+        self.persistence.close_without_save();
+        self.dirty = true;
+        self.poll()
+    }
+    pub(crate) fn request_reset(&mut self) -> UiUpdate {
+        self.persistence.request_reset();
+        self.dirty = true;
+        self.poll()
+    }
+    pub(crate) fn decide_reset(&mut self, token: u64, confirmed: bool) -> UiUpdate {
+        self.persistence.decide_reset(token, confirmed);
+        self.dirty = true;
+        self.poll()
+    }
+    pub(crate) fn set_fullscreen(&mut self, fullscreen: bool) -> UiUpdate {
+        if self.persistence.mutations_open() {
+            let mut preferences = self.persistence.preferences();
+            preferences.fullscreen = fullscreen;
+            self.persistence.set_preferences(preferences);
+        }
+        self.dirty = true;
+        self.poll()
     }
     fn rejection(&mut self, error: impl std::fmt::Display) {
         self.command_error = error.to_string();
@@ -106,21 +221,27 @@ impl RuntimeCoordinator {
     /// session: reconnection is the separate explicit idempotent admission in
     /// [`Self::reconnect`], and `restart` stays the explicit forced restart.
     pub(crate) fn open(&mut self) -> UiUpdate {
+        if !self.persistence.mutations_open() {
+            return self.poll();
+        }
         if let Some(engine) = &mut self.engine {
-            let result = engine.apply(
-                engine.model().state_identity(),
-                engine.model().draft().revision,
-            );
-            if let Err(error) = result {
-                self.rejection(error);
-            } else {
-                self.command_error.clear();
-                self.dirty = true;
+            let submitted = engine.model().draft().clone();
+            let result = engine.apply(engine.model().state_identity(), submitted.revision);
+            match result {
+                Err(error) => self.rejection(error),
+                Ok(apply) => {
+                    self.persistence.admit_user_apply(apply, submitted);
+                    self.command_error.clear();
+                    self.dirty = true;
+                }
             }
         }
         self.poll()
     }
     pub(crate) fn restart(&mut self, expected_attempt: u64) -> UiUpdate {
+        if !self.persistence.mutations_open() {
+            return self.poll();
+        }
         if let Some(engine) = &mut self.engine {
             let current = engine
                 .model()
@@ -143,6 +264,9 @@ impl RuntimeCoordinator {
         self.poll()
     }
     pub(crate) fn close(&mut self, expected_attempt: u64) -> UiUpdate {
+        if !self.persistence.mutations_open() {
+            return self.poll();
+        }
         if let Some(engine) = &mut self.engine {
             let current = engine
                 .model()
@@ -169,6 +293,9 @@ impl RuntimeCoordinator {
     /// session starts recovery, and shutdown refuses. There is no default
     /// capture open behind this path.
     pub(crate) fn reconnect(&mut self, expected_attempt: u64) -> UiUpdate {
+        if !self.persistence.mutations_open() {
+            return self.poll();
+        }
         if let Some(engine) = &mut self.engine {
             let current = engine
                 .model()
@@ -203,6 +330,9 @@ impl RuntimeCoordinator {
         epoch: u64,
         candidate: u64,
     ) -> UiUpdate {
+        if !self.persistence.mutations_open() {
+            return self.poll();
+        }
         let token = (|| {
             Some(SelectionToken {
                 stamp: WatchStamp {
@@ -239,13 +369,11 @@ impl RuntimeCoordinator {
         }
         self.poll()
     }
+    /// Uncontrolled root/event-loop loss drains without unavailable UI dialogs.
+    /// Normal window close uses request_application_close.
     pub(crate) fn quit(&mut self) -> UiUpdate {
-        if let Some(engine) = &mut self.engine {
-            engine.quit();
-        } else {
-            self.quit_empty = true;
-        }
-        self.dirty = true;
+        self.persistence.force_close();
+        self.begin_shutdown();
         self.poll()
     }
     pub(crate) fn surface_ready(&mut self, token: SurfaceToken) -> UiUpdate {
@@ -278,6 +406,9 @@ impl RuntimeCoordinator {
         self.poll()
     }
     pub(crate) fn pause(&mut self, attempt: AttemptId) -> SubmitStatus {
+        if !self.persistence.mutations_open() {
+            return SubmitStatus::Closing;
+        }
         let result = self
             .engine
             .as_mut()
@@ -312,10 +443,7 @@ impl RuntimeCoordinator {
     /// reconciliation instead of being suppressed by stamp equality.
     pub(crate) fn set_volume(&mut self, percent: i32) -> SubmitStatus {
         self.dirty = true;
-        let Some(current) = self.engine.as_ref().map(|engine| engine.gain()) else {
-            self.rejection("volume requires an active capture engine");
-            return SubmitStatus::NotReady;
-        };
+        let current = self.persistence.preferences().gain;
         let Some(gain) = u8::try_from(percent)
             .ok()
             .filter(|value| *value <= 100)
@@ -328,22 +456,24 @@ impl RuntimeCoordinator {
     }
     pub(crate) fn set_muted(&mut self, muted: bool) -> SubmitStatus {
         self.dirty = true;
-        let gain = self.engine.as_ref().map(|engine| PlaybackGain {
+        self.submit_gain(PlaybackGain {
             muted,
-            ..engine.gain()
-        });
-        let Some(gain) = gain else {
-            self.rejection("mute requires an active capture engine");
-            return SubmitStatus::NotReady;
-        };
-        self.submit_gain(gain)
+            ..self.persistence.preferences().gain
+        })
     }
     fn submit_gain(&mut self, gain: PlaybackGain) -> SubmitStatus {
+        if !self.persistence.mutations_open() {
+            self.rejection("gain submission Closing");
+            return SubmitStatus::Closing;
+        }
         let status = match self.engine.as_mut() {
             Some(engine) => engine.set_gain(gain),
-            None => SubmitStatus::NotReady,
+            None => SubmitStatus::Accepted,
         };
         if status == SubmitStatus::Accepted {
+            let mut preferences = self.persistence.preferences();
+            preferences.gain = gain;
+            self.persistence.set_preferences(preferences);
             self.command_error.clear();
         } else {
             self.rejection(format!("gain submission {status:?}"));
@@ -371,6 +501,43 @@ impl RuntimeCoordinator {
         }
     }
     pub(crate) fn qualification_command(&mut self, line: &str) -> UiUpdate {
+        // Opt-in qualification calls the same production application decisions.
+        match line.trim() {
+            "settings" => {
+                self.dirty = true;
+                return self.poll();
+            }
+            "application-close" => return self.request_application_close(),
+            "close-cancel" => return self.decide_close(false, self.persistence.close_revision()),
+            "close-discard" => return self.decide_close(true, self.persistence.close_revision()),
+            "save-retry" => return self.retry_save(),
+            "close-without-save" => return self.close_without_save(),
+            "settings-reset" => return self.request_reset(),
+            "reset-cancel" => return self.decide_reset(self.persistence.reset_token(), false),
+            "reset-confirm" => return self.decide_reset(self.persistence.reset_token(), true),
+            _ => {}
+        }
+        if let Some(value) = line.strip_prefix("preference-volume ") {
+            match value.parse::<i32>() {
+                Ok(value) => {
+                    self.set_volume(value);
+                }
+                Err(_) => self.rejection("preference-volume requires an integer"),
+            }
+            return self.poll();
+        }
+        if let Some(value) = line.strip_prefix("preference-mute ") {
+            match value {
+                "true" => {
+                    self.set_muted(true);
+                }
+                "false" => {
+                    self.set_muted(false);
+                }
+                _ => self.rejection("preference-mute requires true or false"),
+            }
+            return self.poll();
+        }
         let command = match control::parse(line) {
             Ok(command) => command,
             Err(error) => {
@@ -380,6 +547,10 @@ impl RuntimeCoordinator {
         };
         if command == Command::Snapshot {
             self.dirty = true;
+            return self.poll();
+        }
+        if !self.persistence.mutations_open() {
+            self.rejection("application is closing; capture/draft mutations are blocked");
             return self.poll();
         }
         let Some(engine) = &mut self.engine else {
@@ -441,9 +612,11 @@ impl RuntimeCoordinator {
                 Command::Apply(expected, revision) => {
                     let state =
                         Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
-                    engine
+                    let submitted = engine.model().draft().clone();
+                    let apply = engine
                         .apply(state, revision)
                         .map_err(|error| error.to_string())?;
+                    self.persistence.admit_user_apply(apply, submitted);
                 }
                 Command::Restart(expected) => {
                     let state =
@@ -470,7 +643,13 @@ impl RuntimeCoordinator {
                 }
                 Command::Quit(expected) => {
                     Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
-                    engine.quit();
+                    let draft = Some((
+                        &engine.model().draft().settings,
+                        engine.model().draft().revision,
+                    ));
+                    if self.persistence.request_close(draft) {
+                        engine.quit();
+                    }
                 }
                 Command::Volume(attempt, percent) => {
                     if engine.model().state_identity().attempt() != Some(attempt) {
@@ -483,6 +662,9 @@ impl RuntimeCoordinator {
                     if status != SubmitStatus::Accepted {
                         return Err(format!("volume submission {status:?}"));
                     }
+                    let mut preferences = self.persistence.preferences();
+                    preferences.gain = gain;
+                    self.persistence.set_preferences(preferences);
                 }
                 Command::Mute(attempt, muted) => {
                     if engine.model().state_identity().attempt() != Some(attempt) {
@@ -497,6 +679,9 @@ impl RuntimeCoordinator {
                     if status != SubmitStatus::Accepted {
                         return Err(format!("mute submission {status:?}"));
                     }
+                    let mut preferences = self.persistence.preferences();
+                    preferences.gain = gain;
+                    self.persistence.set_preferences(preferences);
                 }
                 Command::Pause(attempt) => {
                     let status = engine.pause(attempt).map_err(|error| error.to_string())?;
@@ -524,6 +709,89 @@ impl RuntimeCoordinator {
         self.poll()
     }
     pub(crate) fn poll(&mut self) -> UiUpdate {
+        if let Some(engine) = &mut self.engine {
+            if let Some((key, _)) = engine.model().opening() {
+                self.persistence.observe_opening(key);
+            }
+            engine.poll();
+            if let Some((key, _)) = engine.model().opening() {
+                self.persistence.observe_opening(key);
+            }
+            if let Some(event) = engine.take_verified_open() {
+                if self.startup_apply == Some(event.key.apply) {
+                    self.startup_apply = None;
+                    self.persistence.startup_verified();
+                } else {
+                    self.persistence.verified_open(event);
+                }
+                self.dirty = true;
+            }
+            if self.startup_apply.is_some()
+                && engine.model().opening().is_none()
+                && engine.model().validation_request().is_none()
+                && engine.model().cleanup() == &CleanupStatus::Complete
+                && !matches!(engine.model().phase(), ProductPhase::Active)
+            {
+                self.startup_apply = None;
+                let reason = engine
+                    .model()
+                    .validation_rejection()
+                    .map(|rejection| rejection.failure.to_string())
+                    .or_else(|| {
+                        engine
+                            .model()
+                            .failures()
+                            .map(|failures| format!("{failures:?}"))
+                    })
+                    .unwrap_or_else(|| "source disappeared during initial restoration".into());
+                self.persistence.startup_failed(reason);
+                self.dirty = true;
+            }
+        }
+        let mut update = self.poll_media();
+        let drained = self.quit_empty
+            || self
+                .engine
+                .as_ref()
+                .is_some_and(|engine| engine.model().shutdown_ready());
+        let previous_dialog = self.persistence.close_dialog();
+        if drained {
+            self.persistence.drained();
+        }
+        if previous_dialog != self.persistence.close_dialog() {
+            update.changed = true;
+        }
+        update.quit = drained && self.persistence.quit_allowed();
+        if update.changed {
+            update.settings_status = self.persistence.status();
+            update.settings_path = self.persistence.path();
+            update.settings_refused = self.persistence.refused();
+            update.startup_reason = self.persistence.startup_reason().into();
+            update.draft_dirty = self.persistence.draft_dirty(
+                self.engine
+                    .as_ref()
+                    .map(|engine| &engine.model().draft().settings),
+            );
+            update.saved_selection = self
+                .engine
+                .as_ref()
+                .map(|engine| selection_text(&engine.model().draft().settings))
+                .unwrap_or_default();
+            update.close_dialog = self.persistence.close_dialog().into();
+            update.close_revision = self.persistence.close_revision();
+            update.reset_token = self.persistence.reset_token();
+            update.fullscreen = self.persistence.preferences().fullscreen;
+            update.closing = !self.persistence.mutations_open();
+        }
+        if update.changed {
+            tracing::info!(settings_status = %update.settings_status, settings_path = %update.settings_path,
+                settings_refused = update.settings_refused, startup_reason = %update.startup_reason,
+                draft_dirty = update.draft_dirty, close_dialog = %update.close_dialog, reset_token = update.reset_token,
+                fullscreen = update.fullscreen, selection = %update.saved_selection, quit = update.quit, "settings_runtime");
+        }
+        update
+    }
+    fn poll_media(&mut self) -> UiUpdate {
         let Some(engine) = &mut self.engine else {
             let changed = std::mem::take(&mut self.dirty);
             return UiUpdate {
@@ -565,17 +833,27 @@ impl RuntimeCoordinator {
                 candidates: Vec::new(),
                 paused: false,
                 prepared_paused: false,
-                volume_percent: 0,
-                muted: false,
+                volume_percent: i32::from(self.persistence.preferences().gain.volume_percent),
+                muted: self.persistence.preferences().gain.muted,
                 can_toggle_pause: false,
-                can_set_gain: false,
+                can_set_gain: self.persistence.mutations_open(),
                 playback_status: "Unavailable".into(),
                 create_native: false,
                 release_native: false,
                 quit: self.quit_empty,
+                settings_status: String::new(),
+                settings_path: String::new(),
+                settings_refused: false,
+                saved_selection: String::new(),
+                startup_reason: String::new(),
+                draft_dirty: false,
+                close_dialog: String::new(),
+                close_revision: 0,
+                reset_token: 0,
+                fullscreen: false,
+                closing: false,
             };
         };
-        engine.poll();
         let native = engine.runner_mut().take_native_update();
         let identity = engine.model().state_identity();
         let active_playback = engine.model().active().map(|active| active.playback());
@@ -606,8 +884,10 @@ impl RuntimeCoordinator {
             .map(|source| source.name().to_owned())
             .unwrap_or_default();
         let desired_audio_enabled = desired_settings.audio.enabled();
-        let can_open = model.can_apply() || model.can_reconnect();
-        let can_restart = model.can_restart() || model.can_reconnect();
+        let can_open =
+            self.persistence.mutations_open() && (model.can_apply() || model.can_reconnect());
+        let can_restart =
+            self.persistence.mutations_open() && (model.can_restart() || model.can_reconnect());
         let restart_generation = identity.attempt().map(AttemptId::get).unwrap_or(0);
         let quit = model.shutdown_ready();
         let mut diagnostic = String::new();
@@ -690,9 +970,9 @@ impl RuntimeCoordinator {
                 }
                 _ => false,
             };
-        let can_set_gain = engine.gain_admission_open();
-        let volume_percent = i32::from(engine.gain().volume_percent);
-        let muted = engine.gain().muted;
+        let can_set_gain = self.persistence.mutations_open() && engine.gain_admission_open();
+        let volume_percent = i32::from(self.persistence.preferences().gain.volume_percent);
+        let muted = self.persistence.preferences().gain.muted;
         // Actual audio availability is canonical coordinator state, never the
         // desired draft: a draft edit or a desired request cannot masquerade
         // as a running route.
@@ -807,11 +1087,59 @@ impl RuntimeCoordinator {
             create_native: native.create_native,
             release_native: native.release_native,
             quit,
+            settings_status: String::new(),
+            settings_path: String::new(),
+            settings_refused: false,
+            saved_selection: String::new(),
+            startup_reason: String::new(),
+            draft_dirty: false,
+            close_dialog: String::new(),
+            close_revision: 0,
+            reset_token: 0,
+            fullscreen: false,
+            closing: false,
         }
     }
     pub(crate) fn unchanged(&mut self) -> UiUpdate {
         self.poll()
     }
+}
+
+fn selection_text(settings: &DraftSettings) -> String {
+    let identity = &settings.video.identity;
+    let mode = settings.video.mode;
+    let ports = identity
+        .topology()
+        .ports()
+        .iter()
+        .map(|port| port.get().to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    let source = settings
+        .audio
+        .source()
+        .map(|source| format!("{source:?}"))
+        .unwrap_or_else(|| "none".into());
+    format!(
+        "USB {:04x}:{:04x}\nController {} / ports {} / serial {}\n{} ({:#010x}) · {}×{} · {}/{} FPS\nAudio {}: {}",
+        identity.vendor_id(),
+        identity.product_id(),
+        identity.topology().controller(),
+        ports,
+        identity.serial().unwrap_or("none"),
+        String::from_utf8_lossy(&mode.captured_fourcc.bytes()),
+        mode.captured_fourcc.kernel_value(),
+        mode.size.width(),
+        mode.size.height(),
+        mode.rate.numerator(),
+        mode.rate.denominator(),
+        if settings.audio.enabled() {
+            "enabled"
+        } else {
+            "disabled (retained)"
+        },
+        source
+    )
 }
 
 /// Initial playback is tied to the physical opening key, which can differ
@@ -1017,6 +1345,17 @@ mod tests {
                 last_state: None,
                 command_error: String::new(),
                 quit_empty: false,
+                persistence: {
+                    let mut session = PersistenceSession::load(Err("test has no store".into()));
+                    session.prepare_startup(&StartupSelection {
+                        draft: Some(settings()),
+                        auto_open: false,
+                        reason: String::new(),
+                    });
+                    session
+                },
+                auto_open: false,
+                startup_apply: None,
             },
             rx,
         )
@@ -1551,23 +1890,17 @@ mod tests {
         assert!(update.diagnostic.contains("gain submission Closing"));
     }
     #[test]
-    fn muted_setter_without_engine_is_rejected_and_published() {
+    fn muted_setter_without_engine_updates_local_preference_and_is_published() {
         let mut runtime = {
             let (mut runtime, _) = runtime();
             runtime.engine = None;
             runtime
         };
         runtime.poll();
-        assert_eq!(runtime.set_muted(true), SubmitStatus::NotReady);
+        assert_eq!(runtime.set_muted(true), SubmitStatus::Accepted);
         let update = runtime.poll();
-        assert!(update.changed);
-        assert!(!update.can_set_gain);
+        assert!(update.changed && update.can_set_gain && update.muted);
         assert_eq!(update.playback_status, "Unavailable");
-        assert!(
-            update
-                .diagnostic
-                .contains("mute requires an active capture engine")
-        );
     }
     #[test]
     fn explicit_playback_commands_preserve_typed_guards_without_mutation() {
@@ -1994,6 +2327,17 @@ mod tests {
             last_state: None,
             command_error: String::new(),
             quit_empty: false,
+            persistence: {
+                let mut session = PersistenceSession::load(Err("test has no store".into()));
+                session.prepare_startup(&StartupSelection {
+                    draft: Some(settings()),
+                    auto_open: false,
+                    reason: String::new(),
+                });
+                session
+            },
+            auto_open: false,
+            startup_apply: None,
         };
         let initial = runtime.qualification_command("open Stopped 0 0 Complete 0");
         let opening = if initial.create_native {
@@ -2223,5 +2567,108 @@ mod tests {
         assert!(final_update.failed);
         assert!(final_update.diagnostic.contains("surface_lost"));
         assert!(!final_update.can_open && !final_update.can_restart);
+    }
+
+    #[test]
+    fn preferences_are_admitted_and_projected_without_engine_then_saved_at_safe_close() {
+        let temp =
+            std::env::temp_dir().join(format!("furami-runtime-prefs-{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("settings.json");
+        let _ = std::fs::remove_file(&path);
+        let persistence = PersistenceSession::load(Ok(path.clone()));
+        let startup = StartupSelection {
+            draft: None,
+            auto_open: false,
+            reason: "Preferences only".into(),
+        };
+        let mut runtime = RuntimeCoordinator::new(String::new(), startup, persistence, vec![]);
+        let initial = runtime.poll();
+        assert!(initial.can_set_gain && !initial.can_open && !initial.create_native);
+        assert_eq!(runtime.set_volume(27), SubmitStatus::Accepted);
+        assert_eq!(runtime.set_muted(true), SubmitStatus::Accepted);
+        let update = runtime.set_fullscreen(true);
+        assert_eq!(update.volume_percent, 27);
+        assert!(update.muted && update.fullscreen && !update.draft_dirty);
+        assert_eq!(runtime.set_volume(101), SubmitStatus::NotReady);
+        assert_eq!(runtime.poll().volume_percent, 27);
+        let close = runtime.request_application_close();
+        assert!(close.quit && !close.release_native);
+        let reloaded = PersistenceSession::load(Ok(path));
+        assert_eq!(
+            reloaded.preferences().gain,
+            PlaybackGain::new(27, true).unwrap()
+        );
+        assert!(reloaded.preferences().fullscreen && reloaded.saved_selection().is_none());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn dirty_close_cancel_keeps_active_owner_and_discard_drains_before_save_decision() {
+        let (mut runtime, drivers) = runtime();
+        let driver = start_live(&mut runtime, &drivers);
+        runtime.qualification_command("draft-video 0 YUYV 1920x1080 30/1");
+        let dirty = runtime.request_application_close();
+        assert_eq!(dirty.close_dialog, "draft");
+        assert!(dirty.draft_dirty && !dirty.release_native && !dirty.quit);
+        assert!(driver.destroyed.try_recv().is_err());
+        let cancelled = runtime.decide_close(false, dirty.close_revision);
+        assert_eq!(cancelled.close_dialog, "");
+        assert!(cancelled.can_toggle_pause && !cancelled.release_native);
+        assert!(driver.destroyed.try_recv().is_err());
+        runtime.request_application_close();
+        let discard = runtime.decide_close(true, dirty.close_revision);
+        assert!(!discard.quit);
+        let retired = if discard.release_native {
+            discard
+        } else {
+            await_update(&mut runtime, |update| update.release_native)
+        };
+        assert!(!retired.quit);
+        driver.destroyed.recv().unwrap();
+        let drained = runtime.native_released(AttemptId::new(retired.generation).unwrap());
+        let drained = if drained.close_dialog == "save" {
+            drained
+        } else {
+            await_update(&mut runtime, |update| update.close_dialog == "save")
+        };
+        assert!(!drained.quit && !drained.can_open && !drained.can_set_gain);
+        assert_eq!(runtime.set_volume(22), SubmitStatus::Closing);
+        assert!(runtime.close_without_save().quit);
+        assert!(drivers.try_recv().is_err());
+    }
+
+    #[test]
+    fn startup_restore_opens_once_and_never_authorizes_applied_file_write() {
+        let (mut runtime, drivers) = runtime();
+        runtime.auto_open = true;
+        let opening = runtime.ui_ready();
+        let opening = if opening.create_native {
+            opening
+        } else {
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        assert!(runtime.startup_apply.is_some());
+        let driver = drivers.recv().unwrap();
+        let again = runtime.ui_ready();
+        assert!(!again.create_native && drivers.try_recv().is_err());
+        runtime.surface_ready(SurfaceToken {
+            generation: Generation::new(opening.generation).unwrap(),
+            xid: X11WindowId::new(71).unwrap(),
+        });
+        driver.initialized.recv().unwrap();
+        let (load, _) = driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        driver.send(BackendEvent::FileLoaded);
+        driver.send(BackendEvent::PlaybackRestart);
+        driver.fence();
+        await_update(&mut runtime, |update| update.can_toggle_pause);
+        assert!(runtime.startup_apply.is_none());
+        assert!(!runtime.persistence.status().contains("Save"));
+        assert!(!runtime.ui_ready().create_native && drivers.try_recv().is_err());
+        cleanup(&mut runtime);
     }
 }

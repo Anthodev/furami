@@ -7,4 +7,5 @@ pub mod capture;
 pub mod domain;
 pub mod media;
 pub mod native_host;
+pub mod settings;
 pub mod ui;

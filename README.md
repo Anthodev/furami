@@ -22,6 +22,7 @@ View a console connected through a USB capture card, with playback controls besi
 - **Collapsible controls.** Hide the panel when you want more space for the picture.
 - **Capture recovery.** Reconnects the last applied selection when the same card returns; paused playback stays paused, and ambiguous matches require your choice.
 - **Audio-only recovery.** Keeps video running silently while waiting for the selected audio source, without choosing a different input.
+- **Saved settings.** Restores the last successfully applied capture and keeps local volume, mute and fullscreen preferences across safe closes.
 
 ## First use
 
@@ -31,7 +32,7 @@ Choose your capture device and one of its supported video modes. All four option
 ./furami --capture-node /dev/video0 --capture-fourcc NV12 --capture-size 2560x1440 --capture-rate 60/1
 ```
 
-The values above are examples — use what your card actually supports. Without a selection the window opens idle.
+The values above are examples — use what your card actually supports. With no saved capture and no explicit selection, the window opens idle. Explicit capture arguments take precedence over automatic restoration until you apply them.
 
 Audio is optional. List the available PulseAudio/PipeWire sources, then replace the example source name with your capture card's source:
 
@@ -43,7 +44,7 @@ Audio is optional. List the available PulseAudio/PipeWire sources, then replace 
 
 ## Using it
 
-Click **Open capture** to start playback. Pause or resume with `Space` or the panel button, adjust volume and mute in the panel, toggle fullscreen with `F11`. **Close session** returns to idle; **Restart capture** fully reopens the capture. **Reconnect** retries the last valid selection after a failure and leaves a healthy session unchanged.
+Click **Open capture** to apply an explicit selection. Normal launches automatically reopen the saved selection when its requested sources and exact mode are available; otherwise the panel shows the selection and the reason without starting a stream. Pause or resume with `Space` or the panel button, adjust volume and mute in the panel, and toggle fullscreen with `F11`. **Close session** returns to idle; **Restart capture** fully reopens the capture. **Reconnect** retries the last valid selection after a failure and leaves a healthy session unchanged.
 
 Resuming briefly reconnects: the panel shows `Resuming` for a moment, then the console's current scene.
 
@@ -62,10 +63,18 @@ Resuming briefly reconnects: the panel shows `Resuming` for a moment, then the c
 
 Focused controls keep their keys: `Space` types a space or activates the focused control instead of pausing. No global shortcuts; fullscreen and focus stay local to the window.
 
+## Saved settings
+
+Furami stores only a successfully applied capture selection and local volume, mute and fullscreen preferences — never a draft or paused playback. Preferences are saved at safe application close, even if no capture opens. Closing with an edited, unapplied selection offers **Cancel close** or **Quit without applying**.
+
+The file is `$XDG_CONFIG_HOME/furami/settings.json` when `XDG_CONFIG_HOME` is an absolute path. If that variable is unset or empty, Furami uses `$HOME/.config/furami/settings.json`. An invalid location is reported rather than replaced with a guessed path.
+
+A corrupt, invalid or newer-version file is preserved. All automatic saves remain blocked; preference changes are session-only until you explicitly confirm **Reset saved file**. Reset replaces the saved file with your current preferences and no saved capture. It does not stop live capture, apply the draft or reset live preferences.
+
 ## Limitations
 
-- **Initial selection is command-line only.** Recovery can ask you to choose between matching cards; there is no general device, mode or audio-source picker.
-- **Settings are not persisted.** Every launch restates the capture selection; no profiles.
+- **New selections are command-line only.** Saved selections restore automatically, and recovery can ask you to choose between matching cards; there is no general device, mode or audio-source picker.
+- **Profiles are not available.** Local application settings are saved, but named profiles have not been implemented.
 - **Recovery qualification is pending.** Physical unplug/replug, recovery while paused, audio-only loss and post-recovery A/V still need live hardware verification.
 - **Narrowly tested.** Fedora 44 / KDE Plasma Wayland with an AMD RX 7900 XTX is the exercised setup; Ubuntu and Arch are untested. See the [portability notes](packaging/appimage/PORTABILITY.md).
 - **Hardware Vulkan is required.** Wayland sessions also need XWayland; software rendering is not supported.
