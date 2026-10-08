@@ -19,6 +19,7 @@
 - Derive mpv capture playback timing from the selected mode instead of a fixed rate (FUR-013): submit the validated six-option timing recipe before `mpv_initialize`, with `container-fps-override` set as a typed `f64` through a new synchronous `mpv_set_option` binding from the selection's exact rational (for example `60/1` or `60000/1001`) — never a hardcoded 60, an integer or a formatted string — while the requested and lavf rationals stay unchanged and the unforced file fixture remains unforced.
 - Report the capture frame rate with explicit provenance (FUR-013): a `Configured` verification/fact status and an `MpvConfiguredContainerFps` source mark the rate as application-configured playback timing rather than a measurement, kept distinct from the still-approximate ordinary nominal report, and the rate row states that capture cadence remains unverified and unmeasured.
 - Make the owned-loopback receipt one immutable shared value and the two audio `Active` variants route-only (FUR-013): `LoopbackReceipt` keeps its read-only getters and flat serialization but now holds a single `Arc` allocation, and `Active` carries only the route, removing its duplicated source identity so a contradictory source/route state is unrepresentable; a freshly minted route observation allocates once instead of deep-cloning the receipt, `Silent` keeps its selected source, and the `OpenReceipt` value contracts are unchanged with the `OpenVerified` event payload boxed once.
+- Define a closed typed video-filter catalog for native mpv SDR `format` and FFmpeg `eq`, `unsharp`, `hqdn3d` and `bwdif` through lavfi: validated parameters and strict serde, ordered chains with unique display labels and atomic edits, qualified-build capability checks including disabled entries, and media-only syntax construction with generated safe labels ([FUR-014](https://github.com/Anthodev/furami/issues/14)). Live-stream chain application remains outside this change.
 
 ### Fixes
 
@@ -27,6 +28,7 @@
 - Parse empty Deb822 checksum headers correctly and attribute built-in QML generated metadata through verified vendor backing modules.
 - Isolate CI Rust toolchain state in the job's temporary directory to avoid component conflicts with the runner's preinstalled or partial toolchains.
 - Select the GNU BFD linker for CI's Build, Test and Clippy steps through a job-scope `RUSTFLAGS` and install `binutils` explicitly, so the pinned 1.97.1 `rust-lld` default no longer rejects the GNU-only `-Wl,--require-defined=cxx_qt_init_crate_furami` emitted by `build.rs`; the flag and the build script are unchanged.
+- Run `cargo fmt --all -- --check` as the first Cargo step of the Linux CI job, under the same pinned 1.97.1 toolchain, so unformatted Rust fails the gate before Build, Test and Clippy.
 - Wait for actual worker retirement in the owner-disconnection regression tests instead of treating channel closure during panic unwinding as completed teardown; retain strict rejection of fabricated destruction acknowledgements.
 
 ### Maintenance

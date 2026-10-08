@@ -3,5 +3,6 @@
 
 pub mod capture;
 pub mod failure;
+pub mod filters;
 pub mod output;
 pub mod state;

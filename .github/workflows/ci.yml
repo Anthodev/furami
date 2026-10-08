@@ -65,6 +65,9 @@ jobs:
           toolchain: 1.97.1
           components: clippy, rustfmt
 
+      - name: Format
+        run: cargo fmt --all -- --check
+
       - name: Build
         run: cargo build --locked
 
