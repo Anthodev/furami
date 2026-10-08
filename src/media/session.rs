@@ -1,5 +1,6 @@
 //! Requested capture facts and provenance-labeled decoder observations.
-//! `container-fps` is a possibly inaccurate nominal report, not measured cadence.
+//! `container-fps` reports configured playback timing or an unforced nominal
+//! rate, never independently measured capture cadence.
 
 pub use crate::capture::input::RequestedFacts;
 use crate::domain::failure::{BackendEvidence, BackendOperation, Cause, Stage};
@@ -12,6 +13,7 @@ pub const NOMINAL_RATE_RELATIVE_TOLERANCE: f64 = 0.005;
 pub enum Source {
     MpvDecodedParams,
     MpvContainerFps,
+    MpvConfiguredContainerFps,
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Observation<T> {
@@ -29,6 +31,8 @@ pub enum VerificationStatus {
     Unverified,
     ObservedCompatible,
     Approximate,
+    /// Application-configured playback timing, not capture certification.
+    Configured,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Verification {
@@ -168,6 +172,13 @@ impl SessionFacts {
         };
         let nominal_rate = match &observed.nominal_rate {
             Some(observation)
+                if observation.source == Source::MpvConfiguredContainerFps
+                    && observation.value.is_finite()
+                    && observation.value > 0.0 =>
+            {
+                VerificationStatus::Configured
+            }
+            Some(observation)
                 if observation.source == Source::MpvContainerFps
                     && observation.value.is_finite()
                     && observation.value > 0.0 =>
@@ -245,15 +256,19 @@ impl SessionFacts {
             .observed
             .nominal_rate
             .as_ref()
-            .map(|o| {
-                format!(
+            .map(|o| match o.source {
+                Source::MpvConfiguredContainerFps => format!(
+                    "{} nominal fps (MpvConfiguredContainerFps; application-configured playback timing, capture cadence unverified, not measured)",
+                    o.value
+                ),
+                _ => format!(
                     "{} nominal fps (MpvContainerFps; approximate, not measured)",
                     o.value
-                )
+                ),
             })
             .unwrap_or_else(|| "unverified".into());
         format!(
-            "Requested: {}\nObserved decoded: {size}, {format}\nObserved rate: {rate}\nCaptured FourCC: unverified",
+            "Requested: {}\nObserved decoded: {size}, {format}\nRate metadata: {rate}\nCaptured FourCC: unverified",
             self.requested
         )
     }
@@ -396,18 +411,92 @@ mod tests {
         );
         assert!(SessionFacts::verify(requested(), observed(2560, Some(60.3))).is_ok());
         assert!(SessionFacts::verify(requested(), observed(2560, Some(60.300001))).is_err());
-        for value in [f64::NAN, f64::INFINITY, 0.0, -60.0] {
-            assert_eq!(
-                SessionFacts::verify(requested(), observed(2560, Some(value)))
-                    .unwrap()
-                    .verification
-                    .nominal_rate,
-                VerificationStatus::Unverified
-            );
+        for source in [Source::MpvContainerFps, Source::MpvConfiguredContainerFps] {
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -60.0] {
+                let mut metadata = observed(2560, Some(value));
+                metadata.nominal_rate.as_mut().unwrap().source = source;
+                let facts = SessionFacts::verify(requested(), metadata).unwrap();
+                assert_eq!(
+                    facts.verification.nominal_rate,
+                    VerificationStatus::Unverified
+                );
+                assert!(facts.observed.nominal_rate.is_none());
+            }
         }
         let error = SessionFacts::verify(requested(), observed(1920, Some(60.0))).unwrap_err();
         assert_eq!(error.stage, Stage::Verification);
         assert!(error.to_string().contains("2560x1440"));
+    }
+
+    #[test]
+    fn configured_fractional_timing_preserves_exact_request_without_certifying_cadence() {
+        for numerator in [60_000, 30_000] {
+            let rate = FrameRate::new(numerator, 1001).unwrap();
+            let mut request = requested();
+            request.mode.rate = rate;
+            let mut metadata = observed(2560, Some(f64::from(numerator) / 1001.0));
+            metadata.nominal_rate.as_mut().unwrap().source = Source::MpvConfiguredContainerFps;
+            let facts = SessionFacts::verify(request.clone(), metadata).unwrap();
+            assert_eq!(facts.requested, request);
+            assert_eq!(facts.requested.mode.rate.numerator(), numerator);
+            assert_eq!(facts.requested.mode.rate.denominator(), 1001);
+            assert_eq!(
+                facts.verification.nominal_rate,
+                VerificationStatus::Configured
+            );
+            assert_eq!(
+                facts.verification.decoded_size,
+                VerificationStatus::ObservedCompatible
+            );
+            assert_eq!(
+                facts.verification.captured_fourcc,
+                VerificationStatus::Unverified
+            );
+            assert_eq!(
+                facts.observed.nominal_rate.as_ref().unwrap().source,
+                Source::MpvConfiguredContainerFps
+            );
+            let summary = facts.summary();
+            assert!(summary.contains("application-configured playback timing"));
+            assert!(summary.contains("capture cadence unverified"));
+            assert!(summary.contains("not measured"));
+        }
+    }
+
+    #[test]
+    fn configured_timing_cannot_detect_rate_renegotiation_but_decoded_size_still_rejects() {
+        let mut metadata = observed(2560, Some(50.0));
+        metadata.nominal_rate.as_mut().unwrap().source = Source::MpvConfiguredContainerFps;
+        let facts = SessionFacts::verify(requested(), metadata).unwrap();
+        assert_eq!(
+            facts.verification.nominal_rate,
+            VerificationStatus::Configured
+        );
+
+        let mut mismatch = observed(1920, Some(60.0));
+        mismatch.nominal_rate.as_mut().unwrap().source = Source::MpvConfiguredContainerFps;
+        let error = SessionFacts::verify(requested(), mismatch).unwrap_err();
+        assert_eq!(
+            (error.stage, error.cause),
+            (Stage::Verification, Cause::RequestedModeRefused)
+        );
+    }
+
+    #[test]
+    fn timing_snapshot_compatibility_requires_same_provenance_and_exact_requested_rate() {
+        let request = requested();
+        let unforced = SessionFacts::verify(request.clone(), observed(2560, Some(60.0))).unwrap();
+        let mut metadata = observed(2560, Some(60.0));
+        metadata.nominal_rate.as_mut().unwrap().source = Source::MpvConfiguredContainerFps;
+        let configured = SessionFacts::verify(request.clone(), metadata.clone()).unwrap();
+        assert!(!configured.comparable_to(&unforced));
+        assert!(!unforced.comparable_to(&configured));
+        let mut fractional_request = request;
+        fractional_request.mode.rate = FrameRate::new(60_000, 1001).unwrap();
+        let fractional = SessionFacts::verify(fractional_request, metadata).unwrap();
+        assert!(!configured.comparable_to(&fractional));
+        assert!(!fractional.comparable_to(&configured));
+        assert!(unforced.summary().contains("approximate, not measured"));
     }
 
     #[test]

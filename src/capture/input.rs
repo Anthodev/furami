@@ -286,14 +286,6 @@ impl InputSpec {
     pub fn lavf_options(&self) -> &CStr {
         &self.lavf_options
     }
-    /// Shared device wall clock is requested only for audio-enabled openings.
-    /// This changes timestamp origin, not proof of capture FourCC or cadence.
-    pub(crate) fn common_clock_options(&self) -> Result<CString, InputError> {
-        let mut options = self.lavf_options.to_bytes().to_vec();
-        options.extend_from_slice(b",timestamps=abs");
-        CString::new(options)
-            .map_err(|_| InputError::MalformedSpec("NUL in generated common-clock options"))
-    }
 }
 
 fn node_text(node: &Path) -> Result<&str, InputError> {
@@ -471,29 +463,5 @@ mod tests {
             CaptureSelection::from_snapshot(&duplicate, Path::new("/dev/video0"), mode),
             Err(SelectionError::NodeAmbiguous(_))
         ));
-    }
-}
-
-#[cfg(test)]
-mod audio_input_tests {
-    use super::*;
-
-    #[test]
-    fn common_clock_preserves_requested_tuple_and_adds_only_absolute_timestamps() {
-        let mode = super::tests::mode();
-        let snapshot = linux::session_fixture(&["/dev/video0"], mode);
-        let selection =
-            CaptureSelection::from_snapshot(&snapshot, Path::new("/dev/video0"), mode).unwrap();
-        let input = selection.validate_snapshot(&snapshot).unwrap();
-        let requested = input.requested().clone();
-        assert_eq!(
-            input.common_clock_options().unwrap().to_bytes(),
-            b"input_format=nv12,video_size=2560x1440,framerate=60/1,timestamps=abs"
-        );
-        assert_eq!(input.requested(), &requested);
-        assert_eq!(
-            input.lavf_options().to_bytes(),
-            b"input_format=nv12,video_size=2560x1440,framerate=60/1"
-        );
     }
 }

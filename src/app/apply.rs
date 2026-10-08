@@ -6,6 +6,7 @@ use crate::domain::{
         RecoveryObservation, RecoveryWatchTarget, SelectionToken, SourcePresence, WatchStamp,
     },
     failure::{ApplyFailure, Cause, FailureCategory, LifecycleFailure, Stage, ValidationLayer},
+    output::{OutputPlan, OutputRevision, OutputSilence},
     state::{
         AppliedSettings, ApplyId, AttemptId, AttemptKey, AttemptPurpose, CleanupStatus,
         CommandRejection, DraftRevision, DraftSettings, InitialPlayback, ModelEffect,
@@ -44,6 +45,7 @@ struct Lease {
     audio_retired: bool,
     audio_detaching: bool,
     audio_attempted: Option<WatchStamp>,
+    audio_terminal: bool,
     choice: Option<SelectionToken>,
 }
 
@@ -56,6 +58,8 @@ where
     validator: V,
     runner: R,
     gain: PlaybackGain,
+    output: OutputPlan,
+    output_initialized: bool,
     validation: Option<ValidationRequest>,
     prepared: Option<(ValidationRequest, V::Prepared)>,
     lease: Option<Lease>,
@@ -78,6 +82,11 @@ where
             validator,
             runner,
             gain,
+            output: OutputPlan::Silent {
+                revision: OutputRevision::first(),
+                reason: OutputSilence::CatalogUnavailable("output catalog not observed".into()),
+            },
+            output_initialized: false,
             validation: None,
             prepared: None,
             lease: None,
@@ -105,14 +114,52 @@ where
     pub fn audio_availability(&self) -> Option<&AudioAvailability> {
         self.audio.as_ref()
     }
+    pub fn output_plan(&self) -> &OutputPlan {
+        &self.output
+    }
+
+    /// Immediate preference/policy intent, separate from capture Draft/Applied.
+    /// Idle and paused sessions retain it for the next fresh open.
+    pub fn set_output_plan(&mut self, plan: OutputPlan) -> Result<SubmitStatus, CommandRejection> {
+        self.check_drain()?;
+        if self.model.phase() == ProductPhase::Stopping
+            || self
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.stopping || lease.owner_stopped || lease.blocked)
+        {
+            return Ok(SubmitStatus::Closing);
+        }
+        if self.output_initialized
+            && (plan.revision().get() < self.output.revision().get()
+                || (plan.revision() == self.output.revision() && plan != self.output))
+        {
+            return Err(CommandRejection::StaleState);
+        }
+        if plan == self.output {
+            self.output_initialized = true;
+            return Ok(SubmitStatus::Accepted);
+        }
+        let status = self.lease.as_ref().map_or(SubmitStatus::Accepted, |lease| {
+            self.runner
+                .submit_immediate(lease.key.attempt, ImmediateIntent::SetOutput(plan.clone()))
+        });
+        if status == SubmitStatus::Accepted {
+            self.output = plan;
+            self.output_initialized = true;
+            self.reconcile_audio();
+        }
+        Ok(status)
+    }
     /// Consume the latest verified open once. Drain after each poll before
     /// admitting another operation: a later verified open replaces an untaken
     /// notification. Session loss or draft edits do not revoke a past success.
     pub fn take_verified_open(&mut self) -> Option<VerifiedOpen> {
         self.verified_open.take()
     }
-    /// Startup auto-open requires genuinely active requested audio, unlike the
-    /// ordinary FUR-011 policy that keeps healthy video when audio is silent.
+    /// Startup restore requires the exact requested source to be healthy. A
+    /// missing output may honestly keep verified video silent; source/transport
+    /// failures still reject restoration rather than borrowing an active receipt.
     /// Arm immediately after admitting this initial Candidate, before polling.
     /// The guard cannot attach to an incumbent, rollback, or stale operation.
     pub fn require_startup_restore_audio(
@@ -384,8 +431,9 @@ where
         let epoch = match &status {
             AudioAvailability::Opening { epoch }
             | AudioAvailability::Detaching { epoch }
-            | AudioAvailability::Blocked { epoch, .. } => Some(*epoch),
-            AudioAvailability::Active { route, .. } => Some(route.epoch),
+            | AudioAvailability::Blocked { epoch, .. }
+            | AudioAvailability::Switching { epoch, .. } => Some(*epoch),
+            AudioAvailability::Active { route, .. } => Some(route.epoch()),
             AudioAvailability::Disabled | AudioAvailability::Silent { .. } => None,
         };
         if let Some(epoch) = epoch
@@ -412,13 +460,19 @@ where
         }
         match &status {
             AudioAvailability::Disabled if lease.settings.audio.enabled() => return,
-            AudioAvailability::Active { source, route }
-                if !matches!(&lease.settings.audio, AudioSelection::Enabled { source: desired } if desired == source)
-                    || lease.audio_epoch != Some(route.epoch)
-                    || lease.audio_stamp != Some(route.stamp)
-                    || route.source_index == u32::MAX
-                    || route.source_output_index == u32::MAX
-                    || route.client_index == u32::MAX
+            AudioAvailability::Switching { revision, .. }
+                if *revision != self.output.revision() =>
+            {
+                return;
+            }
+            AudioAvailability::Active { route }
+                if !matches!(&lease.settings.audio, AudioSelection::Enabled { source: desired } if desired == route.source())
+                    || lease.audio_epoch != Some(route.epoch())
+                    || lease.audio_stamp != Some(route.watch())
+                    || route.attempt() != attempt
+                    || route.generation().get() != attempt.get()
+                    || route.destination() != self.output.target()
+                    || route.output_revision() != self.output.revision()
                     || self.model.observation().is_some_and(|observation| {
                         matches!(
                             observation.audio,
@@ -429,6 +483,14 @@ where
                 return;
             }
             _ => {}
+        }
+        if matches!(
+            &status,
+            AudioAvailability::Silent {
+                reason: AudioSilence::Failed(_)
+            }
+        ) {
+            lease.audio_terminal = true;
         }
         if matches!(
             status,
@@ -464,6 +526,9 @@ where
         let AudioSelection::Enabled { source } = &lease.settings.audio else {
             return;
         };
+        if lease.audio_terminal {
+            return;
+        }
         match audio {
             SourcePresence::Absent(error) | SourcePresence::Unknown(error) => {
                 if let Some(epoch) = lease.audio_epoch {
@@ -484,10 +549,18 @@ where
             }
             SourcePresence::Present
                 if lease.verified
+                    && self.output.target().is_some()
+                    && !lease.audio_terminal
                     && !paused
                     && lease.audio_retired
                     && lease.audio_epoch.is_none()
-                    && lease.audio_attempted != Some(stamp) =>
+                    && (lease.audio_attempted != Some(stamp)
+                        || matches!(
+                            self.audio,
+                            Some(AudioAvailability::Silent {
+                                reason: AudioSilence::Output(_)
+                            })
+                        )) =>
             {
                 let Some(value) = lease.last_audio_epoch.checked_add(1) else {
                     return;
@@ -587,12 +660,16 @@ where
                         audio_retired: true,
                         audio_detaching: false,
                         audio_attempted: None,
+                        audio_terminal: false,
                         choice: request.choice,
                     });
-                    match self
-                        .runner
-                        .begin_open(key, prepared, self.gain, request.playback)
-                    {
+                    match self.runner.begin_open(
+                        key,
+                        prepared,
+                        self.gain,
+                        request.playback,
+                        self.output.clone(),
+                    ) {
                         Ok(()) => {}
                         Err(StartFailure::NoResourcesCreated(failure)) => {
                             let _ = self.model.open_failed(key, failure);
@@ -669,7 +746,7 @@ where
     }
     fn handle_event(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::OpenVerified { key, receipt } => self.commit_receipt(key, receipt),
+            SessionEvent::OpenVerified { key, receipt } => self.commit_receipt(key, *receipt),
             SessionEvent::OpenFailed { key, failure } => {
                 if !self.known_key(key) {
                     return;
@@ -859,14 +936,14 @@ where
         let Some((_, settings)) = self.model.opening() else {
             return;
         };
-        if let AudioOutcome::Active { source, route } = &receipt.audio
+        if let AudioOutcome::Active { route } = &receipt.audio
             && receipt.matches(settings)
             && self.lease.as_ref().is_some_and(|lease| {
-                route.stamp == lease.watch
-                    && route.epoch.get() == lease.last_audio_epoch
-                    && route.source_index != u32::MAX
-                    && route.source_output_index != u32::MAX
-                    && route.client_index != u32::MAX
+                route.watch() == lease.watch
+                    && route.epoch().get() == lease.last_audio_epoch
+                    && route.attempt() == key.attempt
+                    && route.generation().get() == key.attempt.get()
+                    && route.output_revision().get() <= self.output.revision().get()
             })
         {
             match &self.audio {
@@ -874,18 +951,44 @@ where
                     // Video proof survives an independently observed, genuinely
                     // silent audio retirement. This is never an Active receipt.
                     receipt.audio = AudioOutcome::Silent {
-                        source: source.clone(),
+                        source: route.source().clone(),
                         reason: reason.clone(),
                     };
                 }
-                Some(AudioAvailability::Detaching { .. }) => {
+                Some(
+                    AudioAvailability::Detaching { .. }
+                    | AudioAvailability::Opening { .. }
+                    | AudioAvailability::Switching { .. }
+                    | AudioAvailability::Blocked { .. },
+                ) => {
                     // Retain one bounded readiness proof while the genuine
                     // audio-only barrier completes; do not destroy video.
                     self.deferred_ready = Some((key, receipt));
                     return;
                 }
+                Some(AudioAvailability::Active { route: observed })
+                    if observed.source() == route.source()
+                        && observed.output_revision() == self.output.revision()
+                        && observed.destination() == self.output.target() =>
+                {
+                    receipt.audio = AudioOutcome::Active {
+                        route: observed.clone(),
+                    };
+                }
+                _ if route.output_revision() != self.output.revision() => {
+                    self.deferred_ready = Some((key, receipt));
+                    return;
+                }
                 _ => {}
             }
+        }
+        if matches!(&receipt.audio, AudioOutcome::Silent { .. })
+            && let Some(AudioAvailability::Silent { reason }) = &self.audio
+            && let AudioOutcome::Silent {
+                reason: received, ..
+            } = &mut receipt.audio
+        {
+            *received = reason.clone();
         }
         let readiness_matches = self.model.opening_request().is_some_and(|request| {
             matches!(
@@ -895,22 +998,33 @@ where
             )
         });
         let audio_matches = match &receipt.audio {
-            AudioOutcome::Active { source, route } => self.lease.as_ref().is_some_and(|lease| {
-                lease.audio_epoch == Some(route.epoch)
-                    && lease.audio_stamp == Some(route.stamp)
-                    && route.stamp == lease.watch
-                    && route.source_index != u32::MAX
-                    && route.source_output_index != u32::MAX
-                    && route.client_index != u32::MAX
-                    && matches!(&self.audio, Some(AudioAvailability::Active { source: active, route: observed })
-                        if active == source && observed == route)
+            AudioOutcome::Active { route } => self.lease.as_ref().is_some_and(|lease| {
+                lease.audio_epoch == Some(route.epoch())
+                    && lease.audio_stamp == Some(route.watch())
+                    && route.watch() == lease.watch
+                    && route.attempt() == key.attempt
+                    && route.generation().get() == key.attempt.get()
+                    && route.destination() == self.output.target()
+                    && route.output_revision() == self.output.revision()
+                    && matches!(&self.audio, Some(AudioAvailability::Active { route: observed })
+                        if observed == route)
             }),
             AudioOutcome::Silent { .. } | AudioOutcome::Disabled => true,
         };
         let startup_audio_matches = self.strict_startup_apply != Some(key.apply)
             || key.purpose != AttemptPurpose::Candidate
             || !settings.audio.enabled()
-            || matches!(&receipt.audio, AudioOutcome::Active { .. });
+            || matches!(&receipt.audio, AudioOutcome::Active { .. })
+            || (matches!(
+                &receipt.audio,
+                AudioOutcome::Silent {
+                    reason: AudioSilence::Output(_),
+                    ..
+                }
+            ) && self
+                .model
+                .observation()
+                .is_some_and(|observation| observation.audio == SourcePresence::Present));
         if !receipt.matches(settings)
             || !readiness_matches
             || !audio_matches
@@ -947,9 +1061,7 @@ where
             self.audio = Some(match receipt.audio {
                 AudioOutcome::Disabled => AudioAvailability::Disabled,
                 AudioOutcome::Silent { reason, .. } => AudioAvailability::Silent { reason },
-                AudioOutcome::Active { source, route } => {
-                    AudioAvailability::Active { source, route }
-                }
+                AudioOutcome::Active { route } => AudioAvailability::Active { route },
             });
         }
         // A physical choice is authorized for this one opening only, including
@@ -1002,7 +1114,7 @@ where
             match event {
                 SessionEvent::OpenVerified { key, receipt } if self.known_key(key) => {
                     if self.model.opening().map(|(current, _)| current) == Some(key) {
-                        ready = Some((key, receipt));
+                        ready = Some((key, *receipt));
                     }
                 }
                 other => self.handle_event(other),
@@ -1170,6 +1282,30 @@ mod tests {
         },
     };
 
+    fn output_fixture() -> crate::domain::output::LiveSinkTarget {
+        crate::domain::output::LiveSinkTarget::new(
+            crate::domain::output::SinkIdentity::new("fixture.output".into(), vec![]).unwrap(),
+            std::num::NonZeroU64::new(20).unwrap(),
+            10,
+        )
+        .unwrap()
+    }
+    fn route_fixture(
+        attempt: AttemptId,
+        epoch: AudioEpoch,
+        stamp: WatchStamp,
+        source: crate::domain::capture::AudioSourceIdentity,
+    ) -> crate::media::loopback::LoopbackReceipt {
+        crate::media::loopback::LoopbackReceipt::for_test(
+            crate::media::controller::Generation::new(attempt.get()).unwrap(),
+            attempt,
+            epoch,
+            stamp,
+            source,
+            output_fixture(),
+            OutputRevision::first(),
+        )
+    }
     fn settings(rate: u32) -> DraftSettings {
         DraftSettings {
             video: crate::domain::capture::ModeRequest {
@@ -1365,6 +1501,7 @@ mod tests {
         start_failure: Option<StartFailure>,
         stop_failure: Option<StopSubmission>,
         playback: Vec<InitialPlayback>,
+        outputs: Vec<OutputPlan>,
     }
     impl Runner {
         fn verified(&mut self) {
@@ -1374,8 +1511,10 @@ mod tests {
                 InitialPlayback::Live => OpenReadiness::Live,
                 InitialPlayback::Paused => OpenReadiness::PausedPrepared,
             };
-            self.events
-                .push_back(SessionEvent::OpenVerified { key: *key, receipt });
+            self.events.push_back(SessionEvent::OpenVerified {
+                key: *key,
+                receipt: Box::new(receipt),
+            });
         }
         fn fail(&mut self, detail: &str) {
             let (key, settings, _) = self.opens.last().unwrap();
@@ -1401,9 +1540,11 @@ mod tests {
             prepared: TestPrepared,
             gain: PlaybackGain,
             playback: InitialPlayback,
+            output: OutputPlan,
         ) -> Result<(), StartFailure> {
             self.opens.push((key, prepared.settings, gain));
             self.playback.push(playback);
+            self.outputs.push(output);
             self.start_failure.take().map_or(Ok(()), Err)
         }
         fn stop(&mut self, attempt: AttemptId, reason: StopReason) -> StopSubmission {
@@ -1432,6 +1573,14 @@ mod tests {
         )
     }
     fn apply(engine: &mut Engine) -> ApplyId {
+        if !engine.output_initialized {
+            engine
+                .set_output_plan(OutputPlan::Target {
+                    revision: OutputRevision::first(),
+                    target: output_fixture(),
+                })
+                .unwrap();
+        }
         engine
             .apply(
                 engine.model().state_identity(),
@@ -1535,7 +1684,7 @@ mod tests {
         ] {
             engine.runner.events.push_back(SessionEvent::OpenVerified {
                 key: stale,
-                receipt: receipt(settings(60)),
+                receipt: Box::new(receipt(settings(60))),
             });
             engine.poll();
             assert_eq!(engine.model.opening().unwrap().0, key);
@@ -1543,7 +1692,7 @@ mod tests {
         }
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key,
-            receipt: receipt(settings(30)),
+            receipt: Box::new(receipt(settings(30))),
         });
         engine.poll();
         assert!(engine.model.active().is_none());
@@ -1670,7 +1819,7 @@ mod tests {
             };
             engine.runner.events.push_back(SessionEvent::OpenVerified {
                 key,
-                receipt: opened,
+                receipt: Box::new(opened),
             });
             engine.poll();
             assert_eq!(engine.model.active().is_some(), !strict);
@@ -1690,9 +1839,7 @@ mod tests {
 
     #[test]
     fn strict_startup_active_audio_commits_once_and_later_loss_keeps_video() {
-        use crate::domain::capture::{
-            AudioError, AudioRouteReceipt, AudioSourceIdentity, VideoPresence,
-        };
+        use crate::domain::capture::{AudioError, AudioSourceIdentity, VideoPresence};
         let source = AudioSourceIdentity::new("exact.capture".into(), vec![]).unwrap();
         let mut desired = settings(60);
         desired.audio = AudioSelection::Enabled {
@@ -1708,28 +1855,26 @@ mod tests {
         engine.require_startup_restore_audio(apply).unwrap();
         validate(&mut engine);
         let key = engine.runner.opens.last().unwrap().0;
-        let route = AudioRouteReceipt {
-            epoch: AudioEpoch::new(1).unwrap(),
-            stamp: engine.lease.as_ref().unwrap().watch,
-            source_index: 7,
-            source_output_index: 8,
-            client_index: 9,
-        };
+        let route = route_fixture(
+            key.attempt,
+            AudioEpoch::new(1).unwrap(),
+            engine.lease.as_ref().unwrap().watch,
+            source.clone(),
+        );
         engine
             .runner
             .events
             .push_back(SessionEvent::AudioAvailability {
                 attempt: key.attempt,
                 status: AudioAvailability::Active {
-                    source: source.clone(),
                     route: route.clone(),
                 },
             });
         let mut opened = receipt(desired.clone());
-        opened.audio = AudioOutcome::Active { source, route };
+        opened.audio = AudioOutcome::Active { route };
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key,
-            receipt: opened,
+            receipt: Box::new(opened),
         });
         engine.poll();
         let event = engine.take_verified_open().unwrap();
@@ -2683,7 +2828,7 @@ mod tests {
             .events
             .push_back(SessionEvent::OpenVerified {
                 key,
-                receipt: receipt(settings(60)),
+                receipt: Box::new(receipt(settings(60))),
             });
         engine.poll();
         assert!(engine.model().active().is_none());
@@ -2821,7 +2966,7 @@ mod tests {
                         .events
                         .push_back(SessionEvent::OpenVerified {
                             key,
-                            receipt: stale,
+                            receipt: Box::new(stale),
                         });
                     engine.runner_mut().barrier(key.attempt);
                 }
@@ -2864,7 +3009,7 @@ mod tests {
             .events
             .push_back(SessionEvent::OpenVerified {
                 key: candidate,
-                receipt: receipt(settings(30)),
+                receipt: Box::new(receipt(settings(30))),
             });
         engine
             .runner_mut()
@@ -2990,21 +3135,23 @@ mod tests {
             validate(&mut engine);
             let key = engine.runner_mut().opens[0].0;
             let mut opened = receipt(selected);
-            let route = crate::domain::capture::AudioRouteReceipt {
-                epoch: AudioEpoch::new(1).unwrap(),
-                stamp: engine.lease.as_ref().unwrap().watch,
-                source_index: 7,
-                source_output_index: 8,
-                client_index: 9,
-            };
+            let route = route_fixture(
+                key.attempt,
+                AudioEpoch::new(1).unwrap(),
+                engine.lease.as_ref().unwrap().watch,
+                source.clone(),
+            );
             opened.audio = match outcome {
                 0 => AudioOutcome::Disabled,
                 1 => AudioOutcome::Active {
-                    source: AudioSourceIdentity::new("wrong".into(), vec![]).unwrap(),
-                    route: route.clone(),
+                    route: route_fixture(
+                        key.attempt,
+                        AudioEpoch::new(1).unwrap(),
+                        engine.lease.as_ref().unwrap().watch,
+                        AudioSourceIdentity::new("wrong".into(), vec![]).unwrap(),
+                    ),
                 },
                 _ => AudioOutcome::Active {
-                    source: source.clone(),
                     route: route.clone(),
                 },
             };
@@ -3013,14 +3160,14 @@ mod tests {
                 .events
                 .push_back(SessionEvent::AudioAvailability {
                     attempt: key.attempt,
-                    status: AudioAvailability::Active { source, route },
+                    status: AudioAvailability::Active { route },
                 });
             engine
                 .runner_mut()
                 .events
                 .push_back(SessionEvent::OpenVerified {
                     key,
-                    receipt: opened,
+                    receipt: Box::new(opened),
                 });
             engine.poll();
             assert_eq!(engine.model().active().is_some(), outcome == 2);
@@ -3061,7 +3208,7 @@ mod tests {
             .events
             .push_back(SessionEvent::OpenVerified {
                 key,
-                receipt: opened,
+                receipt: Box::new(opened),
             });
         engine.poll();
         assert!(engine.model().active().is_some());
@@ -3791,7 +3938,7 @@ mod tests {
         assert_ne!(next, first.attempt);
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key: first,
-            receipt: receipt(settings(60)),
+            receipt: Box::new(receipt(settings(60))),
         });
         engine.runner.events.push_back(SessionEvent::StreamEnded {
             attempt: old,
@@ -4017,7 +4164,7 @@ mod tests {
         let key = engine.runner.opens.last().unwrap().0;
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key,
-            receipt: receipt(settings(60)),
+            receipt: Box::new(receipt(settings(60))),
         });
         engine.poll();
         assert!(engine.model().active().is_none());
@@ -4206,10 +4353,10 @@ mod tests {
             source: source.clone(),
             reason: AudioSilence::WaitingForSource(crate::domain::capture::AudioError::Cancelled),
         };
-        engine
-            .runner
-            .events
-            .push_back(SessionEvent::OpenVerified { key, receipt });
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key,
+            receipt: Box::new(receipt),
+        });
         engine.poll();
         (engine, key.attempt, source)
     }
@@ -4281,7 +4428,7 @@ mod tests {
     }
     #[test]
     fn enabled_absent_source_commits_silent_video_and_return_serializes_detach_before_reattach() {
-        use crate::domain::capture::{AudioRouteReceipt, VideoPresence};
+        use crate::domain::capture::VideoPresence;
         let (mut engine, attempt, source) = silent_audio_engine();
         assert!(
             engine
@@ -4310,22 +4457,13 @@ mod tests {
             matches!(engine.runner.intents.last(), Some((current, ImmediateIntent::AttachAudio { epoch, source: selected, stamp }))
             if *current == attempt && *epoch == first && selected == &source && *stamp == present.stamp)
         );
-        let route = AudioRouteReceipt {
-            epoch: first,
-            stamp: present.stamp,
-            source_index: 7,
-            source_output_index: 8,
-            client_index: 9,
-        };
+        let route = route_fixture(attempt, first, present.stamp, source.clone());
         engine
             .runner
             .events
             .push_back(SessionEvent::AudioAvailability {
                 attempt,
-                status: AudioAvailability::Active {
-                    source: source.clone(),
-                    route,
-                },
+                status: AudioAvailability::Active { route },
             });
         engine.poll();
         assert!(matches!(
@@ -4366,14 +4504,7 @@ mod tests {
             .push_back(SessionEvent::AudioAvailability {
                 attempt,
                 status: AudioAvailability::Active {
-                    source: source.clone(),
-                    route: AudioRouteReceipt {
-                        epoch: first,
-                        stamp: present.stamp,
-                        source_index: 7,
-                        source_output_index: 8,
-                        client_index: 9,
-                    },
+                    route: route_fixture(attempt, first, present.stamp, source.clone()),
                 },
             });
         engine.poll();
@@ -4403,14 +4534,7 @@ mod tests {
             .push_back(SessionEvent::AudioAvailability {
                 attempt,
                 status: AudioAvailability::Active {
-                    source: source.clone(),
-                    route: AudioRouteReceipt {
-                        epoch: first,
-                        stamp: present.stamp,
-                        source_index: 7,
-                        source_output_index: 8,
-                        client_index: 9,
-                    },
+                    route: route_fixture(attempt, first, present.stamp, source.clone()),
                 },
             });
         engine.poll();
@@ -4423,19 +4547,12 @@ mod tests {
             .push_back(SessionEvent::AudioAvailability {
                 attempt,
                 status: AudioAvailability::Active {
-                    source,
-                    route: AudioRouteReceipt {
-                        epoch: second,
-                        stamp: returned.stamp,
-                        source_index: 17,
-                        source_output_index: 18,
-                        client_index: 19,
-                    },
+                    route: route_fixture(attempt, second, returned.stamp, source.clone()),
                 },
             });
         engine.poll();
         assert!(
-            matches!(engine.audio_availability(), Some(AudioAvailability::Active { route, .. }) if route.epoch == second && route.source_index == 17)
+            matches!(engine.audio_availability(), Some(AudioAvailability::Active { route, .. }) if route.epoch() == second && route.source() == &source)
         );
         assert_eq!(engine.model().active().unwrap().attempt(), attempt);
         assert_eq!(
@@ -4449,8 +4566,8 @@ mod tests {
         );
     }
     #[test]
-    fn pending_wrong_source_wrong_stamp_and_unassigned_routes_never_become_active() {
-        use crate::domain::capture::{AudioRouteReceipt, AudioSourceIdentity, VideoPresence};
+    fn pending_wrong_source_wrong_stamp_and_wrong_attempt_never_become_active() {
+        use crate::domain::capture::{AudioSourceIdentity, VideoPresence};
         for wrong in 0..4 {
             let (mut engine, attempt, source) = silent_audio_engine();
             let present = observation(
@@ -4476,29 +4593,32 @@ mod tests {
                 engine.audio_availability(),
                 Some(AudioAvailability::Active { .. })
             ));
-            let mut route = AudioRouteReceipt {
-                epoch,
-                stamp: present.stamp,
-                source_index: 7,
-                source_output_index: 8,
-                client_index: 9,
+            let mut stamp = present.stamp;
+            let route_attempt = if wrong == 0 {
+                AttemptId::new(attempt.get() + 1).unwrap()
+            } else {
+                attempt
             };
-            let mut selected = source;
-            match wrong {
-                0 => route.source_index = u32::MAX,
-                1 => selected = AudioSourceIdentity::new("microphone".into(), vec![]).unwrap(),
-                2 => route.stamp.epoch = crate::domain::capture::ObservationEpoch::new(2).unwrap(),
-                _ => route.epoch = AudioEpoch::new(2).unwrap(),
+            let route_epoch = if wrong == 3 {
+                AudioEpoch::new(2).unwrap()
+            } else {
+                epoch
+            };
+            if wrong == 2 {
+                stamp.epoch = crate::domain::capture::ObservationEpoch::new(2).unwrap();
             }
+            let selected = if wrong == 1 {
+                AudioSourceIdentity::new("microphone".into(), vec![]).unwrap()
+            } else {
+                source.clone()
+            };
+            let route = route_fixture(route_attempt, route_epoch, stamp, selected);
             engine
                 .runner
                 .events
                 .push_back(SessionEvent::AudioAvailability {
                     attempt,
-                    status: AudioAvailability::Active {
-                        source: selected,
-                        route,
-                    },
+                    status: AudioAvailability::Active { route },
                 });
             engine.poll();
             assert!(!matches!(
@@ -4604,7 +4724,7 @@ mod tests {
     }
     #[test]
     fn audio_only_loss_during_initial_readiness_keeps_video_and_waits_for_real_detachment() {
-        use crate::domain::capture::{AudioRouteReceipt, AudioSourceIdentity, VideoPresence};
+        use crate::domain::capture::{AudioSourceIdentity, VideoPresence};
         let source = AudioSourceIdentity::new("capture".into(), vec![]).unwrap();
         let mut desired = settings(60);
         desired.audio = AudioSelection::Enabled {
@@ -4620,28 +4740,26 @@ mod tests {
         validate(&mut engine);
         let key = engine.runner.opens.last().unwrap().0;
         let epoch = AudioEpoch::new(1).unwrap();
-        let route = AudioRouteReceipt {
+        let route = route_fixture(
+            key.attempt,
             epoch,
-            stamp: engine.lease.as_ref().unwrap().watch,
-            source_index: 7,
-            source_output_index: 8,
-            client_index: 9,
-        };
+            engine.lease.as_ref().unwrap().watch,
+            source.clone(),
+        );
         engine
             .runner
             .events
             .push_back(SessionEvent::AudioAvailability {
                 attempt: key.attempt,
                 status: AudioAvailability::Active {
-                    source: source.clone(),
                     route: route.clone(),
                 },
             });
         let mut ready = receipt(desired);
-        ready.audio = AudioOutcome::Active { source, route };
+        ready.audio = AudioOutcome::Active { route };
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key,
-            receipt: ready,
+            receipt: Box::new(ready),
         });
         let absent = observation(
             &engine,
@@ -4793,7 +4911,7 @@ mod tests {
         };
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key,
-            receipt: ready,
+            receipt: Box::new(ready),
         });
         engine.poll();
         assert_eq!(engine.model().active().unwrap().attempt(), key.attempt);
@@ -4961,5 +5079,716 @@ mod tests {
         );
         assert!(engine.validator.requests.last().unwrap().choice.is_none());
         assert_eq!(engine.runner.opens.len(), 3);
+    }
+    fn output_silent_engine() -> (
+        Engine,
+        AttemptId,
+        crate::domain::capture::AudioSourceIdentity,
+    ) {
+        let source =
+            crate::domain::capture::AudioSourceIdentity::new("exact.capture".into(), vec![])
+                .unwrap();
+        let mut desired = settings(60);
+        desired.audio = AudioSelection::Enabled {
+            source: source.clone(),
+        };
+        let mut engine = ApplyCoordinator::new(
+            desired.clone(),
+            PlaybackGain::default(),
+            Validator::default(),
+            Runner::default(),
+        );
+        engine
+            .set_output_plan(OutputPlan::Silent {
+                revision: OutputRevision::first(),
+                reason: OutputSilence::ManualRequiresAction,
+            })
+            .unwrap();
+        let apply = apply(&mut engine);
+        engine.require_startup_restore_audio(apply).unwrap();
+        validate(&mut engine);
+        let key = engine.runner.opens.last().unwrap().0;
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt: key.attempt,
+                status: AudioAvailability::Silent {
+                    reason: AudioSilence::Output(OutputSilence::ManualRequiresAction),
+                },
+            });
+        let mut opened = receipt(desired);
+        opened.audio = AudioOutcome::Silent {
+            source: source.clone(),
+            reason: AudioSilence::Output(OutputSilence::ManualRequiresAction),
+        };
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key,
+            receipt: Box::new(opened),
+        });
+        engine.poll();
+        assert_eq!(engine.model().active().unwrap().attempt(), key.attempt);
+        assert!(engine.lease.as_ref().unwrap().audio_retired);
+        assert!(engine.lease.as_ref().unwrap().audio_epoch.is_none());
+        assert!(engine.runner.intents.is_empty());
+        (engine, key.attempt, source)
+    }
+
+    #[test]
+    fn initial_output_silence_verifies_video_and_target_return_admits_only_fresh_audio_epoch() {
+        let (mut engine, attempt, source) = output_silent_engine();
+        let applied = engine.model().last_valid().unwrap().settings().clone();
+        let mut dirty = applied.clone();
+        dirty.video.mode.rate = FrameRate::new(30, 1).unwrap();
+        engine
+            .edit_draft(engine.model().draft().revision, dirty.clone())
+            .unwrap();
+        let revision = engine.output.revision().next();
+        let target = OutputPlan::Target {
+            revision,
+            target: output_fixture(),
+        };
+        assert_eq!(
+            engine.set_output_plan(target.clone()),
+            Ok(SubmitStatus::Accepted)
+        );
+        assert_eq!(engine.runner.intents.len(), 2);
+        assert_eq!(
+            engine.runner.intents[0],
+            (attempt, ImmediateIntent::SetOutput(target))
+        );
+        let epoch = AudioEpoch::new(1).unwrap();
+        assert!(
+            matches!(&engine.runner.intents[1], (active, ImmediateIntent::AttachAudio { epoch: admitted, source: selected, stamp })
+            if *active == attempt && *admitted == epoch && selected == &source && *stamp == engine.lease.as_ref().unwrap().watch)
+        );
+        let route = crate::media::loopback::LoopbackReceipt::for_test(
+            crate::media::controller::Generation::new(attempt.get()).unwrap(),
+            attempt,
+            epoch,
+            engine.lease.as_ref().unwrap().watch,
+            source.clone(),
+            output_fixture(),
+            revision,
+        );
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Active { route },
+            });
+        engine.poll();
+        assert!(matches!(
+            engine.audio_availability(),
+            Some(AudioAvailability::Active { .. })
+        ));
+        assert_eq!(engine.model().active().unwrap().attempt(), attempt);
+        assert_eq!(engine.model().last_valid().unwrap().settings(), &applied);
+        assert_eq!(engine.model().draft().settings, dirty);
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+    }
+
+    #[test]
+    fn terminal_audio_failure_is_not_no_owner_output_availability_or_source_recovery() {
+        let (mut engine, attempt, _) = output_silent_engine();
+        let revision = engine.output.revision().next();
+        engine
+            .set_output_plan(OutputPlan::Target {
+                revision,
+                target: output_fixture(),
+            })
+            .unwrap();
+        let epoch = AudioEpoch::new(1).unwrap();
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Silent {
+                    reason: AudioSilence::Failed(crate::domain::capture::AudioError::Control(
+                        "helper died".into(),
+                    )),
+                },
+            });
+        engine.runner.events.push_back(SessionEvent::AudioDetached {
+            attempt,
+            epoch,
+            outcome: Ok(()),
+        });
+        engine.poll();
+        engine
+            .set_output_plan(OutputPlan::Target {
+                revision: revision.next(),
+                target: output_fixture(),
+            })
+            .unwrap();
+        let present = observation(
+            &engine,
+            3,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Present,
+            None,
+        );
+        observe(&mut engine, present);
+        assert!(engine.lease.as_ref().unwrap().audio_terminal);
+        assert!(engine.lease.as_ref().unwrap().audio_retired);
+        assert!(matches!(
+            engine.audio_availability(),
+            Some(AudioAvailability::Silent {
+                reason: AudioSilence::Failed(_)
+            })
+        ));
+        assert_eq!(
+            engine
+                .runner
+                .intents
+                .iter()
+                .filter(|(_, intent)| matches!(intent, ImmediateIntent::AttachAudio { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(engine.model().active().unwrap().attempt(), attempt);
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+    }
+
+    #[test]
+    fn paused_output_and_manual_wait_latch_survive_fresh_applied_resume_not_dirty_draft() {
+        let (mut engine, attempt, _) = output_silent_engine();
+        engine.pause(attempt).unwrap();
+        let request = match &engine.runner.intents.last().unwrap().1 {
+            ImmediateIntent::SetPaused { request, .. } => *request,
+            _ => unreachable!(),
+        };
+        engine.handle_event(SessionEvent::PauseObserved {
+            attempt,
+            request,
+            paused: true,
+        });
+        let applied = engine.model().last_valid().unwrap().settings().clone();
+        let mut dirty = applied.clone();
+        dirty.video.mode.rate = FrameRate::new(30, 1).unwrap();
+        engine
+            .edit_draft(engine.model().draft().revision, dirty.clone())
+            .unwrap();
+        let waiting = OutputPlan::Silent {
+            revision: engine.output.revision().next(),
+            reason: OutputSilence::ManualRequiresAction,
+        };
+        engine.set_output_plan(waiting.clone()).unwrap();
+        assert!(
+            !engine
+                .runner
+                .intents
+                .iter()
+                .any(|(_, intent)| matches!(intent, ImmediateIntent::AttachAudio { .. }))
+        );
+        engine
+            .resume(engine.model().state_identity(), attempt)
+            .unwrap();
+        engine.runner.barrier(attempt);
+        engine.poll();
+        validate(&mut engine);
+        assert_eq!(engine.runner.opens.len(), 2);
+        assert_eq!(engine.runner.opens.last().unwrap().1, applied);
+        assert_eq!(engine.runner.outputs.last(), Some(&waiting));
+        assert_eq!(engine.output_plan(), &waiting);
+        assert_eq!(engine.model().draft().settings, dirty);
+    }
+
+    #[test]
+    fn stale_or_conflicting_output_revision_never_changes_draft_applied_or_current_intent() {
+        let (mut engine, attempt, _) = output_silent_engine();
+        let before_draft = engine.model().draft().clone();
+        let before_applied = engine.model().last_valid().unwrap().clone();
+        let revision = engine.output.revision().next();
+        let current = OutputPlan::Target {
+            revision,
+            target: output_fixture(),
+        };
+        engine.set_output_plan(current.clone()).unwrap();
+        let intents = engine.runner.intents.len();
+        assert_eq!(
+            engine.set_output_plan(OutputPlan::Silent {
+                revision: OutputRevision::first(),
+                reason: OutputSilence::NoAvailableOutput
+            }),
+            Err(CommandRejection::StaleState)
+        );
+        assert_eq!(
+            engine.set_output_plan(OutputPlan::Silent {
+                revision,
+                reason: OutputSilence::ManualUnavailable
+            }),
+            Err(CommandRejection::StaleState)
+        );
+        assert_eq!(engine.output_plan(), &current);
+        assert_eq!(engine.runner.intents.len(), intents);
+        assert_eq!(engine.model().draft(), &before_draft);
+        assert_eq!(engine.model().last_valid(), Some(&before_applied));
+        assert_eq!(engine.model().active().unwrap().attempt(), attempt);
+    }
+
+    #[test]
+    fn live_output_silence_and_return_only_move_playback_keep_epoch_and_ignore_old_active() {
+        let (mut engine, attempt, source) = output_silent_engine();
+        let first = engine.output.revision().next();
+        engine
+            .set_output_plan(OutputPlan::Target {
+                revision: first,
+                target: output_fixture(),
+            })
+            .unwrap();
+        let epoch = AudioEpoch::new(1).unwrap();
+        let route = crate::media::loopback::LoopbackReceipt::for_test(
+            crate::media::controller::Generation::new(attempt.get()).unwrap(),
+            attempt,
+            epoch,
+            engine.lease.as_ref().unwrap().watch,
+            source.clone(),
+            output_fixture(),
+            first,
+        );
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Active {
+                    route: route.clone(),
+                },
+            });
+        engine.poll();
+        let silent = first.next();
+        engine
+            .set_output_plan(OutputPlan::Silent {
+                revision: silent,
+                reason: OutputSilence::ManualRequiresAction,
+            })
+            .unwrap();
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Silent {
+                    reason: AudioSilence::Output(OutputSilence::ManualRequiresAction),
+                },
+            });
+        engine.poll();
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Active {
+                    route: route.clone(),
+                },
+            });
+        engine.poll();
+        assert!(matches!(
+            engine.audio_availability(),
+            Some(AudioAvailability::Silent {
+                reason: AudioSilence::Output(OutputSilence::ManualRequiresAction)
+            })
+        ));
+        engine
+            .set_output_plan(OutputPlan::Target {
+                revision: silent.next(),
+                target: output_fixture(),
+            })
+            .unwrap();
+        let current = crate::media::loopback::LoopbackReceipt::for_test(
+            crate::media::controller::Generation::new(attempt.get()).unwrap(),
+            attempt,
+            epoch,
+            engine.lease.as_ref().unwrap().watch,
+            source,
+            output_fixture(),
+            silent.next(),
+        );
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Active {
+                    route: current.clone(),
+                },
+            });
+        engine.poll();
+        assert_eq!(
+            engine.audio_availability(),
+            Some(&AudioAvailability::Active {
+                route: current.clone()
+            })
+        );
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Active { route },
+            });
+        engine.poll();
+        assert_eq!(
+            engine.audio_availability(),
+            Some(&AudioAvailability::Active { route: current })
+        );
+        assert_eq!(engine.lease.as_ref().unwrap().audio_epoch, Some(epoch));
+        assert!(!engine.lease.as_ref().unwrap().audio_retired);
+        assert_eq!(
+            engine
+                .runner
+                .intents
+                .iter()
+                .filter(|(_, intent)| matches!(intent, ImmediateIntent::AttachAudio { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !engine
+                .runner
+                .intents
+                .iter()
+                .any(|(_, intent)| matches!(intent, ImmediateIntent::DetachAudio { .. }))
+        );
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+    }
+
+    #[test]
+    fn unavailable_output_cannot_hide_missing_requested_source_from_startup_restore() {
+        let source =
+            crate::domain::capture::AudioSourceIdentity::new("absent.capture".into(), vec![])
+                .unwrap();
+        let mut desired = settings(60);
+        desired.audio = AudioSelection::Enabled {
+            source: source.clone(),
+        };
+        let mut engine = ApplyCoordinator::new(
+            desired.clone(),
+            PlaybackGain::default(),
+            Validator::default(),
+            Runner::default(),
+        );
+        engine
+            .set_output_plan(OutputPlan::Silent {
+                revision: OutputRevision::first(),
+                reason: OutputSilence::NoAvailableOutput,
+            })
+            .unwrap();
+        let apply = apply(&mut engine);
+        engine.require_startup_restore_audio(apply).unwrap();
+        let absent = observation(
+            &engine,
+            2,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Absent(crate::domain::capture::AudioError::SourceMissing {
+                name: source.name().into(),
+            }),
+            None,
+        );
+        observe(&mut engine, absent);
+        validate(&mut engine);
+        let key = engine.runner.opens.last().unwrap().0;
+        let mut opened = receipt(desired);
+        opened.audio = AudioOutcome::Silent {
+            source,
+            reason: AudioSilence::Output(OutputSilence::NoAvailableOutput),
+        };
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key,
+            receipt: Box::new(opened),
+        });
+        engine.poll();
+        assert!(engine.model().active().is_none());
+        assert!(engine.model().last_valid().is_none());
+        assert_eq!(
+            engine.runner.stops.last(),
+            Some(&(key.attempt, StopReason::Failed))
+        );
+        assert!(engine.take_verified_open().is_none());
+    }
+
+    #[test]
+    fn rejected_output_intent_does_not_commit_revision_or_implicitly_retry_audio() {
+        for rejection in [
+            SubmitStatus::StaleGeneration,
+            SubmitStatus::NotReady,
+            SubmitStatus::Closing,
+            SubmitStatus::CapacityExceeded,
+        ] {
+            let (mut engine, attempt, _) = output_silent_engine();
+            let before = engine.output.clone();
+            let revision = before.revision().next();
+            let candidate = OutputPlan::Target {
+                revision,
+                target: output_fixture(),
+            };
+            engine.runner.immediate = Some(rejection);
+            assert_eq!(engine.set_output_plan(candidate), Ok(rejection));
+            assert_eq!(engine.output_plan(), &before);
+            engine.poll();
+            assert!(
+                !engine
+                    .runner
+                    .intents
+                    .iter()
+                    .any(|(_, intent)| matches!(intent, ImmediateIntent::AttachAudio { .. }))
+            );
+            assert_eq!(engine.runner.opens.len(), 1);
+            assert_eq!(engine.model().active().unwrap().attempt(), attempt);
+            // The same unconsumed revision is usable by a later explicit action.
+            assert_eq!(
+                engine.set_output_plan(OutputPlan::Silent {
+                    revision,
+                    reason: OutputSilence::ManualUnavailable
+                }),
+                Ok(SubmitStatus::Accepted)
+            );
+            assert_eq!(engine.output.revision(), revision);
+        }
+    }
+
+    #[test]
+    fn idle_output_is_accepted_but_closing_output_rejects_without_owner_or_plan_side_effects() {
+        let mut idle = engine();
+        let candidate = OutputPlan::Target {
+            revision: OutputRevision::first(),
+            target: output_fixture(),
+        };
+        assert_eq!(
+            idle.set_output_plan(candidate.clone()),
+            Ok(SubmitStatus::Accepted)
+        );
+        assert_eq!(idle.output_plan(), &candidate);
+        assert!(idle.runner.intents.is_empty() && idle.runner.opens.is_empty());
+        let (mut closing, attempt, _) = output_silent_engine();
+        let before = closing.output.clone();
+        closing.close(closing.model().state_identity()).unwrap();
+        let intents = closing.runner.intents.len();
+        assert_eq!(
+            closing.set_output_plan(OutputPlan::Target {
+                revision: before.revision().next(),
+                target: output_fixture()
+            }),
+            Ok(SubmitStatus::Closing)
+        );
+        assert_eq!(closing.output_plan(), &before);
+        assert_eq!(closing.runner.intents.len(), intents);
+        assert_eq!(
+            closing.runner.stops.last(),
+            Some(&(attempt, StopReason::Close))
+        );
+    }
+
+    #[test]
+    fn superseded_no_resource_epoch_retirement_allows_later_target_without_video_restart() {
+        let (mut engine, attempt, source) = output_silent_engine();
+        let first_revision = engine.output.revision().next();
+        engine
+            .set_output_plan(OutputPlan::Target {
+                revision: first_revision,
+                target: output_fixture(),
+            })
+            .unwrap();
+        let first = AudioEpoch::new(1).unwrap();
+        assert_eq!(engine.lease.as_ref().unwrap().audio_epoch, Some(first));
+        let silent_revision = first_revision.next();
+        engine
+            .set_output_plan(OutputPlan::Silent {
+                revision: silent_revision,
+                reason: OutputSilence::ManualRequiresAction,
+            })
+            .unwrap();
+        // Actual owner/gate completion for the admitted epoch that spawned nothing.
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Silent {
+                    reason: AudioSilence::Output(OutputSilence::ManualRequiresAction),
+                },
+            });
+        engine.runner.events.push_back(SessionEvent::AudioDetached {
+            attempt,
+            epoch: first,
+            outcome: Ok(()),
+        });
+        engine.poll();
+        assert!(engine.lease.as_ref().unwrap().audio_retired);
+        assert!(engine.lease.as_ref().unwrap().audio_epoch.is_none());
+        engine
+            .set_output_plan(OutputPlan::Target {
+                revision: silent_revision.next(),
+                target: output_fixture(),
+            })
+            .unwrap();
+        let second = AudioEpoch::new(2).unwrap();
+        assert_eq!(engine.lease.as_ref().unwrap().audio_epoch, Some(second));
+        assert!(
+            matches!(engine.runner.intents.last(), Some((active, ImmediateIntent::AttachAudio { epoch, source: selected, .. }))
+            if *active == attempt && *epoch == second && selected == &source)
+        );
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert_eq!(engine.model().active().unwrap().attempt(), attempt);
+        assert!(engine.runner.stops.is_empty());
+    }
+
+    #[test]
+    fn source_retirement_gain_and_join_preserve_fresh_same_source_recovery_and_video() {
+        let (mut engine, attempt, source) = silent_audio_engine();
+        let present = observation(
+            &engine,
+            3,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Present,
+            None,
+        );
+        observe(&mut engine, present.clone());
+        let first = AudioEpoch::new(1).unwrap();
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::AudioAvailability {
+                attempt,
+                status: AudioAvailability::Active {
+                    route: route_fixture(attempt, first, present.stamp, source.clone()),
+                },
+            });
+        engine.poll();
+        let lost = observation(
+            &engine,
+            4,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Absent(crate::domain::capture::AudioError::SourceMissing {
+                name: source.name().into(),
+            }),
+            None,
+        );
+        observe(&mut engine, lost);
+        let gain = PlaybackGain::new(37, true).unwrap();
+        assert_eq!(engine.set_gain(gain), SubmitStatus::Accepted);
+        assert_eq!(engine.gain(), gain);
+        engine.runner.events.push_back(SessionEvent::AudioDetached {
+            attempt,
+            epoch: first,
+            outcome: Ok(()),
+        });
+        engine.poll();
+        let returned = observation(
+            &engine,
+            5,
+            crate::domain::capture::VideoPresence::Present,
+            SourcePresence::Present,
+            None,
+        );
+        observe(&mut engine, returned);
+        assert!(!engine.lease.as_ref().unwrap().audio_terminal);
+        assert_eq!(
+            engine.lease.as_ref().unwrap().audio_epoch,
+            Some(AudioEpoch::new(2).unwrap())
+        );
+        assert!(
+            matches!(engine.runner.intents.last(), Some((active, ImmediateIntent::AttachAudio { epoch, source: selected, .. }))
+            if *active == attempt && epoch.get() == 2 && selected == &source)
+        );
+        assert_eq!(engine.gain(), gain);
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert_eq!(engine.model().active().unwrap().attempt(), attempt);
+        assert!(engine.runner.stops.is_empty());
+    }
+
+    #[test]
+    fn terminal_failure_after_pending_source_or_pause_retirement_cannot_auto_retry() {
+        for paused in [false, true] {
+            let (mut engine, attempt, _) = output_silent_engine();
+            let revision = engine.output.revision().next();
+            engine
+                .set_output_plan(OutputPlan::Target {
+                    revision,
+                    target: output_fixture(),
+                })
+                .unwrap();
+            let epoch = AudioEpoch::new(1).unwrap();
+            let reason = if paused {
+                AudioSilence::Paused
+            } else {
+                AudioSilence::WaitingForSource(crate::domain::capture::AudioError::SourceMissing {
+                    name: "exact.capture".into(),
+                })
+            };
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::AudioAvailability {
+                    attempt,
+                    status: AudioAvailability::Detaching { epoch },
+                });
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::AudioAvailability {
+                    attempt,
+                    status: AudioAvailability::Silent { reason },
+                });
+            engine.poll();
+            let failure = crate::domain::capture::AudioError::Control("bounded reap failed".into());
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::AudioAvailability {
+                    attempt,
+                    status: AudioAvailability::Silent {
+                        reason: AudioSilence::Failed(failure.clone()),
+                    },
+                });
+            engine.runner.events.push_back(SessionEvent::AudioDetached {
+                attempt,
+                epoch,
+                outcome: Ok(()),
+            });
+            engine.poll();
+            engine
+                .set_output_plan(OutputPlan::Target {
+                    revision: revision.next(),
+                    target: output_fixture(),
+                })
+                .unwrap();
+            let returned = observation(
+                &engine,
+                3,
+                crate::domain::capture::VideoPresence::Present,
+                SourcePresence::Present,
+                None,
+            );
+            observe(&mut engine, returned);
+            assert!(
+                engine.lease.as_ref().unwrap().audio_terminal
+                    && engine.lease.as_ref().unwrap().audio_retired
+            );
+            assert_eq!(
+                engine.audio_availability(),
+                Some(&AudioAvailability::Silent {
+                    reason: AudioSilence::Failed(failure)
+                })
+            );
+            assert_eq!(
+                engine
+                    .runner
+                    .intents
+                    .iter()
+                    .filter(|(_, intent)| matches!(intent, ImmediateIntent::AttachAudio { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(engine.runner.opens.len(), 1);
+            assert_eq!(engine.model().active().unwrap().attempt(), attempt);
+            assert!(engine.runner.stops.is_empty());
+        }
     }
 }

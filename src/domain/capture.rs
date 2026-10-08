@@ -86,14 +86,10 @@ pub enum AudioSilence {
     WaitingForSource(AudioError),
     PendingRoute,
     Paused,
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct AudioRouteReceipt {
-    pub epoch: AudioEpoch,
-    pub stamp: WatchStamp,
-    pub source_index: u32,
-    pub source_output_index: u32,
-    pub client_index: u32,
+    Output(super::output::OutputSilence),
+    /// The owner really retired after a transport/control failure. Availability
+    /// changes do not authorize an automatic replacement child.
+    Failed(AudioError),
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum AudioAvailability {
@@ -105,8 +101,11 @@ pub enum AudioAvailability {
         epoch: AudioEpoch,
     },
     Active {
-        source: AudioSourceIdentity,
-        route: AudioRouteReceipt,
+        route: crate::media::loopback::LoopbackReceipt,
+    },
+    Switching {
+        epoch: AudioEpoch,
+        revision: super::output::OutputRevision,
     },
     Detaching {
         epoch: AudioEpoch,
@@ -175,6 +174,8 @@ pub enum AudioError {
     Cancelled,
     #[error("audio cancellation failed: {0}")]
     Control(String),
+    #[error("owned playback node `{node}` exposes no valid native object.id")]
+    MissingGlobalId { node: String },
     #[error("audio backend {operation} failed (code {code:?}): {detail}")]
     Backend {
         operation: String,

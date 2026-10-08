@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use furami::media::capabilities::{
+use super::capabilities::{
     Backend, Capability, CapabilityError, CaptureFormat, CatalogFilter, Component, Decoder,
     GpuContext, PixelFormat, Player, ProbeCollection, ProbeRun, RendererOption, VideoOutput,
 };
@@ -218,7 +218,7 @@ fn capabilities(bundle: &str) -> ProbeCollection {
     probes
 }
 
-use furami::media::capabilities::Capabilities;
+use super::capabilities::Capabilities;
 
 fn assert_stack_alignment(common: &ProbeCollection, effective: &ProbeCollection) {
     assert_eq!(common.stack_sha256, STACK_SHA256);

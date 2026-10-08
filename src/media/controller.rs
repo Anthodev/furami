@@ -20,19 +20,23 @@ use crate::domain::capture::{
     AudioAvailability, AudioEpoch, AudioError, AudioSelection, AudioSourceIdentity, PlaybackGain,
     SelectedRouteAuthorization, WatchStamp,
 };
-use crate::domain::state::{InitialPlayback, PauseRequestId};
+use crate::domain::{
+    output::OutputPlan,
+    state::{InitialPlayback, PauseRequestId},
+};
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     pub video: CaptureSelection,
     pub audio: AudioSelection,
     pub gain: PlaybackGain,
+    pub output: OutputPlan,
     pub playback: InitialPlayback,
     pub watch: WatchStamp,
     pub selected_route: Option<SelectedRouteAuthorization>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct Generation(NonZeroU64);
 impl Generation {
     pub fn new(value: u64) -> Option<Self> {
@@ -69,6 +73,7 @@ pub enum PlaybackIntent {
         paused: bool,
     },
     SetGain(PlaybackGain),
+    SetOutput(OutputPlan),
     DetachAudio {
         epoch: AudioEpoch,
     },
@@ -147,6 +152,7 @@ pub(crate) struct StopFlag {
     state: AtomicU8,
     reason: Mutex<Option<MediaError>>,
     audio_cancel: Arc<AtomicBool>,
+    output: Mutex<Option<OutputPlan>>,
 }
 impl StopFlag {
     fn new() -> Self {
@@ -154,6 +160,7 @@ impl StopFlag {
             state: AtomicU8::new(0),
             reason: Mutex::new(None),
             audio_cancel: Arc::new(AtomicBool::new(false)),
+            output: Mutex::new(None),
         }
     }
     #[cfg(test)]
@@ -222,6 +229,7 @@ pub(crate) enum BackendCommand {
         paused: bool,
     },
     SetGain(PlaybackGain),
+    SetOutput(OutputPlan),
     DetachAudio {
         epoch: AudioEpoch,
     },
@@ -304,6 +312,7 @@ pub(crate) struct OwnerEndpoint {
     buffered_ack: Option<OwnerStopped>,
     ack_received: bool,
     ack_disconnected: bool,
+    worker: Option<thread::JoinHandle<()>>,
 }
 impl OwnerEndpoint {
     pub(crate) fn spawn(
@@ -361,6 +370,7 @@ impl OwnerEndpoint {
                         config.gain,
                         config.playback,
                         config.watch,
+                        config.output,
                     ),
                     surface,
                     commands,
@@ -550,7 +560,7 @@ impl OwnerEndpoint {
             })
             .map_err(|error| MediaError::new("owner_spawn", error.to_string()))?;
         let owner_thread = handle.thread().clone();
-        drop(handle);
+        let worker = Some(handle);
         Ok(Self {
             generation,
             surface,
@@ -564,6 +574,7 @@ impl OwnerEndpoint {
             buffered_ack: None,
             ack_received: false,
             ack_disconnected: false,
+            worker,
         })
     }
 
@@ -613,6 +624,19 @@ impl OwnerEndpoint {
             return SubmitStatus::Closing;
         }
         let command = match intent {
+            PlaybackIntent::SetOutput(output) => {
+                let mut slot = self
+                    .stop_flag
+                    .output
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if self.stop_flag.is_set() {
+                    return SubmitStatus::Closing;
+                }
+                *slot = Some(output);
+                self.thread.unpark();
+                return SubmitStatus::Accepted;
+            }
             PlaybackIntent::SetGain(gain) => {
                 let mut slot = self.gain.lock().unwrap_or_else(|p| p.into_inner());
                 if self.stop_flag.is_set() {
@@ -662,6 +686,19 @@ impl OwnerEndpoint {
     }
 
     pub(crate) fn take_stopped(&mut self) -> Result<Option<OwnerStopped>, MediaError> {
+        // Expose destruction only after the session worker itself has retired.
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return Ok(None);
+        }
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| MediaError::new("owner_disconnect", "session worker panicked"))?;
+        }
         if let Some(ack) = self.buffered_ack.take() {
             self.ack_received = true;
             return Ok(Some(ack));
@@ -691,6 +728,11 @@ impl OwnerEndpoint {
 
     /// Buffer the destruction acknowledgment without consuming it for the GUI reducer.
     pub(crate) fn wait_for_ack(&mut self) -> Result<(), MediaError> {
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| MediaError::new("owner_disconnect", "session worker panicked"))?;
+        }
         if self.ack_received || self.buffered_ack.is_some() {
             return Ok(());
         }
@@ -855,6 +897,17 @@ fn run_owner<B: OwnerBackend>(
         if stop.is_set() {
             return stop.outcome();
         }
+        // Output loss must not wait behind a slow video load/pause readback.
+        let output = stop.output.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(output) = output {
+            if stop.is_set() {
+                return stop.outcome();
+            }
+            backend.submit(
+                RequestId::next(&mut last_request)?,
+                BackendCommand::SetOutput(output),
+            )?;
+        }
         if pending.is_none() && snapshot.stream_ended.is_none() {
             match commands.try_recv() {
                 Ok(intent) => {
@@ -878,7 +931,9 @@ fn run_owner<B: OwnerBackend>(
                             source,
                             stamp,
                         },
-                        PlaybackIntent::SetGain(_) => unreachable!("gain uses latest slot"),
+                        PlaybackIntent::SetGain(_) | PlaybackIntent::SetOutput(_) => {
+                            unreachable!("latest-value controls")
+                        }
                     };
                     if matches!(command, BackendCommand::SetPaused { .. }) {
                         snapshot.pause = None;
@@ -1339,12 +1394,12 @@ pub(crate) mod test_support {
             if self.config.hold_shutdown {
                 self.shutdown_release.recv().unwrap();
             }
-            self.destroyed.send(self.has_handle).unwrap();
-            self.has_handle = false;
             if self.config.hold_quiesce {
                 self.quiesce_started.send(()).unwrap();
                 self.quiesce_release.recv().unwrap();
             }
+            self.destroyed.send(self.has_handle).unwrap();
+            self.has_handle = false;
             Ok(())
         }
     }
@@ -1367,7 +1422,7 @@ mod tests {
             paused: true,
         }
     }
-    fn generation() -> Generation {
+    pub(super) fn generation() -> Generation {
         Generation::new(1).unwrap()
     }
     fn token() -> SurfaceToken {
@@ -1376,14 +1431,14 @@ mod tests {
             xid: X11WindowId::new(47).unwrap(),
         }
     }
-    fn start(config: Config) -> (OwnerEndpoint, Driver) {
+    pub(super) fn start(config: Config) -> (OwnerEndpoint, Driver) {
         let (driver, backend) = Driver::pair(config);
         let owner = OwnerEndpoint::spawn_with_backend(generation(), move || backend).unwrap();
         assert_eq!(owner.attach(token()), SubmitStatus::Accepted);
         driver.initialized.recv().unwrap();
         (owner, driver)
     }
-    fn load(driver: &Driver) -> RequestId {
+    pub(super) fn load(driver: &Driver) -> RequestId {
         let (id, command) = driver.submitted.recv().unwrap();
         assert_eq!(command, BackendCommand::LoadInput);
         id
@@ -1393,6 +1448,27 @@ mod tests {
         owner.wait_for_ack().unwrap();
         assert!(driver.destroyed.recv().is_ok());
         owner.take_stopped().unwrap().unwrap()
+    }
+
+    fn wait_for_owner_disconnect(owner: &mut OwnerEndpoint) -> MediaError {
+        // Channel disconnection during unwind does not mean the worker has retired.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let stopped = owner.take_stopped();
+            assert!(!owner.ack_received);
+            assert!(owner.buffered_ack.is_none());
+            match stopped {
+                Err(error) => return error,
+                Ok(Some(_)) => panic!("owner panic fabricated a destruction acknowledgment"),
+                Ok(None) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owner disconnect was not reported within five seconds"
+                    );
+                    thread::yield_now();
+                }
+            }
+        }
     }
 
     #[test]
@@ -1997,10 +2073,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(owner.stopped.recv().is_err());
+        assert_eq!(
+            wait_for_owner_disconnect(&mut owner).code,
+            "owner_disconnect"
+        );
+        assert!(!owner.ack_received);
+        // The worker-join panic path is sticky: a repeat call must remain an
+        // owner_disconnect error, never a completed destruction ack.
         assert_eq!(owner.take_stopped().unwrap_err().code, "owner_disconnect");
         assert!(!owner.ack_received);
-        assert!(owner.take_stopped().unwrap().is_none());
     }
 
     #[test]
@@ -2058,15 +2139,17 @@ mod tests {
             )
             .unwrap();
             if disconnect_already_observed {
-                assert!(owner.stopped.recv().is_err());
-                assert_eq!(owner.take_stopped().unwrap_err().code, "owner_disconnect");
+                assert_eq!(
+                    wait_for_owner_disconnect(&mut owner).code,
+                    "owner_disconnect"
+                );
             }
-            let expected = MediaError::new(
-                "owner_disconnect",
-                "owner exited without destruction completion acknowledgment",
-            );
-            assert_eq!(owner.wait_for_ack().unwrap_err(), expected);
-            assert_eq!(owner.wait_for_ack().unwrap_err(), expected);
+            // The join failure surfaces as an owner_disconnect failure; the
+            // wording belongs to the join path, so only the code is asserted.
+            let first = owner.wait_for_ack().unwrap_err();
+            assert_eq!(first.code, "owner_disconnect");
+            let repeat = owner.wait_for_ack().unwrap_err();
+            assert_eq!(repeat.code, "owner_disconnect");
             assert!(!owner.ack_received);
             assert!(owner.buffered_ack.is_none());
             assert!(owner.take_stopped().unwrap().is_none());
@@ -2077,6 +2160,7 @@ mod tests {
 #[cfg(test)]
 mod audio_tests {
     use super::test_support::{Config, Driver};
+    use super::tests::{generation, load, start};
     use super::*;
 
     #[test]
@@ -2127,7 +2211,46 @@ mod audio_tests {
     }
 
     #[test]
-    fn destruction_ack_waits_for_audio_worker_quiescence_after_native_destroy() {
+    fn latest_output_is_coalesced_and_bypasses_pending_video_load_without_wrong_generation() {
+        let (mut owner, driver) = start(Config {
+            hold_initialize: true,
+            ..Config::default()
+        });
+        let first = OutputPlan::Silent {
+            revision: crate::domain::output::OutputRevision::first(),
+            reason: crate::domain::output::OutputSilence::ManualUnavailable,
+        };
+        let latest = OutputPlan::Silent {
+            revision: first.revision().next(),
+            reason: crate::domain::output::OutputSilence::ManualRequiresAction,
+        };
+        assert_eq!(
+            owner.submit(
+                Generation::new(2).unwrap(),
+                PlaybackIntent::SetOutput(first.clone())
+            ),
+            SubmitStatus::StaleGeneration
+        );
+        assert_eq!(
+            owner.submit(generation(), PlaybackIntent::SetOutput(first)),
+            SubmitStatus::Accepted
+        );
+        assert_eq!(
+            owner.submit(generation(), PlaybackIntent::SetOutput(latest.clone())),
+            SubmitStatus::Accepted
+        );
+        driver.initialize_release.send(()).unwrap();
+        load(&driver); // Intentionally withhold its terminal reply.
+        let (_, command) = driver.submitted.recv().unwrap();
+        assert_eq!(command, BackendCommand::SetOutput(latest));
+        assert!(driver.submitted.try_recv().is_err());
+        owner.stop(generation(), None);
+        owner.wait_for_ack().unwrap();
+        assert!(owner.take_stopped().unwrap().unwrap().outcome.is_ok());
+    }
+
+    #[test]
+    fn audio_retirement_precedes_video_destroy_and_joined_session_ack() {
         let generation = Generation::new(1).unwrap();
         let (driver, backend) = Driver::pair(Config {
             creates_handle: true,
@@ -2142,10 +2265,11 @@ mod audio_tests {
         driver.initialized.recv().unwrap();
         driver.submitted.recv().unwrap();
         owner.stop(generation, None);
-        assert!(driver.destroyed.recv().unwrap());
         driver.quiesce_started.recv().unwrap();
+        assert!(driver.destroyed.try_recv().is_err());
         assert!(owner.take_stopped().unwrap().is_none());
         driver.quiesce_release.send(()).unwrap();
+        assert!(driver.destroyed.recv().unwrap());
         owner.wait_for_ack().unwrap();
         assert!(owner.take_stopped().unwrap().unwrap().outcome.is_ok());
     }

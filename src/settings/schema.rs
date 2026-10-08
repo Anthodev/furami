@@ -19,6 +19,7 @@ use crate::domain::capture::{
     AudioError, AudioSelection, AudioSourceIdentity, CaptureDataError, CaptureMode, CapturedFourCc,
     DeviceIdentity, FrameRate, FrameSize, ModeRequest, PlaybackGain, UsbTopology,
 };
+use crate::domain::output::{PersistentOutputChoice, SinkIdentity};
 use crate::domain::state::DraftSettings;
 
 /// On-disk schema version this module reads and writes.
@@ -214,12 +215,28 @@ object_dto! {
     }
 }
 
+#[derive(Debug)]
+struct PreferencesV1 {
+    volume_percent: u8,
+    muted: bool,
+    fullscreen: bool,
+    /// Optional for backward compatibility: a strict v1 document written
+    /// before the output choice existed has no `output` key and means `Auto`.
+    /// An explicit `null` is a schema violation, not `Auto`.
+    output: Option<OutputV1>,
+}
+
+#[derive(Debug)]
+enum OutputV1 {
+    Auto,
+    Manual { sink: SinkV1 },
+}
+
 object_dto! {
-    #[derive(Debug, Clone, Copy, Serialize)]
-    struct PreferencesV1 {
-        volume_percent: u8,
-        muted: bool,
-        fullscreen: bool,
+    #[derive(Debug)]
+    struct SinkV1 {
+        name: String,
+        stable_properties: Vec<StablePropertyV1>,
     }
 }
 
@@ -230,6 +247,145 @@ object_dto! {
 const DOCUMENT_FIELDS: &[&str] = &["schema_version", "applied", "preferences"];
 const IDENTITY_FIELDS: &[&str] = &["vendor_id", "product_id", "topology", "serial"];
 const AUDIO_FIELDS: &[&str] = &["kind", "source", "retained"];
+const PREFS_FIELDS: &[&str] = &["volume_percent", "muted", "fullscreen", "output"];
+const OUTPUT_FIELDS: &[&str] = &["kind", "sink"];
+
+impl<'de> Deserialize<'de> for PreferencesV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Not the `object_dto!` derive: `output` is absent-by-default for
+        // backward compatibility, which a fully strict field set cannot
+        // express. Everything else keeps the derive's strictness.
+        deserializer.deserialize_struct("PreferencesV1", PREFS_FIELDS, PreferencesVisitor)
+    }
+}
+
+struct PreferencesVisitor;
+
+impl<'de> Visitor<'de> for PreferencesVisitor {
+    type Value = PreferencesV1;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "a preferences object with volume_percent, muted, fullscreen and optional output",
+        )
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut volume_percent: Option<u8> = None;
+        let mut muted: Option<bool> = None;
+        let mut fullscreen: Option<bool> = None;
+        let mut output: Option<Option<OutputV1>> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "volume_percent" => {
+                    if volume_percent.is_some() {
+                        return Err(de::Error::duplicate_field("volume_percent"));
+                    }
+                    volume_percent = Some(map.next_value()?);
+                }
+                "muted" => {
+                    if muted.is_some() {
+                        return Err(de::Error::duplicate_field("muted"));
+                    }
+                    muted = Some(map.next_value()?);
+                }
+                "fullscreen" => {
+                    if fullscreen.is_some() {
+                        return Err(de::Error::duplicate_field("fullscreen"));
+                    }
+                    fullscreen = Some(map.next_value()?);
+                }
+                "output" => {
+                    if output.is_some() {
+                        return Err(de::Error::duplicate_field("output"));
+                    }
+                    // Present field deserializes `OutputV1` directly: an
+                    // explicit null is refused (map-only visitor), only the
+                    // absent key defaults to `Auto`.
+                    output = Some(Some(map.next_value::<OutputV1>()?));
+                }
+                other => return Err(de::Error::unknown_field(other, PREFS_FIELDS)),
+            }
+        }
+
+        Ok(PreferencesV1 {
+            volume_percent: volume_percent
+                .ok_or_else(|| de::Error::missing_field("volume_percent"))?,
+            muted: muted.ok_or_else(|| de::Error::missing_field("muted"))?,
+            fullscreen: fullscreen.ok_or_else(|| de::Error::missing_field("fullscreen"))?,
+            output: output.flatten(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for OutputV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // `deserialize_map`, not `deserialize_struct`: the tagged union must
+        // never accept the sequence form or null, and the tag decides which
+        // sibling fields are legal. The visitor's `expecting` names the shape.
+        deserializer.deserialize_map(OutputVisitor)
+    }
+}
+
+struct OutputVisitor;
+
+impl<'de> Visitor<'de> for OutputVisitor {
+    type Value = OutputV1;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an output choice object with a kind tag of auto or manual")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut kind: Option<String> = None;
+        let mut sink: Option<SinkV1> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "kind" => {
+                    if kind.is_some() {
+                        return Err(de::Error::duplicate_field("kind"));
+                    }
+                    kind = Some(map.next_value()?);
+                }
+                "sink" => {
+                    if sink.is_some() {
+                        return Err(de::Error::duplicate_field("sink"));
+                    }
+                    sink = Some(map.next_value()?);
+                }
+                other => return Err(de::Error::unknown_field(other, OUTPUT_FIELDS)),
+            }
+        }
+
+        let kind = kind.ok_or_else(|| de::Error::missing_field("kind"))?;
+        match kind.as_str() {
+            "auto" => {
+                if sink.is_some() {
+                    return Err(de::Error::unknown_field("sink", &[]));
+                }
+                Ok(OutputV1::Auto)
+            }
+            "manual" => Ok(OutputV1::Manual {
+                sink: sink.ok_or_else(|| de::Error::missing_field("sink"))?,
+            }),
+            other => Err(de::Error::unknown_variant(other, &["auto", "manual"])),
+        }
+    }
+}
 
 impl<'de> Deserialize<'de> for DocumentV1 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -488,7 +644,34 @@ fn stored_from_document(document: DocumentV1) -> Result<StoredDocument, Settings
 struct DocumentWrite<'a> {
     schema_version: u64,
     applied: Option<AppliedWrite<'a>>,
-    preferences: PreferencesV1,
+    preferences: PreferencesWrite<'a>,
+}
+
+/// Borrowed wire view of the mutable preferences. `Auto` omits the `output`
+/// key entirely so documents stay byte-compatible with pre-output v1 readers;
+/// a manual choice serializes `{"kind":"manual","sink":…}`. Downgrade limit:
+/// such a document is refused by older builds (unknown `output` field); by
+/// design there is no migration path.
+#[derive(Serialize)]
+struct PreferencesWrite<'a> {
+    volume_percent: u8,
+    muted: bool,
+    fullscreen: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<OutputWrite<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum OutputWrite<'a> {
+    Manual { sink: SinkWrite<'a> },
+}
+
+#[derive(Serialize)]
+struct SinkWrite<'a> {
+    name: &'a str,
+    #[serde(serialize_with = "serialize_stable_properties")]
+    stable_properties: &'a [(String, String)],
 }
 
 #[derive(Serialize)]
@@ -560,7 +743,7 @@ where
 /// domain values: their borrowed wire views preserve those invariants without
 /// rebuilding strings/vectors or sorting already-normalized properties.
 pub(crate) fn encode(document: &StoredDocument) -> Result<Vec<u8>, EncodeError> {
-    let preferences = preferences_to_dto(document.preferences)?;
+    let preferences = preferences_to_dto(&document.preferences)?;
     let document = DocumentWrite {
         schema_version: SCHEMA_VERSION,
         applied: document.applied.as_ref().map(applied_to_dto),
@@ -677,21 +860,43 @@ fn audio_source_from_dto(
 }
 
 fn preferences_to_dto(
-    preferences: LocalPreferences,
-) -> Result<PreferencesV1, SettingsValidationError> {
+    preferences: &LocalPreferences,
+) -> Result<PreferencesWrite<'_>, SettingsValidationError> {
     let gain = PlaybackGain::new(preferences.gain.volume_percent, preferences.gain.muted)?;
-    Ok(PreferencesV1 {
+    let output = match &preferences.output {
+        PersistentOutputChoice::Auto => None,
+        PersistentOutputChoice::Manual(identity) => Some(OutputWrite::Manual {
+            sink: SinkWrite {
+                name: identity.name(),
+                stable_properties: identity.stable_properties(),
+            },
+        }),
+    };
+    Ok(PreferencesWrite {
         volume_percent: gain.volume_percent,
         muted: gain.muted,
         fullscreen: preferences.fullscreen,
+        output,
     })
 }
 
 fn preferences_from_dto(
     preferences: PreferencesV1,
 ) -> Result<LocalPreferences, SettingsValidationError> {
+    let output = match preferences.output {
+        None | Some(OutputV1::Auto) => PersistentOutputChoice::Auto,
+        Some(OutputV1::Manual { sink }) => {
+            let properties = sink
+                .stable_properties
+                .into_iter()
+                .map(|property| (property.key, property.value))
+                .collect();
+            PersistentOutputChoice::Manual(SinkIdentity::new(sink.name, properties)?)
+        }
+    };
     Ok(LocalPreferences {
         gain: PlaybackGain::new(preferences.volume_percent, preferences.muted)?,
         fullscreen: preferences.fullscreen,
+        output,
     })
 }

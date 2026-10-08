@@ -100,6 +100,21 @@ fn main() {
         })
     };
     builder.build();
+    // --require-defined forces GNU ld to extract the root CXX-Qt initializer
+    // (cxx_qt_init_crate_furami) from the rlibs archives: it sits semantically
+    // before archive traversal, and pulls in the provider archives that bundle
+    // the QML module, cxx_qt_lib and Qt glue for all final targets
+    // (bin, tests and examples alike).
+    println!("cargo:rustc-link-arg=-Wl,--require-defined=cxx_qt_init_crate_furami");
+    // The generated CXX-Qt static archive (libfurami_cxxqt_generated.a) is emitted
+    // before any Qt6Quick reference is resolved. With --as-needed (the default
+    // final-campaign link command), a shared library is retained only if it
+    // satisfies an undefined symbol from objects already seen at its position on
+    // the link line — so the .qt_module("Quick") directive emitted by
+    // builder.build() is dropped before the archive that needs it is scanned.
+    // Re-emitting Qt6Quick here places it after the archive, so the linker sees
+    // the archive's undefined Quick symbols first and retains the library.
+    println!("cargo:rustc-link-lib=Qt6Quick");
     for library in ["X11", "xcb", "xcb-shape"] {
         println!("cargo:rustc-link-lib={library}");
     }

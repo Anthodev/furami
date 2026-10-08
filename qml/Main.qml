@@ -378,6 +378,130 @@ ApplicationWindow {
                         }
                     }
                     Label {
+                        text: "Audio output"
+                        Accessible.name: "Audio output selection label"
+                    }
+                    ComboBox {
+                        id: outputSelector
+                        objectName: "outputSelector"
+                        Layout.fillWidth: true
+                        Accessible.name: "Audio output selection"
+                        // Rows come from the authoritative runtime projection
+                        // as a JSON array of objects: sink names and
+                        // descriptions are external data and are only ever
+                        // rendered as plain text, never markup.
+                        property var rows: {
+                            let parsed = []
+                            try {
+                                parsed = JSON.parse(root.bridge.outputRows)
+                            } catch (e) {
+                                parsed = []
+                            }
+                            return Array.isArray(parsed) ? parsed : []
+                        }
+                        model: rows
+                        textRole: "label"
+                        // The runtime projects the action key of the current
+                        // choice (reserved auto key or the unique compatible
+                        // catalog row). A missing manual choice has an empty
+                        // key: it is shown as selected-but-unavailable
+                        // (index -1), never mapped onto Auto. onActivated is
+                        // the only explicit action path and fires even when
+                        // the same row is chosen again.
+                        currentIndex: {
+                            const current = rows
+                            const key = root.bridge.outputSelectedKey
+                            if (key.length === 0)
+                                return -1
+                            for (let i = 0; i < current.length; ++i)
+                                if (current[i].key === key)
+                                    return i
+                            return -1
+                        }
+                        displayText: {
+                            const i = outputSelector.currentIndex
+                            if (i >= 0 && i < outputSelector.rows.length)
+                                return outputSelector.rows[i].label
+                            return root.bridge.outputSelectedKey === "auto"
+                                ? "Auto" : root.bridge.outputSelected
+                        }
+                        delegate: ItemDelegate {
+                            required property var modelData
+                            required property int index
+                            width: outputSelector.width
+                            highlighted: outputSelector.highlightedIndex === index
+                            contentItem: Text {
+                                text: modelData.label
+                                    + (modelData.eligible ? "" : " (currently unavailable)")
+                                textFormat: Text.PlainText
+                                elide: Text.ElideRight
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                        }
+                        onActivated: {
+                            if (currentIndex < 0 || currentIndex >= rows.length)
+                                return
+                            root.bridge.selectOutput(
+                                rows[currentIndex].key,
+                                root.bridge.outputCatalogRevision)
+                            root.reconcilePlaybackControls()
+                        }
+                    }
+                    Label {
+                        objectName: "outputMissing"
+                        // The saved manual output has no unique compatible
+                        // observed row (empty action key): it stays visibly
+                        // selected, with no Auto fallback and no claim it is
+                        // reachable.
+                        textFormat: Text.PlainText
+                        text: "Selected output " + root.bridge.outputSelected
+                            + " is not available"
+                        visible: root.bridge.outputSelectedKey.length === 0
+                            && root.bridge.outputSelected.length > 0
+                        wrapMode: Text.WrapAnywhere
+                        Layout.fillWidth: true
+                        Accessible.name: "Selected audio output unavailable"
+                    }
+                    Button {
+                        id: reconnectOutput
+                        objectName: "reconnectOutput"
+                        Layout.fillWidth: true
+                        // Contextual reconnect: offered only while the saved
+                        // manual choice needs an explicit re-selection and
+                        // its projected action key is present in the current
+                        // rows, so the action always submits the opaque key
+                        // of the observed row, never its name.
+                        readonly property var selectedRow: {
+                            const key = root.bridge.outputSelectedKey
+                            if (key.length === 0 || key === "auto")
+                                return null
+                            const current = outputSelector.rows
+                            for (let i = 0; i < current.length; ++i)
+                                if (current[i].key === key)
+                                    return current[i]
+                            return null
+                        }
+                        visible: root.bridge.outputNeedsAction
+                            && selectedRow !== null
+                        text: "Reconnect " + root.bridge.outputSelected
+                        Accessible.name: "Reconnect saved audio output"
+                        onClicked: root.bridge.selectOutput(
+                            selectedRow.key,
+                            root.bridge.outputCatalogRevision)
+                    }
+                    Label {
+                        objectName: "outputStatus"
+                        text: root.bridge.outputStatus
+                            + (root.bridge.outputEffective.length > 0
+                                ? "\nActive output: " + root.bridge.outputEffective : "")
+                        textFormat: Text.PlainText
+                        visible: root.bridge.outputStatus.length > 0
+                            || root.bridge.outputEffective.length > 0
+                        wrapMode: Text.WrapAnywhere
+                        Layout.fillWidth: true
+                        Accessible.name: "Audio output status"
+                    }
+                    Label {
                         text: "Audio: " + root.bridge.audioStatus
                             + (root.bridge.audioSource.length > 0 ? "\n" + root.bridge.audioSource : "")
                             + (root.bridge.audioStatus === "Disabled" && root.bridge.audioDesired.length > 0
