@@ -54,7 +54,7 @@ pub struct RecoveryCandidate {
     /// Display only; never an identity match key.
     pub description: String,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum VideoPresence {
     Present,
     Absent,
@@ -68,7 +68,7 @@ pub enum SourcePresence {
     Absent(AudioError),
     Unknown(AudioError),
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RecoveryObservation {
     pub stamp: WatchStamp,
     pub video: VideoPresence,

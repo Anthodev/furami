@@ -869,6 +869,7 @@ mod tests {
         audio: AudioSelection,
     ) -> DraftSettings {
         DraftSettings {
+            filters: crate::domain::filters::FilterChain::default(),
             video: ModeRequest {
                 identity: video_identity,
                 mode,

@@ -132,7 +132,7 @@ public:
     bool bindRoot(QQuickWindow *root, QQuickItem *container, QString &diagnostic);
     bool enableQualificationInput(QString &diagnostic);
     Q_INVOKABLE bool quitAuthorized() const;
-    bool failed() const;
+    bool launchFailed() const;
 
     Q_INVOKABLE void openCapture();
     Q_INVOKABLE void restartCapture(const QString &expectedGeneration);

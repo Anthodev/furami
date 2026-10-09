@@ -5,11 +5,16 @@ use crate::domain::{
         AudioAvailability, AudioEpoch, AudioSelection, AudioSilence, LossEvidence, PlaybackGain,
         RecoveryObservation, RecoveryWatchTarget, SelectionToken, SourcePresence, WatchStamp,
     },
-    failure::{ApplyFailure, Cause, FailureCategory, LifecycleFailure, Stage, ValidationLayer},
+    failure::{
+        ApplyFailure, Cause, FailureCategory, FilterAttemptDiagnostics, FilterConfirmationFailure,
+        FilterEntryMetadata, FilterErrorKind, FilterFailure, LifecycleFailure, Stage,
+        ValidationLayer,
+    },
     output::{OutputPlan, OutputRevision, OutputSilence},
     state::{
-        AppliedSettings, ApplyId, AttemptId, AttemptKey, AttemptPurpose, CleanupStatus,
-        CommandRejection, DraftRevision, DraftSettings, InitialPlayback, ModelEffect,
+        AppliedSettings, ApplyAdmission, ApplyId, AttemptId, AttemptKey, AttemptPurpose,
+        CleanupStatus, CommandRejection, DraftRevision, DraftSettings, FilterAttemptKey,
+        FilterConfirmation, FilterPass, FilterRestoreRoute, InitialPlayback, ModelEffect,
         PlaybackState, ProductModel, ProductPhase, ReconnectAdmission, StateIdentity, StopIntent,
         ValidationRequest,
     },
@@ -21,13 +26,19 @@ use super::ports::{
     ValidationOutcome,
 };
 
-/// An exact verified open, after committed health monitoring has been installed.
-/// Its purpose alone does not identify a user Apply; consumers correlate the key
-/// with their admitted application intent.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerifiedOpen {
-    pub key: AttemptKey,
-    pub applied: AppliedSettings,
+/// A complete runtime-verified configuration. Consumers must independently
+/// correlate it with an immutable user admission before authorizing a save.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VerifiedApplied {
+    Open {
+        key: AttemptKey,
+        applied: AppliedSettings,
+    },
+    Filters {
+        key: FilterAttemptKey,
+        revision: DraftRevision,
+        applied: AppliedSettings,
+    },
 }
 
 struct Lease {
@@ -49,6 +60,12 @@ struct Lease {
     choice: Option<SelectionToken>,
 }
 
+struct PreparedFilterApply<F> {
+    key: FilterAttemptKey,
+    candidate: Option<F>,
+    prior: Option<F>,
+}
+
 pub struct ApplyCoordinator<V, R>
 where
     V: DraftValidator,
@@ -61,15 +78,21 @@ where
     output: OutputPlan,
     output_initialized: bool,
     validation: Option<ValidationRequest>,
-    prepared: Option<(ValidationRequest, V::Prepared)>,
+    prepared: Option<(ValidationRequest, V::Prepared, R::PreparedFilters)>,
     lease: Option<Lease>,
     audio: Option<AudioAvailability>,
     validator_shutdown: bool,
     installed_watch: Option<RecoveryWatchTarget>,
     pending_validation: Option<ValidationRequest>,
     deferred_ready: Option<(AttemptKey, OpenReceipt)>,
-    verified_open: Option<VerifiedOpen>,
+    verified_applied: Option<VerifiedApplied>,
+    admitted_apply: Option<ApplyId>,
     strict_startup_apply: Option<ApplyId>,
+    filter_apply: Option<PreparedFilterApply<R::PreparedFilters>>,
+    // One-owner event arbitration may record model failures before blockers,
+    // but adapter effects (including resource-free retirement) wait for them.
+    defer_effects: bool,
+    deferred_effect: Option<ModelEffect>,
 }
 impl<V, R> ApplyCoordinator<V, R>
 where
@@ -95,8 +118,12 @@ where
             installed_watch: None,
             pending_validation: None,
             deferred_ready: None,
-            verified_open: None,
+            verified_applied: None,
+            admitted_apply: None,
             strict_startup_apply: None,
+            filter_apply: None,
+            defer_effects: false,
+            deferred_effect: None,
         }
     }
     pub fn model(&self) -> &ProductModel {
@@ -151,11 +178,21 @@ where
         }
         Ok(status)
     }
-    /// Consume the latest verified open once. Drain after each poll before
-    /// admitting another operation: a later verified open replaces an untaken
-    /// notification. Session loss or draft edits do not revoke a past success.
-    pub fn take_verified_open(&mut self) -> Option<VerifiedOpen> {
-        self.verified_open.take()
+    /// Consume the latest verified configuration once. Draft edits preserve it;
+    /// health loss, replacement, close and quit revoke an unconsumed result.
+    pub fn take_verified_applied(&mut self) -> Option<VerifiedApplied> {
+        if self
+            .verified_applied
+            .as_ref()
+            .is_some_and(|event| !self.positive_is_valid(event))
+        {
+            self.verified_applied = None;
+        }
+        let result = self.verified_applied.take();
+        if result.is_some() {
+            self.admitted_apply = None;
+        }
+        result
     }
     /// Startup restore requires the exact requested source to be healthy. A
     /// missing output may honestly keep verified video silent; source/transport
@@ -209,15 +246,130 @@ where
         &mut self,
         expected_state: StateIdentity,
         expected_revision: DraftRevision,
-    ) -> Result<ApplyId, CommandRejection> {
+    ) -> Result<ApplyAdmission, CommandRejection> {
         self.check_drain()?;
-        let (id, effect) = self.model.apply(expected_state, expected_revision)?;
+        let draft = &self.model.draft().settings;
+        if self.model.active().is_some_and(|active| {
+            active.playback() == PlaybackState::Live
+                && active.applied().settings().video == draft.video
+                && active.applied().settings().audio == draft.audio
+        }) {
+            return self.apply_filters(expected_state, expected_revision);
+        }
+        let (apply, effect) = self.model.apply(expected_state, expected_revision)?;
+        self.verified_applied = None;
+        self.admitted_apply = Some(apply);
         self.drive(Some(effect))?;
-        Ok(id)
+        Ok(ApplyAdmission::Open { apply })
+    }
+    pub fn apply_filters(
+        &mut self,
+        expected_state: StateIdentity,
+        expected_revision: DraftRevision,
+    ) -> Result<ApplyAdmission, CommandRejection> {
+        self.check_drain()?;
+        self.model.check_command(expected_state)?;
+        if self.validation.is_some() || self.pending_validation.is_some() {
+            return Err(CommandRejection::CleanupIncomplete);
+        }
+        let active = self
+            .model
+            .active()
+            .ok_or(CommandRejection::PlaybackUnavailable)?;
+        if self.lease.as_ref().is_none_or(|lease| {
+            lease.key.attempt != active.attempt()
+                || lease.stopping
+                || lease.owner_stopped
+                || lease.blocked
+                || !lease.verified
+        }) {
+            return Err(CommandRejection::PlaybackUnavailable);
+        }
+        let admission = self
+            .model
+            .apply_filters(expected_state, expected_revision)?;
+        let ApplyAdmission::Filters { key, .. } = admission else {
+            unreachable!()
+        };
+        self.verified_applied = None;
+        self.admitted_apply = Some(admission.id());
+        let transition = self.model.filtering().expect("admitted filter transition");
+        let candidate = transition.candidate().clone();
+        let prior = transition.prior().settings().clone();
+        let prepared = self
+            .runner
+            .prepare_filters(&candidate)
+            .and_then(|candidate| {
+                self.runner
+                    .prepare_filters(&prior)
+                    .map(|prior| (candidate, prior))
+            });
+        match prepared {
+            Ok((candidate, prior)) => {
+                self.filter_apply = Some(PreparedFilterApply {
+                    key,
+                    candidate: Some(candidate),
+                    prior: Some(prior),
+                });
+                self.drive(Some(ModelEffect::ApplyFilters { key }))?;
+            }
+            Err(mut failure) => {
+                if let Some(filter) = &mut failure.filter {
+                    filter.diagnostics.key = Some(key);
+                }
+                self.model.filter_submission_refused(key, failure);
+            }
+        }
+        Ok(admission)
+    }
+    /// Authorization is independent of any later receipt-derived owner.
+    pub fn has_user_apply_result_or_pending(&self, apply: ApplyId) -> bool {
+        self.admitted_apply == Some(apply)
+            && (self.model.has_pending_user_apply(apply)
+                || self.verified_applied.as_ref().is_some_and(|event| {
+                    let id = match event {
+                        VerifiedApplied::Open { key, .. } => key.apply,
+                        VerifiedApplied::Filters { key, .. } => key.apply,
+                    };
+                    id == apply && self.positive_is_valid(event)
+                }))
+    }
+    fn positive_is_valid(&self, event: &VerifiedApplied) -> bool {
+        let (key, applied) = match event {
+            VerifiedApplied::Open { key, applied } if key.purpose == AttemptPurpose::Candidate => (
+                FilterAttemptKey {
+                    apply: key.apply,
+                    attempt: key.attempt,
+                    pass: FilterPass::Open,
+                },
+                applied,
+            ),
+            VerifiedApplied::Filters { key, applied, .. }
+                if key.pass == FilterPass::LiveCandidate =>
+            {
+                (*key, applied)
+            }
+            _ => return false,
+        };
+        self.model.confirmed_filter_key() == Some(key)
+            && self.model.filtering().is_none()
+            && self.model.cleanup() == &CleanupStatus::Complete
+            && self.model.active().is_some_and(|active| {
+                active.attempt() == key.attempt && active.applied() == applied
+            })
+            && self.lease.as_ref().is_some_and(|lease| {
+                lease.key.attempt == key.attempt
+                    && lease.verified
+                    && !lease.stopping
+                    && !lease.owner_stopped
+                    && !lease.blocked
+            })
     }
     pub fn restart(&mut self, expected_state: StateIdentity) -> Result<ApplyId, CommandRejection> {
         self.check_drain()?;
         let (id, effect) = self.model.restart(expected_state)?;
+        self.verified_applied = None;
+        self.admitted_apply = None;
         self.drive(Some(effect))?;
         Ok(id)
     }
@@ -229,6 +381,12 @@ where
             return Err(CommandRejection::ShuttingDown);
         }
         let (admission, effect) = self.model.reconnect(expected_state)?;
+        if matches!(admission, ReconnectAdmission::Started(_)) {
+            self.verified_applied = None;
+        }
+        if matches!(admission, ReconnectAdmission::Started(_)) {
+            self.admitted_apply = None;
+        }
         self.drive(effect)?;
         Ok(admission)
     }
@@ -267,6 +425,8 @@ where
         );
         if status == SubmitStatus::Accepted {
             self.model.pause_admitted(attempt, request);
+        } else {
+            self.model.cancel_prepared_pause(attempt, request);
         }
         Ok(status)
     }
@@ -277,6 +437,8 @@ where
     ) -> Result<ApplyId, CommandRejection> {
         self.check_playback()?;
         let (id, effect) = self.model.resume(expected_state, attempt)?;
+        self.verified_applied = None;
+        self.admitted_apply = None;
         self.drive(Some(effect))?;
         Ok(id)
     }
@@ -306,6 +468,9 @@ where
     }
     fn cancel_validation(&mut self) {
         self.prepared = None;
+        self.filter_apply = None;
+        self.verified_applied = None;
+        self.admitted_apply = None;
         self.pending_validation = None;
         self.deferred_ready = None;
         if let Some(request) = &self.validation {
@@ -593,12 +758,381 @@ where
             self.validator.retire_selection(token);
         }
     }
+    fn filter_failure(settings: DraftSettings, failure: FilterFailure) -> ApplyFailure {
+        ApplyFailure::new(
+            FailureCategory::Session,
+            Stage::Verification,
+            Cause::Generic,
+            settings,
+            "filter_verification",
+            format!("{:?}", failure.kind),
+        )
+        .with_filter(failure)
+    }
+    fn filter_unavailable(
+        key: FilterAttemptKey,
+        settings: DraftSettings,
+        detail: &str,
+    ) -> ApplyFailure {
+        let entries = settings
+            .filters
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, entry)| FilterEntryMetadata {
+                ordinal,
+                label: entry.label().to_owned(),
+                enabled: entry.enabled(),
+            })
+            .collect();
+        let mut failure = Self::filter_failure(
+            settings,
+            FilterFailure {
+                kind: FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::BackendUnavailable,
+                },
+                attributed_ordinal: None,
+                requires_fresh_owner: true,
+                diagnostics: FilterAttemptDiagnostics {
+                    key: Some(key),
+                    entries,
+                    records: Vec::new(),
+                    native_evidence_lost: false,
+                    truncated: false,
+                    dropped_context: 0,
+                },
+            },
+        );
+        failure.diagnostic = detail.to_owned();
+        failure
+    }
+    fn current_filter_key(&self, key: FilterAttemptKey) -> bool {
+        if !self.known_attempt(key.attempt) {
+            return false;
+        }
+        if let Some(transition) = self.model.filtering() {
+            return transition.key() == key
+                || self.model.confirmed_filter_key() == Some(key)
+                || (transition.route() == Some(FilterRestoreRoute::FreshOwner)
+                    && transition.key().apply == key.apply
+                    && key.pass == FilterPass::LiveCandidate);
+        }
+        if key.pass == FilterPass::Open
+            && self
+                .model
+                .opening()
+                .is_some_and(|(open, _)| open.apply == key.apply && open.attempt == key.attempt)
+        {
+            return true;
+        }
+        // Previous-owner proof is diagnostic-only once source loss is frozen.
+        // A fresh owner's exact Open key remains eligible above.
+        self.model.confirmed_filter_key() == Some(key)
+            && self.model.recovery().is_none()
+            && matches!(
+                self.model.phase(),
+                ProductPhase::Active
+                    | ProductPhase::Paused
+                    | ProductPhase::PausePending
+                    | ProductPhase::ErrorWithActiveRestored
+                    | ProductPhase::Validating
+                    | ProductPhase::ClosingOld
+                    | ProductPhase::ValidatingResume
+                    | ProductPhase::ClosingResume
+            )
+    }
+    fn event_filter_key(&self, event: &SessionEvent) -> Option<FilterAttemptKey> {
+        let key = match event {
+            SessionEvent::FilterResult {
+                key,
+                result: Err(failure),
+            }
+            | SessionEvent::FilterFault { key, failure }
+                if failure.diagnostics.key == Some(*key) =>
+            {
+                *key
+            }
+            SessionEvent::SessionFailed { failure, .. }
+            | SessionEvent::OpenFailed { failure, .. } => {
+                failure.filter.as_ref()?.diagnostics.key?
+            }
+            _ => return None,
+        };
+        self.current_filter_key(key).then_some(key)
+    }
+    fn handle_stream_ended(
+        &mut self,
+        attempt: AttemptId,
+        reason: i32,
+        error: i32,
+        treatment_terminal: bool,
+    ) {
+        let Some(lease) = self
+            .lease
+            .as_ref()
+            .filter(|lease| lease.key.attempt == attempt)
+        else {
+            return;
+        };
+        let failure = ApplyFailure::new(
+            FailureCategory::Session,
+            Stage::Unknown,
+            Cause::Generic,
+            lease.settings.clone(),
+            "stream_ended",
+            format!("capture stream ended: reason={reason}, error={error}"),
+        );
+        self.verified_applied = None;
+        let effect = if let Some(transition) = self.model.filtering().filter(|transition| {
+            treatment_terminal || transition.key().pass == FilterPass::LiveRestore
+        }) {
+            let failure = if transition.route() == Some(FilterRestoreRoute::FreshOwner) {
+                failure
+            } else {
+                Self::filter_unavailable(
+                    transition.key(),
+                    transition.prior().settings().clone(),
+                    &failure.diagnostic,
+                )
+            };
+            self.model.session_failed(attempt, failure)
+        } else if treatment_terminal {
+            // The exact keyed negative already failed an opening/restore or
+            // revoked this owner. Its EndFile is not a second source-recovery trigger.
+            None
+        } else {
+            self.model.video_lost(
+                attempt,
+                LossEvidence::StreamEnded { reason, error },
+                failure,
+            )
+        };
+        let _ = self.drive(effect);
+    }
+    fn handle_filter_failure(
+        &mut self,
+        key: FilterAttemptKey,
+        failure: FilterFailure,
+        fault: bool,
+    ) {
+        if failure.diagnostics.key != Some(key) || !self.known_attempt(key.attempt) {
+            return;
+        }
+        let transition = self.model.filtering();
+        let effect = if let Some(transition) = transition {
+            if key.attempt != transition.key().attempt {
+                return;
+            }
+            if !fault && transition.route() == Some(FilterRestoreRoute::FreshOwner) {
+                return;
+            }
+            let current = transition.key();
+            let matching = key == current
+                || (fault
+                    && key.apply == current.apply
+                    && key.pass == FilterPass::LiveCandidate
+                    && transition.route() == Some(FilterRestoreRoute::FreshOwner));
+            let incumbent_fault = fault && self.model.confirmed_filter_key() == Some(key);
+            if !matching && !incumbent_fault {
+                return;
+            }
+            if fault && transition.route() == Some(FilterRestoreRoute::FreshOwner) {
+                let settings =
+                    if key.pass == FilterPass::LiveCandidate && key.apply == current.apply {
+                        transition.candidate().clone()
+                    } else {
+                        transition.prior().settings().clone()
+                    };
+                self.model
+                    .filter_incumbent_failed(Self::filter_failure(settings, failure));
+                return;
+            }
+            let settings = if key.pass == FilterPass::LiveCandidate && !incumbent_fault {
+                transition.candidate().clone()
+            } else {
+                transition.prior().settings().clone()
+            };
+            let failure = Self::filter_failure(settings, failure);
+            if incumbent_fault {
+                let requested = if current.pass == FilterPass::LiveCandidate {
+                    self.model
+                        .filtering()
+                        .expect("current transition")
+                        .candidate()
+                        .clone()
+                } else {
+                    self.model
+                        .filtering()
+                        .expect("current transition")
+                        .prior()
+                        .settings()
+                        .clone()
+                };
+                self.model.filter_incumbent_failed(failure);
+                let failure =
+                    Self::filter_unavailable(current, requested, "incumbent filter health revoked");
+                self.model.filter_failed(current, failure, true)
+            } else {
+                self.model.filter_failed(key, failure, fault)
+            }
+        } else if self.model.confirmed_filter_key() == Some(key) {
+            self.verified_applied = None;
+            let settings = self
+                .model
+                .last_valid()
+                .expect("confirmed chain has applied state")
+                .settings()
+                .clone();
+            let effect = self
+                .model
+                .late_filter_failed(key, Self::filter_failure(settings, failure));
+            if effect.is_some() {
+                self.cancel_validation();
+            }
+            effect
+        } else if key.pass == FilterPass::Open
+            && self
+                .model
+                .opening()
+                .is_some_and(|(open, _)| open.apply == key.apply && open.attempt == key.attempt)
+        {
+            let (open, settings) = self.model.opening().expect("matched opening");
+            let failure = Self::filter_failure(settings.clone(), failure);
+            self.model.open_failed(open, failure)
+        } else {
+            return;
+        };
+        let _ = self.drive(effect);
+    }
+    fn commit_filter_confirmation(
+        &mut self,
+        key: FilterAttemptKey,
+        confirmation: FilterConfirmation,
+    ) {
+        if key != confirmation.key() {
+            return;
+        }
+        if self.lease.as_ref().is_none_or(|lease| {
+            lease.key.attempt != key.attempt
+                || lease.stopping
+                || lease.owner_stopped
+                || lease.blocked
+        }) {
+            return;
+        }
+        let revision = self
+            .model
+            .filtering()
+            .map(|transition| transition.revision());
+        if self.model.filter_confirmed(confirmation) {
+            if let (Some(lease), Some(active)) = (&mut self.lease, self.model.active()) {
+                lease.settings = active.applied().settings().clone();
+            }
+            self.filter_apply = None;
+            self.verified_applied = self.model.active().and_then(|active| {
+                (key.pass == FilterPass::LiveCandidate).then(|| VerifiedApplied::Filters {
+                    key,
+                    revision: revision.expect("confirmed frozen filter transition"),
+                    applied: active.applied().clone(),
+                })
+            });
+        }
+    }
     fn drive(&mut self, mut effect: Option<ModelEffect>) -> Result<(), CommandRejection> {
+        if self.defer_effects {
+            if let Some(ModelEffect::Stop { attempt, .. }) = &effect
+                && let Some(lease) = self
+                    .lease
+                    .as_mut()
+                    .filter(|lease| lease.key.attempt == *attempt)
+            {
+                // Cleanup is logically selected now; physical stop/retirement
+                // still waits behind the blocker fence and actual owner facts.
+                lease.stopping = true;
+            }
+            if effect.is_some() {
+                self.deferred_effect = effect;
+            }
+            return Ok(());
+        }
         self.retire_startup_restore_guard();
         // Each event has at most one next effect. Synchronous no-resource failure
         // can advance through the single rollback, never create an unbounded retry.
         while let Some(next) = effect.take() {
             match next {
+                ModelEffect::ApplyFilters { key } => {
+                    let usable = self.lease.as_ref().is_some_and(|lease| {
+                        lease.key.attempt == key.attempt
+                            && lease.verified
+                            && !lease.stopping
+                            && !lease.owner_stopped
+                            && !lease.blocked
+                    });
+                    let settings = self.model.filtering().map(|transition| {
+                        if key.pass == FilterPass::LiveCandidate {
+                            transition.candidate().clone()
+                        } else {
+                            transition.prior().settings().clone()
+                        }
+                    });
+                    let Some(settings) = settings else { continue };
+                    if !usable {
+                        let failure = Self::filter_unavailable(
+                            key,
+                            settings,
+                            "selected filter owner unavailable",
+                        );
+                        effect = self.model.filter_failed(key, failure, true);
+                        continue;
+                    }
+                    let prepared = self
+                        .filter_apply
+                        .as_mut()
+                        .filter(|slot| {
+                            slot.key.apply == key.apply && slot.key.attempt == key.attempt
+                        })
+                        .and_then(|slot| match key.pass {
+                            FilterPass::LiveCandidate => slot.candidate.take(),
+                            FilterPass::LiveRestore => slot.prior.take(),
+                            FilterPass::Open => None,
+                        });
+                    let Some(prepared) = prepared else {
+                        let failure = Self::filter_unavailable(
+                            key,
+                            settings,
+                            "matching prepared filter request unavailable",
+                        );
+                        effect = self.model.filter_submission_refused(key, failure);
+                        continue;
+                    };
+                    let status = self.runner.submit_filters(key, prepared);
+                    if status != SubmitStatus::Accepted {
+                        let mut failure = Self::filter_unavailable(
+                            key,
+                            settings,
+                            &format!("filter admission: {status:?}"),
+                        );
+                        if let Some(filter) = &mut failure.filter {
+                            filter.requires_fresh_owner = matches!(
+                                status,
+                                SubmitStatus::StaleGeneration
+                                    | SubmitStatus::NotReady
+                                    | SubmitStatus::Closing
+                            );
+                        }
+                        effect = if key.pass == FilterPass::LiveCandidate
+                            && matches!(
+                                status,
+                                SubmitStatus::StaleGeneration
+                                    | SubmitStatus::NotReady
+                                    | SubmitStatus::Closing
+                            ) {
+                            self.model.filter_failed(key, failure, true)
+                        } else {
+                            self.model.filter_submission_refused(key, failure)
+                        };
+                    }
+                }
                 ModelEffect::Validate(request) => {
                     if let Some(old) = &self.validation
                         && old != &request
@@ -627,11 +1161,13 @@ where
                         self.prepared = None;
                         continue;
                     }
-                    let prepared = self
-                        .prepared
-                        .take()
-                        .and_then(|(identity, prepared)| (identity == request).then_some(prepared));
-                    let Some(prepared) = prepared else {
+                    let prepared =
+                        self.prepared
+                            .take()
+                            .and_then(|(identity, prepared, filters)| {
+                                (identity == request).then_some((prepared, filters))
+                            });
+                    let Some((prepared, filters)) = prepared else {
                         let failure = Self::protocol_failure(
                             request.settings,
                             "begin_open",
@@ -666,6 +1202,7 @@ where
                     match self.runner.begin_open(
                         key,
                         prepared,
+                        filters,
                         self.gain,
                         request.playback,
                         self.output.clone(),
@@ -700,6 +1237,12 @@ where
                         self.model.cleanup_blocked(attempt, failure);
                         continue;
                     };
+                    // A batched destruction acknowledgement may precede effect
+                    // dispatch. Retain the native lease, but never command an
+                    // owner already retired while awaiting native release.
+                    if lease.owner_stopped {
+                        continue;
+                    }
                     lease.stopping = true;
                     let reason = match reason {
                         StopIntent::Replace => StopReason::Replace,
@@ -746,17 +1289,79 @@ where
     }
     fn handle_event(&mut self, event: SessionEvent) {
         match event {
+            SessionEvent::FilterResult {
+                key,
+                result: Err(failure),
+            } => {
+                self.handle_filter_failure(key, *failure, false);
+            }
+            SessionEvent::FilterFault { key, failure } => {
+                self.handle_filter_failure(key, *failure, true);
+            }
+            SessionEvent::FilterResult {
+                key,
+                result: Ok(confirmation),
+            } => {
+                self.commit_filter_confirmation(key, confirmation);
+            }
             SessionEvent::OpenVerified { key, receipt } => self.commit_receipt(key, *receipt),
-            SessionEvent::OpenFailed { key, failure } => {
+            SessionEvent::OpenFailed { key, mut failure } => {
                 if !self.known_key(key) {
+                    return;
+                }
+                if let Some(filter_key) = failure
+                    .filter
+                    .as_ref()
+                    .and_then(|filter| filter.diagnostics.key)
+                    && (self.current_filter_key(filter_key)
+                        || self.model.confirmed_filter_key() == Some(filter_key))
+                {
+                    let mut filter = failure.filter.take().expect("keyed filter failure");
+                    filter.requires_fresh_owner = true;
+                    self.handle_filter_failure(filter_key, *filter, false);
                     return;
                 }
                 let effect = self.model.open_failed(key, failure);
                 let _ = self.drive(effect);
             }
-            SessionEvent::SessionFailed { attempt, failure } => {
+            SessionEvent::SessionFailed {
+                attempt,
+                mut failure,
+            } => {
                 if !self.known_attempt(attempt) {
                     return;
+                }
+                self.verified_applied = None;
+                if let Some(filter_key) = failure
+                    .filter
+                    .as_ref()
+                    .and_then(|filter| filter.diagnostics.key)
+                    && (self.current_filter_key(filter_key)
+                        || self.model.confirmed_filter_key() == Some(filter_key))
+                {
+                    let mut filter = failure.filter.take().expect("keyed filter failure");
+                    filter.requires_fresh_owner = true;
+                    let fault = self.model.confirmed_filter_key() == Some(filter_key);
+                    self.handle_filter_failure(filter_key, *filter, fault);
+                    return;
+                }
+                if let Some(transition) = self
+                    .model
+                    .filtering()
+                    .filter(|transition| transition.route() != Some(FilterRestoreRoute::FreshOwner))
+                {
+                    let key = transition.key();
+                    let settings = if key.pass == FilterPass::LiveCandidate {
+                        transition.candidate().clone()
+                    } else {
+                        transition.prior().settings().clone()
+                    };
+                    if failure.filter.is_none() {
+                        let mut typed =
+                            Self::filter_unavailable(key, settings, &failure.diagnostic);
+                        typed.category = failure.category;
+                        failure = typed;
+                    }
                 }
                 let effect = self.model.session_failed(attempt, failure);
                 let _ = self.drive(effect);
@@ -766,27 +1371,7 @@ where
                 reason,
                 error,
             } => {
-                let Some(lease) = self
-                    .lease
-                    .as_ref()
-                    .filter(|lease| lease.key.attempt == attempt)
-                else {
-                    return;
-                };
-                let failure = ApplyFailure::new(
-                    FailureCategory::Session,
-                    Stage::Unknown,
-                    Cause::Generic,
-                    lease.settings.clone(),
-                    "stream_ended",
-                    format!("capture stream ended: reason={reason}, error={error}"),
-                );
-                let effect = self.model.video_lost(
-                    attempt,
-                    LossEvidence::StreamEnded { reason, error },
-                    failure,
-                );
-                let _ = self.drive(effect);
+                self.handle_stream_ended(attempt, reason, error, false);
             }
             SessionEvent::PauseObserved {
                 attempt,
@@ -807,13 +1392,14 @@ where
                 else {
                     return;
                 };
-                if self.model.active().map(|active| active.attempt()) == Some(attempt)
-                    || self
-                        .model
-                        .opening()
-                        .is_some_and(|(key, _)| key.attempt == attempt)
+                if !lease.stopping
+                    && (self.model.active().map(|active| active.attempt()) == Some(attempt)
+                        || self
+                            .model
+                            .opening()
+                            .is_some_and(|(key, _)| key.attempt == attempt))
                 {
-                    let failure = ApplyFailure::new(
+                    let mut failure = ApplyFailure::new(
                         FailureCategory::Lifecycle(LifecycleFailure::Acknowledgement),
                         Stage::Unknown,
                         Cause::Generic,
@@ -821,6 +1407,16 @@ where
                         "owner_stopped",
                         "owner stopped before product requested cleanup",
                     );
+                    self.verified_applied = None;
+                    if let Some(transition) = self.model.filtering() {
+                        let key = transition.key();
+                        let settings = if key.pass == FilterPass::LiveCandidate {
+                            transition.candidate().clone()
+                        } else {
+                            transition.prior().settings().clone()
+                        };
+                        failure = Self::filter_unavailable(key, settings, &failure.diagnostic);
+                    }
                     // Owner already retired. Revoke live product state, without
                     // submitting another command to the destroyed owner.
                     let _ = self.model.session_failed(attempt, failure);
@@ -991,11 +1587,21 @@ where
             *received = reason.clone();
         }
         let readiness_matches = self.model.opening_request().is_some_and(|request| {
-            matches!(
-                (request.playback, receipt.readiness),
-                (InitialPlayback::Live, OpenReadiness::Live)
-                    | (InitialPlayback::Paused, OpenReadiness::PausedPrepared)
-            )
+            match (request.playback, receipt.readiness) {
+                (InitialPlayback::Live, OpenReadiness::Live) => true,
+                (InitialPlayback::Paused, OpenReadiness::PausedPrepared) => {
+                    matches!(
+                        key.purpose,
+                        AttemptPurpose::Recovery
+                            | AttemptPurpose::Reconnect
+                            | AttemptPurpose::Restore
+                    ) && self
+                        .model
+                        .last_valid()
+                        .is_some_and(|prior| prior.settings() == settings)
+                }
+                _ => false,
+            }
         });
         let audio_matches = match &receipt.audio {
             AudioOutcome::Active { route } => self.lease.as_ref().is_some_and(|lease| {
@@ -1026,6 +1632,7 @@ where
                 .observation()
                 .is_some_and(|observation| observation.audio == SourcePresence::Present));
         if !receipt.matches(settings)
+            || !receipt.matches_filters(key)
             || !readiness_matches
             || !audio_matches
             || !startup_audio_matches
@@ -1034,7 +1641,7 @@ where
                 settings.clone(),
                 "open_receipt",
                 if startup_audio_matches {
-                    "receipt settings or requested audio outcome mismatch"
+                    "receipt settings, filter proof or requested audio outcome mismatch"
                 } else {
                     "startup restore requires active requested audio"
                 },
@@ -1089,39 +1696,169 @@ where
             }
             return;
         }
-        if let Some(active) = self
-            .model
-            .active()
-            .filter(|active| active.attempt() == key.attempt)
-        {
-            self.verified_open = Some(VerifiedOpen {
+        if let Some(active) = self.model.active().filter(|active| {
+            active.attempt() == key.attempt
+                && key.purpose == AttemptPurpose::Candidate
+                && receipt.readiness == OpenReadiness::Live
+                && self.admitted_apply == Some(key.apply)
+        }) {
+            self.verified_applied = Some(VerifiedApplied::Open {
                 key,
                 applied: active.applied().clone(),
             });
         }
     }
     pub fn poll(&mut self) {
+        self.defer_effects = true;
         // Subscribe/observe health first; positive removals invalidate even a
         // coalesced Present before any cached media readiness can be committed.
         self.poll_observation();
         let mut ready = self.deferred_ready.take();
-        // One bounded batch. Terminal resource/health events beat readiness even
-        // if a faulty adapter presents a cached Ready before its acknowledgement.
-        for _ in 0..16 {
-            let Some(event) = self.runner.poll() else {
+        // Stack-bounded drain: source cancellation first, settled rejection
+        // plus independent health facts next, barriers then positive commits.
+        let mut events: [Option<SessionEvent>; 16] = std::array::from_fn(|_| None);
+        for slot in &mut events {
+            *slot = self.runner.poll();
+            if slot.is_none() {
                 break;
-            };
+            }
+        }
+        for slot in &mut events {
+            if !matches!(
+                slot,
+                Some(
+                    SessionEvent::FilterResult { .. }
+                        | SessionEvent::FilterFault { .. }
+                        | SessionEvent::OpenVerified { .. }
+                        | SessionEvent::NativeReleased { .. }
+                        | SessionEvent::OpenFailed { .. }
+                        | SessionEvent::StreamEnded { .. }
+                        | SessionEvent::CleanupBlocked { .. }
+                        | SessionEvent::SessionFailed { .. }
+                        | SessionEvent::OwnerStopped { .. }
+                )
+            ) && let Some(event) = slot.take()
+            {
+                self.handle_event(event);
+            }
+        }
+        self.poll_observation();
+        let treatment_terminal = events
+            .iter()
+            .flatten()
+            .find_map(|event| self.event_filter_key(event))
+            .map(|key| key.attempt)
+            .or_else(|| {
+                self.model
+                    .filtering()
+                    .filter(|transition| transition.route() == Some(FilterRestoreRoute::FreshOwner))
+                    .map(|transition| transition.key().attempt)
+            });
+        for index in 0..events.len() {
+            if let Some(SessionEvent::FilterResult {
+                key,
+                result: Err(mut failure),
+            }) = events[index]
+                .take_if(|event| matches!(event, SessionEvent::FilterResult { result: Err(_), .. }))
+            {
+                let fault = events.iter().any(|event| matches!(event,
+                    Some(SessionEvent::FilterFault { key: fault_key, failure })
+                        if fault_key.attempt == key.attempt && failure.diagnostics.key == Some(*fault_key)
+                            && (*fault_key == key || self.model.confirmed_filter_key() == Some(*fault_key))
+                ));
+                let terminal = events.iter().any(|event| matches!(event,
+                    Some(SessionEvent::SessionFailed { attempt, .. } | SessionEvent::OwnerStopped { attempt, .. }
+                        | SessionEvent::StreamEnded { attempt, .. })
+                        if *attempt == key.attempt
+                ));
+                if fault || terminal {
+                    failure.requires_fresh_owner = true;
+                }
+                if events.iter().any(|event| {
+                    matches!(event,
+                        Some(SessionEvent::OwnerStopped { attempt, .. }) if *attempt == key.attempt
+                    )
+                }) && let Some(lease) = self.lease.as_ref().filter(|lease| !lease.stopping)
+                {
+                    self.model.filter_incumbent_failed(ApplyFailure::new(
+                        FailureCategory::Lifecycle(LifecycleFailure::Acknowledgement),
+                        Stage::Unknown,
+                        Cause::Generic,
+                        lease.settings.clone(),
+                        "owner_stopped",
+                        "owner retired during filter settlement",
+                    ));
+                }
+                self.handle_filter_failure(key, *failure, false);
+            }
+        }
+        for slot in &mut events {
+            if matches!(slot, Some(SessionEvent::FilterFault { .. }))
+                && let Some(event) = slot.take()
+            {
+                self.handle_event(event);
+            }
+        }
+        for slot in &mut events {
+            if matches!(
+                slot,
+                Some(
+                    SessionEvent::OpenFailed { .. }
+                        | SessionEvent::SessionFailed { .. }
+                        | SessionEvent::OwnerStopped { .. }
+                )
+            ) && let Some(event) = slot.take()
+            {
+                self.handle_event(event);
+            }
+        }
+        for slot in &mut events {
+            if let Some(SessionEvent::StreamEnded {
+                attempt,
+                reason,
+                error,
+            }) = slot.take_if(|event| matches!(event, SessionEvent::StreamEnded { .. }))
+            {
+                self.handle_stream_ended(
+                    attempt,
+                    reason,
+                    error,
+                    treatment_terminal == Some(attempt),
+                );
+            }
+        }
+        for slot in &mut events {
+            if matches!(slot, Some(SessionEvent::CleanupBlocked { .. }))
+                && let Some(event) = slot.take()
+            {
+                self.handle_event(event);
+            }
+        }
+        self.defer_effects = false;
+        let effect = self.deferred_effect.take();
+        let _ = self.drive(effect);
+        for slot in &mut events {
+            if matches!(slot, Some(SessionEvent::NativeReleased { .. }))
+                && let Some(event) = slot.take()
+            {
+                self.handle_event(event);
+            }
+        }
+        self.reconcile_audio();
+        for event in events.into_iter().flatten() {
             match event {
                 SessionEvent::OpenVerified { key, receipt } if self.known_key(key) => {
-                    if self.model.opening().map(|(current, _)| current) == Some(key) {
+                    if self
+                        .model
+                        .opening()
+                        .is_some_and(|(current, _)| current == key)
+                    {
                         ready = Some((key, *receipt));
                     }
                 }
                 other => self.handle_event(other),
             }
         }
-        self.poll_observation();
-        self.reconcile_audio();
         if let Some((key, receipt)) = ready {
             self.commit_receipt(key, receipt);
         }
@@ -1178,14 +1915,24 @@ where
                             } else if let Some(accepted) =
                                 self.model.accept_prepared(&request, settings, stamp)
                             {
-                                self.prepared = Some((accepted.clone(), prepared));
-                                let effect = self.model.validation_succeeded(&accepted);
-                                let _ = self.drive(effect);
+                                match self.runner.prepare_filters(&accepted.settings) {
+                                    Ok(filters) => {
+                                        self.prepared = Some((accepted.clone(), prepared, filters));
+                                        let effect = self.model.validation_succeeded(&accepted);
+                                        let _ = self.drive(effect);
+                                    }
+                                    Err(failure) => {
+                                        if let Some(token) = accepted.choice {
+                                            self.validator.retire_selection(token);
+                                        }
+                                        self.model.validation_failed(accepted, failure);
+                                    }
+                                }
                             } else {
                                 let failure = Self::protocol_failure(
                                     request.settings.clone(),
                                     "validation_result",
-                                    "prepared settings do not preserve the requested tuple and audio",
+                                    "prepared settings do not preserve the requested tuple, audio and filters",
                                 );
                                 if let Some(token) = request.choice {
                                     self.validator.retire_selection(token);
@@ -1225,6 +1972,26 @@ where
     }
     fn finish_drain(&mut self) {
         self.retire_startup_restore_guard();
+        if self
+            .model
+            .filtering()
+            .is_none_or(|transition| transition.route() == Some(FilterRestoreRoute::FreshOwner))
+        {
+            self.filter_apply = None;
+        }
+        if self
+            .verified_applied
+            .as_ref()
+            .is_some_and(|event| !self.positive_is_valid(event))
+        {
+            self.verified_applied = None;
+        }
+        if self
+            .admitted_apply
+            .is_some_and(|apply| !self.has_user_apply_result_or_pending(apply))
+        {
+            self.admitted_apply = None;
+        }
         let retired = self.validator_shutdown && self.validator.shutdown_complete();
         self.model.drain_complete(
             self.validation.is_none() && self.pending_validation.is_none(),
@@ -1308,6 +2075,7 @@ mod tests {
     }
     fn settings(rate: u32) -> DraftSettings {
         DraftSettings {
+            filters: crate::domain::filters::FilterChain::default(),
             video: crate::domain::capture::ModeRequest {
                 identity: DeviceIdentity::new(
                     0x32ed,
@@ -1343,7 +2111,7 @@ mod tests {
             diagnostic,
         )
     }
-    fn receipt(settings: DraftSettings) -> OpenReceipt {
+    fn receipt(settings: DraftSettings, key: AttemptKey) -> OpenReceipt {
         OpenReceipt {
             settings,
             verification: VerificationSummary {
@@ -1353,6 +2121,19 @@ mod tests {
             },
             audio: AudioOutcome::Disabled,
             readiness: OpenReadiness::Live,
+            filters: crate::app::ports::FilterOpenReceipt::Confirmed(
+                crate::domain::state::FilterConfirmation::checked(
+                    crate::domain::state::FilterAttemptKey {
+                        apply: key.apply,
+                        attempt: key.attempt,
+                        pass: crate::domain::state::FilterPass::Open,
+                    },
+                    0.0,
+                    2.0,
+                    32,
+                )
+                .unwrap(),
+            ),
         }
     }
     #[derive(Clone)]
@@ -1502,15 +2283,24 @@ mod tests {
         stop_failure: Option<StopSubmission>,
         playback: Vec<InitialPlayback>,
         outputs: Vec<OutputPlan>,
+        filter_intents: Vec<(
+            crate::domain::state::FilterAttemptKey,
+            crate::domain::filters::FilterChain,
+        )>,
+        filter_prepare_failure: Option<ApplyFailure>,
+        filter_preparations: Vec<DraftSettings>,
     }
     impl Runner {
         fn verified(&mut self) {
             let (key, settings, _) = self.opens.last().unwrap();
-            let mut receipt = receipt(settings.clone());
+            let mut receipt = receipt(settings.clone(), *key);
             receipt.readiness = match self.playback.last().unwrap() {
                 InitialPlayback::Live => OpenReadiness::Live,
                 InitialPlayback::Paused => OpenReadiness::PausedPrepared,
             };
+            if receipt.readiness == OpenReadiness::PausedPrepared {
+                receipt.filters = crate::app::ports::FilterOpenReceipt::PreparedPaused;
+            }
             self.events.push_back(SessionEvent::OpenVerified {
                 key: *key,
                 receipt: Box::new(receipt),
@@ -1534,14 +2324,27 @@ mod tests {
     }
     impl SessionRunner for Runner {
         type Prepared = TestPrepared;
+        type PreparedFilters = crate::domain::filters::FilterChain;
+        fn prepare_filters(
+            &mut self,
+            settings: &DraftSettings,
+        ) -> Result<Self::PreparedFilters, ApplyFailure> {
+            self.filter_preparations.push(settings.clone());
+            if let Some(failure) = self.filter_prepare_failure.take() {
+                return Err(failure);
+            }
+            Ok(settings.filters.clone())
+        }
         fn begin_open(
             &mut self,
             key: AttemptKey,
             prepared: TestPrepared,
+            filters: Self::PreparedFilters,
             gain: PlaybackGain,
             playback: InitialPlayback,
             output: OutputPlan,
         ) -> Result<(), StartFailure> {
+            assert_eq!(filters, prepared.settings.filters);
             self.opens.push((key, prepared.settings, gain));
             self.playback.push(playback);
             self.outputs.push(output);
@@ -1562,7 +2365,2223 @@ mod tests {
             self.intents.push((attempt, intent));
             self.immediate.take().unwrap_or(SubmitStatus::Accepted)
         }
+        fn submit_filters(
+            &mut self,
+            key: crate::domain::state::FilterAttemptKey,
+            filters: Self::PreparedFilters,
+        ) -> SubmitStatus {
+            self.filter_intents.push((key, filters));
+            self.immediate.take().unwrap_or(SubmitStatus::Accepted)
+        }
     }
+    fn filter_settings(label: &str) -> DraftSettings {
+        use crate::domain::filters::{
+            ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
+        };
+        let mut settings = settings(60);
+        settings.filters = FilterChain::new(vec![FilterEntry::new(
+            label.into(),
+            Filter::Format(FormatParams::new(
+                SdrMatrix::Auto,
+                ColorLevels::Auto,
+                SdrGamma::Auto,
+            )),
+            true,
+        )])
+        .unwrap();
+        settings
+    }
+    fn complete_treatments(label: &str) -> DraftSettings {
+        use crate::domain::filters::{FilterChain, FilterEntry};
+        let mut settings = filter_settings(label);
+        let enabled = settings.filters.entries()[0].clone();
+        settings.filters = FilterChain::new(vec![
+            enabled.clone(),
+            FilterEntry::new(
+                format!("{label} disabled\ninert"),
+                enabled.filter().clone(),
+                false,
+            ),
+            FilterEntry::new(
+                format!("{label} retained third"),
+                enabled.filter().clone(),
+                true,
+            ),
+        ])
+        .unwrap();
+        settings
+    }
+    #[test]
+    fn complete_treatments_survive_each_source_lifecycle_with_only_user_apply_receipts() {
+        for route in 0..5 {
+            for paused in [false, true] {
+                let mut engine = engine();
+                let prior = complete_treatments("verified prior");
+                engine
+                    .edit_draft(engine.model().draft().revision, prior.clone())
+                    .unwrap();
+                let old = initial(&mut engine);
+                let VerifiedApplied::Open { applied, .. } = engine.take_verified_applied().unwrap()
+                else {
+                    panic!("initial full LIVE proof")
+                };
+                assert_eq!(applied.settings(), &prior);
+                if paused || route == 0 {
+                    confirm_pause(&mut engine, old);
+                    assert!(
+                        engine.runner.filter_intents.is_empty(),
+                        "ordinary pause sends no filter command"
+                    );
+                    assert_eq!(engine.runner.filter_preparations.len(), 1);
+                }
+                let mut newer = complete_treatments("newer draft");
+                newer.video.mode = settings(30).video.mode;
+                engine
+                    .edit_draft(engine.model().draft().revision, newer.clone())
+                    .unwrap();
+                let target = if route == 2 {
+                    newer.clone()
+                } else {
+                    prior.clone()
+                };
+                match route {
+                    0 => {
+                        engine.resume(engine.model().state_identity(), old).unwrap();
+                    }
+                    1 => {
+                        engine.restart(engine.model().state_identity()).unwrap();
+                    }
+                    2 => {
+                        assert!(matches!(
+                            engine
+                                .apply(
+                                    engine.model().state_identity(),
+                                    engine.model().draft().revision
+                                )
+                                .unwrap(),
+                            ApplyAdmission::Open { .. }
+                        ));
+                    }
+                    3 => {
+                        engine.close(engine.model().state_identity()).unwrap();
+                        engine.runner.barrier(old);
+                        engine.poll();
+                        assert!(matches!(
+                            engine.reconnect(engine.model().state_identity()).unwrap(),
+                            ReconnectAdmission::Started(_)
+                        ));
+                    }
+                    4 => {
+                        let returned = observation(
+                            &engine,
+                            2,
+                            crate::domain::capture::VideoPresence::Present,
+                            SourcePresence::Disabled,
+                            Some(2),
+                        );
+                        observe(&mut engine, returned);
+                        assert_eq!(
+                            engine.model().recovery().unwrap().applied.settings(),
+                            &prior
+                        );
+                        engine.runner.barrier(old);
+                        engine.poll();
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(engine.validator.requests.last().unwrap().settings, target);
+                validate(&mut engine);
+                if route < 3 {
+                    assert_eq!(
+                        engine.runner.opens.len(),
+                        1,
+                        "preparation precedes incumbent retirement"
+                    );
+                    assert_eq!(engine.runner.filter_preparations.last(), Some(&target));
+                    engine.runner.barrier(old);
+                    engine.poll();
+                }
+                let (key, opened, _) = engine.runner.opens.last().unwrap().clone();
+                assert_ne!(key.attempt, old);
+                assert_eq!(opened, target);
+                assert_eq!(engine.runner.filter_preparations.last(), Some(&target));
+                let prepared_paused = paused && route >= 3;
+                assert_eq!(
+                    *engine.runner.playback.last().unwrap(),
+                    if prepared_paused {
+                        InitialPlayback::Paused
+                    } else {
+                        InitialPlayback::Live
+                    }
+                );
+                assert!(
+                    engine.model().active().is_none(),
+                    "partial source readiness is not success"
+                );
+                assert!(engine.take_verified_applied().is_none());
+                engine.runner.verified();
+                engine.poll();
+                assert_eq!(
+                    engine.model().active().unwrap().applied().settings(),
+                    &target
+                );
+                assert_eq!(
+                    engine.model().active().unwrap().playback(),
+                    if prepared_paused {
+                        PlaybackState::Paused
+                    } else {
+                        PlaybackState::Live
+                    }
+                );
+                assert_eq!(engine.model().draft().settings, newer);
+                assert_eq!(engine.runner.opens.len(), 2);
+                if route == 2 {
+                    assert!(engine.has_user_apply_result_or_pending(key.apply));
+                    assert!(
+                        matches!(engine.take_verified_applied(), Some(VerifiedApplied::Open { key: received, applied })
+                        if received == key && applied.settings() == &target)
+                    );
+                } else {
+                    assert!(!engine.has_user_apply_result_or_pending(key.apply));
+                    assert!(
+                        engine.take_verified_applied().is_none(),
+                        "lifecycle opens never authorize a user save"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn startup_source_or_catalog_unavailability_preserves_complete_editable_treatments() {
+        for catalog in [false, true] {
+            let mut engine = engine();
+            let submitted = complete_treatments("startup saved");
+            engine
+                .edit_draft(engine.model().draft().revision, submitted.clone())
+                .unwrap();
+            let apply = apply(&mut engine);
+            engine.require_startup_restore_audio(apply).unwrap();
+            let refusal = failure(
+                submitted.clone(),
+                FailureCategory::Validation(if catalog {
+                    ValidationLayer::Filters
+                } else {
+                    ValidationLayer::Discovery
+                }),
+                if catalog {
+                    "qualified filter catalog unavailable"
+                } else {
+                    "saved capture source unavailable"
+                },
+            );
+            if catalog {
+                engine.runner.filter_prepare_failure = Some(refusal.clone());
+                validate(&mut engine);
+            } else {
+                engine.validator.finish(Err(refusal.clone()));
+                engine.poll();
+            }
+            assert_eq!(engine.model().draft().settings, submitted);
+            assert_eq!(
+                engine.model().validation_rejection().unwrap().failure,
+                refusal
+            );
+            assert!(engine.model().active().is_none());
+            assert!(engine.model().last_valid().is_none());
+            assert!(engine.runner.opens.is_empty());
+            assert!(engine.runner.stops.is_empty());
+            assert!(engine.take_verified_applied().is_none());
+            assert!(!engine.has_user_apply_result_or_pending(apply));
+        }
+    }
+    fn admit_filters(engine: &mut Engine, candidate: DraftSettings) -> FilterAttemptKey {
+        let revision = engine
+            .edit_draft(engine.model().draft().revision, candidate)
+            .unwrap();
+        let ApplyAdmission::Filters {
+            key,
+            revision: frozen,
+        } = engine
+            .apply(engine.model().state_identity(), revision)
+            .unwrap()
+        else {
+            panic!("live filter admission")
+        };
+        assert_eq!(frozen, revision);
+        key
+    }
+    fn filter_error(
+        key: FilterAttemptKey,
+        kind: FilterErrorKind,
+        fresh: bool,
+    ) -> Box<FilterFailure> {
+        let native_evidence_lost = matches!(
+            kind,
+            FilterErrorKind::Unconfirmed {
+                reason: FilterConfirmationFailure::EvidenceLost
+            }
+        );
+        Box::new(FilterFailure {
+            kind,
+            requires_fresh_owner: fresh,
+            attributed_ordinal: None,
+            diagnostics: FilterAttemptDiagnostics {
+                key: Some(key),
+                entries: Vec::new(),
+                records: Vec::new(),
+                native_evidence_lost,
+                truncated: false,
+                dropped_context: 0,
+            },
+        })
+    }
+    fn filter_success(engine: &mut Engine, key: FilterAttemptKey) {
+        engine.runner.events.push_back(SessionEvent::FilterResult {
+            key,
+            result: Ok(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()),
+        });
+    }
+    fn filter_failed(
+        engine: &mut Engine,
+        key: FilterAttemptKey,
+        kind: FilterErrorKind,
+        fresh: bool,
+    ) {
+        engine.runner.events.push_back(SessionEvent::FilterResult {
+            key,
+            result: Err(filter_error(key, kind, fresh)),
+        });
+    }
+    fn deadline() -> FilterErrorKind {
+        FilterErrorKind::Unconfirmed {
+            reason: FilterConfirmationFailure::Deadline,
+        }
+    }
+    #[test]
+    fn correlated_stream_terminal_keeps_exact_candidate_cause_and_frozen_settings_in_both_orders() {
+        for ended_first in [false, true] {
+            for typed_session in [false, true] {
+                let mut engine = engine();
+                let old = initial(&mut engine);
+                let candidate = filter_settings("frozen failing candidate");
+                let key = admit_filters(&mut engine, candidate.clone());
+                if ended_first {
+                    engine.runner.events.push_back(SessionEvent::StreamEnded {
+                        attempt: old,
+                        reason: 4,
+                        error: -1,
+                    });
+                }
+                if typed_session {
+                    // Gate's original Open snapshot is intentionally different.
+                    let terminal = Engine::filter_failure(
+                        settings(60),
+                        *filter_error(key, FilterErrorKind::RuntimeGraph, true),
+                    );
+                    engine.runner.events.push_back(SessionEvent::SessionFailed {
+                        attempt: old,
+                        failure: terminal,
+                    });
+                } else {
+                    filter_failed(&mut engine, key, FilterErrorKind::RuntimeGraph, true);
+                }
+                if !ended_first {
+                    engine.runner.events.push_back(SessionEvent::StreamEnded {
+                        attempt: old,
+                        reason: 4,
+                        error: -1,
+                    });
+                }
+                engine.poll();
+                assert_eq!(
+                    engine.model().filtering().unwrap().route(),
+                    Some(FilterRestoreRoute::FreshOwner)
+                );
+                assert!(engine.model().recovery().is_none());
+                let cause = engine
+                    .model()
+                    .failures()
+                    .unwrap()
+                    .candidate
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(cause.requested.as_ref(), &candidate);
+                assert_eq!(cause.filter.as_ref().unwrap().diagnostics.key, Some(key));
+                assert_eq!(
+                    cause.filter.as_ref().unwrap().kind,
+                    FilterErrorKind::RuntimeGraph
+                );
+                engine.runner.barrier(old);
+                engine.poll();
+                assert_eq!(
+                    engine.model().validation_request().unwrap().key.purpose,
+                    AttemptPurpose::Restore
+                );
+                validate(&mut engine);
+                engine.runner.verified();
+                engine.poll();
+                assert_eq!(
+                    engine.model().phase(),
+                    ProductPhase::ErrorWithActiveRestored
+                );
+                assert_eq!(engine.runner.opens.len(), 2);
+                assert!(engine.take_verified_applied().is_none());
+            }
+        }
+    }
+    #[test]
+    fn post_transfer_removal_recovers_frozen_prior_after_stale_validation_or_open_and_real_barriers()
+     {
+        for opening in [false, true] {
+            for coalesced_return in [false, true] {
+                for paused in [false, true] {
+                    let mut engine = engine();
+                    let prior = filter_settings("complete prior");
+                    engine
+                        .edit_draft(engine.model().draft().revision, prior.clone())
+                        .unwrap();
+                    let old = initial(&mut engine);
+                    engine.take_verified_applied();
+                    let apply = if paused {
+                        confirm_pause(&mut engine, old);
+                        let key = engine.model().confirmed_filter_key().unwrap();
+                        engine.runner.events.push_back(SessionEvent::FilterFault {
+                            key,
+                            failure: filter_error(key, FilterErrorKind::RuntimeGraph, true),
+                        });
+                        engine.poll();
+                        engine.model().state_identity().operation().unwrap()
+                    } else {
+                        let key = admit_filters(&mut engine, filter_settings("failed candidate"));
+                        filter_failed(&mut engine, key, FilterErrorKind::RuntimeGraph, true);
+                        engine.poll();
+                        key.apply
+                    };
+                    let candidate_cause = engine
+                        .model()
+                        .failures()
+                        .unwrap()
+                        .candidate
+                        .clone()
+                        .unwrap();
+                    engine.runner.barrier(old);
+                    engine.poll();
+                    assert_eq!(engine.model().phase(), ProductPhase::ValidatingPrior);
+                    let restore_request = engine.model().validation_request().unwrap().clone();
+                    let expected_playback = if paused {
+                        InitialPlayback::Paused
+                    } else {
+                        InitialPlayback::Live
+                    };
+                    assert_eq!(restore_request.playback, expected_playback);
+                    let mut restore_owner = None;
+                    if opening {
+                        validate(&mut engine);
+                        restore_owner = Some(engine.model().opening().unwrap().0.attempt);
+                        engine.runner.verified(); // Cached readiness must lose to removal.
+                    }
+                    let newer = filter_settings("newer editable draft");
+                    engine
+                        .edit_draft(engine.model().draft().revision, newer.clone())
+                        .unwrap();
+                    let removal = observation(
+                        &engine,
+                        2,
+                        if coalesced_return {
+                            crate::domain::capture::VideoPresence::Present
+                        } else {
+                            crate::domain::capture::VideoPresence::Absent
+                        },
+                        SourcePresence::Disabled,
+                        Some(2),
+                    );
+                    observe(&mut engine, removal);
+                    assert_eq!(
+                        engine.model().recovery().unwrap().applied.settings(),
+                        &prior
+                    );
+                    assert_eq!(
+                        engine.model().recovery().unwrap().playback,
+                        expected_playback
+                    );
+                    assert_eq!(
+                        engine.model().failures().unwrap().candidate.as_ref(),
+                        Some(&candidate_cause)
+                    );
+                    assert!(engine.model().active().is_none());
+                    assert!(!engine.has_user_apply_result_or_pending(apply));
+                    assert!(engine.take_verified_applied().is_none());
+                    if !opening {
+                        engine.validator.finish(Ok(())); // Real accepted stale Restore result drains.
+                        engine.poll();
+                        assert_eq!(engine.runner.opens.len(), 1);
+                    }
+                    if !coalesced_return {
+                        let returned = observation(
+                            &engine,
+                            3,
+                            crate::domain::capture::VideoPresence::Present,
+                            SourcePresence::Disabled,
+                            Some(2),
+                        );
+                        observe(&mut engine, returned);
+                    }
+                    if let Some(attempt) = restore_owner {
+                        assert_eq!(engine.model().cleanup(), &CleanupStatus::Draining);
+                        assert!(engine.model().validation_request().is_none());
+                        engine
+                            .runner
+                            .events
+                            .push_back(SessionEvent::NativeReleased { attempt });
+                        engine.poll();
+                        assert!(
+                            engine.model().validation_request().is_none(),
+                            "release before owner destruction is not recovery authorization"
+                        );
+                        engine.runner.barrier(attempt);
+                        engine.poll();
+                    }
+                    let recovery = engine.model().validation_request().unwrap();
+                    assert_eq!(recovery.key.purpose, AttemptPurpose::Recovery);
+                    assert_eq!(recovery.settings, prior);
+                    assert_eq!(recovery.playback, expected_playback);
+                    validate(&mut engine);
+                    engine.runner.verified();
+                    engine.poll();
+                    assert_eq!(
+                        engine.model().active().unwrap().applied().settings(),
+                        &prior
+                    );
+                    assert_eq!(
+                        engine.model().active().unwrap().playback(),
+                        if paused {
+                            PlaybackState::Paused
+                        } else {
+                            PlaybackState::Live
+                        }
+                    );
+                    assert_eq!(engine.model().draft().settings, newer);
+                    assert_eq!(
+                        engine.model().failures().unwrap().candidate.as_ref(),
+                        Some(&candidate_cause)
+                    );
+                    assert_eq!(
+                        engine
+                            .validator
+                            .requests
+                            .iter()
+                            .filter(|request| request.key.purpose == AttemptPurpose::Restore)
+                            .count(),
+                        1
+                    );
+                    assert_eq!(engine.runner.opens.len(), if opening { 3 } else { 2 });
+                    assert!(!engine.has_user_apply_result_or_pending(apply));
+                }
+            }
+        }
+    }
+    #[test]
+    fn late_confirmed_fault_supersedes_source_restart_and_resume_validation_or_closing_in_both_drain_orders()
+     {
+        for operation in 0..3 {
+            for closing in [false, true] {
+                for barrier_first in [false, true] {
+                    for restore_fails in [false, true] {
+                        let mut engine = engine();
+                        let prior = filter_settings("then verified prior");
+                        engine
+                            .edit_draft(engine.model().draft().revision, prior.clone())
+                            .unwrap();
+                        let old = initial(&mut engine);
+                        engine.take_verified_applied();
+                        if operation == 2 {
+                            confirm_pause(&mut engine, old);
+                        }
+                        let confirmed = engine.model().confirmed_filter_key().unwrap();
+                        let superseded = match operation {
+                            0 => {
+                                let mut changed = settings(30);
+                                changed.filters =
+                                    filter_settings("superseded source filters").filters;
+                                engine
+                                    .edit_draft(engine.model().draft().revision, changed)
+                                    .unwrap();
+                                engine
+                                    .apply(
+                                        engine.model().state_identity(),
+                                        engine.model().draft().revision,
+                                    )
+                                    .unwrap()
+                                    .id()
+                            }
+                            1 => engine.restart(engine.model().state_identity()).unwrap(),
+                            2 => engine.resume(engine.model().state_identity(), old).unwrap(),
+                            _ => unreachable!(),
+                        };
+                        let request = engine.model().validation_request().unwrap().clone();
+                        if closing {
+                            validate(&mut engine);
+                        }
+                        let newer = filter_settings("newer unsaved");
+                        engine
+                            .edit_draft(engine.model().draft().revision, newer.clone())
+                            .unwrap();
+                        engine.runner.events.push_back(SessionEvent::FilterFault {
+                            key: confirmed,
+                            failure: filter_error(confirmed, FilterErrorKind::RuntimeGraph, true),
+                        });
+                        engine.poll();
+                        assert_eq!(engine.model().phase(), ProductPhase::RestoringFilters);
+                        assert_eq!(
+                            engine.model().filtering().unwrap().route(),
+                            Some(FilterRestoreRoute::FreshOwner)
+                        );
+                        assert_eq!(
+                            engine.model().filtering().unwrap().prior().settings(),
+                            &prior
+                        );
+                        assert!(engine.prepared.is_none() && engine.pending_validation.is_none());
+                        assert!(!engine.has_user_apply_result_or_pending(superseded));
+                        if !closing {
+                            assert!(engine.validator.cancelled);
+                        }
+                        let cause = engine
+                            .model()
+                            .failures()
+                            .unwrap()
+                            .candidate
+                            .clone()
+                            .unwrap();
+                        assert_eq!(cause.requested.as_ref(), &prior);
+                        assert_eq!(
+                            cause.filter.as_ref().unwrap().diagnostics.key,
+                            Some(confirmed)
+                        );
+                        if barrier_first {
+                            engine.runner.barrier(old);
+                            engine.poll();
+                        }
+                        if !closing {
+                            engine.validator.finish(Ok(()));
+                        } else {
+                            // An old completed result cannot replace the new Restore preparation.
+                            engine.validator.result = Some(ValidationResult {
+                                stamp: request.watch,
+                                result: ValidationOutcome::Prepared(TestPrepared {
+                                    settings: request.settings.clone(),
+                                    stamp: request.watch,
+                                }),
+                                request: request.clone(),
+                            });
+                        }
+                        engine.poll();
+                        assert_eq!(
+                            engine.runner.opens.len(),
+                            1,
+                            "superseded source candidate must never open"
+                        );
+                        if !barrier_first {
+                            engine.runner.barrier(old);
+                            engine.poll();
+                        }
+                        let restore = engine.model().validation_request().unwrap();
+                        assert_eq!(restore.key.purpose, AttemptPurpose::Restore);
+                        assert_eq!(restore.settings, prior);
+                        assert_eq!(
+                            restore.playback,
+                            if operation == 2 {
+                                InitialPlayback::Paused
+                            } else {
+                                InitialPlayback::Live
+                            }
+                        );
+                        validate(&mut engine);
+                        let fresh = engine.model().opening().unwrap().0;
+                        if restore_fails {
+                            engine.runner.fail("single fresh restore failed");
+                            engine.poll();
+                            engine.runner.barrier(fresh.attempt);
+                            engine.poll();
+                            assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+                            assert!(engine.model().failures().unwrap().restore.is_some());
+                            assert!(engine.model().validation_request().is_none());
+                        } else {
+                            engine.runner.verified();
+                            engine.poll();
+                            assert_eq!(
+                                engine.model().phase(),
+                                ProductPhase::ErrorWithActiveRestored
+                            );
+                            assert_eq!(
+                                engine.model().active().unwrap().applied().settings(),
+                                &prior
+                            );
+                        }
+                        assert_eq!(engine.model().draft().settings, newer);
+                        assert_eq!(
+                            engine.model().failures().unwrap().candidate.as_ref(),
+                            Some(&cause)
+                        );
+                        assert_eq!(engine.runner.opens.len(), 2);
+                        assert_eq!(
+                            engine
+                                .validator
+                                .requests
+                                .iter()
+                                .filter(|request| request.key.purpose == AttemptPurpose::Restore)
+                                .count(),
+                            1
+                        );
+                        assert!(engine.take_verified_applied().is_none());
+                        assert!(!engine.has_user_apply_result_or_pending(superseded));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matching_removal_outranks_old_filter_fault_during_source_restart_and_resume_validation() {
+        fn unchanged(actual: &Engine, ordinary: &Engine, admitted: ApplyId) {
+            assert_eq!(
+                actual.model().state_identity(),
+                ordinary.model().state_identity()
+            );
+            assert!(actual.model().filtering().is_none());
+            assert_eq!(actual.model().active(), ordinary.model().active());
+            assert_eq!(actual.model().last_valid(), ordinary.model().last_valid());
+            assert_eq!(actual.model().draft(), ordinary.model().draft());
+            assert_eq!(
+                actual.model().validation_request(),
+                ordinary.model().validation_request()
+            );
+            assert_eq!(actual.model().opening(), ordinary.model().opening());
+            assert_eq!(
+                actual.model().can_reconnect(),
+                ordinary.model().can_reconnect()
+            );
+            assert_eq!(
+                actual.has_user_apply_result_or_pending(admitted),
+                ordinary.has_user_apply_result_or_pending(admitted)
+            );
+            let mut loss = actual.model().recovery().cloned();
+            if let Some(loss) = &mut loss {
+                loss.failure.filter = None;
+            }
+            assert_eq!(loss.as_ref(), ordinary.model().recovery());
+            let mut report = actual.model().failures().cloned();
+            if let Some(incumbent) = report.as_mut().and_then(|report| report.incumbent.as_mut()) {
+                incumbent.filter = None;
+            }
+            assert_eq!(report.as_ref(), ordinary.model().failures());
+            assert_eq!(actual.validator.cancelled, ordinary.validator.cancelled);
+            assert_eq!(actual.validator.requests, ordinary.validator.requests);
+            assert_eq!(actual.runner.opens, ordinary.runner.opens);
+            assert_eq!(actual.runner.stops, ordinary.runner.stops);
+            assert_eq!(
+                actual.runner.filter_preparations,
+                ordinary.runner.filter_preparations
+            );
+            assert!(
+                actual.runner.filter_intents.is_empty(),
+                "source-loss evidence cannot submit filter work"
+            );
+        }
+        for operation in 0..3 {
+            for fault_timing in 0..4 {
+                for typed_terminal in [false, true] {
+                    for coalesced_return in [false, true] {
+                        for validation_before_release in [false, true] {
+                            if fault_timing == 3 && validation_before_release {
+                                continue;
+                            }
+                            let prior = filter_settings("frozen verified loss target");
+                            let newer = filter_settings("newer unsaved draft");
+                            let mut actual = engine();
+                            let mut ordinary = engine();
+                            for engine in [&mut actual, &mut ordinary] {
+                                engine
+                                    .edit_draft(engine.model().draft().revision, prior.clone())
+                                    .unwrap();
+                                let old = initial(engine);
+                                engine
+                                    .take_verified_applied()
+                                    .expect("initial candidate receipt");
+                                if operation == 2 {
+                                    confirm_pause(engine, old);
+                                }
+                                match operation {
+                                    0 => {
+                                        let mut source = settings(30);
+                                        source.filters =
+                                            filter_settings("source candidate").filters;
+                                        engine
+                                            .edit_draft(engine.model().draft().revision, source)
+                                            .unwrap();
+                                        assert!(matches!(
+                                            engine
+                                                .apply(
+                                                    engine.model().state_identity(),
+                                                    engine.model().draft().revision
+                                                )
+                                                .unwrap(),
+                                            ApplyAdmission::Open { .. }
+                                        ));
+                                    }
+                                    1 => {
+                                        engine.restart(engine.model().state_identity()).unwrap();
+                                    }
+                                    2 => {
+                                        engine
+                                            .resume(engine.model().state_identity(), old)
+                                            .unwrap();
+                                    }
+                                    _ => unreachable!(),
+                                }
+                                engine
+                                    .edit_draft(engine.model().draft().revision, newer.clone())
+                                    .unwrap();
+                            }
+                            let key = actual.model().confirmed_filter_key().unwrap();
+                            let old = key.attempt;
+                            let request = actual.model().validation_request().unwrap().clone();
+                            let admitted = request.key.apply;
+                            let kind = if typed_terminal {
+                                FilterErrorKind::Unconfirmed {
+                                    reason: FilterConfirmationFailure::EvidenceLost,
+                                }
+                            } else {
+                                FilterErrorKind::RuntimeGraph
+                            };
+                            let fault = if typed_terminal {
+                                SessionEvent::SessionFailed {
+                                    attempt: old,
+                                    failure: Engine::filter_failure(
+                                        prior.clone(),
+                                        *filter_error(key, kind.clone(), true),
+                                    ),
+                                }
+                            } else {
+                                SessionEvent::FilterFault {
+                                    key,
+                                    failure: filter_error(key, kind.clone(), true),
+                                }
+                            };
+                            if fault_timing == 0 {
+                                actual.runner.events.push_back(fault.clone());
+                            }
+                            for engine in [&mut actual, &mut ordinary] {
+                                let removal = observation(
+                                    engine,
+                                    2,
+                                    if coalesced_return {
+                                        crate::domain::capture::VideoPresence::Present
+                                    } else {
+                                        crate::domain::capture::VideoPresence::Absent
+                                    },
+                                    SourcePresence::Disabled,
+                                    Some(2),
+                                );
+                                observe(engine, removal);
+                            }
+                            assert!(
+                                !actual.current_filter_key(key),
+                                "lost proof is diagnostic-only, never treatment terminal correlation"
+                            );
+                            if fault_timing == 2 {
+                                for engine in [&mut actual, &mut ordinary] {
+                                    engine.runner.events.push_back(SessionEvent::OwnerStopped {
+                                        attempt: old,
+                                        outcome: Ok(()),
+                                    });
+                                    engine.poll();
+                                }
+                            } else if fault_timing == 3 {
+                                for engine in [&mut actual, &mut ordinary] {
+                                    engine.runner.barrier(old);
+                                    engine.poll();
+                                }
+                            }
+                            if fault_timing != 0 {
+                                actual.runner.events.push_back(fault);
+                            }
+                            for engine in [&mut actual, &mut ordinary] {
+                                engine.runner.events.push_back(SessionEvent::StreamEnded {
+                                    attempt: old,
+                                    reason: 4,
+                                    error: -1,
+                                });
+                                engine.poll();
+                            }
+                            unchanged(&actual, &ordinary, admitted);
+                            let loss = actual.model().recovery().unwrap();
+                            assert_eq!(loss.applied.settings(), &prior);
+                            assert_eq!(
+                                loss.playback,
+                                if operation == 2 {
+                                    InitialPlayback::Paused
+                                } else {
+                                    InitialPlayback::Live
+                                }
+                            );
+                            assert!(matches!(loss.evidence, LossEvidence::Removed { .. }));
+                            let retained = loss.failure.filter.as_ref();
+                            if fault_timing == 3 {
+                                assert!(retained.is_none(), "retired-owner evidence is stale");
+                            } else {
+                                let retained = retained.expect(
+                                    "exact keyed native evidence retained alongside removal",
+                                );
+                                assert_eq!(retained.diagnostics.key, Some(key));
+                                assert_eq!(retained.kind, kind);
+                                assert_eq!(
+                                    actual
+                                        .model()
+                                        .failures()
+                                        .unwrap()
+                                        .incumbent
+                                        .as_ref()
+                                        .unwrap()
+                                        .filter
+                                        .as_ref(),
+                                    Some(retained)
+                                );
+                            }
+                            for engine in [&mut actual, &mut ordinary] {
+                                if !validation_before_release && fault_timing != 3 {
+                                    engine.runner.barrier(old);
+                                    engine.poll();
+                                }
+                                engine.validator.finish(Err(failure(
+                                    request.settings.clone(),
+                                    FailureCategory::Validation(ValidationLayer::Mode),
+                                    "source unavailable during validation",
+                                )));
+                                engine.poll();
+                                if validation_before_release {
+                                    let state = engine.model().state_identity();
+                                    assert_eq!(
+                                        engine.reconnect(state).unwrap(),
+                                        ReconnectAdmission::Joined(state.operation().unwrap()),
+                                        "Reconnect joins frozen recovery without authorizing an early owner",
+                                    );
+                                    assert_eq!(
+                                        engine.runner.opens.len(),
+                                        1,
+                                        "no owner opens before the native barrier"
+                                    );
+                                    assert!(engine.model().opening().is_none());
+                                    engine.runner.barrier(old);
+                                    engine.poll();
+                                }
+                            }
+                            unchanged(&actual, &ordinary, admitted);
+                            assert!(!actual.has_user_apply_result_or_pending(admitted));
+                            assert!(actual.take_verified_applied().is_none());
+                            assert_eq!(actual.runner.opens.len(), 1);
+                            assert!(
+                                actual
+                                    .validator
+                                    .requests
+                                    .iter()
+                                    .all(|request| request.key.purpose != AttemptPurpose::Restore)
+                            );
+                            for engine in [&mut actual, &mut ordinary] {
+                                let returned = observation(
+                                    engine,
+                                    3,
+                                    crate::domain::capture::VideoPresence::Present,
+                                    SourcePresence::Disabled,
+                                    Some(2),
+                                );
+                                observe(engine, returned);
+                                let recovery = engine.model().validation_request().unwrap();
+                                assert_eq!(recovery.key.purpose, AttemptPurpose::Recovery);
+                                assert_eq!(recovery.settings, prior);
+                                assert_eq!(
+                                    recovery.playback,
+                                    if operation == 2 {
+                                        InitialPlayback::Paused
+                                    } else {
+                                        InitialPlayback::Live
+                                    }
+                                );
+                                validate(engine);
+                                engine.runner.verified();
+                                engine.poll();
+                            }
+                            unchanged(&actual, &ordinary, admitted);
+                            assert_eq!(
+                                actual.model().active().unwrap().applied().settings(),
+                                &prior
+                            );
+                            assert_eq!(actual.model().draft().settings, newer);
+                            assert_eq!(
+                                actual.runner.opens.len(),
+                                2,
+                                "only positive return may authorize ordinary Recovery"
+                            );
+                            assert!(
+                                actual
+                                    .validator
+                                    .requests
+                                    .iter()
+                                    .all(|request| request.key.purpose != AttemptPurpose::Restore)
+                            );
+                            assert!(!actual.has_user_apply_result_or_pending(admitted));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_apply_emits_only_exact_frozen_complete_filter_result() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        engine.take_verified_applied();
+        let candidate = complete_treatments("candidate\ninert");
+        let key = admit_filters(&mut engine, candidate.clone());
+        let revision = engine.model().draft().revision;
+        let admitted_state = engine.model().state_identity();
+        assert_eq!(
+            engine.apply(admitted_state, DraftRevision::new(revision.get() + 1)),
+            Err(CommandRejection::ApplyInProgress)
+        );
+        assert!(engine.take_verified_applied().is_none());
+        assert_eq!(engine.runner.filter_preparations.len(), 3);
+        assert_eq!(engine.runner.filter_preparations[1], candidate);
+        assert_eq!(engine.runner.filter_preparations[2], settings(60));
+        assert_eq!(
+            engine.runner.filter_intents,
+            vec![(key, candidate.filters.clone())]
+        );
+        assert_eq!(
+            engine.model().last_valid().unwrap().settings(),
+            &settings(60)
+        );
+        assert!(engine.has_user_apply_result_or_pending(key.apply));
+        engine
+            .edit_draft(engine.model().draft().revision, filter_settings("newer"))
+            .unwrap();
+        assert_eq!(
+            engine.set_gain(PlaybackGain::new(37, false).unwrap()),
+            SubmitStatus::Accepted
+        );
+        filter_success(&mut engine, key);
+        engine.poll();
+        assert_eq!(engine.model().last_valid().unwrap().settings(), &candidate);
+        assert_eq!(engine.model().draft().settings, filter_settings("newer"));
+        assert_eq!(engine.model().active().unwrap().attempt(), old);
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+        assert!(engine.has_user_apply_result_or_pending(key.apply));
+        let VerifiedApplied::Filters {
+            key: received,
+            revision: frozen,
+            applied,
+        } = engine
+            .take_verified_applied()
+            .expect("exact candidate filter receipt")
+        else {
+            panic!("filter receipt must never masquerade as Open")
+        };
+        assert_eq!(received, key);
+        assert_eq!(frozen, revision);
+        assert_eq!(applied.settings(), &candidate);
+        assert!(!engine.has_user_apply_result_or_pending(key.apply));
+        filter_success(&mut engine, key);
+        engine.poll();
+        assert_eq!(engine.model().last_valid().unwrap().settings(), &candidate);
+        assert!(
+            engine.take_verified_applied().is_none(),
+            "duplicates cannot replace the consumed slot"
+        );
+    }
+    #[test]
+    fn retained_filter_positive_is_revoked_by_later_health_loss_and_lifecycle_cancellation() {
+        for cancellation in 0..5 {
+            let mut engine = engine();
+            initial(&mut engine);
+            engine.take_verified_applied();
+            let key = admit_filters(&mut engine, filter_settings("verified candidate"));
+            filter_success(&mut engine, key);
+            engine.poll();
+            assert!(engine.has_user_apply_result_or_pending(key.apply));
+            match cancellation {
+                0 => {
+                    engine.runner.events.push_back(SessionEvent::FilterFault {
+                        key,
+                        failure: filter_error(key, FilterErrorKind::RuntimeGraph, true),
+                    });
+                    engine.poll();
+                }
+                1 => engine.close(engine.model().state_identity()).unwrap(),
+                2 => engine.quit(),
+                3 => {
+                    engine.restart(engine.model().state_identity()).unwrap();
+                }
+                4 => {
+                    let absent = observation(
+                        &engine,
+                        2,
+                        crate::domain::capture::VideoPresence::Absent,
+                        SourcePresence::Disabled,
+                        Some(2),
+                    );
+                    observe(&mut engine, absent);
+                }
+                _ => unreachable!(),
+            }
+            assert!(!engine.has_user_apply_result_or_pending(key.apply));
+            assert!(engine.take_verified_applied().is_none());
+            filter_success(&mut engine, key);
+            engine.poll();
+            assert!(
+                engine.take_verified_applied().is_none(),
+                "stale success cannot reauthorize save"
+            );
+        }
+    }
+    #[test]
+    fn identical_empty_apply_is_filter_transaction_but_explicit_dirty_capture_is_rejected() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        let ApplyAdmission::Filters { key, .. } = engine
+            .apply(
+                engine.model().state_identity(),
+                engine.model().draft().revision,
+            )
+            .unwrap()
+        else {
+            panic!("empty replay must use live filters")
+        };
+        assert_eq!(engine.runner.filter_intents.len(), 1);
+        assert!(engine.runner.filter_intents[0].1.entries().is_empty());
+        assert_eq!(
+            engine.restart(engine.model().state_identity()),
+            Err(CommandRejection::ApplyInProgress)
+        );
+        assert_eq!(
+            engine.resume(engine.model().state_identity(), old),
+            Err(CommandRejection::ApplyInProgress)
+        );
+        assert_eq!(
+            engine.apply_filters(
+                engine.model().state_identity(),
+                engine.model().draft().revision
+            ),
+            Err(CommandRejection::ApplyInProgress)
+        );
+        filter_success(&mut engine, key);
+        engine.poll();
+        engine
+            .edit_draft(engine.model().draft().revision, settings(30))
+            .unwrap();
+        let identity = engine.model().state_identity();
+        assert_eq!(
+            engine.apply_filters(identity, engine.model().draft().revision),
+            Err(CommandRejection::CaptureDraftChanged)
+        );
+        assert_eq!(engine.model().state_identity(), identity);
+        assert_eq!(engine.runner.filter_intents.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+    }
+    #[test]
+    fn live_prevalidation_refusal_keeps_draft_and_healthy_incumbent_without_owner_work() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        let candidate = filter_settings("unsupported");
+        let mut typed = filter_error(
+            FilterAttemptKey {
+                apply: ApplyId::new(99).unwrap(),
+                attempt: old,
+                pass: FilterPass::LiveCandidate,
+            },
+            FilterErrorKind::CatalogUnavailable,
+            false,
+        );
+        typed.diagnostics.key = None;
+        engine.runner.filter_prepare_failure = Some(
+            ApplyFailure::new(
+                FailureCategory::Validation(ValidationLayer::Filters),
+                Stage::Prevalidation,
+                Cause::Generic,
+                candidate.clone(),
+                "filter_prepare",
+                "qualified catalog unavailable",
+            )
+            .with_filter(*typed),
+        );
+        let key = admit_filters(&mut engine, candidate.clone());
+        let failure = engine
+            .model()
+            .failures()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap();
+        assert_eq!(failure.filter.as_ref().unwrap().diagnostics.key, Some(key));
+        assert_eq!(
+            failure.category,
+            FailureCategory::Validation(ValidationLayer::Filters)
+        );
+        assert_eq!(engine.model().active().unwrap().attempt(), old);
+        assert_eq!(engine.model().draft().settings, candidate);
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+        assert!(engine.runner.filter_intents.is_empty());
+        assert!(!engine.has_user_apply_result_or_pending(key.apply));
+    }
+    #[test]
+    fn clean_native_submission_and_command_rejections_never_restore_healthy_incumbent() {
+        for kind in [
+            FilterErrorKind::CommandSubmission { mpv_error: -4 },
+            FilterErrorKind::CommandRejected { mpv_error: -5 },
+        ] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            let candidate = filter_settings("rejected");
+            let key = admit_filters(&mut engine, candidate.clone());
+            filter_failed(&mut engine, key, kind.clone(), false);
+            engine.poll();
+            assert_eq!(
+                engine.model().phase(),
+                ProductPhase::ErrorWithActiveRestored
+            );
+            assert_eq!(engine.model().active().unwrap().attempt(), old);
+            assert_eq!(
+                engine.model().last_valid().unwrap().settings(),
+                &settings(60)
+            );
+            assert_eq!(engine.model().draft().settings, candidate);
+            assert_eq!(engine.runner.filter_intents.len(), 1);
+            assert!(engine.runner.stops.is_empty());
+            assert_eq!(engine.runner.opens.len(), 1);
+            assert_eq!(
+                engine
+                    .model()
+                    .failures()
+                    .unwrap()
+                    .candidate
+                    .as_ref()
+                    .unwrap()
+                    .filter
+                    .as_ref()
+                    .unwrap()
+                    .kind,
+                kind
+            );
+        }
+    }
+    #[test]
+    fn accepted_unconfirmed_candidate_restores_prior_live_once_and_preserves_newer_draft() {
+        let mut engine = engine();
+        initial(&mut engine);
+        let candidate = filter_settings("failed");
+        let key = admit_filters(&mut engine, candidate.clone());
+        let candidate_identity = engine.model().state_identity();
+        filter_failed(&mut engine, key, deadline(), false);
+        engine.poll();
+        let restore = engine.model().filtering().unwrap().key();
+        assert_eq!(restore.pass, FilterPass::LiveRestore);
+        assert_eq!(
+            engine.model().state_identity().filter_pass(),
+            Some(FilterPass::LiveRestore)
+        );
+        assert_eq!(
+            engine.close(candidate_identity),
+            Err(CommandRejection::StaleState)
+        );
+        assert_eq!(engine.runner.filter_intents.len(), 2);
+        assert!(engine.runner.filter_intents[1].1.entries().is_empty());
+        assert!(engine.runner.stops.is_empty());
+        engine
+            .edit_draft(engine.model().draft().revision, filter_settings("newer"))
+            .unwrap();
+        filter_success(&mut engine, key);
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::RestoringFilters);
+        filter_success(&mut engine, restore);
+        engine.poll();
+        assert_eq!(
+            engine.model().phase(),
+            ProductPhase::ErrorWithActiveRestored
+        );
+        assert_eq!(
+            engine.model().last_valid().unwrap().settings(),
+            &settings(60)
+        );
+        assert_eq!(engine.model().draft().settings, filter_settings("newer"));
+        assert!(engine.take_verified_applied().is_none());
+        assert!(!engine.has_user_apply_result_or_pending(key.apply));
+        assert_eq!(engine.runner.opens.len(), 1);
+    }
+    #[test]
+    fn every_live_restore_failure_drains_without_second_route_or_fresh_restore_open() {
+        for failure_mode in 0..7 {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            let key = admit_filters(&mut engine, filter_settings("failed"));
+            if failure_mode == 0 {
+                engine.runner.immediate = Some(SubmitStatus::CapacityExceeded);
+            }
+            filter_failed(&mut engine, key, deadline(), false);
+            engine.poll();
+            if failure_mode != 0 {
+                let restore = engine.model().filtering().unwrap().key();
+                match failure_mode {
+                    1 => filter_failed(
+                        &mut engine,
+                        restore,
+                        FilterErrorKind::CommandRejected { mpv_error: -5 },
+                        false,
+                    ),
+                    2 => filter_failed(&mut engine, restore, FilterErrorKind::RuntimeGraph, true),
+                    3 => filter_failed(&mut engine, restore, deadline(), false),
+                    4 => engine.runner.events.push_back(SessionEvent::SessionFailed {
+                        attempt: old,
+                        failure: failure(
+                            settings(60),
+                            FailureCategory::Session,
+                            "terminal restore",
+                        ),
+                    }),
+                    5 => engine.runner.events.push_back(SessionEvent::StreamEnded {
+                        attempt: old,
+                        reason: 4,
+                        error: -1,
+                    }),
+                    6 => engine.runner.events.push_back(SessionEvent::OwnerStopped {
+                        attempt: old,
+                        outcome: Ok(()),
+                    }),
+                    _ => unreachable!(),
+                }
+                filter_success(&mut engine, restore);
+                engine.poll();
+            }
+            assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+            assert!(engine.model().active().is_none());
+            assert!(engine.model().failures().unwrap().candidate.is_some());
+            assert!(engine.model().failures().unwrap().restore.is_some());
+            assert!(!engine.model().can_reconnect());
+            engine.runner.barrier(old);
+            engine.poll();
+            assert!(engine.model().validation_request().is_none());
+            assert_eq!(engine.runner.opens.len(), 1);
+            assert_eq!(engine.runner.filter_intents.len(), 2);
+            assert!(engine.model().can_reconnect());
+        }
+    }
+    #[test]
+    fn rejected_candidate_plus_incumbent_fault_selects_one_fresh_restore_in_either_order() {
+        for fault_first in [false, true] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            let incumbent = engine.model().confirmed_filter_key().unwrap();
+            let key = admit_filters(&mut engine, filter_settings("rejected"));
+            let fault = SessionEvent::FilterFault {
+                key: incumbent,
+                failure: filter_error(incumbent, FilterErrorKind::RuntimeGraph, true),
+            };
+            if fault_first {
+                engine.runner.events.push_back(fault);
+            }
+            filter_failed(
+                &mut engine,
+                key,
+                FilterErrorKind::CommandRejected { mpv_error: -5 },
+                false,
+            );
+            if !fault_first {
+                engine.runner.events.push_back(SessionEvent::FilterFault {
+                    key: incumbent,
+                    failure: filter_error(incumbent, FilterErrorKind::RuntimeGraph, true),
+                });
+            }
+            engine.poll();
+            assert_eq!(
+                engine.model().filtering().unwrap().route(),
+                Some(FilterRestoreRoute::FreshOwner)
+            );
+            assert_eq!(engine.runner.stops.len(), 1);
+            assert_eq!(engine.runner.filter_intents.len(), 1);
+            let failures = engine.model().failures().unwrap();
+            assert_eq!(
+                failures
+                    .candidate
+                    .as_ref()
+                    .unwrap()
+                    .filter
+                    .as_ref()
+                    .unwrap()
+                    .kind,
+                FilterErrorKind::CommandRejected { mpv_error: -5 }
+            );
+            assert!(failures.incumbent.is_some());
+            engine.runner.barrier(old);
+            engine.poll();
+            assert_eq!(
+                engine.model().validation_request().unwrap().key.purpose,
+                AttemptPurpose::Restore
+            );
+            validate(&mut engine);
+            engine.runner.verified();
+            engine.poll();
+            assert_eq!(
+                engine.model().phase(),
+                ProductPhase::ErrorWithActiveRestored
+            );
+            assert_eq!(engine.runner.opens.len(), 2);
+        }
+    }
+    #[test]
+    fn selected_live_restore_queue_refusal_never_transfers_to_fresh_owner() {
+        for status in [
+            SubmitStatus::NotReady,
+            SubmitStatus::Closing,
+            SubmitStatus::StaleGeneration,
+            SubmitStatus::CapacityExceeded,
+        ] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            let key = admit_filters(&mut engine, filter_settings("failed"));
+            engine.runner.immediate = Some(status);
+            filter_failed(&mut engine, key, deadline(), false);
+            engine.poll();
+            assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+            assert!(engine.model().failures().unwrap().restore.is_some());
+            engine.runner.barrier(old);
+            engine.poll();
+            assert_eq!(engine.runner.opens.len(), 1);
+            assert_eq!(engine.runner.filter_intents.len(), 2);
+            assert!(engine.model().validation_request().is_none());
+        }
+    }
+    #[test]
+    fn source_apply_authorization_survives_closing_old_but_not_failed_candidate_cleanup() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        engine
+            .edit_draft(engine.model().draft().revision, settings(30))
+            .unwrap();
+        let admission = engine
+            .apply(
+                engine.model().state_identity(),
+                engine.model().draft().revision,
+            )
+            .unwrap();
+        assert!(matches!(admission, ApplyAdmission::Open { .. }));
+        assert!(engine.has_user_apply_result_or_pending(admission.id()));
+        validate(&mut engine);
+        assert_eq!(engine.model().phase(), ProductPhase::ClosingOld);
+        assert!(engine.has_user_apply_result_or_pending(admission.id()));
+        engine.runner.barrier(old);
+        engine.poll();
+        assert!(engine.has_user_apply_result_or_pending(admission.id()));
+        engine.runner.fail("candidate failed");
+        engine.poll();
+        assert!(!engine.has_user_apply_result_or_pending(admission.id()));
+    }
+    #[test]
+    fn deferred_cleanup_preserves_genuine_incumbent_cause_and_actual_retirement_without_second_route()
+     {
+        for cause_mode in 0..3 {
+            for typed_incumbent in [false, true] {
+                for acknowledged in [false, true] {
+                    for release_in_drain in [false, true] {
+                        for retirement_error in [false, true] {
+                            let mut engine = engine();
+                            let prior = filter_settings("verified prior for retirement");
+                            engine
+                                .edit_draft(engine.model().draft().revision, prior.clone())
+                                .unwrap();
+                            let old = initial(&mut engine);
+                            engine.take_verified_applied();
+                            let confirmed = engine.model().confirmed_filter_key().unwrap();
+                            let expected_candidate = if cause_mode == 2 {
+                                let native =
+                                    filter_error(confirmed, FilterErrorKind::RuntimeGraph, true);
+                                let expected =
+                                    Engine::filter_failure(prior.clone(), *native.clone());
+                                engine.runner.events.push_back(SessionEvent::FilterFault {
+                                    key: confirmed,
+                                    failure: native,
+                                });
+                                expected
+                            } else {
+                                let candidate =
+                                    filter_settings("frozen candidate before retirement");
+                                let key = admit_filters(&mut engine, candidate.clone());
+                                let kind = if cause_mode == 0 {
+                                    FilterErrorKind::CommandRejected { mpv_error: -5 }
+                                } else {
+                                    FilterErrorKind::RuntimeGraph
+                                };
+                                let expected = Engine::filter_failure(
+                                    candidate,
+                                    *filter_error(key, kind.clone(), true),
+                                );
+                                filter_failed(&mut engine, key, kind, cause_mode != 0);
+                                expected
+                            };
+                            let incumbent = if typed_incumbent {
+                                Engine::filter_failure(
+                                    prior.clone(),
+                                    *filter_error(
+                                        confirmed,
+                                        FilterErrorKind::Unconfirmed {
+                                            reason: FilterConfirmationFailure::EvidenceLost,
+                                        },
+                                        true,
+                                    ),
+                                )
+                            } else {
+                                ApplyFailure::new(
+                                    FailureCategory::Session,
+                                    Stage::Negotiation,
+                                    Cause::Busy,
+                                    prior.clone(),
+                                    "genuine_incumbent_failure",
+                                    "independent native incumbent error",
+                                )
+                            };
+                            let outcome_error = failure(
+                                prior.clone(),
+                                FailureCategory::Lifecycle(LifecycleFailure::Quiescence),
+                                "distinct actual retirement outcome",
+                            );
+                            engine.runner.events.push_back(SessionEvent::SessionFailed {
+                                attempt: old,
+                                failure: incumbent.clone(),
+                            });
+                            if acknowledged {
+                                engine.runner.events.push_back(SessionEvent::OwnerStopped {
+                                    attempt: old,
+                                    outcome: if retirement_error {
+                                        Err(outcome_error.clone())
+                                    } else {
+                                        Ok(())
+                                    },
+                                });
+                            }
+                            if release_in_drain {
+                                engine
+                                    .runner
+                                    .events
+                                    .push_back(SessionEvent::NativeReleased { attempt: old });
+                            }
+                            let newer = filter_settings("newer editable draft during retirement");
+                            engine
+                                .edit_draft(engine.model().draft().revision, newer.clone())
+                                .unwrap();
+                            engine.poll();
+                            let report = engine.model().failures().unwrap();
+                            assert_eq!(report.candidate.as_ref(), Some(&expected_candidate));
+                            assert_eq!(
+                                report.incumbent.as_ref(),
+                                Some(&incumbent),
+                                "logical cleanup cannot manufacture a different incumbent error"
+                            );
+                            if let Some(filter) = &incumbent.filter {
+                                assert_eq!(
+                                    report
+                                        .incumbent
+                                        .as_ref()
+                                        .unwrap()
+                                        .filter
+                                        .as_ref()
+                                        .unwrap()
+                                        .diagnostics
+                                        .key,
+                                    filter.diagnostics.key
+                                );
+                            }
+                            assert_eq!(
+                                report.cleanup,
+                                if acknowledged && retirement_error {
+                                    vec![outcome_error.clone()]
+                                } else {
+                                    Vec::new()
+                                }
+                            );
+                            assert_eq!(engine.model().last_valid().unwrap().settings(), &prior);
+                            assert_eq!(engine.model().draft().settings, newer);
+                            assert_eq!(engine.runner.opens.len(), 1);
+                            if acknowledged && release_in_drain {
+                                assert_eq!(
+                                    engine.model().validation_request().unwrap().key.purpose,
+                                    AttemptPurpose::Restore
+                                );
+                            } else {
+                                assert!(
+                                    engine.model().validation_request().is_none(),
+                                    "logical stop cannot impersonate actual retirement/native release"
+                                );
+                            }
+                            if acknowledged {
+                                assert!(
+                                    engine.runner.stops.is_empty(),
+                                    "a genuinely retired owner must not receive a redundant Stop"
+                                );
+                            } else {
+                                assert_eq!(
+                                    engine.runner.stops,
+                                    vec![(old, StopReason::Failed)],
+                                    "logical selection still requires physical Stop without acknowledgement"
+                                );
+                                engine.runner.events.push_back(SessionEvent::OwnerStopped {
+                                    attempt: old,
+                                    outcome: if retirement_error {
+                                        Err(outcome_error.clone())
+                                    } else {
+                                        Ok(())
+                                    },
+                                });
+                            }
+                            if !acknowledged || !release_in_drain {
+                                engine
+                                    .runner
+                                    .events
+                                    .push_back(SessionEvent::NativeReleased { attempt: old });
+                                engine.poll();
+                            }
+                            assert_eq!(
+                                engine.model().failures().unwrap().incumbent.as_ref(),
+                                Some(&incumbent)
+                            );
+                            assert_eq!(
+                                engine.model().validation_request().unwrap().settings,
+                                prior
+                            );
+                            validate(&mut engine);
+                            let restore = engine.model().opening().unwrap().0;
+                            assert_eq!(restore.purpose, AttemptPurpose::Restore);
+                            engine.runner.fail("one chosen fresh Restore failed");
+                            engine.poll();
+                            engine.runner.barrier(restore.attempt);
+                            engine.poll();
+                            assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+                            let report = engine.model().failures().unwrap();
+                            assert_eq!(report.candidate.as_ref(), Some(&expected_candidate));
+                            assert_eq!(report.incumbent.as_ref(), Some(&incumbent));
+                            assert!(report.restore.is_some());
+                            assert_eq!(
+                                report.cleanup,
+                                if retirement_error {
+                                    vec![outcome_error]
+                                } else {
+                                    Vec::new()
+                                }
+                            );
+                            assert!(engine.model().validation_request().is_none());
+                            assert_eq!(engine.validator.requests.iter().filter(|request| request.key.purpose == AttemptPurpose::Restore).count(), 1);
+                            assert_eq!(
+                                engine.runner.opens.len(),
+                                2,
+                                "no alternate restoration route or retry"
+                            );
+                            assert_eq!(engine.model().draft().settings, newer);
+                            assert!(engine.take_verified_applied().is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_rejection_survives_terminal_and_release_in_same_drain() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        let key = admit_filters(&mut engine, filter_settings("rejected"));
+        filter_failed(
+            &mut engine,
+            key,
+            FilterErrorKind::CommandRejected { mpv_error: -5 },
+            false,
+        );
+        engine.runner.barrier(old);
+        engine.poll();
+        let request = engine.model().validation_request().unwrap();
+        assert_eq!(request.key.purpose, AttemptPurpose::Restore);
+        assert_eq!(
+            engine
+                .model()
+                .failures()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .filter
+                .as_ref()
+                .unwrap()
+                .kind,
+            FilterErrorKind::CommandRejected { mpv_error: -5 }
+        );
+        assert_eq!(engine.runner.opens.len(), 1);
+    }
+    #[test]
+    fn graph_failure_awaits_both_barriers_and_failed_fresh_restore_never_retries() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        let key = admit_filters(&mut engine, filter_settings("graph failure"));
+        filter_failed(&mut engine, key, FilterErrorKind::RuntimeGraph, true);
+        filter_success(&mut engine, key);
+        engine.poll();
+        assert_eq!(engine.runner.stops.len(), 1);
+        assert_eq!(engine.runner.filter_intents.len(), 1);
+        assert!(engine.model().validation_request().is_none());
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::NativeReleased { attempt: old });
+        engine.poll();
+        assert!(engine.model().validation_request().is_none());
+        engine.runner.barrier(old);
+        engine.poll();
+        assert_eq!(
+            engine.model().validation_request().unwrap().settings,
+            settings(60)
+        );
+        validate(&mut engine);
+        let restore = engine.model().opening().unwrap().0;
+        assert_eq!(restore.purpose, AttemptPurpose::Restore);
+        engine.runner.fail("fresh restore graph failure");
+        engine.poll();
+        engine.runner.barrier(restore.attempt);
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+        assert!(engine.model().failures().unwrap().restore.is_some());
+        assert!(engine.model().validation_request().is_none());
+        assert_eq!(engine.runner.opens.len(), 2);
+        assert!(engine.model().can_reconnect());
+    }
+    #[test]
+    fn late_fault_restores_then_last_verified_chain_not_older_history_or_new_draft() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        let applied = filter_settings("verified");
+        let key = admit_filters(&mut engine, applied.clone());
+        filter_success(&mut engine, key);
+        engine.poll();
+        engine
+            .edit_draft(engine.model().draft().revision, filter_settings("newer"))
+            .unwrap();
+        engine.runner.events.push_back(SessionEvent::FilterFault {
+            key,
+            failure: filter_error(
+                key,
+                FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::EvidenceLost,
+                },
+                true,
+            ),
+        });
+        engine.poll();
+        assert_eq!(
+            engine.model().filtering().unwrap().prior().settings(),
+            &applied
+        );
+        assert_eq!(engine.runner.stops.len(), 1);
+        engine.runner.barrier(old);
+        engine.poll();
+        assert_eq!(
+            engine.model().validation_request().unwrap().settings,
+            applied
+        );
+        validate(&mut engine);
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(
+            engine.model().phase(),
+            ProductPhase::ErrorWithActiveRestored
+        );
+        assert_eq!(engine.model().last_valid().unwrap().settings(), &applied);
+        assert_eq!(engine.model().draft().settings, filter_settings("newer"));
+        assert_eq!(engine.runner.opens.len(), 2);
+        assert_eq!(engine.runner.filter_intents.len(), 1);
+    }
+    #[test]
+    fn late_fault_and_terminal_same_drain_fail_one_fresh_restore_without_older_fallback() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        let applied = filter_settings("then verified");
+        let key = admit_filters(&mut engine, applied.clone());
+        filter_success(&mut engine, key);
+        engine.poll();
+        engine.runner.events.push_back(SessionEvent::SessionFailed {
+            attempt: old,
+            failure: failure(applied.clone(), FailureCategory::Session, "terminal owner"),
+        });
+        engine.runner.events.push_back(SessionEvent::FilterFault {
+            key,
+            failure: filter_error(key, FilterErrorKind::RuntimeGraph, true),
+        });
+        engine.poll();
+        assert_eq!(
+            engine.model().filtering().unwrap().prior().settings(),
+            &applied
+        );
+        assert_eq!(engine.runner.stops.len(), 1);
+        engine.runner.barrier(old);
+        engine.poll();
+        assert_eq!(
+            engine.model().validation_request().unwrap().settings,
+            applied
+        );
+        validate(&mut engine);
+        let restore = engine.model().opening().unwrap().0;
+        engine
+            .runner
+            .fail("then verified chain also fails on fresh owner");
+        engine.poll();
+        engine.runner.barrier(restore.attempt);
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+        assert!(engine.model().failures().unwrap().candidate.is_some());
+        assert!(engine.model().failures().unwrap().restore.is_some());
+        assert_eq!(engine.model().last_valid().unwrap().settings(), &applied);
+        assert_eq!(engine.runner.opens.len(), 2);
+        assert!(engine.model().validation_request().is_none());
+    }
+    #[test]
+    fn close_quit_and_removal_cancel_both_selected_restoration_routes() {
+        for fresh in [false, true] {
+            for cancellation in 0..3 {
+                let mut engine = engine();
+                let prior = filter_settings("prior verified");
+                engine
+                    .edit_draft(engine.model().draft().revision, prior.clone())
+                    .unwrap();
+                let old = initial(&mut engine);
+                let key = admit_filters(&mut engine, filter_settings("failed candidate"));
+                filter_failed(
+                    &mut engine,
+                    key,
+                    if fresh {
+                        FilterErrorKind::RuntimeGraph
+                    } else {
+                        deadline()
+                    },
+                    fresh,
+                );
+                engine.poll();
+                let restore = engine.model().filtering().unwrap().key();
+                let submitted = engine.runner.filter_intents.len();
+                filter_success(&mut engine, restore);
+                match cancellation {
+                    0 => engine.close(engine.model().state_identity()).unwrap(),
+                    1 => engine.quit(),
+                    2 => {
+                        engine.validator.observation = Some(observation(
+                            &engine,
+                            2,
+                            crate::domain::capture::VideoPresence::Present,
+                            SourcePresence::Disabled,
+                            Some(2),
+                        ))
+                    }
+                    _ => unreachable!(),
+                }
+                engine.poll();
+                assert_eq!(engine.model().last_valid().unwrap().settings(), &prior);
+                assert!(engine.model().filtering().is_none());
+                assert_eq!(engine.runner.filter_intents.len(), submitted);
+                engine.runner.barrier(old);
+                engine.poll();
+                assert!(
+                    engine
+                        .model()
+                        .validation_request()
+                        .is_none_or(|request| request.key.purpose != AttemptPurpose::Restore)
+                );
+                assert_eq!(engine.runner.opens.len(), 1);
+                assert!(!engine.has_user_apply_result_or_pending(key.apply));
+                assert!(engine.take_verified_applied().is_none());
+                if cancellation == 2 {
+                    assert_eq!(
+                        engine.model().recovery().unwrap().applied.settings(),
+                        &prior
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_quit_and_physical_loss_cancel_pending_filter_commit_and_restore() {
+        for cancellation in 0..4 {
+            let mut engine = engine();
+            let prior = filter_settings("prior verified");
+            engine
+                .edit_draft(engine.model().draft().revision, prior.clone())
+                .unwrap();
+            let old = initial(&mut engine);
+            let key = admit_filters(&mut engine, filter_settings("provisional"));
+            filter_success(&mut engine, key);
+            match cancellation {
+                0 => engine.close(engine.model().state_identity()).unwrap(),
+                1 => engine.quit(),
+                2 => engine.runner.events.push_back(SessionEvent::StreamEnded {
+                    attempt: old,
+                    reason: 0,
+                    error: 0,
+                }),
+                3 => {
+                    engine.validator.observation = Some(observation(
+                        &engine,
+                        2,
+                        crate::domain::capture::VideoPresence::Present,
+                        SourcePresence::Disabled,
+                        Some(2),
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            engine.poll();
+            assert_eq!(engine.model().last_valid().unwrap().settings(), &prior);
+            assert!(!engine.has_user_apply_result_or_pending(key.apply));
+            assert!(engine.take_verified_applied().is_none());
+            assert_eq!(engine.runner.filter_intents.len(), 1);
+            assert_eq!(engine.runner.opens.len(), 1);
+            if cancellation >= 2 {
+                assert_eq!(
+                    engine.model().recovery().unwrap().applied.settings(),
+                    &prior
+                );
+            }
+        }
+    }
+    #[test]
+    fn wrong_operation_owner_pass_or_confirmation_key_cannot_commit() {
+        for mismatch in 0..4 {
+            let mut engine = engine();
+            initial(&mut engine);
+            let key = admit_filters(&mut engine, filter_settings("pending"));
+            let mut wrong = key;
+            match mismatch {
+                0 => wrong.apply = ApplyId::new(key.apply.get() + 1).unwrap(),
+                1 => wrong.attempt = AttemptId::new(key.attempt.get() + 1).unwrap(),
+                2 => wrong.pass = FilterPass::LiveRestore,
+                3 => {}
+                _ => unreachable!(),
+            }
+            engine.runner.events.push_back(SessionEvent::FilterResult {
+                key: wrong,
+                result: Ok(FilterConfirmation::checked(
+                    if mismatch == 3 {
+                        FilterAttemptKey {
+                            pass: FilterPass::Open,
+                            ..key
+                        }
+                    } else {
+                        wrong
+                    },
+                    0.0,
+                    2.0,
+                    32,
+                )
+                .unwrap()),
+            });
+            engine.poll();
+            assert_eq!(engine.model().phase(), ProductPhase::ApplyingFilters);
+            assert_eq!(
+                engine.model().last_valid().unwrap().settings(),
+                &settings(60)
+            );
+        }
+    }
+
+    #[test]
+    fn source_filter_prevalidation_refusal_preserves_incumbent_before_stop() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        let prior = engine.model().last_valid().unwrap().clone();
+        let mut candidate = settings(30);
+        candidate.filters = crate::domain::filters::FilterChain::new(vec![
+            crate::domain::filters::FilterEntry::new(
+                "retained disabled".into(),
+                crate::domain::filters::Filter::Format(crate::domain::filters::FormatParams::new(
+                    crate::domain::filters::SdrMatrix::Auto,
+                    crate::domain::filters::ColorLevels::Auto,
+                    crate::domain::filters::SdrGamma::Auto,
+                )),
+                false,
+            ),
+        ])
+        .unwrap();
+        engine
+            .edit_draft(engine.model().draft().revision, candidate.clone())
+            .unwrap();
+        let failure = ApplyFailure::new(
+            FailureCategory::Validation(ValidationLayer::Filters),
+            Stage::Prevalidation,
+            Cause::Generic,
+            candidate.clone(),
+            "filter_prepare",
+            "catalog unavailable",
+        )
+        .with_filter(crate::domain::failure::FilterFailure {
+            kind: crate::domain::failure::FilterErrorKind::CatalogUnavailable,
+            attributed_ordinal: None,
+            requires_fresh_owner: false,
+            diagnostics: crate::domain::failure::FilterAttemptDiagnostics {
+                key: None,
+                entries: vec![crate::domain::failure::FilterEntryMetadata {
+                    ordinal: 0,
+                    label: "retained disabled".into(),
+                    enabled: false,
+                }],
+                records: Vec::new(),
+                native_evidence_lost: false,
+                truncated: false,
+                dropped_context: 0,
+            },
+        });
+        engine.runner.filter_prepare_failure = Some(failure.clone());
+        apply(&mut engine);
+        validate(&mut engine);
+        assert_eq!(engine.model().active().unwrap().attempt(), old);
+        assert_eq!(engine.model().last_valid(), Some(&prior));
+        assert_eq!(engine.model().draft().settings, candidate);
+        assert!(engine.runner.stops.is_empty());
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert_eq!(engine.runner.filter_preparations.last(), Some(&candidate));
+        assert_eq!(
+            engine.model().validation_rejection().unwrap().failure,
+            failure
+        );
+    }
+    #[test]
+    fn source_open_refuses_wrong_filter_operation_owner_pass_or_paused_preparation() {
+        use crate::app::ports::FilterOpenReceipt;
+        use crate::domain::state::{FilterAttemptKey, FilterConfirmation, FilterPass};
+        for mismatch in 0..6 {
+            let mut engine = engine();
+            let requested = complete_treatments("full Open chain");
+            engine
+                .edit_draft(engine.model().draft().revision, requested.clone())
+                .unwrap();
+            apply(&mut engine);
+            validate(&mut engine);
+            let key = engine.model().opening().unwrap().0;
+            let mut received = receipt(requested, key);
+            if mismatch == 3 || mismatch == 5 {
+                received.filters = FilterOpenReceipt::PreparedPaused;
+                if mismatch == 5 {
+                    received.readiness = OpenReadiness::PausedPrepared;
+                }
+            } else {
+                let mut observed = FilterAttemptKey {
+                    apply: key.apply,
+                    attempt: key.attempt,
+                    pass: FilterPass::Open,
+                };
+                match mismatch {
+                    0 => observed.apply = ApplyId::new(key.apply.get() + 1).unwrap(),
+                    1 => observed.attempt = AttemptId::new(key.attempt.get() + 1).unwrap(),
+                    2 => observed.pass = FilterPass::LiveCandidate,
+                    4 => received.settings.filters = crate::domain::filters::FilterChain::default(),
+                    _ => unreachable!(),
+                }
+                received.filters = FilterOpenReceipt::Confirmed(
+                    FilterConfirmation::checked(observed, 0.0, 2.0, 32).unwrap(),
+                );
+            }
+            engine.runner.events.push_back(SessionEvent::OpenVerified {
+                key,
+                receipt: Box::new(received),
+            });
+            engine.poll();
+            assert!(engine.model().active().is_none());
+            assert!(engine.model().last_valid().is_none());
+            assert!(engine.take_verified_applied().is_none());
+            assert_eq!(
+                engine
+                    .model()
+                    .failures()
+                    .unwrap()
+                    .candidate
+                    .as_ref()
+                    .unwrap()
+                    .operation,
+                "open_receipt"
+            );
+            assert_eq!(engine.runner.stops.len(), 1);
+        }
+    }
+    #[test]
+    fn paused_recovery_receipt_cannot_drop_or_change_frozen_treatments() {
+        let mut engine = engine();
+        let prior = complete_treatments("verified paused");
+        engine
+            .edit_draft(engine.model().draft().revision, prior.clone())
+            .unwrap();
+        let old = initial(&mut engine);
+        engine.take_verified_applied();
+        confirm_pause(&mut engine, old);
+        engine
+            .edit_draft(
+                engine.model().draft().revision,
+                complete_treatments("unapplied newer"),
+            )
+            .unwrap();
+        eof(&mut engine, old);
+        engine.runner.barrier(old);
+        engine.poll();
+        validate(&mut engine);
+        let key = engine.runner.opens.last().unwrap().0;
+        assert_eq!(
+            *engine.runner.playback.last().unwrap(),
+            InitialPlayback::Paused
+        );
+        let mut received = receipt(prior.clone(), key);
+        received.readiness = OpenReadiness::PausedPrepared;
+        received.filters = crate::app::ports::FilterOpenReceipt::PreparedPaused;
+        received.settings.filters = crate::domain::filters::FilterChain::default();
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key,
+            receipt: Box::new(received),
+        });
+        engine.poll();
+        assert!(engine.model().active().is_none());
+        assert_eq!(engine.model().last_valid().unwrap().settings(), &prior);
+        assert!(engine.take_verified_applied().is_none());
+        assert_eq!(
+            engine
+                .model()
+                .failures()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .operation,
+            "open_receipt"
+        );
+    }
+    #[test]
+    fn exact_paused_restore_prepares_prior_without_save_then_resume_requires_fresh_live_proof() {
+        for wrong_chain in [false, true] {
+            let mut engine = engine();
+            let prior = complete_treatments("paused prior");
+            engine
+                .edit_draft(engine.model().draft().revision, prior.clone())
+                .unwrap();
+            let old = initial(&mut engine);
+            engine.take_verified_applied();
+            confirm_pause(&mut engine, old);
+            let mut candidate = complete_treatments("failed new treatment");
+            candidate.video.mode = settings(30).video.mode;
+            engine
+                .edit_draft(engine.model().draft().revision, candidate.clone())
+                .unwrap();
+            let admission = engine
+                .apply(
+                    engine.model().state_identity(),
+                    engine.model().draft().revision,
+                )
+                .unwrap();
+            validate(&mut engine);
+            engine.runner.barrier(old);
+            engine.poll();
+            let failed_owner = engine.runner.opens.last().unwrap().0.attempt;
+            engine.runner.fail("actual candidate open failure");
+            engine.poll();
+            engine.runner.barrier(failed_owner);
+            engine.poll();
+            validate(&mut engine);
+            let restore = engine.runner.opens.last().unwrap().0;
+            assert_eq!(restore.purpose, AttemptPurpose::Restore);
+            assert_eq!(
+                *engine.runner.playback.last().unwrap(),
+                InitialPlayback::Paused
+            );
+            assert_eq!(engine.runner.opens.last().unwrap().1, prior);
+            let mut received = receipt(prior.clone(), restore);
+            received.readiness = OpenReadiness::PausedPrepared;
+            received.filters = crate::app::ports::FilterOpenReceipt::PreparedPaused;
+            if wrong_chain {
+                received.settings.filters = crate::domain::filters::FilterChain::default();
+            }
+            engine.runner.events.push_back(SessionEvent::OpenVerified {
+                key: restore,
+                receipt: Box::new(received),
+            });
+            engine.poll();
+            assert!(engine.take_verified_applied().is_none());
+            assert!(!engine.has_user_apply_result_or_pending(admission.id()));
+            assert_eq!(engine.model().last_valid().unwrap().settings(), &prior);
+            assert_eq!(engine.model().draft().settings, candidate);
+            if wrong_chain {
+                assert!(engine.model().active().is_none());
+                assert_eq!(
+                    engine
+                        .model()
+                        .failures()
+                        .unwrap()
+                        .restore
+                        .as_ref()
+                        .unwrap()
+                        .operation,
+                    "open_receipt"
+                );
+                continue;
+            }
+            assert_eq!(
+                engine.model().phase(),
+                ProductPhase::ErrorWithActiveRestored
+            );
+            assert_eq!(
+                engine.model().active().unwrap().playback(),
+                PlaybackState::Paused
+            );
+            engine
+                .resume(engine.model().state_identity(), restore.attempt)
+                .unwrap();
+            validate(&mut engine);
+            engine.runner.barrier(restore.attempt);
+            engine.poll();
+            let resumed = engine.runner.opens.last().unwrap().0;
+            assert_eq!(resumed.purpose, AttemptPurpose::Resume);
+            assert_eq!(
+                *engine.runner.playback.last().unwrap(),
+                InitialPlayback::Live
+            );
+            assert!(engine.model().active().is_none());
+            let proof = receipt(prior.clone(), resumed);
+            let crate::app::ports::FilterOpenReceipt::Confirmed(confirmation) = &proof.filters
+            else {
+                panic!("LIVE resume requires confirmation")
+            };
+            assert_eq!(confirmation.advances(), 32);
+            assert_eq!(
+                confirmation.key(),
+                FilterAttemptKey {
+                    apply: resumed.apply,
+                    attempt: resumed.attempt,
+                    pass: FilterPass::Open
+                }
+            );
+            engine.runner.events.push_back(SessionEvent::OpenVerified {
+                key: resumed,
+                receipt: Box::new(proof),
+            });
+            engine.poll();
+            assert_eq!(
+                engine.model().active().unwrap().playback(),
+                PlaybackState::Live
+            );
+            assert_eq!(
+                engine.model().active().unwrap().applied().settings(),
+                &prior
+            );
+            assert!(engine.take_verified_applied().is_none());
+        }
+    }
+
     type Engine = ApplyCoordinator<Validator, Runner>;
     fn engine() -> Engine {
         ApplyCoordinator::new(
@@ -1581,12 +4600,22 @@ mod tests {
                 })
                 .unwrap();
         }
+        // Existing source-lifecycle fixtures deliberately exercise a fresh open.
+        // Same-source user Apply now has its own LIVE filter tests above.
+        if engine.model().active().is_some_and(|active| {
+            active.playback() == PlaybackState::Live
+                && active.applied().settings().video == engine.model().draft().settings.video
+                && active.applied().settings().audio == engine.model().draft().settings.audio
+        }) {
+            return engine.restart(engine.model().state_identity()).unwrap();
+        }
         engine
             .apply(
                 engine.model().state_identity(),
                 engine.model().draft().revision,
             )
             .unwrap()
+            .id()
     }
     fn validate(engine: &mut Engine) {
         engine.validator_mut().finish(Ok(()));
@@ -1636,12 +4665,12 @@ mod tests {
     }
 
     #[test]
-    fn verified_open_uses_exact_committed_settings_and_is_consumed_once() {
+    fn verified_applied_uses_exact_committed_settings_and_is_consumed_once() {
         let mut engine = engine();
         let apply = apply(&mut engine);
-        assert!(engine.take_verified_open().is_none());
+        assert!(engine.take_verified_applied().is_none());
         validate(&mut engine);
-        assert!(engine.take_verified_open().is_none());
+        assert!(engine.take_verified_applied().is_none());
         let key = engine.runner.opens.last().unwrap().0;
         engine
             .edit_draft(engine.model().draft().revision, settings(30))
@@ -1651,19 +4680,25 @@ mod tests {
         engine.runner.verified();
         engine.poll();
         assert_eq!(engine.installed_watch.as_ref(), engine.model.watch_target());
-        let event = engine.take_verified_open().unwrap();
-        assert_eq!(event.key, key);
-        assert_eq!(event.key.apply, apply);
-        assert_eq!(event.applied.settings(), &settings(60));
+        let VerifiedApplied::Open {
+            key: received,
+            applied,
+        } = engine.take_verified_applied().unwrap()
+        else {
+            panic!("user Open result")
+        };
+        assert_eq!(received, key);
+        assert_eq!(received.apply, apply);
+        assert_eq!(applied.settings(), &settings(60));
         assert_eq!(engine.model.draft().settings, settings(30));
-        assert!(engine.take_verified_open().is_none());
+        assert!(engine.take_verified_applied().is_none());
         engine.runner.verified();
         engine.poll();
-        assert!(engine.take_verified_open().is_none());
+        assert!(engine.take_verified_applied().is_none());
     }
 
     #[test]
-    fn stale_or_wrong_receipts_never_publish_verified_open() {
+    fn stale_or_wrong_receipts_never_publish_verified_applied() {
         let mut engine = engine();
         apply(&mut engine);
         validate(&mut engine);
@@ -1684,23 +4719,23 @@ mod tests {
         ] {
             engine.runner.events.push_back(SessionEvent::OpenVerified {
                 key: stale,
-                receipt: Box::new(receipt(settings(60))),
+                receipt: Box::new(receipt(settings(60), stale)),
             });
             engine.poll();
             assert_eq!(engine.model.opening().unwrap().0, key);
-            assert!(engine.take_verified_open().is_none());
+            assert!(engine.take_verified_applied().is_none());
         }
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key,
-            receipt: Box::new(receipt(settings(30))),
+            receipt: Box::new(receipt(settings(30), key)),
         });
         engine.poll();
         assert!(engine.model.active().is_none());
         assert!(engine.model.last_valid().is_none());
-        assert!(engine.take_verified_open().is_none());
+        assert!(engine.take_verified_applied().is_none());
         engine.runner.verified();
         engine.poll();
-        assert!(engine.take_verified_open().is_none());
+        assert!(engine.take_verified_applied().is_none());
     }
 
     #[test]
@@ -1718,12 +4753,12 @@ mod tests {
             }
             engine.poll();
             assert!(engine.model.active().is_none());
-            assert!(engine.take_verified_open().is_none());
+            assert!(engine.take_verified_applied().is_none());
         }
     }
 
     #[test]
-    fn verified_open_requires_successful_committed_watch_installation() {
+    fn verified_applied_requires_successful_committed_watch_installation() {
         for rejection in [
             None,
             Some(SubmitFailure::CapacityUnavailable),
@@ -1760,7 +4795,7 @@ mod tests {
             if rejection.is_some() {
                 assert!(engine.model.active().is_none());
                 assert_eq!(engine.installed_watch, prior_watch);
-                assert!(engine.take_verified_open().is_none());
+                assert!(engine.take_verified_applied().is_none());
                 assert_eq!(
                     engine
                         .model
@@ -1775,10 +4810,16 @@ mod tests {
             } else {
                 assert_ne!(engine.installed_watch, prior_watch);
                 assert_eq!(engine.installed_watch.as_ref(), engine.model.watch_target());
-                let event = engine.take_verified_open().unwrap();
-                assert_eq!(event.key, key);
-                assert_eq!(event.applied.settings(), &relocated);
-                assert!(engine.take_verified_open().is_none());
+                let VerifiedApplied::Open {
+                    key: received,
+                    applied,
+                } = engine.take_verified_applied().unwrap()
+                else {
+                    panic!("user Open result")
+                };
+                assert_eq!(received, key);
+                assert_eq!(applied.settings(), &relocated);
+                assert!(engine.take_verified_applied().is_none());
             }
         }
     }
@@ -1812,7 +4853,7 @@ mod tests {
             observe(&mut engine, absent);
             validate(&mut engine);
             let key = engine.runner.opens.last().unwrap().0;
-            let mut opened = receipt(desired.clone());
+            let mut opened = receipt(desired.clone(), key);
             opened.audio = AudioOutcome::Silent {
                 source,
                 reason: AudioSilence::WaitingForSource(AudioError::Cancelled),
@@ -1824,7 +4865,7 @@ mod tests {
             engine.poll();
             assert_eq!(engine.model.active().is_some(), !strict);
             assert_eq!(engine.model.last_valid().is_some(), !strict);
-            assert_eq!(engine.take_verified_open().is_some(), !strict);
+            assert_eq!(engine.take_verified_applied().is_some(), !strict);
             assert!(engine.strict_startup_apply.is_none());
             if strict {
                 assert_eq!(engine.runner.stops, vec![(key.attempt, StopReason::Failed)]);
@@ -1870,16 +4911,22 @@ mod tests {
                     route: route.clone(),
                 },
             });
-        let mut opened = receipt(desired.clone());
+        let mut opened = receipt(desired.clone(), key);
         opened.audio = AudioOutcome::Active { route };
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key,
             receipt: Box::new(opened),
         });
         engine.poll();
-        let event = engine.take_verified_open().unwrap();
-        assert_eq!(event.key, key);
-        assert_eq!(event.applied.settings(), &desired);
+        let VerifiedApplied::Open {
+            key: received,
+            applied,
+        } = engine.take_verified_applied().unwrap()
+        else {
+            panic!("startup Open result")
+        };
+        assert_eq!(received, key);
+        assert_eq!(applied.settings(), &desired);
         assert!(engine.strict_startup_apply.is_none());
         let absent = observation(
             &engine,
@@ -1901,7 +4948,7 @@ mod tests {
             Some(AudioAvailability::Silent { .. })
         ));
         assert!(engine.runner.stops.is_empty());
-        assert!(engine.take_verified_open().is_none());
+        assert!(engine.take_verified_applied().is_none());
     }
 
     #[test]
@@ -1928,13 +4975,15 @@ mod tests {
                 engine.poll();
             }
             assert!(engine.strict_startup_apply.is_none());
-            assert!(engine.take_verified_open().is_none());
+            assert!(engine.take_verified_applied().is_none());
             let next = apply(&mut engine);
             assert_ne!(next, id);
             validate(&mut engine);
             engine.runner.verified();
             engine.poll();
-            assert_eq!(engine.take_verified_open().unwrap().key.apply, next);
+            assert!(
+                matches!(engine.take_verified_applied(), Some(VerifiedApplied::Open { key, .. }) if key.apply == next)
+            );
             assert_eq!(
                 engine.require_startup_restore_audio(next),
                 Err(CommandRejection::StaleState)
@@ -2336,31 +5385,66 @@ mod tests {
     }
 
     #[test]
-    fn explicit_pause_rejected_admission_keeps_live_playback_eligible() {
-        let mut engine = engine();
-        let current = initial(&mut engine);
-        let before = engine.model().state_identity();
+    fn explicit_pause_rejected_admission_keeps_actual_same_source_and_explicit_filter_apply_eligible()
+     {
         for status in [
             SubmitStatus::NotReady,
             SubmitStatus::Closing,
             SubmitStatus::CapacityExceeded,
             SubmitStatus::StaleGeneration,
         ] {
-            engine.runner_mut().immediate = Some(status);
-            assert_eq!(engine.pause(current), Ok(status));
-            assert_eq!(engine.model().state_identity(), before);
-            assert_eq!(
-                engine.model().active().unwrap().playback(),
-                PlaybackState::Live
-            );
-            assert!(engine.model().can_apply() && engine.model().can_restart());
-            assert!(engine.model().validation_request().is_none());
+            for explicit in [false, true] {
+                let mut engine = engine();
+                let current = initial(&mut engine);
+                let before = engine.model().state_identity();
+                engine.runner.immediate = Some(status);
+                assert_eq!(engine.pause(current), Ok(status));
+                assert_eq!(engine.model().state_identity(), before);
+                let ImmediateIntent::SetPaused { request, .. } =
+                    &engine.runner.intents.last().unwrap().1
+                else {
+                    panic!("pause reservation")
+                };
+                let request = *request;
+                assert!(
+                    !engine.model.pause_admitted(current, request),
+                    "a refused old reservation cannot become pending"
+                );
+                let candidate = filter_settings("after refused pause");
+                let revision = engine
+                    .edit_draft(engine.model().draft().revision, candidate.clone())
+                    .unwrap();
+                let admission = if explicit {
+                    engine
+                        .apply_filters(engine.model().state_identity(), revision)
+                        .unwrap()
+                } else {
+                    engine
+                        .apply(engine.model().state_identity(), revision)
+                        .unwrap()
+                };
+                let ApplyAdmission::Filters { key, .. } = admission else {
+                    panic!("LIVE filter admission")
+                };
+                filter_success(&mut engine, key);
+                engine.poll();
+                assert_eq!(
+                    engine.model().active().unwrap().applied().settings(),
+                    &candidate
+                );
+                assert_eq!(
+                    engine.model().active().unwrap().playback(),
+                    PlaybackState::Live
+                );
+                assert_eq!(engine.runner.opens.len(), 1);
+                assert!(engine.runner.stops.is_empty());
+                assert_eq!(engine.pause(current), Ok(SubmitStatus::Accepted));
+                assert!(matches!(
+                    engine.model().active().unwrap().playback(),
+                    PlaybackState::PausePending { .. }
+                ));
+            }
         }
-        assert_eq!(engine.pause(current), Ok(SubmitStatus::Accepted));
-        assert!(matches!(
-            engine.model().active().unwrap().playback(),
-            PlaybackState::PausePending { .. }
-        ));
     }
 
     #[test]
@@ -2607,6 +5691,7 @@ mod tests {
             ValidationLayer::Input,
             ValidationLayer::Audio,
             ValidationLayer::Discovery,
+            ValidationLayer::Filters,
         ] {
             let mut engine = engine();
             let old = initial(&mut engine);
@@ -2828,7 +5913,7 @@ mod tests {
             .events
             .push_back(SessionEvent::OpenVerified {
                 key,
-                receipt: Box::new(receipt(settings(60))),
+                receipt: Box::new(receipt(settings(60), key)),
             });
         engine.poll();
         assert!(engine.model().active().is_none());
@@ -2960,7 +6045,7 @@ mod tests {
                 assert!(engine.model().active().is_none());
                 if let Some(lease) = &engine.lease {
                     let key = lease.key;
-                    let stale = receipt(lease.settings.clone());
+                    let stale = receipt(lease.settings.clone(), key);
                     engine
                         .runner_mut()
                         .events
@@ -3009,7 +6094,7 @@ mod tests {
             .events
             .push_back(SessionEvent::OpenVerified {
                 key: candidate,
-                receipt: Box::new(receipt(settings(30))),
+                receipt: Box::new(receipt(settings(30), candidate)),
             });
         engine
             .runner_mut()
@@ -3134,7 +6219,7 @@ mod tests {
             apply(&mut engine);
             validate(&mut engine);
             let key = engine.runner_mut().opens[0].0;
-            let mut opened = receipt(selected);
+            let mut opened = receipt(selected, key);
             let route = route_fixture(
                 key.attempt,
                 AudioEpoch::new(1).unwrap(),
@@ -3200,7 +6285,7 @@ mod tests {
         apply(&mut engine);
         validate(&mut engine);
         let key = engine.runner_mut().opens[0].0;
-        let mut opened = receipt(settings(60));
+        let mut opened = receipt(settings(60), key);
         opened.verification.decoded_size = FactStatus::Unverified;
         opened.verification.nominal_rate = FactStatus::Unverified;
         engine
@@ -3222,6 +6307,9 @@ mod tests {
         ] {
             let mut engine = engine();
             let old = initial(&mut engine);
+            engine
+                .edit_draft(engine.model().draft().revision, settings(30))
+                .unwrap();
             engine.validator_mut().reject = Some(rejection);
             let result = engine.apply(
                 engine.model().state_identity(),
@@ -3547,6 +6635,216 @@ mod tests {
                 ),
             });
         engine.poll();
+    }
+
+    #[test]
+    fn terminal_and_cleanup_blockers_preserve_causes_before_retirement_in_either_order() {
+        for blocker_first in [false, true] {
+            for retire_in_drain in [false, true] {
+                let mut engine = engine();
+                let old = initial(&mut engine);
+                engine.take_verified_applied();
+                let terminal = failure(
+                    settings(60),
+                    FailureCategory::Lifecycle(LifecycleFailure::SurfaceLoss),
+                    "surface lost",
+                );
+                let poison = failure(
+                    settings(60),
+                    FailureCategory::Lifecycle(LifecycleFailure::SurfaceLoss),
+                    "native lifetime poisoned",
+                );
+                let acknowledgement = failure(
+                    settings(60),
+                    FailureCategory::Lifecycle(LifecycleFailure::Acknowledgement),
+                    "missing acknowledgement",
+                );
+                if blocker_first {
+                    engine
+                        .runner
+                        .events
+                        .push_back(SessionEvent::CleanupBlocked {
+                            attempt: old,
+                            failure: poison.clone(),
+                        });
+                }
+                engine.runner.events.push_back(SessionEvent::SessionFailed {
+                    attempt: old,
+                    failure: terminal.clone(),
+                });
+                if !blocker_first {
+                    engine
+                        .runner
+                        .events
+                        .push_back(SessionEvent::CleanupBlocked {
+                            attempt: old,
+                            failure: poison.clone(),
+                        });
+                }
+                for _ in 0..2 {
+                    engine
+                        .runner
+                        .events
+                        .push_back(SessionEvent::CleanupBlocked {
+                            attempt: old,
+                            failure: acknowledgement.clone(),
+                        });
+                }
+                if retire_in_drain {
+                    engine.runner.barrier(old);
+                }
+                engine.runner.verified(); // A cached positive cannot cross terminal/blocker facts.
+                engine.poll();
+                assert!(engine.model().active().is_none());
+                assert_eq!(
+                    engine.model().cleanup(),
+                    &CleanupStatus::Blocked {
+                        failure: poison.clone()
+                    }
+                );
+                let report = engine.model().failures().unwrap();
+                assert_eq!(report.incumbent.as_ref(), Some(&terminal));
+                assert_eq!(
+                    report.cleanup,
+                    vec![poison.clone(), acknowledgement.clone()]
+                );
+                assert_eq!(engine.runner.opens.len(), 1);
+                assert_eq!(engine.validator.requests.len(), 1);
+                assert!(engine.model().opening().is_none());
+                assert!(engine.take_verified_applied().is_none());
+                assert_eq!(
+                    engine.reconnect(engine.model().state_identity()),
+                    Err(CommandRejection::CleanupBlocked)
+                );
+                engine.quit();
+                engine.validator.retired = true;
+                engine.poll();
+                if !retire_in_drain {
+                    assert!(!engine.model().shutdown_ready());
+                    engine.runner.barrier(old);
+                    engine.poll();
+                }
+                assert!(engine.model().shutdown_ready());
+                let report = engine.model().failures().unwrap();
+                assert_eq!(report.incumbent.as_ref(), Some(&terminal));
+                assert_eq!(report.cleanup, vec![poison, acknowledgement]);
+                assert_eq!(
+                    engine.runner.opens.len(),
+                    1,
+                    "blocked lifetime cannot reopen during retirement or Quit"
+                );
+            }
+        }
+    }
+    #[test]
+    fn opening_failure_blockers_fence_resource_free_and_same_drain_retirement_before_restore() {
+        for blocker_first in [false, true] {
+            for resource_free_stop in [false, true] {
+                let mut engine = engine();
+                let old = initial(&mut engine);
+                engine.take_verified_applied();
+                engine
+                    .edit_draft(engine.model().draft().revision, settings(30))
+                    .unwrap();
+                let admission = engine
+                    .apply(
+                        engine.model().state_identity(),
+                        engine.model().draft().revision,
+                    )
+                    .unwrap();
+                validate(&mut engine);
+                engine.runner.barrier(old);
+                engine.poll();
+                let candidate = engine.model().opening().unwrap().0;
+                assert_eq!(candidate.purpose, AttemptPurpose::Candidate);
+                let rejected = failure(
+                    settings(30),
+                    FailureCategory::Session,
+                    "source candidate failed",
+                );
+                let poison = failure(
+                    settings(30),
+                    FailureCategory::Lifecycle(LifecycleFailure::SurfaceLoss),
+                    "candidate native lifetime poisoned",
+                );
+                if resource_free_stop {
+                    engine.runner.stop_failure = Some(StopSubmission::NoResourcesCreated);
+                }
+                if blocker_first {
+                    engine
+                        .runner
+                        .events
+                        .push_back(SessionEvent::CleanupBlocked {
+                            attempt: candidate.attempt,
+                            failure: poison.clone(),
+                        });
+                }
+                engine.runner.events.push_back(SessionEvent::OpenFailed {
+                    key: candidate,
+                    failure: rejected.clone(),
+                });
+                if !blocker_first {
+                    engine
+                        .runner
+                        .events
+                        .push_back(SessionEvent::CleanupBlocked {
+                            attempt: candidate.attempt,
+                            failure: poison.clone(),
+                        });
+                }
+                if !resource_free_stop {
+                    engine.runner.barrier(candidate.attempt);
+                }
+                engine.runner.verified();
+                engine.poll();
+                assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+                assert!(engine.model().active().is_none());
+                assert!(engine.model().opening().is_none());
+                assert_eq!(
+                    engine.model().cleanup(),
+                    &CleanupStatus::Blocked {
+                        failure: poison.clone()
+                    }
+                );
+                assert_eq!(
+                    engine.model().failures().unwrap().candidate.as_ref(),
+                    Some(&rejected)
+                );
+                assert_eq!(
+                    engine.model().failures().unwrap().cleanup,
+                    vec![poison.clone()]
+                );
+                assert_eq!(
+                    engine.runner.opens.len(),
+                    2,
+                    "no Restore owner may cross a cleanup blocker"
+                );
+                assert_eq!(
+                    engine.validator.requests.len(),
+                    2,
+                    "even resource-free retirement cannot admit Restore validation"
+                );
+                assert!(
+                    engine
+                        .validator
+                        .requests
+                        .iter()
+                        .all(|request| request.key.purpose != AttemptPurpose::Restore)
+                );
+                assert!(!engine.has_user_apply_result_or_pending(admission.id()));
+                assert!(engine.take_verified_applied().is_none());
+                engine.quit();
+                engine.validator.retired = true;
+                engine.poll();
+                assert!(engine.model().shutdown_ready());
+                assert_eq!(
+                    engine.model().failures().unwrap().candidate.as_ref(),
+                    Some(&rejected)
+                );
+                assert_eq!(engine.model().failures().unwrap().cleanup, vec![poison]);
+                assert_eq!(engine.runner.opens.len(), 2);
+            }
+        }
     }
 
     #[test]
@@ -3938,7 +7236,7 @@ mod tests {
         assert_ne!(next, first.attempt);
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key: first,
-            receipt: Box::new(receipt(settings(60))),
+            receipt: Box::new(receipt(settings(60), first)),
         });
         engine.runner.events.push_back(SessionEvent::StreamEnded {
             attempt: old,
@@ -4164,7 +7462,7 @@ mod tests {
         let key = engine.runner.opens.last().unwrap().0;
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key,
-            receipt: Box::new(receipt(settings(60))),
+            receipt: Box::new(receipt(settings(60), key)),
         });
         engine.poll();
         assert!(engine.model().active().is_none());
@@ -4348,7 +7646,7 @@ mod tests {
         observe(&mut engine, absent);
         validate(&mut engine);
         let key = engine.runner.opens.last().unwrap().0;
-        let mut receipt = receipt(desired);
+        let mut receipt = receipt(desired, key);
         receipt.audio = AudioOutcome::Silent {
             source: source.clone(),
             reason: AudioSilence::WaitingForSource(crate::domain::capture::AudioError::Cancelled),
@@ -4755,7 +8053,7 @@ mod tests {
                     route: route.clone(),
                 },
             });
-        let mut ready = receipt(desired);
+        let mut ready = receipt(desired, key);
         ready.audio = AudioOutcome::Active { route };
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key,
@@ -4904,7 +8202,7 @@ mod tests {
             epoch: AudioEpoch::new(1).unwrap(),
             outcome: Ok(()),
         });
-        let mut ready = receipt(desired);
+        let mut ready = receipt(desired, key);
         ready.audio = AudioOutcome::Silent {
             source: source.clone(),
             reason: AudioSilence::WaitingForSource(crate::domain::capture::AudioError::Cancelled),
@@ -5117,7 +8415,7 @@ mod tests {
                     reason: AudioSilence::Output(OutputSilence::ManualRequiresAction),
                 },
             });
-        let mut opened = receipt(desired);
+        let mut opened = receipt(desired, key);
         opened.audio = AudioOutcome::Silent {
             source: source.clone(),
             reason: AudioSilence::Output(OutputSilence::ManualRequiresAction),
@@ -5494,7 +8792,7 @@ mod tests {
         observe(&mut engine, absent);
         validate(&mut engine);
         let key = engine.runner.opens.last().unwrap().0;
-        let mut opened = receipt(desired);
+        let mut opened = receipt(desired, key);
         opened.audio = AudioOutcome::Silent {
             source,
             reason: AudioSilence::Output(OutputSilence::NoAvailableOutput),
@@ -5510,7 +8808,7 @@ mod tests {
             engine.runner.stops.last(),
             Some(&(key.attempt, StopReason::Failed))
         );
-        assert!(engine.take_verified_open().is_none());
+        assert!(engine.take_verified_applied().is_none());
     }
 
     #[test]

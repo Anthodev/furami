@@ -46,7 +46,7 @@ pub struct LocalPreferences {
 
 /// The complete persisted document: last verified applied settings, if any,
 /// plus local preferences.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredDocument {
     pub applied: Option<DraftSettings>,
     pub preferences: LocalPreferences,

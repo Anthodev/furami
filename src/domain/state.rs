@@ -10,13 +10,15 @@ use super::{
         RecoveryObservation, RecoveryWatchTarget, SelectionToken, VideoPresence, WatchId,
         WatchStamp,
     },
-    failure::ApplyFailure,
+    failure::{ApplyFailure, FilterErrorKind},
+    filters::FilterChain,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DraftSettings {
     pub video: ModeRequest,
     pub audio: AudioSelection,
+    pub filters: FilterChain,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DraftRevision(u64);
@@ -76,12 +78,104 @@ pub struct AttemptKey {
     pub attempt: AttemptId,
     pub purpose: AttemptPurpose,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum FilterPass {
+    LiveCandidate,
+    LiveRestore,
+    Open,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct FilterAttemptKey {
+    pub apply: ApplyId,
+    pub attempt: AttemptId,
+    pub pass: FilterPass,
+}
+
+/// Immutable authorization supplied before any owner work is submitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplyAdmission {
+    Open {
+        apply: ApplyId,
+    },
+    Filters {
+        key: FilterAttemptKey,
+        revision: DraftRevision,
+    },
+}
+impl ApplyAdmission {
+    pub fn id(&self) -> ApplyId {
+        match self {
+            Self::Open { apply } => *apply,
+            Self::Filters { key, .. } => key.apply,
+        }
+    }
+}
+/// Attests bounded media observation, not physical display or future frames.
+/// Only media observation may construct this value; it is never deserialized.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct FilterConfirmation {
+    key: FilterAttemptKey,
+    baseline: f64,
+    last_position: f64,
+    advances: u16,
+}
+
+impl FilterConfirmation {
+    pub const REQUIRED_ADVANCES: u16 = 32;
+    pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    pub const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    pub fn key(&self) -> FilterAttemptKey {
+        self.key
+    }
+    pub fn baseline(&self) -> f64 {
+        self.baseline
+    }
+    pub fn last_position(&self) -> f64 {
+        self.last_position
+    }
+    pub fn advances(&self) -> u16 {
+        self.advances
+    }
+
+    /// The owner must first witness a matching successful command reply,
+    /// in-window reconfiguration, 50-ms sampling with at most one read pending,
+    /// and a final clean drain without failure/evidence loss within DEADLINE.
+    /// `advances` counts strictly increasing post-baseline observations, not
+    /// reads or elapsed intervals. This boundary checks the numeric summary;
+    /// the keyed media observer owns the event-ordering proof.
+    pub(crate) fn checked(
+        key: FilterAttemptKey,
+        baseline: f64,
+        last_position: f64,
+        advances: u16,
+    ) -> Result<Self, super::failure::FilterConfirmationFailure> {
+        use super::failure::FilterConfirmationFailure;
+        if !baseline.is_finite() || !last_position.is_finite() {
+            return Err(FilterConfirmationFailure::ProgressUnavailable);
+        }
+        if last_position <= baseline {
+            return Err(FilterConfirmationFailure::TimeDiscontinuity);
+        }
+        if advances < Self::REQUIRED_ADVANCES {
+            return Err(FilterConfirmationFailure::Deadline);
+        }
+        Ok(Self {
+            key,
+            baseline,
+            last_position,
+            advances,
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ValidationKey {
     pub apply: ApplyId,
     pub purpose: AttemptPurpose,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ValidationRequest {
     pub key: ValidationKey,
     pub revision: DraftRevision,
@@ -90,12 +184,12 @@ pub struct ValidationRequest {
     pub watch: WatchStamp,
     pub choice: Option<SelectionToken>,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Draft {
     pub revision: DraftRevision,
     pub settings: DraftSettings,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AppliedSettings {
     settings: DraftSettings,
 }
@@ -105,7 +199,7 @@ impl AppliedSettings {
     }
 }
 /// Frozen last-successful state and real loss facts; never derived from the draft.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RecoveryLoss {
     pub applied: AppliedSettings,
     pub playback: InitialPlayback,
@@ -113,7 +207,7 @@ pub struct RecoveryLoss {
     pub failure: ApplyFailure,
     pub stamp: WatchStamp,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Active {
     applied: AppliedSettings,
     key: AttemptKey,
@@ -135,7 +229,7 @@ impl Active {
         self.initial_playback
     }
 }
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct FailureReport {
     pub candidate: Option<ApplyFailure>,
     pub restore: Option<ApplyFailure>,
@@ -143,7 +237,7 @@ pub struct FailureReport {
     pub incumbent: Option<ApplyFailure>,
     pub cleanup: Vec<ApplyFailure>,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum CleanupStatus {
     Draining,
     Complete,
@@ -153,6 +247,8 @@ pub enum CleanupStatus {
 pub enum ProductPhase {
     Stopped,
     Active,
+    ApplyingFilters,
+    RestoringFilters,
     PausePending,
     Paused,
     Validating,
@@ -182,6 +278,7 @@ pub struct StateIdentity {
     cleanup: u8,
     playback: Option<PlaybackState>,
     observation: Option<WatchStamp>,
+    filter_pass: Option<FilterPass>,
 }
 impl StateIdentity {
     pub fn phase(self) -> ProductPhase {
@@ -192,6 +289,9 @@ impl StateIdentity {
     }
     pub fn attempt(self) -> Option<AttemptId> {
         self.attempt
+    }
+    pub fn filter_pass(self) -> Option<FilterPass> {
+        self.filter_pass
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,9 +306,12 @@ pub enum StopIntent {
     Close,
     Quit,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ModelEffect {
     Validate(ValidationRequest),
+    ApplyFilters {
+        key: FilterAttemptKey,
+    },
     Open {
         key: AttemptKey,
         request: ValidationRequest,
@@ -236,6 +339,8 @@ pub enum CommandRejection {
     PlaybackBusy,
     #[error("playback control unavailable")]
     PlaybackUnavailable,
+    #[error("filter-only Apply cannot change video or audio")]
+    CaptureDraftChanged,
     #[error("shutdown is latched")]
     ShuttingDown,
     #[error("monotonic counter exhausted")]
@@ -247,40 +352,86 @@ pub enum CommandRejection {
     #[error("recovery selection is stale or unavailable")]
     SelectionUnavailable,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Origin {
     Stopped,
     Active,
     Restored(Box<RestoredOrigin>),
     Error(Box<FailureReport>),
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct RestoredOrigin {
     failed_candidate: DraftSettings,
     failures: FailureReport,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "One bounded transition slot intentionally stores its incumbent inline to avoid a source-validation allocation."
+)]
 enum Step {
     Validating { incumbent: Option<Active> },
     ClosingOld,
     Opening { key: AttemptKey },
     Cleaning { key: AttemptKey },
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PriorOwner {
+    key: AttemptKey,
+    playback: PlaybackState,
+    initial_playback: InitialPlayback,
+}
+#[derive(Clone, Debug, PartialEq)]
 pub struct Transition {
     request: ValidationRequest,
     requested_target: DraftSettings,
     prior: Option<AppliedSettings>,
+    prior_owner: Option<PriorOwner>,
+    filter_restore: bool,
     origin: Origin,
     step: Step,
     failures: FailureReport,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilterRestoreRoute {
+    Live,
+    FreshOwner,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterTransition {
+    key: FilterAttemptKey,
+    revision: DraftRevision,
+    incumbent: Active,
+    prior: AppliedSettings,
+    candidate: DraftSettings,
+    failures: FailureReport,
+    route: Option<FilterRestoreRoute>,
+}
+impl FilterTransition {
+    pub fn key(&self) -> FilterAttemptKey {
+        self.key
+    }
+    pub fn revision(&self) -> DraftRevision {
+        self.revision
+    }
+    pub fn candidate(&self) -> &DraftSettings {
+        &self.candidate
+    }
+    pub fn prior(&self) -> &AppliedSettings {
+        &self.prior
+    }
+    pub fn route(&self) -> Option<FilterRestoreRoute> {
+        self.route
+    }
+}
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProductState {
     Stopped,
     Active(Active),
     Applying(Transition),
     Recovering(Transition),
+    Filtering(FilterTransition),
     ErrorWithActiveRestored {
         active: Active,
         failed_candidate: DraftSettings,
@@ -304,6 +455,10 @@ impl ProductState {
                 PlaybackState::Live => ProductPhase::Active,
                 PlaybackState::PausePending { .. } => ProductPhase::PausePending,
                 PlaybackState::Paused => ProductPhase::Paused,
+            },
+            Self::Filtering(transition) => match transition.key.pass {
+                FilterPass::LiveCandidate => ProductPhase::ApplyingFilters,
+                FilterPass::LiveRestore | FilterPass::Open => ProductPhase::RestoringFilters,
             },
             Self::Applying(transition) | Self::Recovering(transition) => {
                 if transition.request.key.purpose == AttemptPurpose::Recovery {
@@ -362,6 +517,7 @@ pub struct ProductModel {
     next_watch: u64,
     consumed_removal: Option<ObservationEpoch>,
     recovery: Option<RecoveryLoss>,
+    recovery_filter_transaction: bool,
     recovery_candidates: Vec<RecoveryCandidate>,
     loss_attempt: Option<AttemptId>,
     recovery_attempted: Option<WatchStamp>,
@@ -369,6 +525,7 @@ pub struct ProductModel {
     // Fallback reconnect intent when no frozen RecoveryLoss exists. Pause
     // admission retains Paused; a validated fresh Resume open replaces it.
     last_playback: InitialPlayback,
+    confirmed_filters: Option<FilterAttemptKey>,
 }
 impl ProductModel {
     pub fn new(settings: DraftSettings) -> Self {
@@ -394,11 +551,13 @@ impl ProductModel {
             next_watch: 0,
             consumed_removal: None,
             recovery: None,
+            recovery_filter_transaction: false,
             recovery_candidates: Vec::new(),
             loss_attempt: None,
             recovery_attempted: None,
             recovery_apply: None,
             last_playback: InitialPlayback::Live,
+            confirmed_filters: None,
         }
     }
     pub fn draft(&self) -> &Draft {
@@ -428,6 +587,9 @@ impl ProductModel {
                 step: Step::Validating { incumbent },
                 ..
             }) => incumbent.as_ref(),
+            // This is the last-verified configuration, not proof that the
+            // provisional native chain still executes.
+            ProductState::Filtering(transition) => Some(&transition.incumbent),
             _ => None,
         }
     }
@@ -436,6 +598,7 @@ impl ProductModel {
             ProductState::Applying(transition) | ProductState::Recovering(transition) => {
                 Some(&transition.failures)
             }
+            ProductState::Filtering(transition) => Some(&transition.failures),
             ProductState::ErrorWithActiveRestored { failures, .. }
             | ProductState::ErrorWithoutActive { failures } => Some(failures),
             ProductState::Disconnected
@@ -451,6 +614,7 @@ impl ProductModel {
             phase: self.phase(),
             operation: self.last_operation,
             attempt: self.owned_attempt,
+            filter_pass: self.filtering().map(|transition| transition.key.pass),
             cleanup: match self.cleanup {
                 CleanupStatus::Complete => 0,
                 CleanupStatus::Draining => 1,
@@ -481,6 +645,7 @@ impl ProductModel {
     }
     pub fn can_reconnect(&self) -> bool {
         !self.quitting
+            && self.filtering().is_none()
             && !matches!(
                 self.state,
                 ProductState::Stopping { .. } | ProductState::ShutdownReady
@@ -491,6 +656,31 @@ impl ProductModel {
     }
     pub fn can_restart(&self) -> bool {
         self.can_apply() && self.last_valid.is_some()
+    }
+    pub fn filtering(&self) -> Option<&FilterTransition> {
+        match &self.state {
+            ProductState::Filtering(transition) => Some(transition),
+            _ => None,
+        }
+    }
+    pub fn confirmed_filter_key(&self) -> Option<FilterAttemptKey> {
+        self.confirmed_filters
+    }
+    pub fn has_pending_user_apply(&self, apply: ApplyId) -> bool {
+        if self.quitting || matches!(self.cleanup, CleanupStatus::Blocked { .. }) {
+            return false;
+        }
+        match &self.state {
+            ProductState::Filtering(transition) => {
+                transition.key.apply == apply && transition.key.pass == FilterPass::LiveCandidate
+            }
+            ProductState::Applying(transition) => {
+                transition.request.key.apply == apply
+                    && transition.request.key.purpose == AttemptPurpose::Candidate
+                    && !matches!(transition.step, Step::Cleaning { .. })
+            }
+            _ => false,
+        }
     }
     pub fn shutdown_ready(&self) -> bool {
         matches!(self.state, ProductState::ShutdownReady)
@@ -630,6 +820,7 @@ impl ProductModel {
             || stamp.epoch.get() < request.watch.epoch.get()
             || settings.video.mode != request.settings.video.mode
             || settings.audio != request.settings.audio
+            || settings.filters != request.settings.filters
         {
             return None;
         }
@@ -727,6 +918,7 @@ impl ProductModel {
             return None;
         }
         if let Some(active) = self.active().cloned() {
+            self.recovery_filter_transaction = self.filtering().is_some();
             let stamp = self
                 .observation
                 .as_ref()
@@ -790,6 +982,58 @@ impl ProductModel {
             return self.open_failed(key, failure);
         }
         None
+    }
+    fn filter_restore_source_lost(
+        &mut self,
+        mut transition: Transition,
+        stamp: WatchStamp,
+        latest: WatchStamp,
+    ) -> Option<ModelEffect> {
+        let prior = transition
+            .prior
+            .take()
+            .expect("filter restoration retains verified prior");
+        let playback = transition.request.playback;
+        let failure = ApplyFailure::new(
+            super::failure::FailureCategory::Session,
+            super::failure::Stage::Unknown,
+            super::failure::Cause::Generic,
+            prior.settings.clone(),
+            "video_removed",
+            "matching capture device removal cancelled filter restoration",
+        );
+        self.last_playback = playback;
+        self.recovery = Some(RecoveryLoss {
+            applied: prior,
+            playback,
+            evidence: LossEvidence::Removed { stamp },
+            failure: failure.clone(),
+            stamp: latest,
+        });
+        self.recovery_filter_transaction = true;
+        self.recovery_attempted = None;
+        self.recovery_candidates.clear();
+        self.prepared_pause = None;
+        if let Some(value) = self.next_apply.checked_add(1)
+            && let Some(apply) = ApplyId::new(value)
+        {
+            self.next_apply = value;
+            self.recovery_apply = Some(apply);
+            self.last_operation = Some(apply);
+        }
+        transition.failures.incumbent = Some(failure);
+        self.completed_failures = Some(transition.failures);
+        self.state = ProductState::Disconnected;
+        if let Some(attempt) = self.owned_attempt {
+            self.loss_attempt = Some(attempt);
+            self.cleanup = CleanupStatus::Draining;
+            Some(ModelEffect::Stop {
+                attempt,
+                reason: StopIntent::Failed,
+            })
+        } else {
+            self.continue_recovery()
+        }
     }
     pub fn recovery_observed(&mut self, observation: &RecoveryObservation) -> Option<ModelEffect> {
         if self.quitting
@@ -861,6 +1105,13 @@ impl ProductModel {
                 if transition.request.watch.watch == stamp.watch
                     && epoch.get() >= transition.request.watch.epoch.get()
                 {
+                    if transition.filter_restore {
+                        return self.filter_restore_source_lost(
+                            transition,
+                            stamp,
+                            observation.stamp,
+                        );
+                    }
                     self.recovery_attempted = None;
                     if let Step::Opening { key } = transition.step {
                         self.cleanup = CleanupStatus::Draining;
@@ -1082,7 +1333,7 @@ impl ProductModel {
         };
         Ok(self.draft.revision)
     }
-    fn check_command(&self, expected: StateIdentity) -> Result<(), CommandRejection> {
+    pub(crate) fn check_command(&self, expected: StateIdentity) -> Result<(), CommandRejection> {
         if self.quitting {
             return Err(CommandRejection::ShuttingDown);
         }
@@ -1091,7 +1342,7 @@ impl ProductModel {
         }
         if matches!(
             self.state,
-            ProductState::Applying(_) | ProductState::Recovering(_)
+            ProductState::Applying(_) | ProductState::Recovering(_) | ProductState::Filtering(_)
         ) {
             return Err(CommandRejection::ApplyInProgress);
         }
@@ -1109,6 +1360,336 @@ impl ProductModel {
             }
             CleanupStatus::Complete => Ok(()),
         }
+    }
+    /// Freeze a complete LIVE treatment request before compilation/submission.
+    pub fn apply_filters(
+        &mut self,
+        expected: StateIdentity,
+        revision: DraftRevision,
+    ) -> Result<ApplyAdmission, CommandRejection> {
+        self.check_command(expected)?;
+        if revision != self.draft.revision {
+            return Err(CommandRejection::StaleRevision);
+        }
+        let active = self.active().ok_or(CommandRejection::PlaybackUnavailable)?;
+        if active.playback != PlaybackState::Live {
+            return Err(CommandRejection::PlaybackUnavailable);
+        }
+        if self.prepared_pause.is_some() {
+            return Err(CommandRejection::PlaybackBusy);
+        }
+        if active.applied.settings.video != self.draft.settings.video
+            || active.applied.settings.audio != self.draft.settings.audio
+        {
+            return Err(CommandRejection::CaptureDraftChanged);
+        }
+        // A fresh Restore may reserve a no-resource cutover followed by an open.
+        self.next_attempt
+            .checked_add(2)
+            .ok_or(CommandRejection::CounterExhausted)?;
+        let value = self
+            .next_apply
+            .checked_add(1)
+            .ok_or(CommandRejection::CounterExhausted)?;
+        let apply = ApplyId::new(value).ok_or(CommandRejection::CounterExhausted)?;
+        let incumbent = active.clone();
+        let key = FilterAttemptKey {
+            apply,
+            attempt: incumbent.attempt(),
+            pass: FilterPass::LiveCandidate,
+        };
+        self.state = ProductState::Filtering(FilterTransition {
+            key,
+            revision,
+            prior: incumbent.applied.clone(),
+            incumbent,
+            candidate: self.draft.settings.clone(),
+            failures: FailureReport::default(),
+            route: None,
+        });
+        self.next_apply = value;
+        self.last_operation = Some(apply);
+        self.validation_rejection = None;
+        self.completed_failures = None;
+        Ok(ApplyAdmission::Filters { key, revision })
+    }
+    pub fn filter_confirmed(&mut self, confirmation: FilterConfirmation) -> bool {
+        let key = confirmation.key();
+        if self
+            .filtering()
+            .is_none_or(|transition| transition.key != key)
+            || self.owned_attempt != Some(key.attempt)
+            || !matches!(self.cleanup, CleanupStatus::Complete)
+            || self
+                .filtering()
+                .is_some_and(|transition| transition.route == Some(FilterRestoreRoute::FreshOwner))
+        {
+            return false;
+        }
+        let ProductState::Filtering(mut transition) =
+            std::mem::replace(&mut self.state, ProductState::Stopped)
+        else {
+            return false;
+        };
+        self.confirmed_filters = Some(key);
+        if key.pass == FilterPass::LiveCandidate {
+            let applied = AppliedSettings {
+                settings: transition.candidate,
+            };
+            transition.incumbent.applied = applied.clone();
+            self.last_valid = Some(applied);
+            self.state = ProductState::Active(transition.incumbent);
+        } else {
+            self.state = ProductState::ErrorWithActiveRestored {
+                active: transition.incumbent,
+                failed_candidate: transition.candidate,
+                failures: transition.failures,
+            };
+        }
+        true
+    }
+    /// Queue refusal is not candidate acceptance and cannot justify restoration.
+    pub fn filter_submission_refused(
+        &mut self,
+        key: FilterAttemptKey,
+        failure: ApplyFailure,
+    ) -> Option<ModelEffect> {
+        if self
+            .filtering()
+            .is_none_or(|transition| transition.key != key)
+        {
+            return None;
+        }
+        if key.pass == FilterPass::LiveRestore {
+            return self.filter_failed(key, failure, false);
+        }
+        let ProductState::Filtering(mut transition) =
+            std::mem::replace(&mut self.state, ProductState::Stopped)
+        else {
+            return None;
+        };
+        transition.failures.candidate = Some(failure);
+        self.state = ProductState::ErrorWithActiveRestored {
+            active: transition.incumbent,
+            failed_candidate: transition.candidate,
+            failures: transition.failures,
+        };
+        None
+    }
+    /// A selected route never changes. A failure on LiveRestore drains only.
+    pub fn filter_failed(
+        &mut self,
+        key: FilterAttemptKey,
+        failure: ApplyFailure,
+        force_fresh: bool,
+    ) -> Option<ModelEffect> {
+        let current = self.filtering()?.key;
+        if current != key {
+            return None;
+        }
+        if self.filtering()?.route == Some(FilterRestoreRoute::FreshOwner) {
+            return None;
+        }
+        let ProductState::Filtering(mut transition) =
+            std::mem::replace(&mut self.state, ProductState::Stopped)
+        else {
+            return None;
+        };
+        if key.pass == FilterPass::LiveRestore {
+            transition.failures.restore = Some(failure);
+            self.state = ProductState::ErrorWithoutActive {
+                failures: transition.failures,
+            };
+            self.cleanup = CleanupStatus::Draining;
+            return Some(ModelEffect::Stop {
+                attempt: key.attempt,
+                reason: StopIntent::Failed,
+            });
+        }
+        let fresh = force_fresh
+            || failure
+                .filter
+                .as_ref()
+                .is_some_and(|filter| filter.requires_fresh_owner);
+        let rejected = failure.filter.as_ref().is_some_and(|filter| {
+            matches!(
+                filter.kind,
+                FilterErrorKind::Prevalidation
+                    | FilterErrorKind::CatalogUnavailable
+                    | FilterErrorKind::CommandSubmission { .. }
+                    | FilterErrorKind::CommandRejected { .. }
+            )
+        });
+        transition.failures.candidate = Some(failure);
+        if rejected && !fresh {
+            self.state = ProductState::ErrorWithActiveRestored {
+                active: transition.incumbent,
+                failed_candidate: transition.candidate,
+                failures: transition.failures,
+            };
+            return None;
+        }
+        transition.key.pass = FilterPass::LiveRestore;
+        transition.route = Some(if fresh {
+            FilterRestoreRoute::FreshOwner
+        } else {
+            FilterRestoreRoute::Live
+        });
+        let effect = if fresh {
+            self.cleanup = CleanupStatus::Draining;
+            ModelEffect::Stop {
+                attempt: key.attempt,
+                reason: StopIntent::Failed,
+            }
+        } else {
+            ModelEffect::ApplyFilters {
+                key: transition.key,
+            }
+        };
+        self.state = ProductState::Filtering(transition);
+        Some(effect)
+    }
+    pub fn filter_incumbent_failed(&mut self, failure: ApplyFailure) {
+        if let ProductState::Filtering(transition) = &mut self.state {
+            transition.failures.incumbent = Some(failure);
+        }
+    }
+    /// A late native fault restores the then-last-verified chain once, never
+    /// older history. The poisoned owner is always physically retired first.
+    pub fn late_filter_failed(
+        &mut self,
+        key: FilterAttemptKey,
+        failure: ApplyFailure,
+    ) -> Option<ModelEffect> {
+        if self.confirmed_filters != Some(key)
+            || self.filtering().is_some()
+            || self.quitting
+            || matches!(self.cleanup, CleanupStatus::Blocked { .. })
+        {
+            return None;
+        }
+        if self.loss_attempt == Some(key.attempt) {
+            // This proof belongs to the owner already revoked by source loss.
+            // Keep the native evidence without replacing removal truth, frozen
+            // recovery settings/playback, or the existing source transition.
+            if let Some(filter) = failure.filter {
+                if let Some(loss) = &mut self.recovery {
+                    loss.failure.filter.get_or_insert_with(|| filter.clone());
+                }
+                let report = match &mut self.state {
+                    ProductState::Applying(transition) | ProductState::Recovering(transition) => {
+                        Some(&mut transition.failures)
+                    }
+                    ProductState::ErrorWithoutActive { failures }
+                    | ProductState::ErrorWithActiveRestored { failures, .. } => Some(failures),
+                    _ => self.completed_failures.as_mut(),
+                };
+                if let Some(incumbent) = report.and_then(|report| report.incumbent.as_mut()) {
+                    incumbent.filter.get_or_insert(filter);
+                }
+            }
+            return None;
+        }
+        if self.owned_attempt != Some(key.attempt) {
+            return None;
+        }
+        let (incumbent, overlap) = match &self.state {
+            ProductState::Active(active) | ProductState::ErrorWithActiveRestored { active, .. } => {
+                (active.clone(), None)
+            }
+            ProductState::Applying(transition)
+                if matches!(
+                    transition.request.key.purpose,
+                    AttemptPurpose::Candidate | AttemptPurpose::Resume
+                ) && matches!(transition.step, Step::Validating { .. } | Step::ClosingOld) =>
+            {
+                let prior = transition.prior.as_ref()?;
+                let owner = transition.prior_owner?;
+                if owner.key.attempt != key.attempt {
+                    return None;
+                }
+                (
+                    Active {
+                        applied: prior.clone(),
+                        key: owner.key,
+                        playback: owner.playback,
+                        initial_playback: owner.initial_playback,
+                    },
+                    Some((transition.request.key.apply, transition.request.revision)),
+                )
+            }
+            _ => return None,
+        };
+        let required = if overlap.is_some() { 1 } else { 2 };
+        if self.next_attempt.checked_add(required).is_none() {
+            return self.late_filter_capacity_failed(key.attempt, incumbent.applied, failure);
+        }
+        // A superseded source operation already reserved its single Restore.
+        // Reuse that operation identity, but revoke its Candidate authorization.
+        let (apply, revision) = if let Some(overlap) = overlap {
+            overlap
+        } else {
+            let Some(value) = self.next_apply.checked_add(1) else {
+                return self.late_filter_capacity_failed(key.attempt, incumbent.applied, failure);
+            };
+            let apply = ApplyId::new(value).expect("positive checked apply counter");
+            self.next_apply = value;
+            (apply, self.draft.revision)
+        };
+        let candidate = incumbent.applied.settings.clone();
+        self.last_operation = Some(apply);
+        self.prepared_pause = None;
+        self.validation_rejection = None;
+        self.state = ProductState::Filtering(FilterTransition {
+            key: FilterAttemptKey {
+                apply,
+                attempt: key.attempt,
+                pass: FilterPass::LiveRestore,
+            },
+            revision,
+            prior: incumbent.applied.clone(),
+            incumbent,
+            candidate,
+            route: Some(FilterRestoreRoute::FreshOwner),
+            failures: FailureReport {
+                candidate: Some(failure.clone()),
+                incumbent: Some(failure),
+                ..FailureReport::default()
+            },
+        });
+        self.cleanup = CleanupStatus::Draining;
+        Some(ModelEffect::Stop {
+            attempt: key.attempt,
+            reason: StopIntent::Failed,
+        })
+    }
+    fn late_filter_capacity_failed(
+        &mut self,
+        attempt: AttemptId,
+        prior: AppliedSettings,
+        failure: ApplyFailure,
+    ) -> Option<ModelEffect> {
+        let restore = ApplyFailure::new(
+            super::failure::FailureCategory::Lifecycle(super::failure::LifecycleFailure::Protocol),
+            super::failure::Stage::Prevalidation,
+            super::failure::Cause::Generic,
+            prior.settings,
+            "filter_restore_capacity",
+            "monotonic counter exhausted",
+        );
+        self.state = ProductState::ErrorWithoutActive {
+            failures: FailureReport {
+                candidate: Some(failure.clone()),
+                incumbent: Some(failure),
+                restore: Some(restore),
+                ..FailureReport::default()
+            },
+        };
+        self.cleanup = CleanupStatus::Draining;
+        Some(ModelEffect::Stop {
+            attempt,
+            reason: StopIntent::Failed,
+        })
     }
     pub fn apply(
         &mut self,
@@ -1130,6 +1711,9 @@ impl ProductModel {
         }
         if expected != self.state_identity() {
             return Err(CommandRejection::StaleState);
+        }
+        if self.filtering().is_some() {
+            return Err(CommandRejection::ApplyInProgress);
         }
         if let ProductState::Applying(transition) | ProductState::Recovering(transition) =
             &self.state
@@ -1216,6 +1800,18 @@ impl ProductModel {
         self.next_pause = value;
         self.prepared_pause = Some((attempt, request));
         Ok(request)
+    }
+    /// Refusal retires only this exact unadmitted reservation; counters never rewind.
+    pub(crate) fn cancel_prepared_pause(
+        &mut self,
+        attempt: AttemptId,
+        request: PauseRequestId,
+    ) -> bool {
+        if self.prepared_pause != Some((attempt, request)) {
+            return false;
+        }
+        self.prepared_pause = None;
+        true
     }
     /// Called only after the matching owner command has been admitted.
     pub fn pause_admitted(&mut self, attempt: AttemptId, request: PauseRequestId) -> bool {
@@ -1318,6 +1914,11 @@ impl ProductModel {
             ApplyId::new(value).ok_or(CommandRejection::CounterExhausted)?
         };
         let incumbent = self.active().cloned();
+        let prior_owner = incumbent.as_ref().map(|active| PriorOwner {
+            key: active.key,
+            playback: active.playback,
+            initial_playback: active.initial_playback,
+        });
         let watch = self.ensure_watch(&settings)?;
         let playback = if matches!(
             purpose,
@@ -1362,15 +1963,20 @@ impl ProductModel {
             request: request.clone(),
             requested_target: request.settings.clone(),
             prior: self.last_valid.clone(),
+            prior_owner,
+            filter_restore: false,
             origin,
             step: Step::Validating { incumbent },
-            failures: self
-                .recovery
-                .as_ref()
-                .map_or_else(FailureReport::default, |loss| FailureReport {
-                    incumbent: Some(loss.failure.clone()),
-                    ..FailureReport::default()
-                }),
+            failures: if purpose == AttemptPurpose::Recovery && self.recovery_filter_transaction {
+                self.completed_failures.clone().unwrap_or_default()
+            } else {
+                self.recovery
+                    .as_ref()
+                    .map_or_else(FailureReport::default, |loss| FailureReport {
+                        incumbent: Some(loss.failure.clone()),
+                        ..FailureReport::default()
+                    })
+            },
         };
         self.put_transition(transition, purpose == AttemptPurpose::Recovery);
         Ok((apply, ModelEffect::Validate(request)))
@@ -1554,9 +2160,15 @@ impl ProductModel {
             initial_playback: transition.request.playback,
         };
         self.last_valid = Some(applied);
+        self.confirmed_filters = Some(FilterAttemptKey {
+            apply: key.apply,
+            attempt: key.attempt,
+            pass: FilterPass::Open,
+        });
         self.last_playback = transition.request.playback;
         self.recovery_apply = None;
         self.recovery = None;
+        self.recovery_filter_transaction = false;
         self.recovery_candidates.clear();
         self.loss_attempt = None;
         self.recovery_attempted = None;
@@ -1654,6 +2266,15 @@ impl ProductModel {
         if self.owned_attempt != Some(attempt) {
             return None;
         }
+        if let Some(transition) = self.filtering() {
+            let key = transition.key;
+            let waiting_fresh = transition.route == Some(FilterRestoreRoute::FreshOwner);
+            self.filter_incumbent_failed(failure.clone());
+            if waiting_fresh {
+                return None;
+            }
+            return self.filter_failed(key, failure, true);
+        }
         if let Some((key, _)) = self.opening() {
             return self.open_failed(key, failure);
         }
@@ -1686,6 +2307,7 @@ impl ProductModel {
             ProductState::Applying(transition) | ProductState::Recovering(transition) => {
                 Some(&mut transition.failures)
             }
+            ProductState::Filtering(transition) => Some(&mut transition.failures),
             ProductState::ErrorWithoutActive { failures } => Some(failures),
             ProductState::Disconnected
             | ProductState::SelectionRequired
@@ -1726,6 +2348,67 @@ impl ProductModel {
             return None;
         }
         self.cleanup = CleanupStatus::Complete;
+        if let ProductState::Filtering(transition) = &self.state {
+            if transition.route != Some(FilterRestoreRoute::FreshOwner) {
+                let failures = transition.failures.clone();
+                self.state = ProductState::ErrorWithoutActive { failures };
+                return None;
+            }
+            let ProductState::Filtering(transition) =
+                std::mem::replace(&mut self.state, ProductState::Stopped)
+            else {
+                return None;
+            };
+            let settings = transition.prior.settings.clone();
+            let watch = match self.ensure_watch(&settings) {
+                Ok(watch) => watch,
+                Err(error) => {
+                    let mut failures = transition.failures;
+                    failures.restore = Some(ApplyFailure::new(
+                        super::failure::FailureCategory::Lifecycle(
+                            super::failure::LifecycleFailure::Protocol,
+                        ),
+                        super::failure::Stage::Prevalidation,
+                        super::failure::Cause::Generic,
+                        settings,
+                        "filter_restore_watch",
+                        error.to_string(),
+                    ));
+                    self.state = ProductState::ErrorWithoutActive { failures };
+                    return None;
+                }
+            };
+            let request = ValidationRequest {
+                key: ValidationKey {
+                    apply: transition.key.apply,
+                    purpose: AttemptPurpose::Restore,
+                },
+                revision: transition.revision,
+                settings,
+                playback: if transition.incumbent.playback == PlaybackState::Live {
+                    InitialPlayback::Live
+                } else {
+                    InitialPlayback::Paused
+                },
+                watch,
+                choice: None,
+            };
+            let effect = ModelEffect::Validate(request.clone());
+            self.put_transition(
+                Transition {
+                    requested_target: request.settings.clone(),
+                    request,
+                    prior: Some(transition.prior),
+                    origin: Origin::Active,
+                    prior_owner: None,
+                    filter_restore: true,
+                    step: Step::Validating { incumbent: None },
+                    failures: transition.failures,
+                },
+                true,
+            );
+            return Some(effect);
+        }
         let (mut transition, recovering) = self.take_transition()?;
         match transition.step {
             Step::ClosingOld => self.open_transition(transition, recovering),
@@ -1813,6 +2496,7 @@ impl ProductModel {
         self.prepared_pause = None;
         self.recovery_apply = None;
         self.recovery = None;
+        self.recovery_filter_transaction = false;
         self.recovery_candidates.clear();
         self.recovery_attempted = None;
         self.loss_attempt = None;
@@ -1822,6 +2506,7 @@ impl ProductModel {
         if matches!(
             self.state,
             ProductState::Applying(_)
+                | ProductState::Filtering(_)
                 | ProductState::Recovering(_)
                 | ProductState::ErrorWithActiveRestored { .. }
                 | ProductState::ErrorWithoutActive { .. }
@@ -1869,7 +2554,7 @@ impl ProductModel {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ValidationRejection {
     pub request: ValidationRequest,
     pub failure: ApplyFailure,
@@ -1882,8 +2567,218 @@ mod tests {
         CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize, UsbTopology,
     };
 
+    fn treatments() -> FilterChain {
+        use crate::domain::filters::{
+            ColorLevels, Filter, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
+        };
+        FilterChain::new(vec![FilterEntry::new(
+            "inert\nlabel".into(),
+            Filter::Format(FormatParams::new(
+                SdrMatrix::Auto,
+                ColorLevels::Auto,
+                SdrGamma::Auto,
+            )),
+            false,
+        )])
+        .unwrap()
+    }
+
+    #[test]
+    fn live_filter_request_freezes_complete_state_and_phase_identity() {
+        let mut model = ProductModel::new(settings(60));
+        let owner = initial_active(&mut model);
+        let mut candidate = settings(60);
+        candidate.filters = treatments();
+        let revision = model
+            .edit_draft(model.draft().revision, candidate.clone())
+            .unwrap();
+        let ApplyAdmission::Filters {
+            key,
+            revision: admitted_revision,
+        } = model
+            .apply_filters(model.state_identity(), revision)
+            .unwrap()
+        else {
+            panic!("filter admission")
+        };
+        assert_eq!(key.attempt, owner.attempt);
+        assert_eq!(admitted_revision, revision);
+        let pending = model.state_identity();
+        assert_eq!(pending.filter_pass(), Some(FilterPass::LiveCandidate));
+        assert!(!model.can_apply());
+        assert!(!model.can_restart());
+        assert!(!model.can_reconnect());
+        assert_eq!(
+            model.restart(pending),
+            Err(CommandRejection::ApplyInProgress)
+        );
+        assert_eq!(
+            model.resume(pending, owner.attempt),
+            Err(CommandRejection::ApplyInProgress)
+        );
+        assert_eq!(
+            model.apply_filters(pending, revision),
+            Err(CommandRejection::ApplyInProgress)
+        );
+        model.edit_draft(revision, settings(30)).unwrap();
+        assert_eq!(model.filtering().unwrap().candidate(), &candidate);
+        assert!(model.filter_confirmed(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()));
+        assert_eq!(model.last_valid().unwrap().settings(), &candidate);
+        assert_eq!(model.draft().settings, settings(30));
+        assert_eq!(model.active().unwrap().attempt(), owner.attempt);
+        assert_eq!(model.state_identity().filter_pass(), None);
+        assert!(!model.filter_confirmed(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()));
+    }
+    #[test]
+    fn refused_pause_reservation_cancellation_is_exact_and_never_rewinds_counter() {
+        let mut model = ProductModel::new(settings(60));
+        let owner = initial_active(&mut model);
+        let old = model.prepare_pause(owner.attempt).unwrap();
+        let current = model.prepare_pause(owner.attempt).unwrap();
+        assert!(current.get() > old.get());
+        assert!(!model.cancel_prepared_pause(owner.attempt, old));
+        assert_eq!(
+            model.apply_filters(model.state_identity(), model.draft().revision),
+            Err(CommandRejection::PlaybackBusy)
+        );
+        assert!(model.cancel_prepared_pause(owner.attempt, current));
+        assert!(!model.pause_admitted(owner.attempt, old));
+        assert!(!model.pause_admitted(owner.attempt, current));
+        let next = model.prepare_pause(owner.attempt).unwrap();
+        assert!(next.get() > current.get());
+        assert!(model.pause_admitted(owner.attempt, next));
+        assert!(!model.cancel_prepared_pause(owner.attempt, next));
+        assert_eq!(
+            model.active().unwrap().playback(),
+            PlaybackState::PausePending { request: next }
+        );
+    }
+
+    #[test]
+    fn live_filter_admission_checks_capture_pause_and_recovery_counter_capacity() {
+        for (apply_counter, attempt_counter) in [(u64::MAX, 1), (1, u64::MAX - 1)] {
+            let mut model = ProductModel::new(settings(60));
+            initial_active(&mut model);
+            model.next_apply = apply_counter;
+            model.next_attempt = attempt_counter;
+            let identity = model.state_identity();
+            assert_eq!(
+                model.apply_filters(identity, model.draft().revision),
+                Err(CommandRejection::CounterExhausted)
+            );
+            assert_eq!(model.state_identity(), identity);
+            assert_eq!(model.last_valid().unwrap().settings(), &settings(60));
+        }
+        let mut model = ProductModel::new(settings(60));
+        let owner = initial_active(&mut model);
+        model
+            .edit_draft(model.draft().revision, settings(30))
+            .unwrap();
+        assert_eq!(
+            model.apply_filters(model.state_identity(), model.draft().revision),
+            Err(CommandRejection::CaptureDraftChanged)
+        );
+        model
+            .edit_draft(model.draft().revision, settings(60))
+            .unwrap();
+        let pause = model.prepare_pause(owner.attempt).unwrap();
+        assert_eq!(
+            model.apply_filters(model.state_identity(), model.draft().revision),
+            Err(CommandRejection::PlaybackBusy)
+        );
+        assert!(model.pause_admitted(owner.attempt, pause));
+        assert!(model.pause_observed(owner.attempt, pause, true));
+        assert_eq!(
+            model.apply_filters(model.state_identity(), model.draft().revision),
+            Err(CommandRejection::PlaybackUnavailable)
+        );
+    }
+
+    #[test]
+    fn prepared_capture_cannot_drop_or_change_complete_treatments() {
+        let mut submitted = settings(60);
+        submitted.filters = treatments();
+        let mut model = ProductModel::new(submitted.clone());
+        model
+            .apply(model.state_identity(), model.draft().revision)
+            .unwrap();
+        let request = model.validation_request().unwrap().clone();
+        let mut dropped = submitted.clone();
+        dropped.filters = FilterChain::default();
+        assert!(
+            model
+                .accept_prepared(&request, dropped, request.watch)
+                .is_none()
+        );
+        let mut changed = submitted.clone();
+        changed.filters.set_enabled(0, true).unwrap();
+        assert!(
+            model
+                .accept_prepared(&request, changed, request.watch)
+                .is_none()
+        );
+        assert_eq!(model.validation_request(), Some(&request));
+        let accepted = model
+            .accept_prepared(&request, submitted, request.watch)
+            .unwrap();
+        assert_eq!(accepted.settings.filters, treatments());
+    }
+
+    #[test]
+    fn applied_and_recovery_targets_retain_disabled_treatments() {
+        let mut submitted = settings(60);
+        submitted.filters = treatments();
+        let mut model = ProductModel::new(submitted.clone());
+        let key = initial_active(&mut model);
+        assert_eq!(model.active().unwrap().applied().settings(), &submitted);
+        // Watch matching deliberately excludes treatments.
+        assert_eq!(model.watch_target().unwrap().video, submitted.video);
+        assert_eq!(model.watch_target().unwrap().audio, submitted.audio);
+        model
+            .edit_draft(model.draft().revision, settings(30))
+            .unwrap();
+        assert_eq!(model.last_valid().unwrap().settings().filters, treatments());
+        assert_eq!(model.active().unwrap().attempt(), key.attempt);
+    }
+
+    #[test]
+    fn confirmation_requires_finite_forward_progress_and_full_margin() {
+        use crate::domain::failure::FilterConfirmationFailure;
+        let key = FilterAttemptKey {
+            apply: ApplyId::new(1).unwrap(),
+            attempt: AttemptId::new(2).unwrap(),
+            pass: FilterPass::LiveCandidate,
+        };
+        for (baseline, last) in [
+            (f64::NAN, 1.0),
+            (0.0, f64::INFINITY),
+            (f64::NEG_INFINITY, 1.0),
+        ] {
+            assert_eq!(
+                FilterConfirmation::checked(key, baseline, last, 32),
+                Err(FilterConfirmationFailure::ProgressUnavailable)
+            );
+        }
+        for last in [0.0, -1.0] {
+            assert_eq!(
+                FilterConfirmation::checked(key, 0.0, last, 32),
+                Err(FilterConfirmationFailure::TimeDiscontinuity)
+            );
+        }
+        assert_eq!(
+            FilterConfirmation::checked(key, 0.0, 1.0, 31),
+            Err(FilterConfirmationFailure::Deadline)
+        );
+        let confirmation = FilterConfirmation::checked(key, 0.0, 1.0, 32).unwrap();
+        assert_eq!(confirmation.key(), key);
+        assert_eq!(confirmation.baseline(), 0.0);
+        assert_eq!(confirmation.last_position(), 1.0);
+        assert_eq!(confirmation.advances(), 32);
+    }
+
     pub(super) fn settings(rate: u32) -> DraftSettings {
         DraftSettings {
+            filters: crate::domain::filters::FilterChain::default(),
             video: ModeRequest {
                 identity: DeviceIdentity::new(
                     0x32ed,

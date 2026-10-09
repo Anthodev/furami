@@ -11,7 +11,10 @@ use std::{
     time::Duration,
 };
 
-use super::session::{ObservedFacts, RequestedFacts, SessionError, SessionFacts};
+use super::{
+    filter_catalog::CompiledFilterChain,
+    session::{ObservedFacts, RequestedFacts, SessionError, SessionFacts},
+};
 use crate::app::ports::OpenReadiness;
 #[cfg(test)]
 use crate::capture::input::InputSpec;
@@ -21,8 +24,10 @@ use crate::domain::capture::{
     SelectedRouteAuthorization, WatchStamp,
 };
 use crate::domain::{
+    failure::FilterFailure,
+    filters::FilterChain,
     output::OutputPlan,
-    state::{InitialPlayback, PauseRequestId},
+    state::{FilterAttemptKey, FilterConfirmation, FilterPass, InitialPlayback, PauseRequestId},
 };
 
 #[derive(Clone, Debug)]
@@ -34,6 +39,9 @@ pub struct SessionConfig {
     pub playback: InitialPlayback,
     pub watch: WatchStamp,
     pub selected_route: Option<SelectedRouteAuthorization>,
+    pub filters: FilterChain,
+    pub compiled_filters: CompiledFilterChain,
+    pub filter_key: FilterAttemptKey,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -66,8 +74,12 @@ pub struct SurfaceToken {
     pub generation: Generation,
     pub xid: X11WindowId,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PlaybackIntent {
+    ApplyFilters {
+        key: FilterAttemptKey,
+        compiled: CompiledFilterChain,
+    },
     SetPaused {
         request: PauseRequestId,
         paused: bool,
@@ -139,6 +151,20 @@ pub(crate) struct Snapshot {
     pub playback: InitialPlayback,
     pub audio_detached: Option<(AudioEpoch, Result<(), AudioError>)>,
     pub audio_epoch: Option<AudioEpoch>,
+    pub filters: Option<FilterSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FilterSnapshot {
+    pub key: FilterAttemptKey,
+    pub sequence: u64,
+    pub status: FilterStatus,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum FilterStatus {
+    Pending,
+    Confirmed(FilterConfirmation),
+    Failed(Box<FilterFailure>),
 }
 #[derive(Debug)]
 pub(crate) struct OwnerStopped {
@@ -221,8 +247,12 @@ impl RequestId {
         ))
     }
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BackendCommand {
+    ApplyFilters {
+        key: FilterAttemptKey,
+        compiled: CompiledFilterChain,
+    },
     LoadInput,
     SetPaused {
         request: PauseRequestId,
@@ -247,10 +277,22 @@ enum InFlight {
         paused: bool,
     },
     Control,
+    Filters {
+        key: FilterAttemptKey,
+    },
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BackendEvent {
     None,
+    FilterResult {
+        id: u64,
+        key: FilterAttemptKey,
+        result: Result<FilterConfirmation, Box<FilterFailure>>,
+    },
+    FilterFault {
+        key: FilterAttemptKey,
+        failure: Box<FilterFailure>,
+    },
     FileLoaded,
     PlaybackRestart,
     VideoReconfig,
@@ -295,6 +337,9 @@ pub(crate) trait OwnerBackend {
     fn audio_epoch(&self) -> Option<AudioEpoch> {
         None
     }
+    fn initial_filters(&mut self) -> Option<(FilterAttemptKey, CompiledFilterChain)> {
+        None
+    }
     fn shutdown(&mut self) -> Result<(), MediaError>;
 }
 
@@ -322,6 +367,7 @@ impl OwnerEndpoint {
     ) -> Result<Self, MediaError> {
         let requested = config.video.requested();
         let settings = crate::domain::state::DraftSettings {
+            filters: config.filters.clone(),
             video: crate::domain::capture::ModeRequest {
                 identity: requested.identity.clone(),
                 mode: requested.mode,
@@ -371,7 +417,8 @@ impl OwnerEndpoint {
                         config.playback,
                         config.watch,
                         config.output,
-                    ),
+                    )
+                    .with_filters(config.filter_key, config.compiled_filters),
                     surface,
                     commands,
                     gain,
@@ -537,6 +584,7 @@ impl OwnerEndpoint {
                     playback: InitialPlayback::Live,
                     audio_detached: None,
                     audio_epoch: None,
+                    filters: None,
                 };
                 let outcome = task(
                     &surface_rx,
@@ -893,6 +941,7 @@ fn run_owner<B: OwnerBackend>(
     let id = RequestId::next(&mut last_request)?;
     backend.submit(id, BackendCommand::LoadInput)?;
     let mut pending = Some((id, InFlight::LoadInput));
+    let mut reserved_restore = None;
     loop {
         if stop.is_set() {
             return stop.outcome();
@@ -909,13 +958,28 @@ fn run_owner<B: OwnerBackend>(
             )?;
         }
         if pending.is_none() && snapshot.stream_ended.is_none() {
-            match commands.try_recv() {
+            let initial = if snapshot.load_complete && snapshot.playback_started {
+                backend
+                    .initial_filters()
+                    .map(|(key, compiled)| PlaybackIntent::ApplyFilters { key, compiled })
+            } else {
+                None
+            };
+            match initial.map_or_else(|| commands.try_recv(), Ok) {
                 Ok(intent) => {
                     if stop.is_set() {
                         return stop.outcome();
                     }
-                    let id = RequestId::next(&mut last_request)?;
+                    let id = match &intent {
+                        PlaybackIntent::ApplyFilters { key, .. } => {
+                            filter_request(&mut last_request, &mut reserved_restore, *key)?
+                        }
+                        _ => RequestId::next(&mut last_request)?,
+                    };
                     let command = match intent {
+                        PlaybackIntent::ApplyFilters { key, compiled } => {
+                            BackendCommand::ApplyFilters { key, compiled }
+                        }
                         PlaybackIntent::SetPaused { request, paused } => {
                             BackendCommand::SetPaused { request, paused }
                         }
@@ -939,6 +1003,10 @@ fn run_owner<B: OwnerBackend>(
                         snapshot.pause = None;
                     }
                     let in_flight = match &command {
+                        BackendCommand::ApplyFilters { key, .. } => {
+                            record_filter(snapshot, *key, FilterStatus::Pending)?;
+                            InFlight::Filters { key: *key }
+                        }
                         BackendCommand::SetPaused { request, paused } => InFlight::SetPaused {
                             request: *request,
                             paused: *paused,
@@ -979,6 +1047,31 @@ fn run_owner<B: OwnerBackend>(
                 BackendEvent::None => {
                     drained = true;
                     break;
+                }
+                BackendEvent::FilterResult { id, key, result } => {
+                    if matches!(pending, Some((expected, InFlight::Filters { key: expected_key })) if expected.get() == id && expected_key == key)
+                    {
+                        let status = match result {
+                            Ok(confirmation) if confirmation.key() == key => {
+                                FilterStatus::Confirmed(confirmation)
+                            }
+                            Ok(_) => continue,
+                            Err(failure) => FilterStatus::Failed(failure),
+                        };
+                        record_filter(snapshot, key, status)?;
+                        pending = None;
+                        publish(latest, snapshot);
+                    }
+                }
+                BackendEvent::FilterFault { key, failure } => {
+                    if snapshot
+                        .filters
+                        .as_ref()
+                        .is_some_and(|filters| filters.key == key)
+                    {
+                        record_filter(snapshot, key, FilterStatus::Failed(failure))?;
+                        publish(latest, snapshot);
+                    }
                 }
                 BackendEvent::Other => {}
                 BackendEvent::FileLoaded => {
@@ -1038,6 +1131,9 @@ fn run_owner<B: OwnerBackend>(
                     if let Some((expected, kind)) = pending.as_ref()
                         && expected.get() == id
                     {
+                        if matches!(kind, InFlight::Filters { .. }) {
+                            continue; // Only the settled, keyed FilterResult ends this operation.
+                        }
                         if error < 0 {
                             return Err(MediaError::new(
                                 "command_reply",
@@ -1119,6 +1215,49 @@ fn run_owner<B: OwnerBackend>(
             thread::park_timeout(Duration::from_millis(10));
         }
     }
+}
+
+/// Reserve both cookies atomically. Output work advances the counter beyond the
+/// reserved pair and can never consume the restoration cookie.
+fn filter_request(
+    last: &mut u64,
+    reserved: &mut Option<(FilterAttemptKey, RequestId)>,
+    key: FilterAttemptKey,
+) -> Result<RequestId, MediaError> {
+    if key.pass == FilterPass::LiveRestore
+        && reserved.as_ref().is_some_and(|(candidate, _)| {
+            candidate.apply == key.apply && candidate.attempt == key.attempt
+        })
+    {
+        return Ok(reserved.take().expect("matched reservation").1);
+    }
+    let mut next = *last;
+    let candidate = RequestId::next(&mut next)?;
+    let restore = RequestId::next(&mut next)?;
+    *last = next;
+    *reserved = Some((key, restore));
+    Ok(candidate)
+}
+
+fn record_filter(
+    snapshot: &mut Snapshot,
+    key: FilterAttemptKey,
+    status: FilterStatus,
+) -> Result<(), MediaError> {
+    let sequence = snapshot
+        .filters
+        .as_ref()
+        .map_or(0, |filters| filters.sequence)
+        .checked_add(1)
+        .ok_or_else(|| {
+            MediaError::new("filter_sequence", "filter observation sequence exhausted")
+        })?;
+    snapshot.filters = Some(FilterSnapshot {
+        key,
+        sequence,
+        status,
+    });
+    Ok(())
 }
 
 fn record_pause(
@@ -1258,6 +1397,7 @@ pub(crate) mod test_support {
         paused: bool,
         audio_epoch: Option<AudioEpoch>,
         observed: ObservedFacts,
+        open_filters: Option<(FilterAttemptKey, CompiledFilterChain)>,
     }
 
     impl Driver {
@@ -1298,6 +1438,7 @@ pub(crate) mod test_support {
                     paused: false,
                     audio_epoch: None,
                     observed: ObservedFacts::default(),
+                    open_filters: None,
                 },
             )
         }
@@ -1315,6 +1456,40 @@ pub(crate) mod test_support {
             self.events.send(Input::Fence(tx)).unwrap();
             rx.recv().unwrap();
         }
+        /// Script a successful backend boundary only for the real submitted Open
+        /// cookie/key. Production and observer tests never use this test driver.
+        pub(crate) fn confirm_open_filters(&self) -> FilterConfirmation {
+            loop {
+                let (id, command) = self
+                    .submitted
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("owner did not submit configured initial filters");
+                match command {
+                    BackendCommand::LoadInput => continue,
+                    BackendCommand::ApplyFilters { key, .. } if key.pass == FilterPass::Open => {
+                        let confirmation = FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap();
+                        self.send(BackendEvent::FilterResult {
+                            id: id.get(),
+                            key,
+                            result: Ok(confirmation),
+                        });
+                        return confirmation;
+                    }
+                    other => panic!("expected initial filter command, received {other:?}"),
+                }
+            }
+        }
+    }
+
+    impl FakeBackend {
+        pub(crate) fn with_open_filters(
+            mut self,
+            key: FilterAttemptKey,
+            compiled: CompiledFilterChain,
+        ) -> Self {
+            self.open_filters = Some((key, compiled));
+            self
+        }
     }
 
     impl OwnerBackend for FakeBackend {
@@ -1325,6 +1500,9 @@ pub(crate) mod test_support {
                 self.initialize_release.recv().unwrap();
             }
             self.config.initialization_error.take().map_or(Ok(()), Err)
+        }
+        fn initial_filters(&mut self) -> Option<(FilterAttemptKey, CompiledFilterChain)> {
+            self.open_filters.take()
         }
 
         fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
@@ -1448,6 +1626,197 @@ mod tests {
         owner.wait_for_ack().unwrap();
         assert!(driver.destroyed.recv().is_ok());
         owner.take_stopped().unwrap().unwrap()
+    }
+
+    fn filter_key(apply: u64, pass: FilterPass) -> FilterAttemptKey {
+        FilterAttemptKey {
+            apply: crate::domain::state::ApplyId::new(apply).unwrap(),
+            attempt: crate::domain::state::AttemptId::new(1).unwrap(),
+            pass,
+        }
+    }
+    fn filters_intent(key: FilterAttemptKey) -> PlaybackIntent {
+        PlaybackIntent::ApplyFilters {
+            key,
+            compiled: crate::media::filter_catalog::compile_chain(
+                &FilterChain::default(),
+                &crate::media::filter_catalog::fixture_capabilities(),
+            )
+            .unwrap(),
+        }
+    }
+    fn filter_failure(
+        key: FilterAttemptKey,
+        kind: crate::domain::failure::FilterErrorKind,
+    ) -> Box<FilterFailure> {
+        Box::new(FilterFailure {
+            kind,
+            attributed_ordinal: None,
+            requires_fresh_owner: false,
+            diagnostics: crate::domain::failure::FilterAttemptDiagnostics {
+                key: Some(key),
+                entries: vec![],
+                records: vec![],
+                native_evidence_lost: false,
+                truncated: false,
+                dropped_context: 0,
+            },
+        })
+    }
+    fn start_filter() -> (OwnerEndpoint, Driver, RequestId, FilterAttemptKey) {
+        let (owner, driver) = start(Config::default());
+        let load = load(&driver);
+        let key = filter_key(1, FilterPass::LiveCandidate);
+        owner.submit(generation(), filters_intent(key));
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        let (id, command) = driver
+            .submitted
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            matches!(command, BackendCommand::ApplyFilters { key: actual, .. } if actual == key)
+        );
+        (owner, driver, id, key)
+    }
+
+    #[test]
+    fn filter_pending_keeps_discrete_slot_until_exact_settled_result_not_command_reply() {
+        let (mut owner, driver, id, key) = start_filter();
+        owner.submit(generation(), pause_intent());
+        driver.send(BackendEvent::CommandReply {
+            id: id.get(),
+            error: -12,
+        });
+        driver.fence();
+        assert!(driver.submitted.try_recv().is_err());
+        assert!(matches!(
+            owner.take_snapshot().unwrap().filters.unwrap().status,
+            FilterStatus::Pending
+        ));
+        let wrong_key = filter_key(2, FilterPass::LiveCandidate);
+        for (cookie, actual) in [
+            (id.get() + 1, key),
+            (id.get(), wrong_key),
+            (id.get(), filter_key(1, FilterPass::LiveRestore)),
+        ] {
+            driver.send(BackendEvent::FilterResult {
+                id: cookie,
+                key: actual,
+                result: Ok(FilterConfirmation::checked(actual, 0.0, 2.0, 32).unwrap()),
+            });
+        }
+        driver.fence();
+        assert!(
+            driver.submitted.try_recv().is_err(),
+            "wrong cookies/keys/passes cannot retire pending work"
+        );
+        driver.send(BackendEvent::FilterResult {
+            id: id.get(),
+            key,
+            result: Err(filter_failure(
+                key,
+                crate::domain::failure::FilterErrorKind::CommandRejected { mpv_error: -12 },
+            )),
+        });
+        let (_, command) = driver
+            .submitted
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(command, pause_command());
+        assert!(
+            stop(&mut owner, &driver).outcome.is_ok(),
+            "a clean filter rejection is not a fatal owner error"
+        );
+    }
+
+    #[test]
+    fn filter_sticky_confirmed_is_overwritten_by_same_key_fault_before_consumption() {
+        let (mut owner, driver, id, key) = start_filter();
+        driver.send(BackendEvent::FilterResult {
+            id: id.get(),
+            key,
+            result: Ok(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()),
+        });
+        driver.send(BackendEvent::FilterFault {
+            key,
+            failure: filter_failure(key, crate::domain::failure::FilterErrorKind::RuntimeGraph),
+        });
+        driver.fence();
+        let filters = owner.take_snapshot().unwrap().filters.unwrap();
+        assert_eq!(filters.key, key);
+        assert_eq!(filters.sequence, 3);
+        assert!(matches!(filters.status, FilterStatus::Failed(_)));
+        driver.send(BackendEvent::FilterResult {
+            id: id.get(),
+            key,
+            result: Ok(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()),
+        });
+        driver.fence();
+        assert!(
+            owner.take_snapshot().is_none(),
+            "duplicate positive result cannot replace the health fault"
+        );
+        assert!(stop(&mut owner, &driver).outcome.is_ok());
+    }
+
+    #[test]
+    fn filter_terminal_and_native_overflow_share_snapshot_and_outrank_success() {
+        for terminal in [
+            BackendEvent::Shutdown,
+            BackendEvent::QueueOverflow,
+            BackendEvent::EndFile {
+                reason: 4,
+                error: -12,
+            },
+        ] {
+            let (mut owner, driver, id, key) = start_filter();
+            driver.send(BackendEvent::FilterResult {
+                id: id.get(),
+                key,
+                result: Ok(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()),
+            });
+            driver.send(terminal);
+            assert!(owner.wait_for_ack().is_ok());
+            let snapshot = owner.take_snapshot().unwrap();
+            assert!(snapshot.failure.is_some());
+            assert!(snapshot.readiness.is_none());
+            assert!(owner.take_stopped().unwrap().unwrap().outcome.is_err());
+            driver.destroyed.recv().unwrap();
+        }
+    }
+
+    #[test]
+    fn filter_cookie_pair_reservation_is_checked_atomic_and_output_cannot_steal_restore() {
+        let mut last = 0;
+        let mut reserved = None;
+        let key = filter_key(1, FilterPass::LiveCandidate);
+        let candidate = filter_request(&mut last, &mut reserved, key).unwrap();
+        assert_eq!(candidate.get(), 1);
+        assert_eq!(last, 2);
+        assert_eq!(RequestId::next(&mut last).unwrap().get(), 3);
+        assert_eq!(
+            filter_request(
+                &mut last,
+                &mut reserved,
+                filter_key(1, FilterPass::LiveRestore)
+            )
+            .unwrap()
+            .get(),
+            2
+        );
+        assert!(reserved.is_none());
+        assert_eq!(last, 3);
+        let mut exhausted = (1 << 63) - 2;
+        assert!(filter_request(&mut exhausted, &mut reserved, key).is_err());
+        assert_eq!(
+            exhausted,
+            (1 << 63) - 2,
+            "a failed two-cookie reservation does not partially consume capacity"
+        );
+        assert!(reserved.is_none());
     }
 
     fn wait_for_owner_disconnect(owner: &mut OwnerEndpoint) -> MediaError {
@@ -2356,6 +2725,7 @@ mod recovery_readiness_tests {
             playback: InitialPlayback::Paused,
             audio_detached: None,
             audio_epoch: None,
+            filters: None,
         }
     }
 

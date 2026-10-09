@@ -5,11 +5,11 @@ use crate::domain::{
         AudioAvailability, AudioEpoch, AudioError, AudioSilence, AudioSourceIdentity, PlaybackGain,
         RecoveryCandidate, RecoveryObservation, RecoveryWatchTarget, SelectionToken, WatchStamp,
     },
-    failure::ApplyFailure,
+    failure::{ApplyFailure, FilterFailure},
     output::OutputPlan,
     state::{
-        AttemptId, AttemptKey, DraftSettings, InitialPlayback, PauseRequestId, ValidationKey,
-        ValidationRequest,
+        AttemptId, AttemptKey, DraftSettings, FilterAttemptKey, FilterConfirmation, FilterPass,
+        InitialPlayback, PauseRequestId, ValidationKey, ValidationRequest,
     },
 };
 
@@ -21,7 +21,7 @@ pub enum SubmitFailure {
     Disconnected,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ValidationOutcome<P> {
     Prepared(P),
     SelectionRequired(Vec<RecoveryCandidate>),
@@ -54,12 +54,12 @@ pub trait DraftValidator {
     fn shutdown_complete(&mut self) -> bool;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum StartFailure {
     NoResourcesCreated(ApplyFailure),
     ResourcesCreated(ApplyFailure),
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum StopSubmission {
     Accepted,
     AlreadyStopping,
@@ -101,10 +101,17 @@ pub enum SubmitStatus {
 
 pub trait SessionRunner {
     type Prepared;
+    type PreparedFilters;
+    /// Pure compilation against capabilities observed at startup, without I/O.
+    fn prepare_filters(
+        &mut self,
+        settings: &DraftSettings,
+    ) -> Result<Self::PreparedFilters, ApplyFailure>;
     fn begin_open(
         &mut self,
         key: AttemptKey,
         prepared: Self::Prepared,
+        filters: Self::PreparedFilters,
         gain: PlaybackGain,
         playback: InitialPlayback,
         output: OutputPlan,
@@ -113,6 +120,11 @@ pub trait SessionRunner {
     /// Terminal acknowledgement/failure must precede coalesced readiness.
     fn poll(&mut self) -> Option<SessionEvent>;
     fn submit_immediate(&mut self, attempt: AttemptId, intent: ImmediateIntent) -> SubmitStatus;
+    fn submit_filters(
+        &mut self,
+        key: FilterAttemptKey,
+        filters: Self::PreparedFilters,
+    ) -> SubmitStatus;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,12 +157,19 @@ pub enum AudioOutcome {
         route: crate::media::loopback::LoopbackReceipt,
     },
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterOpenReceipt {
+    Confirmed(FilterConfirmation),
+    /// Frozen previously verified configuration installed before paused load.
+    PreparedPaused,
+}
+#[derive(Clone, Debug, PartialEq)]
 pub struct OpenReceipt {
     pub settings: DraftSettings,
     pub verification: VerificationSummary,
     pub audio: AudioOutcome,
     pub readiness: OpenReadiness,
+    pub filters: FilterOpenReceipt,
 }
 impl OpenReceipt {
     pub fn matches(&self, settings: &DraftSettings) -> bool {
@@ -172,10 +191,32 @@ impl OpenReceipt {
             _ => false,
         }
     }
+    pub fn matches_filters(&self, key: AttemptKey) -> bool {
+        match (&self.filters, self.readiness) {
+            (FilterOpenReceipt::Confirmed(confirmation), OpenReadiness::Live) => {
+                confirmation.key()
+                    == FilterAttemptKey {
+                        apply: key.apply,
+                        attempt: key.attempt,
+                        pass: FilterPass::Open,
+                    }
+            }
+            (FilterOpenReceipt::PreparedPaused, OpenReadiness::PausedPrepared) => true,
+            _ => false,
+        }
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SessionEvent {
+    FilterResult {
+        key: FilterAttemptKey,
+        result: Result<FilterConfirmation, Box<FilterFailure>>,
+    },
+    FilterFault {
+        key: FilterAttemptKey,
+        failure: Box<FilterFailure>,
+    },
     OpenVerified {
         key: AttemptKey,
         receipt: Box<OpenReceipt>,
