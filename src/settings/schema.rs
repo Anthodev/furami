@@ -19,6 +19,7 @@ use crate::domain::capture::{
     AudioError, AudioSelection, AudioSourceIdentity, CaptureDataError, CaptureMode, CapturedFourCc,
     DeviceIdentity, FrameRate, FrameSize, ModeRequest, PlaybackGain, UsbTopology,
 };
+use crate::domain::filters::FilterChain;
 use crate::domain::output::{PersistentOutputChoice, SinkIdentity};
 use crate::domain::state::DraftSettings;
 
@@ -143,12 +144,18 @@ struct DocumentV1 {
     preferences: PreferencesV1,
 }
 
-object_dto! {
-    #[derive(Debug)]
-    struct AppliedV1 {
-        video: VideoV1,
-        audio: AudioV1,
-    }
+/// The applied section. `video` and `audio` stay mandatory; `filters` is the
+/// complete applied chain and is absent-by-default for backward compatibility
+/// with pre-filter v1 documents. A present `filters` is decoded straight into
+/// the validated [`FilterChain`] (never through an intermediate `Value`), so an
+/// explicit `null` is a schema violation rather than the empty chain. The
+/// custom deserializer below replaces the `object_dto!` derive for exactly that
+/// reason.
+#[derive(Debug)]
+struct AppliedV1 {
+    video: VideoV1,
+    audio: AudioV1,
+    filters: FilterChain,
 }
 
 object_dto! {
@@ -245,10 +252,77 @@ object_dto! {
 // ---------------------------------------------------------------------------
 
 const DOCUMENT_FIELDS: &[&str] = &["schema_version", "applied", "preferences"];
+const APPLIED_FIELDS: &[&str] = &["video", "audio", "filters"];
 const IDENTITY_FIELDS: &[&str] = &["vendor_id", "product_id", "topology", "serial"];
 const AUDIO_FIELDS: &[&str] = &["kind", "source", "retained"];
 const PREFS_FIELDS: &[&str] = &["volume_percent", "muted", "fullscreen", "output"];
 const OUTPUT_FIELDS: &[&str] = &["kind", "sink"];
+
+impl<'de> Deserialize<'de> for AppliedV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Not the `object_dto!` derive: `filters` is absent-by-default for
+        // backward compatibility, which a fully strict field set cannot
+        // express. A present `filters` decodes straight into the validated
+        // `FilterChain` (never through `serde_json::Value`, which would
+        // collapse duplicate object keys); an explicit `null` is refused.
+        deserializer.deserialize_struct("AppliedV1", APPLIED_FIELDS, AppliedVisitor)
+    }
+}
+
+struct AppliedVisitor;
+
+impl<'de> Visitor<'de> for AppliedVisitor {
+    type Value = AppliedV1;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an applied settings object with video, audio and optional filters")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut video: Option<VideoV1> = None;
+        let mut audio: Option<AudioV1> = None;
+        let mut filters: Option<FilterChain> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "video" => {
+                    if video.is_some() {
+                        return Err(de::Error::duplicate_field("video"));
+                    }
+                    video = Some(map.next_value()?);
+                }
+                "audio" => {
+                    if audio.is_some() {
+                        return Err(de::Error::duplicate_field("audio"));
+                    }
+                    audio = Some(map.next_value()?);
+                }
+                "filters" => {
+                    if filters.is_some() {
+                        return Err(de::Error::duplicate_field("filters"));
+                    }
+                    // Present field decodes the validated chain directly. An
+                    // explicit null is refused here (map-only), so only the
+                    // absent key defaults to the empty chain.
+                    filters = Some(map.next_value::<FilterChain>()?);
+                }
+                other => return Err(de::Error::unknown_field(other, APPLIED_FIELDS)),
+            }
+        }
+
+        Ok(AppliedV1 {
+            video: video.ok_or_else(|| de::Error::missing_field("video"))?,
+            audio: audio.ok_or_else(|| de::Error::missing_field("audio"))?,
+            filters: filters.unwrap_or_default(),
+        })
+    }
+}
 
 impl<'de> Deserialize<'de> for PreferencesV1 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -678,6 +752,11 @@ struct SinkWrite<'a> {
 struct AppliedWrite<'a> {
     video: VideoWrite<'a>,
     audio: AudioWrite<'a>,
+    /// Borrowed, validated chain. Omitted only when the chain has no entries so
+    /// a pre-filters v1 document re-encodes byte-for-byte; a nonempty all-disabled
+    /// chain is serialized exactly.
+    #[serde(skip_serializing_if = "chain_is_empty")]
+    filters: &'a FilterChain,
 }
 
 #[derive(Serialize)]
@@ -738,6 +817,12 @@ where
     sequence.end()
 }
 
+/// `skip_serializing_if` predicate for the applied filter section: only a chain
+/// with no entries is omitted.
+fn chain_is_empty(chain: &FilterChain) -> bool {
+    chain.entries().is_empty()
+}
+
 /// Validate public mutable preferences before serialization. Identity, topology,
 /// source properties, size and rational rate are private constructor-validated
 /// domain values: their borrowed wire views preserve those invariants without
@@ -762,11 +847,13 @@ fn applied_to_dto(applied: &DraftSettings) -> AppliedWrite<'_> {
     AppliedWrite {
         video: video_to_dto(&applied.video),
         audio: audio_to_dto(&applied.audio),
+        filters: &applied.filters,
     }
 }
 
 fn applied_from_dto(applied: AppliedV1) -> Result<DraftSettings, SettingsValidationError> {
     Ok(DraftSettings {
+        filters: applied.filters,
         video: video_from_dto(applied.video)?,
         audio: audio_from_dto(applied.audio)?,
     })

@@ -791,6 +791,7 @@ fn choice_identity_matches(requested: &DeviceIdentity, observed: &DeviceIdentity
 }
 fn settings(target: &RecoveryWatchTarget) -> DraftSettings {
     DraftSettings {
+        filters: crate::domain::filters::FilterChain::default(),
         video: target.video.clone(),
         audio: target.audio.clone(),
     }
@@ -1768,6 +1769,7 @@ mod tests {
     ) {
         use crate::domain::state::{ModelEffect, ProductModel};
         let settings = DraftSettings {
+            filters: crate::domain::filters::FilterChain::default(),
             video: ModeRequest {
                 identity,
                 mode: mode(),

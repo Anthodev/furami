@@ -1,14 +1,14 @@
 //! Application persistence policy: only correlated user Apply receipts authorize
-//! capture writes; draft content is solely a close-negotiation baseline.
+//! complete applied writes; draft content is solely a close-negotiation baseline.
 use std::{ffi::OsStr, path::PathBuf};
 
 use crate::{
-    app::apply::VerifiedOpen,
+    app::apply::VerifiedApplied,
     domain::{
         capture::{AudioSourceIdentity, PlaybackGain},
         state::{
-            AppliedSettings, ApplyId, AttemptKey, AttemptPurpose, Draft, DraftRevision,
-            DraftSettings,
+            AppliedSettings, ApplyAdmission, ApplyId, AttemptKey, AttemptPurpose, Draft,
+            DraftRevision, DraftSettings,
         },
     },
     settings::{Durability, LoadOutcome, LocalPreferences, SettingsStore, WriteOutcome},
@@ -29,7 +29,7 @@ pub fn resolve_settings_path(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Resul
     Ok(root.join(".config/furami/settings.json"))
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct StartupSelection {
     pub draft: Option<DraftSettings>,
     pub auto_open: bool,
@@ -82,7 +82,7 @@ pub fn decide_startup(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum CloseState {
     Open,
     ConfirmDraft {
@@ -99,7 +99,7 @@ pub struct PersistenceSession {
     store: Option<SettingsStore>,
     preferences: LocalPreferences,
     baseline: Option<DraftSettings>,
-    user_apply: Option<(ApplyId, Draft)>,
+    user_apply: Option<(ApplyAdmission, Draft)>,
     user_open: Option<AttemptKey>,
     pending_applied: Option<AppliedSettings>,
     close: CloseState,
@@ -202,29 +202,66 @@ impl PersistenceSession {
     pub fn draft_dirty(&self, draft: Option<&DraftSettings>) -> bool {
         draft != self.baseline.as_ref()
     }
-    pub fn admit_user_apply(&mut self, apply: ApplyId, submitted: Draft) {
-        self.user_apply = Some((apply, submitted));
+    pub fn admit_user_apply(&mut self, admission: ApplyAdmission, submitted: Draft) {
+        self.user_apply = Some((admission, submitted));
         self.user_open = None;
+    }
+    pub fn authorized_apply(&self) -> Option<ApplyId> {
+        self.user_apply
+            .as_ref()
+            .map(|(admission, _)| admission.id())
+    }
+    pub fn cancel_user_apply(&mut self, apply: ApplyId) {
+        if self.authorized_apply() == Some(apply) {
+            self.user_apply = None;
+            self.user_open = None;
+        }
     }
     pub fn observe_opening(&mut self, key: AttemptKey) {
         if self
             .user_apply
             .as_ref()
-            .is_some_and(|(apply, _)| *apply == key.apply)
+            .is_some_and(|(admission, _)| matches!(admission, ApplyAdmission::Open { apply } if *apply == key.apply))
             && key.purpose == AttemptPurpose::Candidate
         {
             self.user_open = Some(key);
         }
     }
-    pub fn verified_open(&mut self, event: VerifiedOpen) {
-        if self.user_open != Some(event.key)
-            || self
-                .user_apply
-                .as_ref()
-                .is_none_or(|(apply, _)| *apply != event.key.apply)
-        {
+    pub fn verified_applied(&mut self, event: VerifiedApplied) {
+        let Some((admission, submitted)) = &self.user_apply else {
             return;
-        }
+        };
+        let applied = match (admission, event) {
+            (ApplyAdmission::Open { apply }, VerifiedApplied::Open { key, applied })
+                if *apply == key.apply
+                    && key.purpose == AttemptPurpose::Candidate
+                    && self.user_open == Some(key)
+                    && applied.settings().video.mode == submitted.settings.video.mode
+                    && applied.settings().audio == submitted.settings.audio
+                    && applied.settings().filters == submitted.settings.filters =>
+            {
+                applied
+            }
+            (
+                ApplyAdmission::Filters {
+                    key: admitted,
+                    revision: admitted_revision,
+                },
+                VerifiedApplied::Filters {
+                    key,
+                    revision,
+                    applied,
+                },
+            ) if *admitted == key
+                && key.pass == crate::domain::state::FilterPass::LiveCandidate
+                && *admitted_revision == revision
+                && submitted.revision == revision
+                && applied.settings() == &submitted.settings =>
+            {
+                applied
+            }
+            _ => return,
+        };
         let Some((_, submitted)) = self.user_apply.take() else {
             return;
         };
@@ -233,7 +270,7 @@ impl PersistenceSession {
         // Cleanliness describes the submitted user selection, not that fresh
         // receipt; a newer draft edit must remain different from this baseline.
         self.baseline = Some(submitted.settings);
-        self.pending_applied = Some(event.applied);
+        self.pending_applied = Some(applied);
         self.save();
     }
     fn save(&mut self) -> bool {
@@ -279,6 +316,9 @@ impl PersistenceSession {
             return false;
         }
         self.reset_token = None;
+        if let Some(apply) = self.authorized_apply() {
+            self.cancel_user_apply(apply);
+        }
         if let Some((settings, revision)) =
             draft.filter(|(settings, _)| self.draft_dirty(Some(settings)))
         {
@@ -320,6 +360,9 @@ impl PersistenceSession {
             return false;
         }
         self.close = CloseState::Draining;
+        if let Some(apply) = self.authorized_apply() {
+            self.cancel_user_apply(apply);
+        }
         true
     }
     pub fn close_revision(&self) -> u64 {
@@ -368,11 +411,17 @@ impl PersistenceSession {
         self.close == CloseState::Allowed
     }
     pub fn force_close(&mut self) {
+        if let Some(apply) = self.authorized_apply() {
+            self.cancel_user_apply(apply);
+        }
         self.close = CloseState::Allowed;
     }
     pub fn request_reset(&mut self) {
         if self.close != CloseState::Open || self.store.is_none() || self.reset_token.is_some() {
             return;
+        }
+        if let Some(apply) = self.authorized_apply() {
+            self.cancel_user_apply(apply);
         }
         self.next_reset_token += 1;
         self.reset_token = Some(self.next_reset_token);
@@ -387,6 +436,9 @@ impl PersistenceSession {
         self.reset_token = None;
         if !confirmed {
             return;
+        }
+        if let Some(apply) = self.authorized_apply() {
+            self.cancel_user_apply(apply);
         }
         let Some(store) = &mut self.store else {
             return;
@@ -456,6 +508,7 @@ mod tests {
     }
     fn selection(rate: u32) -> DraftSettings {
         DraftSettings {
+            filters: crate::domain::filters::FilterChain::default(),
             video: ModeRequest {
                 identity: DeviceIdentity::new(
                     0x1234,
@@ -480,7 +533,7 @@ mod tests {
         )
         .unwrap()
     }
-    fn event(settings: DraftSettings) -> VerifiedOpen {
+    fn event(settings: DraftSettings) -> VerifiedApplied {
         let mut model = ProductModel::new(settings);
         model
             .apply(model.state_identity(), model.draft().revision)
@@ -490,7 +543,7 @@ mod tests {
             panic!("opening")
         };
         model.open_verified(key);
-        VerifiedOpen {
+        VerifiedApplied::Open {
             key,
             applied: model.last_valid().unwrap().clone(),
         }
@@ -501,9 +554,12 @@ mod tests {
             settings: settings.clone(),
         };
         let event = event(settings);
-        session.admit_user_apply(event.key.apply, submitted);
-        session.observe_opening(event.key);
-        session.verified_open(event);
+        let VerifiedApplied::Open { key, .. } = &event else {
+            panic!("Open fixture")
+        };
+        session.admit_user_apply(ApplyAdmission::Open { apply: key.apply }, submitted);
+        session.observe_opening(*key);
+        session.verified_applied(event);
     }
     fn load_document(path: PathBuf) -> crate::settings::StoredDocument {
         let (_, LoadOutcome::Loaded(document)) = SettingsStore::load(path) else {
@@ -605,33 +661,284 @@ mod tests {
         assert_eq!(chosen.draft, Some(explicit));
     }
     #[test]
+    fn confirmed_nonempty_treatments_save_complete_chain_for_both_receipt_variants() {
+        use crate::domain::filters::{
+            ColorLevels, EqParams, EqValues, Filter, FilterChain, FilterEntry, FormatParams,
+            Hqdn3dParams, Hqdn3dValues, SdrGamma, SdrMatrix,
+        };
+        use crate::domain::state::{FilterAttemptKey, FilterPass};
+        for live_filters in [false, true] {
+            for all_disabled in [false, true] {
+                let temp = Temp::new();
+                let mut session = PersistenceSession::load(Ok(temp.file()));
+                let mut submitted = selection(60000);
+                submitted.filters = FilterChain::new(vec![
+                    FilterEntry::new(
+                        "SDR\u{a0}matrix".into(),
+                        Filter::Format(FormatParams::new(
+                            SdrMatrix::Bt709,
+                            ColorLevels::Limited,
+                            SdrGamma::Bt1886,
+                        )),
+                        !all_disabled,
+                    ),
+                    FilterEntry::new(
+                        "inert\n\0label".into(),
+                        Filter::Eq(
+                            EqParams::new(EqValues {
+                                contrast: 1.0,
+                                brightness: 0.0,
+                                saturation: 1.0,
+                                gamma: 1.0,
+                                gamma_r: 1.0,
+                                gamma_g: 1.0,
+                                gamma_b: 1.0,
+                                gamma_weight: 1.0,
+                            })
+                            .unwrap(),
+                        ),
+                        false,
+                    ),
+                    FilterEntry::new(
+                        "denoise".into(),
+                        Filter::Hqdn3d(
+                            Hqdn3dParams::new(Hqdn3dValues {
+                                luma_spatial: 3.0,
+                                chroma_spatial: 0.0,
+                                luma_tmp: 6.0,
+                                chroma_tmp: 4.5,
+                            })
+                            .unwrap(),
+                        ),
+                        !all_disabled,
+                    ),
+                ])
+                .unwrap();
+                let VerifiedApplied::Open { key, applied } = event(submitted.clone()) else {
+                    panic!("Open fixture")
+                };
+                let revision = DraftRevision::new(1);
+                let (admission, receipt) = if live_filters {
+                    let filters = FilterAttemptKey {
+                        apply: key.apply,
+                        attempt: key.attempt,
+                        pass: FilterPass::LiveCandidate,
+                    };
+                    (
+                        ApplyAdmission::Filters {
+                            key: filters,
+                            revision,
+                        },
+                        VerifiedApplied::Filters {
+                            key: filters,
+                            revision,
+                            applied,
+                        },
+                    )
+                } else {
+                    (
+                        ApplyAdmission::Open { apply: key.apply },
+                        VerifiedApplied::Open { key, applied },
+                    )
+                };
+                session.admit_user_apply(
+                    admission,
+                    Draft {
+                        revision,
+                        settings: submitted.clone(),
+                    },
+                );
+                session.observe_opening(key);
+                session.verified_applied(receipt.clone());
+                assert_eq!(load_document(temp.file()).applied, Some(submitted.clone()));
+                assert_eq!(session.authorized_apply(), None);
+                assert!(!session.draft_dirty(Some(&submitted)));
+                let mut newer = submitted.clone();
+                newer.filters = FilterChain::default();
+                assert!(session.draft_dirty(Some(&newer)));
+                let bytes = fs::read(temp.file()).unwrap();
+                session.verified_applied(receipt);
+                assert_eq!(fs::read(temp.file()).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn immutable_filter_admission_cannot_authorize_an_open_receipt_and_cancel_consumes_permission()
+    {
+        use crate::domain::state::{FilterAttemptKey, FilterPass};
+        let temp = Temp::new();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        let receipt = event(selection(60000));
+        let VerifiedApplied::Open { key: open, .. } = &receipt else {
+            panic!("Open fixture")
+        };
+        let key = FilterAttemptKey {
+            apply: open.apply,
+            attempt: open.attempt,
+            pass: FilterPass::LiveCandidate,
+        };
+        session.admit_user_apply(
+            ApplyAdmission::Filters {
+                key,
+                revision: DraftRevision::new(3),
+            },
+            Draft {
+                revision: DraftRevision::new(3),
+                settings: selection(60000),
+            },
+        );
+        session.observe_opening(*open);
+        session.verified_applied(receipt.clone());
+        assert!(!temp.file().exists());
+        assert_eq!(session.authorized_apply(), Some(key.apply));
+        session.cancel_user_apply(ApplyId::new(key.apply.get() + 1).unwrap());
+        assert_eq!(session.authorized_apply(), Some(key.apply));
+        session.cancel_user_apply(key.apply);
+        assert_eq!(session.authorized_apply(), None);
+        session.admit_user_apply(
+            ApplyAdmission::Open { apply: key.apply },
+            Draft {
+                revision: DraftRevision::new(4),
+                settings: selection(60000),
+            },
+        );
+        session.observe_opening(*open);
+        session.cancel_user_apply(key.apply);
+        session.verified_applied(receipt);
+        assert!(!temp.file().exists());
+    }
+
+    #[test]
+    fn immutable_filter_receipts_require_exact_key_revision_and_complete_submission() {
+        use crate::domain::state::{AttemptId, FilterAttemptKey, FilterPass};
+        let VerifiedApplied::Open { key: open, applied } = event(selection(60000)) else {
+            panic!("fixture")
+        };
+        let key = FilterAttemptKey {
+            apply: open.apply,
+            attempt: open.attempt,
+            pass: FilterPass::LiveCandidate,
+        };
+        let revision = DraftRevision::new(3);
+        for mismatch in 0..7 {
+            let temp = Temp::new();
+            let mut session = PersistenceSession::load(Ok(temp.file()));
+            session.admit_user_apply(
+                ApplyAdmission::Filters { key, revision },
+                Draft {
+                    revision: if mismatch == 5 {
+                        DraftRevision::new(4)
+                    } else {
+                        revision
+                    },
+                    settings: selection(60000),
+                },
+            );
+            let mut received = key;
+            let mut received_revision = revision;
+            let mut received_applied = applied.clone();
+            match mismatch {
+                0 => received.apply = ApplyId::new(key.apply.get() + 1).unwrap(),
+                1 => received.attempt = AttemptId::new(key.attempt.get() + 1).unwrap(),
+                2 => received.pass = FilterPass::LiveRestore,
+                3 => received.pass = FilterPass::Open,
+                4 => received_revision = DraftRevision::new(4),
+                5 => {}
+                6 => {
+                    let VerifiedApplied::Open { applied: other, .. } = event(selection(30000))
+                    else {
+                        panic!("fixture")
+                    };
+                    received_applied = other;
+                }
+                _ => unreachable!(),
+            }
+            session.verified_applied(VerifiedApplied::Filters {
+                key: received,
+                revision: received_revision,
+                applied: received_applied,
+            });
+            assert!(!temp.file().exists(), "mismatch {mismatch} must not write");
+            assert_eq!(session.authorized_apply(), Some(key.apply));
+            assert!(session.baseline.is_none());
+        }
+    }
+    #[test]
+    fn exact_filter_receipt_saves_once_keeps_newer_draft_dirty_and_cancellation_revokes_it() {
+        use crate::domain::state::{FilterAttemptKey, FilterPass};
+        let VerifiedApplied::Open { key: open, applied } = event(selection(60000)) else {
+            panic!("fixture")
+        };
+        let key = FilterAttemptKey {
+            apply: open.apply,
+            attempt: open.attempt,
+            pass: FilterPass::LiveCandidate,
+        };
+        let revision = DraftRevision::new(3);
+        let receipt = VerifiedApplied::Filters {
+            key,
+            revision,
+            applied,
+        };
+        for cancelled in [false, true] {
+            let temp = Temp::new();
+            let mut session = PersistenceSession::load(Ok(temp.file()));
+            session.admit_user_apply(
+                ApplyAdmission::Filters { key, revision },
+                Draft {
+                    revision,
+                    settings: selection(60000),
+                },
+            );
+            if cancelled {
+                session.cancel_user_apply(key.apply);
+            }
+            session.verified_applied(receipt.clone());
+            assert_eq!(temp.file().exists(), !cancelled);
+            assert_eq!(session.authorized_apply(), None);
+            assert!(session.draft_dirty(Some(&selection(30000))));
+            if !cancelled {
+                assert!(!session.draft_dirty(Some(&selection(60000))));
+                assert_eq!(load_document(temp.file()).applied, Some(selection(60000)));
+                let bytes = fs::read(temp.file()).unwrap();
+                session.verified_applied(receipt.clone());
+                assert_eq!(fs::read(temp.file()).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
     fn only_exact_correlated_user_receipt_saves_once_not_startup_restart_or_rollback() {
         let temp = Temp::new();
         let mut session = PersistenceSession::load(Ok(temp.file()));
-        session.verified_open(event(selection(60000)));
+        session.verified_applied(event(selection(60000)));
         assert!(!temp.file().exists());
         let mut receipt = event(selection(60000));
+        let VerifiedApplied::Open { key, .. } = &mut receipt else {
+            panic!("Open fixture")
+        };
         session.admit_user_apply(
-            receipt.key.apply,
+            ApplyAdmission::Open { apply: key.apply },
             Draft {
                 revision: DraftRevision::new(0),
                 settings: selection(60000),
             },
         );
         let wrong_key = AttemptKey {
-            attempt: crate::domain::state::AttemptId::new(receipt.key.attempt.get() + 1).unwrap(),
-            ..receipt.key
+            attempt: crate::domain::state::AttemptId::new(key.attempt.get() + 1).unwrap(),
+            ..*key
         };
         session.observe_opening(wrong_key);
-        session.verified_open(event(selection(60000)));
+        session.verified_applied(event(selection(60000)));
         assert!(!temp.file().exists());
-        receipt.key.purpose = AttemptPurpose::Restore;
-        session.verified_open(receipt);
+        key.purpose = AttemptPurpose::Restore;
+        session.verified_applied(receipt);
         assert!(!temp.file().exists());
         user_apply(&mut session, selection(60000));
         assert_eq!(load_document(temp.file()).applied, Some(selection(60000)));
         let bytes = fs::read(temp.file()).unwrap();
-        session.verified_open(event(selection(30000)));
+        session.verified_applied(event(selection(30000)));
         assert_eq!(fs::read(temp.file()).unwrap(), bytes);
     }
     #[test]
@@ -780,6 +1087,139 @@ mod tests {
         assert_eq!(document.applied, Some(selection(60000)));
         assert_eq!(document.preferences, preferences(9));
     }
+
+    #[test]
+    fn confirmed_filter_save_faults_preserve_original_and_retry_frozen_applied_chain() {
+        use crate::{
+            domain::{
+                filters::{
+                    ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma,
+                    SdrMatrix,
+                },
+                state::{FilterAttemptKey, FilterPass},
+            },
+            settings::WriteFaultPoint,
+        };
+        for fault in [
+            WriteFaultPoint::BeforeWrite,
+            WriteFaultPoint::PartialWrite,
+            WriteFaultPoint::BeforeTemporarySync,
+            WriteFaultPoint::TemporarySyncIo,
+            WriteFaultPoint::BeforeRename,
+            WriteFaultPoint::RenameIo,
+        ] {
+            let temp = Temp::new();
+            let mut session = PersistenceSession::load(Ok(temp.file()));
+            user_apply(&mut session, selection(60000));
+            let old = fs::read(temp.file()).unwrap();
+            session.store = Some(SettingsStore::with_injected_fault(temp.file(), fault));
+            let mut submitted = selection(60000);
+            submitted.filters = FilterChain::new(vec![FilterEntry::new(
+                "frozen\n\0disabled".into(),
+                Filter::Format(FormatParams::new(
+                    SdrMatrix::Bt709,
+                    ColorLevels::Limited,
+                    SdrGamma::Bt1886,
+                )),
+                false,
+            )])
+            .unwrap();
+            let VerifiedApplied::Open { key: open, applied } = event(submitted.clone()) else {
+                panic!("fixture")
+            };
+            let key = FilterAttemptKey {
+                apply: open.apply,
+                attempt: open.attempt,
+                pass: FilterPass::LiveCandidate,
+            };
+            let revision = DraftRevision::new(2);
+            session.admit_user_apply(
+                ApplyAdmission::Filters { key, revision },
+                Draft {
+                    revision,
+                    settings: submitted.clone(),
+                },
+            );
+            session.verified_applied(VerifiedApplied::Filters {
+                key,
+                revision,
+                applied,
+            });
+            assert_eq!(session.authorized_apply(), None);
+            assert_eq!(fs::read(temp.file()).unwrap(), old, "fault {fault:?}");
+            assert!(session.status().contains("Save failed"));
+            assert!(
+                session.pending_applied.is_some(),
+                "runtime success survives persistence refusal"
+            );
+            session.set_preferences(preferences(23));
+            assert!(session.request_close(Some((&submitted, revision))));
+            // Each injected fault is one-shot. Fail the safe-close attempt too
+            // so the explicit retry below, not automatic close, publishes it.
+            session.store = Some(SettingsStore::with_injected_fault(temp.file(), fault));
+            session.drained();
+            assert_eq!(fs::read(temp.file()).unwrap(), old, "close fault {fault:?}");
+            assert!(session.pending_applied.is_some());
+            assert!(
+                !session.quit_allowed(),
+                "failed close save must retain the quit barrier"
+            );
+            assert_eq!(session.close_dialog(), "save");
+            session.retry_close_save();
+            assert!(session.quit_allowed());
+            let document = load_document(temp.file());
+            assert_eq!(document.applied, Some(submitted));
+            assert_eq!(document.preferences, preferences(23));
+        }
+    }
+
+    #[test]
+    fn observed_open_key_cannot_authorize_changed_or_dropped_full_submission() {
+        use crate::domain::filters::{
+            ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
+        };
+        let mut submitted = selection(60000);
+        submitted.filters = FilterChain::new(vec![FilterEntry::new(
+            "retained".into(),
+            Filter::Format(FormatParams::new(
+                SdrMatrix::Auto,
+                ColorLevels::Auto,
+                SdrGamma::Auto,
+            )),
+            false,
+        )])
+        .unwrap();
+        for mismatch in 0..3 {
+            let temp = Temp::new();
+            let mut session = PersistenceSession::load(Ok(temp.file()));
+            let mut wrong = submitted.clone();
+            match mismatch {
+                0 => wrong.filters = FilterChain::default(),
+                1 => wrong.video.mode = selection(30000).video.mode,
+                2 => {
+                    wrong.audio = AudioSelection::Enabled {
+                        source: source("unexpected"),
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let receipt = event(wrong);
+            let VerifiedApplied::Open { key, .. } = &receipt else {
+                panic!("fixture")
+            };
+            session.admit_user_apply(
+                ApplyAdmission::Open { apply: key.apply },
+                Draft {
+                    revision: DraftRevision::new(1),
+                    settings: submitted.clone(),
+                },
+            );
+            session.observe_opening(*key);
+            session.verified_applied(receipt);
+            assert!(!temp.file().exists());
+            assert!(session.baseline.is_none());
+        }
+    }
     fn qualify_relocated_user_apply(edit_during_apply: bool) {
         let temp = Temp::new();
         let mut session = PersistenceSession::load(Ok(temp.file()));
@@ -797,7 +1237,7 @@ mod tests {
         let (apply, _) = model
             .apply(model.state_identity(), frozen.revision)
             .unwrap();
-        session.admit_user_apply(apply, frozen);
+        session.admit_user_apply(ApplyAdmission::Open { apply }, frozen);
         let original_request = model.validation_request().unwrap().clone();
         if edit_during_apply {
             model
@@ -818,7 +1258,7 @@ mod tests {
         };
         session.observe_opening(key);
         model.open_verified(key);
-        session.verified_open(VerifiedOpen {
+        session.verified_applied(VerifiedApplied::Open {
             key,
             applied: model.last_valid().unwrap().clone(),
         });

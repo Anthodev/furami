@@ -266,7 +266,9 @@ bool FuramiBridge::textEntryActive() const { assertGuiThread(); return m_textEnt
 bool FuramiBridge::panelVisible() const { assertGuiThread(); return m_panelVisible; }
 bool FuramiBridge::popupOpen() const { assertGuiThread(); return m_popupOpen; }
 bool FuramiBridge::quitAuthorized() const { assertGuiThread(); return m_quitAuthorized; }
-bool FuramiBridge::failed() const { assertGuiThread(); return m_failed; }
+// Launch (not UI) failure: only unauthorized root destruction or a poisoned native lifetime is fatal to startup.
+// A recoverable session failure sets m_failed for the UI but still allows the authorized loop exit to succeed.
+bool FuramiBridge::launchFailed() const { assertGuiThread(); return m_bootstrapFailed || m_poisoned; }
 QString FuramiBridge::settingsStatus() const { assertGuiThread(); return m_settingsStatus; }
 QString FuramiBridge::settingsPath() const { assertGuiThread(); return m_settingsPath; }
 bool FuramiBridge::settingsRefused() const { assertGuiThread(); return m_settingsRefused; }
@@ -423,7 +425,7 @@ bool FuramiBridge::enableQualificationInput(QString &diagnostic)
     m_qualificationInput = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read, this);
     connect(m_qualificationInput.data(), &QSocketNotifier::activated, this,
         [this](QSocketDescriptor, QSocketNotifier::Type) { readQualificationInput(); });
-    qInfo().noquote() << "qualification_stdin_enabled grammar=snapshot|draft-video|draft-identity|draft-audio|draft-source|open|apply|restart|reconnect|volume|mute|close|quit state=phase,apply,attempt,cleanup revision=required_for_draft_apply";
+    qInfo().noquote() << "qualification_stdin_enabled grammar=snapshot|draft-video|draft-identity|draft-audio|draft-source|draft-filters|open|apply|restart|reconnect|volume|mute|close|quit state=phase,apply,attempt,cleanup revision=required_for_draft_apply filter_json=strict_FilterChain limits=legacy:256,filter:65536_bytes";
     return true;
 }
 
@@ -449,23 +451,27 @@ void FuramiBridge::readQualificationInput()
         const char byte = bytes[index];
         if (byte == '\n') {
             if (!m_dropQualificationLine && !m_qualificationLine.isEmpty()) {
-                const auto command = QString::fromUtf8(m_qualificationLine).toUtf8();
-                qInfo().noquote() << "qualification_command" << QString::fromUtf8(command);
-                if (command == "fullscreen") toggleFullscreen();
-                else if (command == "application-close") requestApplicationClose();
-                else if (command == "reset-confirm") decideSettingsReset(QString::number(m_resetToken), true);
-                else {
-                    if (command == "close-discard" || command.startsWith("quit ")) observeFullscreenChoice();
-                    applyUpdate(gate_qualification_command(*m_gate, asRust(command)));
+                if (!m_qualificationLine.isValidUtf8()) {
+                    qWarning() << "qualification_command_rejected reason=invalid_utf8" << m_qualificationLine;
+                } else {
+                    const auto &command = m_qualificationLine;
+                    qInfo() << "qualification_command" << command;
+                    if (command == "fullscreen") toggleFullscreen();
+                    else if (command == "application-close") requestApplicationClose();
+                    else if (command == "reset-confirm") decideSettingsReset(QString::number(m_resetToken), true);
+                    else {
+                        if (command == "close-discard" || command.startsWith("quit ")) observeFullscreenChoice();
+                        applyUpdate(gate_qualification_command(*m_gate, asRust(command)));
+                    }
                 }
             }
             m_qualificationLine.clear();
             m_dropQualificationLine = false;
         } else if (!m_dropQualificationLine) {
-            if (m_qualificationLine.size() == 256) {
+            if (m_qualificationLine.size() == 65'536) {
                 m_dropQualificationLine = true;
                 m_qualificationLine.clear();
-                qWarning() << "qualification_command_rejected reason=line_exceeds_256_bytes";
+                qWarning() << "qualification_command_rejected reason=line_exceeds_65536_bytes";
             } else {
                 m_qualificationLine.append(byte);
             }
@@ -1379,7 +1385,7 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
     }
     qInfo().noquote() << QStringLiteral("qt_event_loop_exit code=%1 owner_cleanup_authorized=%2")
         .arg(exitCode).arg(boolean(bridge.quitAuthorized()));
-    if (bridge.failed())
+    if (bridge.launchFailed())
         return launchFailure(bridge.diagnostic());
     if (exitCode)
         return launchFailure(QStringLiteral("Qt event loop exited with status %1").arg(exitCode));

@@ -12,6 +12,10 @@ use furami::domain::capture::{
     AudioSelection, AudioSourceIdentity, CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate,
     FrameSize, ModeRequest, PlaybackGain, UsbTopology,
 };
+use furami::domain::filters::{
+    ColorLevels, EqParams, EqValues, Filter, FilterChain, FilterEntry, FormatParams, Hqdn3dParams,
+    Hqdn3dValues, SdrGamma, SdrMatrix,
+};
 use furami::domain::output::{PersistentOutputChoice, SinkIdentity};
 use furami::domain::state::{AppliedSettings, DraftSettings, ModelEffect, ProductModel};
 use furami::settings::{
@@ -87,6 +91,7 @@ fn source_identity() -> AudioSourceIdentity {
 
 fn draft_settings() -> DraftSettings {
     DraftSettings {
+        filters: furami::domain::filters::FilterChain::default(),
         video: ModeRequest {
             identity: identity(),
             mode: mode(0x3231_564E, 1920, 1080, 60000, 1001),
@@ -682,6 +687,7 @@ fn stored_fps_is_exact_integer_rational() {
     // Write a 120/2 request: it must land normalized as 60/1, never as a
     // float, and 60000/1001 must survive untouched.
     let draft = DraftSettings {
+        filters: furami::domain::filters::FilterChain::default(),
         video: ModeRequest {
             identity: DeviceIdentity::new(
                 0x1234,
@@ -1337,5 +1343,495 @@ fn temporary_files_are_never_loaded_as_settings() {
         "stray temp file must not affect loading: {outcome:?}"
     );
     assert!(!store.is_refused());
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Applied filter chains (FUR-015)
+// ---------------------------------------------------------------------------
+
+const THREE_FILTER_ENTRIES: &str = concat!(
+    r#"{"entries":["#,
+    r#"{"label":"Levels","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"bt709","levels":"limited","gamma":"bt1886"}}},"#,
+    r#"{"label":"Contrast","enabled":false,"filter":{"kind":"eq","parameters":{"contrast":1.5,"brightness":0.1,"saturation":1.2,"gamma":1.1,"gamma_r":1.0,"gamma_g":1.0,"gamma_b":1.0,"gamma_weight":0.5}}},"#,
+    r#"{"label":"Denoise","enabled":true,"filter":{"kind":"hqdn3d","parameters":{"luma_spatial":4.0,"chroma_spatial":3.0,"luma_tmp":6.0,"chroma_tmp":4.5}}}"#,
+    r#"]}"#,
+);
+
+/// Inject a `filters` member into the object-form `APPLIED` fixture.
+fn applied_with_filters(filters_json: &str) -> String {
+    let inner = APPLIED
+        .strip_suffix('}')
+        .expect("APPLIED fixture is an object");
+    format!(r#"{inner},"filters":{filters_json}}}"#)
+}
+
+fn three_entry_chain() -> FilterChain {
+    FilterChain::new(vec![
+        FilterEntry::new(
+            "Levels".to_owned(),
+            Filter::Format(FormatParams::new(
+                SdrMatrix::Bt709,
+                ColorLevels::Limited,
+                SdrGamma::Bt1886,
+            )),
+            true,
+        ),
+        FilterEntry::new(
+            "Contrast".to_owned(),
+            Filter::Eq(
+                EqParams::new(EqValues {
+                    contrast: 1.5,
+                    brightness: 0.1,
+                    saturation: 1.2,
+                    gamma: 1.1,
+                    gamma_r: 1.0,
+                    gamma_g: 1.0,
+                    gamma_b: 1.0,
+                    gamma_weight: 0.5,
+                })
+                .unwrap(),
+            ),
+            false,
+        ),
+        FilterEntry::new(
+            "Denoise".to_owned(),
+            Filter::Hqdn3d(
+                Hqdn3dParams::new(Hqdn3dValues {
+                    luma_spatial: 4.0,
+                    chroma_spatial: 3.0,
+                    luma_tmp: 6.0,
+                    chroma_tmp: 4.5,
+                })
+                .unwrap(),
+            ),
+            true,
+        ),
+    ])
+    .unwrap()
+}
+
+fn draft_with_filters(filters: FilterChain) -> DraftSettings {
+    DraftSettings {
+        filters,
+        ..draft_settings()
+    }
+}
+
+#[test]
+fn pre_filter_v1_document_loads_empty_chain_and_reencodes_byte_for_byte() {
+    let directory = temp_dir("filters-parity");
+    let path = settings_path(&directory);
+    let original = canonical_document();
+    fs::write(&path, &original).unwrap();
+
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("pre-filter v1 document must load, got {outcome:?}");
+    };
+    let loaded = document.applied.as_ref().expect("applied present");
+    assert!(loaded.filters.entries().is_empty());
+    assert_eq!(loaded, &draft_settings());
+
+    store
+        .save_applied(&applied_settings(draft_settings()), preferences())
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        format!("{original}\n"),
+        "an empty chain must not add a filters key"
+    );
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn full_filter_chain_round_trips_exactly_through_the_store() {
+    let directory = temp_dir("filters-roundtrip");
+    let path = settings_path(&directory);
+    fs::write(
+        &path,
+        document_with_applied(&applied_with_filters(THREE_FILTER_ENTRIES)),
+    )
+    .unwrap();
+
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("three-entry chain must load, got {outcome:?}");
+    };
+    assert_eq!(
+        document.applied.as_ref().unwrap().filters,
+        three_entry_chain()
+    );
+
+    let applied = applied_settings(draft_with_filters(three_entry_chain()));
+    store.save_applied(&applied, preferences()).unwrap();
+
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(reloaded) = outcome else {
+        panic!("re-encoded document must load");
+    };
+    let entries = reloaded.applied.as_ref().unwrap().filters.entries();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].label(), "Levels");
+    assert!(entries[0].enabled());
+    assert_eq!(entries[1].label(), "Contrast");
+    assert!(!entries[1].enabled());
+    assert_eq!(entries[2].label(), "Denoise");
+    assert!(entries[2].enabled());
+    assert_eq!(
+        reloaded.applied.as_ref().unwrap().filters,
+        three_entry_chain()
+    );
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .contains(r#""filters":{"entries":["#),
+        "the nonempty chain must be written"
+    );
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn inert_labels_unicode_whitespace_controls_and_nul_survive_the_store() {
+    let directory = temp_dir("filters-inert-labels");
+    let path = settings_path(&directory);
+    // NBSP as raw UTF-8, plus a JSON \n and a JSON \u0000: all are inert domain
+    // text and must never be treated as a control surface.
+    let filters = concat!(
+        r#"{"entries":["#,
+        r#"{"label":"\u00a0NBSP","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}},"#,
+        r#"{"label":"line\nbreak","enabled":true,"filter":{"kind":"eq","parameters":{"contrast":1.0,"brightness":0.0,"saturation":1.0,"gamma":1.0,"gamma_r":1.0,"gamma_g":1.0,"gamma_b":1.0,"gamma_weight":1.0}}},"#,
+        r#"{"label":"nul\u0000byte","enabled":false,"filter":{"kind":"hqdn3d","parameters":{"luma_spatial":1.0,"chroma_spatial":1.0,"luma_tmp":1.0,"chroma_tmp":1.0}}}"#,
+        r#"]}"#,
+    );
+    let expected = FilterChain::new(vec![
+        FilterEntry::new(
+            "\u{a0}NBSP".to_owned(),
+            Filter::Format(FormatParams::new(
+                SdrMatrix::Auto,
+                ColorLevels::Auto,
+                SdrGamma::Auto,
+            )),
+            true,
+        ),
+        FilterEntry::new(
+            "line\nbreak".to_owned(),
+            Filter::Eq(
+                EqParams::new(EqValues {
+                    contrast: 1.0,
+                    brightness: 0.0,
+                    saturation: 1.0,
+                    gamma: 1.0,
+                    gamma_r: 1.0,
+                    gamma_g: 1.0,
+                    gamma_b: 1.0,
+                    gamma_weight: 1.0,
+                })
+                .unwrap(),
+            ),
+            true,
+        ),
+        FilterEntry::new(
+            "nul\0byte".to_owned(),
+            Filter::Hqdn3d(
+                Hqdn3dParams::new(Hqdn3dValues {
+                    luma_spatial: 1.0,
+                    chroma_spatial: 1.0,
+                    luma_tmp: 1.0,
+                    chroma_tmp: 1.0,
+                })
+                .unwrap(),
+            ),
+            false,
+        ),
+    ])
+    .unwrap();
+
+    fs::write(&path, document_with_applied(&applied_with_filters(filters))).unwrap();
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("inert labels must load, got {outcome:?}");
+    };
+    assert_eq!(document.applied.as_ref().unwrap().filters, expected);
+
+    let applied = applied_settings(draft_with_filters(expected.clone()));
+    store.save_applied(&applied, preferences()).unwrap();
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(reloaded) = outcome else {
+        panic!("re-encoded inert labels must load");
+    };
+    assert_eq!(reloaded.applied.as_ref().unwrap().filters, expected);
+
+    // The bytes on disk prove real JSON escaping rather than a stored echo.
+    let written = fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("line\\nbreak"),
+        "newline must be escaped: {written}"
+    );
+    assert!(
+        written.contains("nul\\u0000byte"),
+        "NUL must be escaped: {written}"
+    );
+    assert!(
+        written.contains('\u{a0}'),
+        "NBSP must survive as raw UTF-8: {written}"
+    );
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn all_disabled_nonempty_chain_is_serialized_and_reloaded_exactly() {
+    let directory = temp_dir("filters-all-disabled");
+    let path = settings_path(&directory);
+    let filters = concat!(
+        r#"{"entries":["#,
+        r#"{"label":"a","enabled":false,"filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}},"#,
+        r#"{"label":"b","enabled":false,"filter":{"kind":"hqdn3d","parameters":{"luma_spatial":0.0,"chroma_spatial":0.0,"luma_tmp":0.0,"chroma_tmp":0.0}}}"#,
+        r#"]}"#,
+    );
+    let expected = FilterChain::new(vec![
+        FilterEntry::new(
+            "a".to_owned(),
+            Filter::Format(FormatParams::new(
+                SdrMatrix::Auto,
+                ColorLevels::Auto,
+                SdrGamma::Auto,
+            )),
+            false,
+        ),
+        FilterEntry::new(
+            "b".to_owned(),
+            Filter::Hqdn3d(
+                Hqdn3dParams::new(Hqdn3dValues {
+                    luma_spatial: 0.0,
+                    chroma_spatial: 0.0,
+                    luma_tmp: 0.0,
+                    chroma_tmp: 0.0,
+                })
+                .unwrap(),
+            ),
+            false,
+        ),
+    ])
+    .unwrap();
+
+    fs::write(&path, document_with_applied(&applied_with_filters(filters))).unwrap();
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("all-disabled chain must load, got {outcome:?}");
+    };
+    assert_eq!(document.applied.as_ref().unwrap().filters, expected);
+
+    let applied = applied_settings(draft_with_filters(expected.clone()));
+    store.save_applied(&applied, preferences()).unwrap();
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .contains(r#""filters":{"entries":["#),
+        "a nonempty all-disabled chain must still be written"
+    );
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(reloaded) = outcome else {
+        panic!("all-disabled chain must reload");
+    };
+    assert_eq!(reloaded.applied.as_ref().unwrap().filters, expected);
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn malformed_filter_json_refuses_the_complete_original_and_blocks_saves_until_reset() {
+    let valid_entry = r#"{"label":"a","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}}"#;
+    let duplicate_filters_key = {
+        let inner = APPLIED
+            .strip_suffix('}')
+            .expect("APPLIED fixture is an object");
+        let chain = r#"{"entries":[]}"#;
+        let applied = format!(r#"{inner},"filters":{chain},"filters":{chain}}}"#);
+        format!(r#"{{"schema_version":1,"applied":{applied},"preferences":{PREFS}}}"#)
+    };
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "filters null",
+            document_with_applied(&applied_with_filters("null")),
+        ),
+        (
+            "filters array",
+            document_with_applied(&applied_with_filters("[]")),
+        ),
+        (
+            "filters string",
+            document_with_applied(&applied_with_filters("\"entries\"")),
+        ),
+        (
+            "filters unknown field",
+            document_with_applied(&applied_with_filters(r#"{"entries":[],"command":"vf"}"#)),
+        ),
+        (
+            "filters missing entries",
+            document_with_applied(&applied_with_filters("{}")),
+        ),
+        (
+            "entry positional array",
+            document_with_applied(&applied_with_filters(&format!(
+                r#"{{"entries":[[{valid_entry}]]}}"#
+            ))),
+        ),
+        (
+            "duplicate label",
+            document_with_applied(&applied_with_filters(&format!(
+                r#"{{"entries":[{valid_entry},{valid_entry}]}}"#
+            ))),
+        ),
+        (
+            "duplicate entry field",
+            document_with_applied(&applied_with_filters(
+                r#"{"entries":[{"label":"a","label":"b","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}}]}"#,
+            )),
+        ),
+        (
+            "unknown entry field",
+            document_with_applied(&applied_with_filters(
+                r#"{"entries":[{"label":"a","enabled":true,"extra":1,"filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}}]}"#,
+            )),
+        ),
+        (
+            "missing enabled",
+            document_with_applied(&applied_with_filters(
+                r#"{"entries":[{"label":"a","filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}}]}"#,
+            )),
+        ),
+        (
+            "unknown filter kind",
+            document_with_applied(&applied_with_filters(
+                r#"{"entries":[{"label":"a","enabled":true,"filter":{"kind":"sharpen","parameters":{}}}]}"#,
+            )),
+        ),
+        (
+            "duplicate parameter key",
+            document_with_applied(&applied_with_filters(
+                r#"{"entries":[{"label":"a","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"auto","matrix":"auto","levels":"auto","gamma":"auto"}}}]}"#,
+            )),
+        ),
+        (
+            "duplicate parameter key parameters-first",
+            document_with_applied(&applied_with_filters(
+                r#"{"entries":[{"label":"a","enabled":true,"filter":{"parameters":{"matrix":"auto","matrix":"auto","levels":"auto","gamma":"auto"},"kind":"format"}}]}"#,
+            )),
+        ),
+        (
+            "duplicate kind tag",
+            document_with_applied(&applied_with_filters(
+                r#"{"entries":[{"label":"a","enabled":true,"filter":{"kind":"format","kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}}]}"#,
+            )),
+        ),
+        (
+            "invalid params even disabled",
+            document_with_applied(&applied_with_filters(
+                r#"{"entries":[{"label":"a","enabled":false,"filter":{"kind":"eq","parameters":{"contrast":5000.0,"brightness":0.0,"saturation":1.0,"gamma":1.0,"gamma_r":1.0,"gamma_g":1.0,"gamma_b":1.0,"gamma_weight":1.0}}}]}"#,
+            )),
+        ),
+        ("duplicate filters key", duplicate_filters_key),
+    ];
+
+    let directory = temp_dir("filters-violations");
+    let path = settings_path(&directory);
+    let applied = applied_settings(draft_with_filters(three_entry_chain()));
+    for (label, json) in cases {
+        fs::write(&path, &json).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let (mut store, outcome) = SettingsStore::load(path.clone());
+        assert!(
+            matches!(
+                outcome,
+                LoadOutcome::Refused(SettingsLoadError::Schema { .. })
+            ),
+            "{label}: expected schema refusal, got {outcome:?}"
+        );
+        assert!(store.is_refused(), "{label}");
+        assert!(store.snapshot().is_none(), "{label}");
+        assert!(
+            matches!(
+                store.save_applied(&applied, preferences()),
+                Err(SettingsWriteError::RefusedOriginal { .. })
+            ),
+            "{label}: applied write must stay blocked"
+        );
+        assert!(
+            matches!(
+                store.save_preferences(preferences()),
+                Err(SettingsWriteError::RefusedOriginal { .. })
+            ),
+            "{label}: preference write must stay blocked"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "{label}: the complete original must be preserved"
+        );
+        assert_no_temp_files(&directory);
+
+        // Only an explicit reset clears the refusal.
+        store.reset(preferences()).unwrap();
+        assert!(!store.is_refused(), "{label}");
+        let (_, outcome) = SettingsStore::load(path.clone());
+        assert!(
+            matches!(outcome, LoadOutcome::Loaded(_)),
+            "{label}: reset must produce a loadable document"
+        );
+    }
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn full_chain_rename_fault_preserves_the_original_and_reports_persistence_separately() {
+    let directory = temp_dir("filters-fault");
+    let path = settings_path(&directory);
+    fs::write(&path, canonical_document()).unwrap();
+    let original = fs::read(&path).unwrap();
+
+    let mut store = SettingsStore::with_injected_fault(path.clone(), WriteFaultPoint::BeforeRename);
+    let previous = store.snapshot().unwrap().clone();
+    let applied = applied_settings(draft_with_filters(three_entry_chain()));
+
+    let result = store.save_applied(&applied, preferences());
+    assert!(
+        matches!(result, Err(SettingsWriteError::Rename { .. })),
+        "persistence failure must be reported separately: {result:?}"
+    );
+    assert_eq!(store.snapshot(), Some(&previous));
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        original,
+        "original bytes must survive a rename fault"
+    );
+    assert_no_temp_files(&directory);
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(reloaded) = outcome else {
+        panic!("original must stay loadable immediately after the fault");
+    };
+    assert_eq!(reloaded, previous);
+    assert!(
+        reloaded
+            .applied
+            .as_ref()
+            .unwrap()
+            .filters
+            .entries()
+            .is_empty()
+    );
+
+    // The fault fires once: the next write commits the full chain.
+    let outcome = store.save_applied(&applied, preferences()).unwrap();
+    assert!(outcome.is_confirmed());
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(stored) = outcome else {
+        panic!("committed chain must load");
+    };
+    assert_eq!(
+        stored.applied.as_ref().unwrap().filters,
+        three_entry_chain()
+    );
     fs::remove_dir_all(&directory).unwrap();
 }

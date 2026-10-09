@@ -139,11 +139,13 @@ impl FilterCapabilities {
 /// use furami::media::filter_catalog::CompiledFilterChain;
 /// let compiled = serde_json::from_str::<CompiledFilterChain>("\"raw graph\"");
 /// ```
+#[derive(Clone, PartialEq)]
 pub struct CompiledFilterChain {
     // Siblings in media may consume this ownership representation for FUR-015.
     // No syntax accessor is public to domain/UI/external callers.
     pub(super) vf: String,
     emitted_entries: usize,
+    pub(super) entries: Vec<crate::domain::failure::FilterEntryMetadata>,
 }
 
 impl CompiledFilterChain {
@@ -460,6 +462,18 @@ pub fn compile_chain(
     Ok(CompiledFilterChain {
         vf,
         emitted_entries,
+        entries: chain
+            .entries()
+            .iter()
+            .enumerate()
+            .map(
+                |(ordinal, entry)| crate::domain::failure::FilterEntryMetadata {
+                    ordinal,
+                    label: entry.label().to_owned(),
+                    enabled: entry.enabled(),
+                },
+            )
+            .collect(),
     })
 }
 
@@ -547,6 +561,11 @@ fn append_filter(vf: &mut String, filter: &Filter) -> fmt::Result {
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_capabilities() -> FilterCapabilities {
+    tests::capabilities(tests::REGISTRY)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::filters::{
@@ -556,10 +575,10 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitStatus, Output};
 
-    const REGISTRY: &str = "Available video filters:\n  format           force output format\n  lavfi            libavfilter bridge\n  lavfi-bridge     explicit bridge\n\nAvailable libavfilter filters:\n  bwdif            Deinterlace the input image.\n  eq               Adjust brightness.\n  format           Convert pixel formats.\n  hqdn3d           Denoise.\n  unsharp          Sharpen.\n\nIf libavfilter filters clash with builtin mpv filters,\nprefix them with lavfi- to select the libavfilter one.\n\nGet help on individual entries via: --vf=entry=help\n";
+    pub(super) const REGISTRY: &str = "Available video filters:\n  format           force output format\n  lavfi            libavfilter bridge\n  lavfi-bridge     explicit bridge\n\nAvailable libavfilter filters:\n  bwdif            Deinterlace the input image.\n  eq               Adjust brightness.\n  format           Convert pixel formats.\n  hqdn3d           Denoise.\n  unsharp          Sharpen.\n\nIf libavfilter filters clash with builtin mpv filters,\nprefix them with lavfi- to select the libavfilter one.\n\nGet help on individual entries via: --vf=entry=help\n";
     const VERSION: &str = "mpv v0.41.0 Copyright © 2000-2025 mpv/MPlayer/mplayer2 projects\nlibplacebo version: v7.360.1\nFFmpeg version: 8.1.2\nFFmpeg library versions:\n   libavfilter     11.14.102\n";
 
-    fn capabilities(registry: &str) -> FilterCapabilities {
+    pub(super) fn capabilities(registry: &str) -> FilterCapabilities {
         let (mpv_version, ffmpeg_version) = parse_versions(VERSION).unwrap();
         FilterCapabilities {
             prefix: PathBuf::from("/qualified/prefix"),

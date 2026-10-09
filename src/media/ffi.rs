@@ -4,6 +4,7 @@ use super::controller::{
     BackendCommand, BackendEvent, MediaError, OwnerBackend, PauseObservation, RequestId, StopFlag,
     SurfaceToken,
 };
+use super::filter_catalog::CompiledFilterChain;
 use super::loopback::{
     LoopbackCommand, LoopbackEvent, LoopbackOpen, LoopbackOwner, LoopbackReceipt,
 };
@@ -13,11 +14,19 @@ use crate::domain::capture::{
     AudioAvailability, AudioEpoch, AudioError, AudioSelection, AudioSilence, AudioSourceIdentity,
     FrameSize, PlaybackGain, WatchStamp,
 };
+#[cfg(test)]
+use crate::domain::state::FilterPass;
 use crate::domain::{
+    failure::{
+        FILTER_DIAGNOSTIC_RECORDS, FILTER_DIAGNOSTIC_TEXT_CHARS, FilterAttemptDiagnostics,
+        FilterConfirmationFailure, FilterDiagnosticRecord, FilterEntryMetadata, FilterErrorKind,
+        FilterFailure,
+    },
     output::OutputPlan,
-    state::{AttemptId, InitialPlayback, PauseRequestId},
+    state::{AttemptId, FilterAttemptKey, FilterConfirmation, InitialPlayback, PauseRequestId},
 };
 use libloading::Library;
+use std::time::Instant;
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_ulong, c_void},
     marker::PhantomData,
@@ -584,6 +593,9 @@ enum Pending {
         expected: bool,
     },
     Metadata(usize),
+    FilterProgress {
+        key: FilterAttemptKey,
+    },
     #[cfg(test)]
     FixtureProperty(&'static CStr),
 }
@@ -594,6 +606,7 @@ impl Pending {
             Self::Pause | Self::PauseRead { .. } => c"pause",
             Self::Metadata(0) => c"video-params",
             Self::Metadata(_) => c"container-fps",
+            Self::FilterProgress { .. } => c"time-pos",
             #[cfg(test)]
             Self::FixtureProperty(name) => name,
         })
@@ -606,6 +619,171 @@ struct MetadataBatch {
     rerun: Option<bool>,
 }
 
+/// One keyed command window. Failure latches are independent of the bounded
+/// context ring, and no successful command reply alone completes this window.
+struct FilterObservation {
+    id: u64,
+    key: FilterAttemptKey,
+    entries: Vec<FilterEntryMetadata>,
+    command: Option<CString>,
+    admitted: Instant,
+    marker: u64,
+    dropped_at_begin: u64,
+    submitted: bool,
+    outcome: Option<i32>,
+    submission_error: Option<i32>,
+    reconfigured: bool,
+    baseline: Option<f64>,
+    position: Option<f64>,
+    advances: u16,
+    next_sample: Instant,
+    outstanding: bool,
+    graph_failure: bool,
+    disable: bool,
+    unrelated_error: bool,
+    attributed_ordinal: Option<usize>,
+    candidate_disable_ordinal: Option<usize>,
+    incumbent_disable_ordinal: Option<usize>,
+    failure: Option<FilterConfirmationFailure>,
+    fresh: bool,
+}
+impl FilterObservation {
+    fn new(
+        id: u64,
+        key: FilterAttemptKey,
+        compiled: CompiledFilterChain,
+        now: Instant,
+        marker: u64,
+        dropped: u64,
+    ) -> Self {
+        Self {
+            id,
+            key,
+            entries: compiled.entries,
+            command: Some(CString::new(compiled.vf).expect("compiler emits NUL-free syntax")),
+            admitted: now,
+            marker,
+            dropped_at_begin: dropped,
+            submitted: false,
+            outcome: None,
+            submission_error: None,
+            reconfigured: false,
+            baseline: None,
+            position: None,
+            advances: 0,
+            next_sample: now,
+            outstanding: false,
+            graph_failure: false,
+            disable: false,
+            unrelated_error: false,
+            attributed_ordinal: None,
+            candidate_disable_ordinal: None,
+            incumbent_disable_ordinal: None,
+            failure: None,
+            fresh: false,
+        }
+    }
+    fn progress(&mut self, value: Option<f64>, now: Instant) {
+        self.outstanding = false;
+        self.next_sample = now + FilterConfirmation::SAMPLE_INTERVAL;
+        let Some(value) = value.filter(|value| value.is_finite()) else {
+            self.failure
+                .get_or_insert(FilterConfirmationFailure::ProgressUnavailable);
+            return;
+        };
+        if let Some(previous) = self.position {
+            if value < previous {
+                self.failure
+                    .get_or_insert(FilterConfirmationFailure::TimeDiscontinuity);
+            } else if value > previous {
+                self.advances += 1; // Bounded by REQUIRED_ADVANCES before the next request.
+            }
+        } else {
+            self.baseline = Some(value);
+        }
+        self.position = Some(value);
+    }
+    fn ready(&self) -> bool {
+        self.outcome.is_some_and(|error| error >= 0)
+            && self.reconfigured
+            && self.advances >= FilterConfirmation::REQUIRED_ADVANCES
+            && !self.outstanding
+    }
+    fn error_kind(&self) -> Option<FilterErrorKind> {
+        if let Some(mpv_error) = self.submission_error {
+            Some(FilterErrorKind::CommandSubmission { mpv_error })
+        } else if let Some(mpv_error) = self.outcome.filter(|error| *error < 0) {
+            Some(FilterErrorKind::CommandRejected { mpv_error })
+        } else if self.failure == Some(FilterConfirmationFailure::EvidenceLost) {
+            Some(FilterErrorKind::Unconfirmed {
+                reason: FilterConfirmationFailure::EvidenceLost,
+            })
+        } else if self.outcome.is_some_and(|error| error >= 0)
+            && (self.graph_failure || self.disable)
+        {
+            Some(FilterErrorKind::RuntimeGraph)
+        } else if let Some(reason) = self.failure {
+            Some(FilterErrorKind::Unconfirmed { reason })
+        } else if self.outcome.is_some_and(|error| error >= 0) && self.unrelated_error {
+            Some(FilterErrorKind::Unconfirmed {
+                reason: FilterConfirmationFailure::EvidenceLost,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+struct FilterHealth {
+    key: FilterAttemptKey,
+    entries: Vec<FilterEntryMetadata>,
+    marker: u64,
+    dropped_at_begin: u64,
+    faulted: bool,
+}
+
+/// Match a complete internal token, never a filter kind or a user label.
+fn filter_ordinal(text: &str, entries: &[FilterEntryMetadata]) -> Option<usize> {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '/' | ':' | '[' | ']' | '(' | ')' | '"' | '\'' | ',' | ';'
+            )
+    })
+    .find_map(|token| {
+        let token = token.strip_prefix('@').unwrap_or(token);
+        let digits = token.strip_prefix("furami_")?;
+        let ordinal = digits.parse::<usize>().ok()?;
+        (!digits.is_empty()
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+            && (digits.len() == 1 || !digits.starts_with('0'))
+            && entries
+                .iter()
+                .any(|entry| entry.ordinal == ordinal && entry.enabled))
+        .then_some(ordinal)
+    })
+}
+
+fn graph_log(prefix: &str, text: &str) -> (bool, bool) {
+    let disable = prefix == "vf"
+        && text.starts_with("Disabling filter ")
+        && text.contains(" because it has failed.");
+    let graph_prefix = prefix == "vf"
+        || prefix == "lavfi"
+        || prefix.starts_with("ffmpeg/")
+        || prefix.starts_with("vf/");
+    let graph = graph_prefix
+        && (text.contains("failed to configure the filter graph")
+            || text.contains("Failed to configure the filter graph")
+            || text.contains("could not initialize filter pads")
+            || text.contains("Could not initialize filter pads")
+            || text.contains(
+                "Cannot convert decoder/filter output to any format supported by the output.",
+            ));
+    (graph, disable)
+}
+
 struct AudioRetirement {
     epoch: AudioEpoch,
     reason: AudioSilence,
@@ -615,7 +793,6 @@ pub(crate) struct MpvBackend {
     handle: Option<Handle>,
     input: InputSpec,
     nominal_rate_source: Source,
-    diagnostics: std::collections::VecDeque<String>,
     audio: AudioSelection,
     gain: PlaybackGain,
     output: OutputPlan,
@@ -642,6 +819,21 @@ pub(crate) struct MpvBackend {
     pause_pending: bool,
     pause_dirty: bool,
     emitted: VecDeque<BackendEvent>,
+    initial_filters: Option<(FilterAttemptKey, CompiledFilterChain)>,
+    filter_observation: Option<FilterObservation>,
+    filter_health: Option<FilterHealth>,
+    filters_poisoned: bool,
+    filter_records: VecDeque<FilterDiagnosticRecord>,
+    log_sequence: u64,
+    last_truncated_sequence: u64,
+    dropped_context: u64,
+    native_evidence_lost: bool,
+    #[cfg(test)]
+    filter_fault: Option<FixtureFault>,
+    #[cfg(test)]
+    filter_fault_pass: Option<FilterPass>,
+    #[cfg(test)]
+    fixture_recorder: Option<FixtureRecorder>,
     #[cfg(test)]
     property_requests: Option<Vec<(u64, &'static CStr, Option<NodeValue>)>>,
     #[cfg(test)]
@@ -663,7 +855,6 @@ impl MpvBackend {
             handle: None,
             input,
             nominal_rate_source: Source::MpvContainerFps,
-            diagnostics: std::collections::VecDeque::new(),
             audio,
             gain,
             audio_status: if audio_enabled {
@@ -703,11 +894,494 @@ impl MpvBackend {
             pause_pending: false,
             pause_dirty: false,
             emitted: VecDeque::new(),
+            initial_filters: None,
+            filter_observation: None,
+            filter_health: None,
+            filters_poisoned: false,
+            filter_records: VecDeque::with_capacity(FILTER_DIAGNOSTIC_RECORDS),
+            log_sequence: 0,
+            last_truncated_sequence: 0,
+            dropped_context: 0,
+            native_evidence_lost: false,
+            #[cfg(test)]
+            filter_fault: None,
+            #[cfg(test)]
+            filter_fault_pass: None,
+            #[cfg(test)]
+            fixture_recorder: None,
             #[cfg(test)]
             property_requests: None,
             #[cfg(test)]
             fixture_properties: None,
         }
+    }
+    pub(crate) fn with_filters(
+        mut self,
+        key: FilterAttemptKey,
+        compiled: CompiledFilterChain,
+    ) -> Self {
+        self.initial_filters = Some((key, compiled));
+        self
+    }
+    #[cfg(test)]
+    fn native_record(&self, event: serde_json::Value) {
+        if let Some(recorder) = &self.fixture_recorder {
+            recorder.record_native(event);
+        }
+    }
+    #[cfg(test)]
+    fn active_fixture_fault(&self) -> Option<FixtureFault> {
+        self.filter_fault.filter(|_| {
+            self.filter_fault_pass.is_none_or(|pass| {
+                self.filter_observation
+                    .as_ref()
+                    .is_some_and(|observation| observation.key.pass == pass)
+            })
+        })
+    }
+
+    fn filter_diagnostics(
+        &self,
+        key: FilterAttemptKey,
+        entries: &[FilterEntryMetadata],
+        marker: u64,
+        dropped: u64,
+    ) -> FilterAttemptDiagnostics {
+        let records: Vec<_> = self
+            .filter_records
+            .iter()
+            .filter(|record| record.sequence > marker)
+            .cloned()
+            .collect();
+        FilterAttemptDiagnostics {
+            key: Some(key),
+            entries: entries.to_vec(),
+            truncated: self.last_truncated_sequence > marker,
+            records,
+            native_evidence_lost: self.native_evidence_lost,
+            dropped_context: self.dropped_context.saturating_sub(dropped),
+        }
+    }
+
+    fn filter_fault(&mut self, kind: FilterErrorKind, ordinal: Option<usize>) {
+        self.filters_poisoned = true;
+        if let Some(health) = self.filter_health.as_ref().filter(|health| !health.faulted) {
+            let key = health.key;
+            let failure = FilterFailure {
+                kind,
+                attributed_ordinal: ordinal,
+                requires_fresh_owner: true,
+                diagnostics: self.filter_diagnostics(
+                    key,
+                    &health.entries,
+                    health.marker,
+                    health.dropped_at_begin,
+                ),
+            };
+            self.filter_health.as_mut().expect("known health").faulted = true;
+            crate::diagnostics::filter_end(key, Err(&failure), &failure.diagnostics);
+            self.emitted.push_back(BackendEvent::FilterFault {
+                key,
+                failure: Box::new(failure),
+            });
+        }
+    }
+
+    fn filter_lost(&mut self, reason: FilterConfirmationFailure) {
+        self.filters_poisoned = true;
+        if reason == FilterConfirmationFailure::EvidenceLost {
+            self.native_evidence_lost = true;
+        }
+        if let Some(observation) = &mut self.filter_observation {
+            if reason == FilterConfirmationFailure::EvidenceLost {
+                observation.failure = Some(reason);
+                observation.attributed_ordinal = None;
+                observation.candidate_disable_ordinal = None;
+                observation.incumbent_disable_ordinal = None;
+            } else {
+                observation.failure.get_or_insert(reason);
+            }
+            observation.fresh = true;
+        }
+        if self.filter_observation.is_none() || reason == FilterConfirmationFailure::EvidenceLost {
+            self.filter_fault(FilterErrorKind::Unconfirmed { reason }, None);
+        }
+    }
+    /// Recoverable malformed raw logs still consume a non-clean observer tick.
+    /// Returning Other/result/fault must never manufacture MPV_EVENT_NONE.
+    fn malformed_filter_log(&mut self, now: Instant) -> Result<BackendEvent, MediaError> {
+        self.filter_lost(FilterConfirmationFailure::EvidenceLost);
+        self.filter_tick(now, false)?;
+        Ok(self.emitted.pop_front().unwrap_or(BackendEvent::Other))
+    }
+
+    fn filter_log(
+        &mut self,
+        prefix: String,
+        level: String,
+        text: String,
+    ) -> Result<(), MediaError> {
+        self.log_sequence = self
+            .log_sequence
+            .checked_add(1)
+            .ok_or_else(|| MediaError::new("filter_sequence", "native log sequence exhausted"))?;
+        #[cfg(test)]
+        self.native_record(serde_json::json!({"event":"log","sequence":self.log_sequence,"key":self.filter_observation.as_ref().map(|observation| observation.key).or_else(|| self.filter_health.as_ref().map(|health| health.key)),"prefix":prefix,"level":level,"text":text}));
+        let loss = prefix == "overflow"
+            && level == "fatal"
+            && text.starts_with("log message buffer overflow:");
+        let (graph, disable) = graph_log(&prefix, &text);
+        let is_error = matches!(level.as_str(), "fatal" | "error");
+        // Full copied text is classified before any retention truncation.
+        let key = self
+            .filter_observation
+            .as_ref()
+            .map(|observation| observation.key)
+            .or_else(|| self.filter_health.as_ref().map(|health| health.key));
+        let submitted = self
+            .filter_observation
+            .as_ref()
+            .is_some_and(|observation| observation.submitted);
+        if submitted {
+            let observation = self
+                .filter_observation
+                .as_mut()
+                .expect("submitted observation");
+            observation.graph_failure |= graph && is_error;
+            observation.disable |= disable;
+            if disable && observation.failure != Some(FilterConfirmationFailure::EvidenceLost) {
+                observation.incumbent_disable_ordinal =
+                    observation.incumbent_disable_ordinal.or_else(|| {
+                        self.filter_health
+                            .as_ref()
+                            .and_then(|health| filter_ordinal(&text, &health.entries))
+                    });
+                observation.candidate_disable_ordinal = observation
+                    .candidate_disable_ordinal
+                    .or_else(|| filter_ordinal(&text, &observation.entries));
+            }
+            observation.unrelated_error |= is_error && !graph && !disable && !loss;
+            if is_error
+                && !disable
+                && observation.failure != Some(FilterConfirmationFailure::EvidenceLost)
+            {
+                observation.attributed_ordinal = observation.attributed_ordinal.or_else(|| {
+                    filter_ordinal(&prefix, &observation.entries)
+                        .or_else(|| filter_ordinal(&text, &observation.entries))
+                });
+            }
+            if disable || (is_error && !loss && observation.outcome.is_some_and(|error| error >= 0))
+            {
+                observation.fresh = true;
+                self.filters_poisoned = true;
+            }
+        }
+        let incumbent_ordinal = self.filter_health.as_ref().and_then(|health| {
+            filter_ordinal(&prefix, &health.entries)
+                .or_else(|| filter_ordinal(&text, &health.entries))
+        });
+        let truncate_at = text
+            .char_indices()
+            .nth(FILTER_DIAGNOSTIC_TEXT_CHARS)
+            .map(|(index, _)| index);
+        let truncated = truncate_at.is_some();
+        let mut text = text;
+        if let Some(index) = truncate_at {
+            text.truncate(index);
+        }
+        if truncated {
+            self.last_truncated_sequence = self.log_sequence;
+        }
+        let record = FilterDiagnosticRecord {
+            sequence: self.log_sequence,
+            prefix,
+            level,
+            text,
+            truncated,
+        };
+        if self.filter_records.len() == FILTER_DIAGNOSTIC_RECORDS {
+            self.filter_records.pop_front();
+            self.dropped_context = self.dropped_context.checked_add(1).ok_or_else(|| {
+                MediaError::new("filter_sequence", "native context counter exhausted")
+            })?;
+        }
+        if let Some(key) = key {
+            crate::diagnostics::filter_record(key, &record);
+        }
+        self.filter_records.push_back(record);
+        if loss {
+            self.filter_lost(FilterConfirmationFailure::EvidenceLost);
+        } else if !submitted && !self.native_evidence_lost && ((graph && is_error) || disable) {
+            let ordinal = incumbent_ordinal;
+            self.filter_fault(FilterErrorKind::RuntimeGraph, ordinal);
+            if let Some(observation) = &mut self.filter_observation {
+                observation.failure = Some(FilterConfirmationFailure::BackendUnavailable);
+                observation.fresh = true;
+            }
+        } else if !submitted
+            && !self.native_evidence_lost
+            && is_error
+            && self.filter_health.is_some()
+        {
+            self.filter_fault(
+                FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::EvidenceLost,
+                },
+                None,
+            );
+            if let Some(observation) = &mut self.filter_observation {
+                observation.failure = Some(FilterConfirmationFailure::BackendUnavailable);
+                observation.fresh = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_filter(&mut self) {
+        let observation = self
+            .filter_observation
+            .take()
+            .expect("settled filter observation");
+        self.pending.retain(|(_, pending)| !matches!(pending, Pending::FilterProgress { key } if *key == observation.key));
+        let diagnostics = self.filter_diagnostics(
+            observation.key,
+            &observation.entries,
+            observation.marker,
+            observation.dropped_at_begin,
+        );
+        let result = if let Some(kind) = observation.error_kind() {
+            let failure = Box::new(FilterFailure {
+                attributed_ordinal: match &kind {
+                    FilterErrorKind::RuntimeGraph => observation
+                        .attributed_ordinal
+                        .or(observation.candidate_disable_ordinal),
+                    FilterErrorKind::CommandRejected { .. } => observation.attributed_ordinal,
+                    _ => None,
+                },
+                kind,
+                requires_fresh_owner: observation.fresh || self.filters_poisoned,
+                diagnostics,
+            });
+            crate::diagnostics::filter_end(observation.key, Err(&failure), &failure.diagnostics);
+            Err(failure)
+        } else {
+            let confirmation = FilterConfirmation::checked(
+                observation.key,
+                observation.baseline.expect("ready baseline"),
+                observation.position.expect("ready position"),
+                observation.advances,
+            )
+            .expect("observer checked positive predicate");
+            crate::diagnostics::filter_end(observation.key, Ok(&confirmation), &diagnostics);
+            self.filter_health = Some(FilterHealth {
+                key: observation.key,
+                entries: observation.entries,
+                marker: observation.marker,
+                dropped_at_begin: observation.dropped_at_begin,
+                faulted: false,
+            });
+            Ok(confirmation)
+        };
+        #[cfg(test)]
+        self.native_record(serde_json::json!({"event":"result","key":observation.key,"request":observation.id,"result":result}));
+        self.emitted.push_back(BackendEvent::FilterResult {
+            id: observation.id,
+            key: observation.key,
+            result,
+        });
+    }
+
+    fn filter_tick(&mut self, now: Instant, clean: bool) -> Result<(), MediaError> {
+        #[cfg(test)]
+        if clean && let Some(observation) = &self.filter_observation {
+            let stage = if !observation.submitted {
+                "pre-submit"
+            } else if observation.ready() {
+                "post-progress"
+            } else if observation.error_kind().is_some() {
+                "settlement"
+            } else {
+                "observation"
+            };
+            self.native_record(serde_json::json!({"event":"drain","key":observation.key,"request":observation.id,"stage":stage}));
+        }
+        if let Some(observation) = &mut self.filter_observation {
+            if now.duration_since(observation.admitted) >= FilterConfirmation::DEADLINE {
+                observation.failure.get_or_insert(
+                    if observation.submitted
+                        && observation.outcome.is_some_and(|error| error >= 0)
+                        && !observation.reconfigured
+                    {
+                        FilterConfirmationFailure::MissingReconfig
+                    } else {
+                        FilterConfirmationFailure::Deadline
+                    },
+                );
+                if observation.submitted
+                    && observation.outcome.is_none()
+                    && observation.submission_error.is_none()
+                {
+                    observation.fresh = true;
+                }
+                if !clean {
+                    observation.fresh = true;
+                    self.native_evidence_lost = true;
+                    self.filters_poisoned = true;
+                }
+                self.finish_filter();
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+        if clean
+            && self.filter_observation.as_ref().is_some_and(|observation| {
+                (observation.error_kind().is_some()
+                    && (!observation.submitted
+                        || observation.outcome.is_some()
+                        || observation.submission_error.is_some()))
+                    || observation.ready()
+            })
+        {
+            // Negative reply and all its buffered logs settle only at native NONE.
+            if let Some(observation) = self.filter_observation.as_ref().filter(|observation| {
+                (observation.submission_error.is_some()
+                    || observation.outcome.is_some_and(|error| error < 0))
+                    && (observation.disable || observation.fresh)
+            }) {
+                let (kind, ordinal) =
+                    if observation.failure == Some(FilterConfirmationFailure::EvidenceLost) {
+                        (
+                            FilterErrorKind::Unconfirmed {
+                                reason: FilterConfirmationFailure::EvidenceLost,
+                            },
+                            None,
+                        )
+                    } else if observation.disable {
+                        (
+                            FilterErrorKind::RuntimeGraph,
+                            observation.incumbent_disable_ordinal,
+                        )
+                    } else {
+                        (
+                            FilterErrorKind::Unconfirmed {
+                                reason: observation
+                                    .failure
+                                    .unwrap_or(FilterConfirmationFailure::EvidenceLost),
+                            },
+                            None,
+                        )
+                    };
+                self.filter_fault(kind, ordinal);
+            }
+            self.finish_filter();
+            return Ok(());
+        }
+        if clean
+            && self
+                .filter_observation
+                .as_ref()
+                .is_some_and(|observation| !observation.submitted)
+        {
+            if self.filters_poisoned || self.video_ended {
+                let observation = self
+                    .filter_observation
+                    .as_mut()
+                    .expect("admitted observation");
+                observation.failure = Some(FilterConfirmationFailure::BackendUnavailable);
+                observation.fresh = true;
+                self.finish_filter();
+                return Ok(());
+            }
+            let observation = self
+                .filter_observation
+                .as_mut()
+                .expect("admitted observation");
+            observation.submitted = true;
+            observation.marker = self.log_sequence;
+            observation.dropped_at_begin = self.dropped_context;
+            let id = observation.id;
+            let vf = observation.command.take().expect("single compiled command");
+            tracing::info!(key = ?observation.key, request = id, vf = ?vf, "filter_command_submit");
+            #[cfg(test)]
+            let result = match self.active_fixture_fault() {
+                Some(FixtureFault::CommandSubmission(error)) => {
+                    self.filter_fault.take();
+                    Ok(error)
+                }
+                Some(FixtureFault::CreationRejected) => {
+                    self.filter_fault.take();
+                    self.vf_command(id, c"@furami_0:furami_nonregistered_creation_fault")
+                }
+                _ => self.vf_command(id, &vf),
+            };
+            #[cfg(not(test))]
+            let result = self.vf_command(id, &vf);
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::info!(request = id, diagnostic = ?error.diagnostic, "filter_backend_unavailable");
+                    self.filter_lost(FilterConfirmationFailure::BackendUnavailable);
+                    self.filter_observation
+                        .as_mut()
+                        .expect("unsubmitted window")
+                        .submitted = false;
+                    return Ok(());
+                }
+            };
+            if result < 0 {
+                let observation = self
+                    .filter_observation
+                    .as_mut()
+                    .expect("submitted observation");
+                observation.submission_error = Some(result);
+            }
+            #[cfg(test)]
+            self.native_record(
+                serde_json::json!({"event":"submission","request":id,"error":result}),
+            );
+        }
+        let sample = self
+            .filter_observation
+            .as_ref()
+            .filter(|observation| {
+                observation.submitted
+                    && observation.outcome.is_some_and(|error| error >= 0)
+                    && observation.reconfigured
+                    && !observation.outstanding
+                    && observation.error_kind().is_none()
+                    && observation.advances < FilterConfirmation::REQUIRED_ADVANCES
+                    && now >= observation.next_sample
+            })
+            .map(|observation| observation.key);
+        if let Some(key) = sample {
+            self.filter_observation
+                .as_mut()
+                .expect("sample observation")
+                .outstanding = true;
+            if self
+                .get(c"time-pos", Pending::FilterProgress { key })
+                .is_err()
+            {
+                let observation = self
+                    .filter_observation
+                    .as_mut()
+                    .expect("sample observation");
+                observation.outstanding = false;
+                observation.failure = Some(FilterConfirmationFailure::ProgressUnavailable);
+            }
+        }
+        Ok(())
+    }
+
+    fn vf_command(&self, id: u64, vf: &CStr) -> Result<i32, MediaError> {
+        #[cfg(test)]
+        self.native_record(serde_json::json!({"event":"command","key":self.filter_observation.as_ref().map(|observation| observation.key),"request":id,"argv":["vf","set",vf.to_str().expect("compiler ASCII")],"fault":format!("{:?}",self.active_fixture_fault())}));
+        let handle = self.handle()?;
+        let argv = [c"vf".as_ptr(), c"set".as_ptr(), vf.as_ptr(), ptr::null()];
+        // SAFETY: One owner handle, exact cookie and NUL-terminated compiled argv;
+        // libmpv copies the command and retains none of these borrowed pointers.
+        Ok(unsafe { (handle.functions.command_async)(handle.raw.as_ptr(), id, argv.as_ptr()) })
     }
     fn handle(&self) -> Result<&Handle, MediaError> {
         self.handle
@@ -719,6 +1393,27 @@ impl MpvBackend {
             MediaError::new("request_exhausted", "internal mpv request IDs exhausted")
         })?;
         Ok(self.last_internal)
+    }
+    fn invalidate_filter_progress(&mut self, id: u64) -> bool {
+        let Some(index) = self.pending.iter().position(|(request, pending)| {
+            *request == id && matches!(pending, Pending::FilterProgress { .. })
+        }) else {
+            return false;
+        };
+        let (_, Pending::FilterProgress { key }) = self.pending.swap_remove(index) else {
+            unreachable!()
+        };
+        if let Some(observation) = self
+            .filter_observation
+            .as_mut()
+            .filter(|observation| observation.key == key)
+        {
+            observation.outstanding = false;
+            observation
+                .failure
+                .get_or_insert(FilterConfirmationFailure::ProgressUnavailable);
+        }
+        true
     }
     fn get(&mut self, name: &'static CStr, pending: Pending) -> Result<(), MediaError> {
         let id = self.next_internal()?;
@@ -1009,6 +1704,65 @@ impl MpvBackend {
         name: Option<CString>,
         value: Option<NodeValue>,
     ) -> Result<BackendEvent, MediaError> {
+        self.reply_at(id, kind, error, name, value, Instant::now())
+    }
+    fn filter_reconfigured(&mut self) {
+        if let Some(observation) = self
+            .filter_observation
+            .as_mut()
+            .filter(|observation| observation.submitted)
+        {
+            observation.reconfigured = true;
+            tracing::info!(key = ?observation.key, "filter_video_reconfig");
+            #[cfg(test)]
+            let key = observation.key;
+            #[cfg(test)]
+            self.native_record(serde_json::json!({"event":"reconfig","key":key}));
+        }
+    }
+
+    fn reply_at(
+        &mut self,
+        id: u64,
+        kind: ReplyKind,
+        error: i32,
+        name: Option<CString>,
+        value: Option<NodeValue>,
+        now: Instant,
+    ) -> Result<BackendEvent, MediaError> {
+        if kind == ReplyKind::Command
+            && let Some(observation) = self.filter_observation.as_mut()
+            && observation.submitted
+            && observation.id == id
+            && observation.outcome.is_none()
+        {
+            #[cfg(test)]
+            let key = observation.key;
+            observation.outcome = Some(error);
+            tracing::info!(key = ?observation.key, request = id, error, "filter_command_reply");
+            if error >= 0 && (observation.graph_failure || observation.unrelated_error) {
+                observation.fresh = true;
+                self.filters_poisoned = true;
+            }
+            #[cfg(test)]
+            self.native_record(
+                serde_json::json!({"event":"reply","key":key,"request":id,"error":error}),
+            );
+            #[cfg(test)]
+            if matches!(
+                self.active_fixture_fault(),
+                Some(FixtureFault::RuntimeGraph)
+            ) && error >= 0
+            {
+                self.filter_fault.take();
+                self.filter_log(
+                    "vf".into(),
+                    "error".into(),
+                    "Disabling filter furami_0 because it has failed.".into(),
+                )?;
+            }
+            return Ok(BackendEvent::Other);
+        }
         let Some((index, pending)) = self
             .pending
             .iter()
@@ -1040,6 +1794,17 @@ impl MpvBackend {
             }
         };
         if expected.is_some_and(|expected| name.as_deref() != Some(expected)) {
+            if let Pending::FilterProgress { key } = pending {
+                self.pending.swap_remove(index);
+                if let Some(observation) = self
+                    .filter_observation
+                    .as_mut()
+                    .filter(|observation| observation.key == key)
+                {
+                    observation.progress(None, now);
+                }
+                return Ok(BackendEvent::Other);
+            }
             return Err(MediaError::new(
                 if matches!(pending, Pending::Pause | Pending::PauseRead { .. }) {
                     "pause_property"
@@ -1052,6 +1817,23 @@ impl MpvBackend {
         self.pending.swap_remove(index);
         tracing::info!(request = id, kind = ?kind, error, property = ?name, value = ?value, "mpv_owned_reply");
         match pending {
+            Pending::FilterProgress { key } => {
+                if let Some(observation) = self
+                    .filter_observation
+                    .as_mut()
+                    .filter(|observation| observation.key == key && observation.outstanding)
+                {
+                    let position = match value {
+                        Some(NodeValue::Double(position)) if error >= 0 => Some(position),
+                        Some(NodeValue::Int(position)) if error >= 0 => Some(position as f64),
+                        _ => None,
+                    };
+                    tracing::info!(key = ?key, request = id, error, position, "filter_progress_sample");
+                    observation.progress(position, now);
+                    #[cfg(test)]
+                    self.native_record(serde_json::json!({"event":"progress","key":key,"request":id,"error":error,"position":position}));
+                }
+            }
             Pending::Pause => {
                 self.pause_pending = false;
                 let paused = match value {
@@ -1228,6 +2010,13 @@ impl OwnerBackend for MpvBackend {
         let path = qualified_library(&self.prefix)?;
         self.handle = Some(Handle::create(&path, stop)?);
         check_stop(stop)?;
+        let paused_vf = if self.playback == InitialPlayback::Paused {
+            self.initial_filters.take().map(|(_, compiled)| {
+                CString::new(compiled.vf).expect("compiler emits NUL-free syntax")
+            })
+        } else {
+            None
+        };
         let handle = self.handle()?;
         // mpv 0.41.0 registers `osc` only with HAVE_LUA. The frozen no-Lua
         // build has neither that option nor an OSC, so no `osc=no` is submitted.
@@ -1266,6 +2055,9 @@ impl OwnerBackend for MpvBackend {
                 c"no"
             },
         )?;
+        if let Some(vf) = &paused_vf {
+            handle.option(c"vf", vf)?;
+        }
         handle.option(c"demuxer-lavf-format", c"v4l2")?;
         handle.option(c"demuxer-lavf-o", self.input.lavf_options())?;
         handle.option(c"audio", c"no")?;
@@ -1304,6 +2096,31 @@ impl OwnerBackend for MpvBackend {
     }
     fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
         match command {
+            BackendCommand::ApplyFilters { key, compiled } => {
+                if self.filter_observation.is_some() {
+                    return Err(MediaError::new(
+                        "filter_admission",
+                        "filter observation already pending",
+                    ));
+                }
+                crate::diagnostics::filter_begin(key, &compiled.entries);
+                #[cfg(test)]
+                self.native_record(serde_json::json!({"event":"admission","key":key,"request":id.get(),"entries":compiled.entries}));
+                let mut observation = FilterObservation::new(
+                    id.get(),
+                    key,
+                    compiled,
+                    Instant::now(),
+                    self.log_sequence,
+                    self.dropped_context,
+                );
+                if self.filters_poisoned {
+                    observation.failure = Some(FilterConfirmationFailure::BackendUnavailable);
+                    observation.fresh = true;
+                }
+                self.filter_observation = Some(observation);
+                Ok(())
+            }
             BackendCommand::SetPaused { request, paused } => {
                 if !paused {
                     return Err(MediaError::new(
@@ -1441,86 +2258,102 @@ impl OwnerBackend for MpvBackend {
         // SAFETY: This owner is the sole wait_event caller. All event and nested
         // values below are consumed/copied before the next wait or handle drop.
         let event = unsafe { &*(handle.functions.wait_event)(handle.raw.as_ptr(), 0.0) };
-        match event.event_id {
-            0 => Ok(BackendEvent::None),
-            1 => Ok(BackendEvent::Shutdown),
+        let raw_id = event.event_id;
+        let result = match raw_id {
+            0 => {
+                self.filter_tick(Instant::now(), true)?;
+                Ok(self.emitted.pop_front().unwrap_or(BackendEvent::None))
+            }
+            1 => {
+                self.filter_lost(FilterConfirmationFailure::BackendUnavailable);
+                if self.filter_observation.is_some() {
+                    self.finish_filter();
+                }
+                self.emitted.push_back(BackendEvent::Shutdown);
+                Ok(self.emitted.pop_front().expect("terminal event"))
+            }
             2 => {
                 if event.data.is_null() {
+                    if self.filter_observation.is_some() || self.filter_health.is_some() {
+                        return self.malformed_filter_log(Instant::now());
+                    }
                     return Err(MediaError::new("mpv_event", "null log payload"));
                 }
                 // SAFETY: LOG_MESSAGE data matches pinned repr(C) payload and its
                 // three C strings stay valid within this wait_event interval.
                 let (prefix, level, text) = unsafe {
                     let log = &*event.data.cast::<MpvLogMessage>();
+                    if log.prefix.is_null() || log.level.is_null() || log.text.is_null() {
+                        if self.filter_observation.is_some() || self.filter_health.is_some() {
+                            return self.malformed_filter_log(Instant::now());
+                        }
+                        return Err(MediaError::new("mpv_event", "null native log string"));
+                    }
                     (
                         CStr::from_ptr(log.prefix).to_string_lossy().into_owned(),
                         CStr::from_ptr(log.level).to_string_lossy().into_owned(),
                         CStr::from_ptr(log.text).to_string_lossy().into_owned(),
                     )
                 };
-                if matches!(level.as_str(), "fatal" | "error" | "warn") {
-                    if self.diagnostics.len() == 16 {
-                        self.diagnostics.pop_front();
-                    }
-                    self.diagnostics.push_back(format!(
-                        "{prefix}/{level}: {}",
-                        text.chars().take(2048).collect::<String>()
-                    ));
-                }
-                tracing::info!(
-                    mpv_prefix = prefix,
-                    mpv_level = level,
-                    "{}",
-                    text.trim_end()
-                );
+                tracing::info!(mpv_prefix = ?prefix, mpv_level = ?level, mpv_text = ?text, "mpv_log");
+                self.filter_log(prefix, level, text)?;
                 Ok(BackendEvent::Other)
             }
             3 => {
-                if event.data.is_null() {
-                    return Err(
-                        self.property_error(event.reply_userdata, "null property reply payload")
-                    );
-                }
-                // SAFETY: GET_PROPERTY_REPLY payload matches pinned C layout.
-                // NODE contents and name copied before any further mpv wait.
-                let (name, value) = unsafe {
-                    let property = &*event.data.cast::<MpvPropertyEvent>();
-                    if property.name.is_null() {
-                        return Err(self.property_error(event.reply_userdata, "null property name"));
+                let payload = (|| -> Result<_, MediaError> {
+                    if event.data.is_null() {
+                        return Err(self
+                            .property_error(event.reply_userdata, "null property reply payload"));
                     }
-                    let value = if property.format == 0 {
-                        None
-                    } else {
-                        if property.format != 6 || property.data.is_null() {
-                            return Err(self.property_error(
-                                event.reply_userdata,
-                                "unexpected property node payload",
-                            ));
-                        }
-                        let node = &*property.data.cast::<MpvNode>();
-                        if self.pending.iter().any(|(id, pending)| {
-                            *id == event.reply_userdata
-                                && matches!(pending, Pending::Pause | Pending::PauseRead { .. })
-                        }) && node.format == 3
-                            && !matches!(node.value.flag, 0 | 1)
-                        {
+                    // SAFETY: GET_PROPERTY_REPLY and its NODE/name are copied in
+                    // this native event lifetime, before the next wait_event.
+                    unsafe {
+                        let property = &*event.data.cast::<MpvPropertyEvent>();
+                        if property.name.is_null() {
                             return Err(
-                                self.property_error(event.reply_userdata, "malformed pause flag")
+                                self.property_error(event.reply_userdata, "null property name")
                             );
                         }
-                        Some(copy_node(node, 0).map_err(|error| {
-                            self.property_error(event.reply_userdata, error.diagnostic)
-                        })?)
-                    };
-                    (CStr::from_ptr(property.name).to_owned(), value)
-                };
-                self.reply(
-                    event.reply_userdata,
-                    ReplyKind::Property,
-                    event.error,
-                    Some(name),
-                    value,
-                )
+                        let value = if property.format == 0 {
+                            None
+                        } else {
+                            if property.format != 6 || property.data.is_null() {
+                                return Err(self.property_error(
+                                    event.reply_userdata,
+                                    "unexpected property node payload",
+                                ));
+                            }
+                            let node = &*property.data.cast::<MpvNode>();
+                            if self.pending.iter().any(|(id, pending)| {
+                                *id == event.reply_userdata
+                                    && matches!(pending, Pending::Pause | Pending::PauseRead { .. })
+                            }) && node.format == 3
+                                && !matches!(node.value.flag, 0 | 1)
+                            {
+                                return Err(self
+                                    .property_error(event.reply_userdata, "malformed pause flag"));
+                            }
+                            Some(copy_node(node, 0).map_err(|error| {
+                                self.property_error(event.reply_userdata, error.diagnostic)
+                            })?)
+                        };
+                        Ok((CStr::from_ptr(property.name).to_owned(), value))
+                    }
+                })();
+                match payload {
+                    Ok((name, value)) => self.reply(
+                        event.reply_userdata,
+                        ReplyKind::Property,
+                        event.error,
+                        Some(name),
+                        value,
+                    ),
+                    Err(error) if self.invalidate_filter_progress(event.reply_userdata) => {
+                        tracing::info!(request = event.reply_userdata, diagnostic = ?error.diagnostic, "filter_progress_invalid");
+                        Ok(BackendEvent::Other)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             4 => self.reply(
                 event.reply_userdata,
@@ -1533,18 +2366,41 @@ impl OwnerBackend for MpvBackend {
                 // Command result is owned before leaving native event lifetime,
                 // even commands whose scalar outcome alone is sufficient.
                 let value = if event.data.is_null() {
-                    None
+                    Ok(None)
                 } else {
                     // SAFETY: COMMAND_REPLY data is pinned mpv_event_command.
-                    Some(unsafe { copy_node(&(*event.data.cast::<MpvCommandEvent>()).result, 0)? })
+                    unsafe {
+                        copy_node(&(*event.data.cast::<MpvCommandEvent>()).result, 0).map(Some)
+                    }
                 };
-                self.reply(
-                    event.reply_userdata,
-                    ReplyKind::Command,
-                    event.error,
-                    None,
-                    value,
-                )
+                match value {
+                    Ok(value) => self.reply(
+                        event.reply_userdata,
+                        ReplyKind::Command,
+                        event.error,
+                        None,
+                        value,
+                    ),
+                    Err(error)
+                        if self.filter_observation.as_ref().is_some_and(|observation| {
+                            observation.submitted && observation.id == event.reply_userdata
+                        }) =>
+                    {
+                        // Preserve the known scalar rejection even when its
+                        // optional native result payload is unavailable.
+                        self.reply(
+                            event.reply_userdata,
+                            ReplyKind::Command,
+                            event.error,
+                            None,
+                            None,
+                        )?;
+                        tracing::info!(request = event.reply_userdata, diagnostic = ?error.diagnostic, "filter_command_evidence_lost");
+                        self.filter_lost(FilterConfirmationFailure::EvidenceLost);
+                        Ok(BackendEvent::Other)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             7 => {
                 if event.data.is_null() {
@@ -1554,22 +2410,42 @@ impl OwnerBackend for MpvBackend {
                 // payload. Copy only scalar reason/error; never retain its pointer.
                 let end = unsafe { &*event.data.cast::<MpvEndFile>() };
                 self.video_ended = true;
-                Ok(BackendEvent::EndFile {
+                let terminal = BackendEvent::EndFile {
                     reason: end.reason,
                     error: end.error,
-                })
+                };
+                self.filter_lost(FilterConfirmationFailure::BackendUnavailable);
+                if self.filter_observation.is_some() {
+                    self.finish_filter();
+                }
+                self.emitted.push_back(terminal);
+                Ok(self.emitted.pop_front().expect("terminal event"))
             }
             8 => Ok(BackendEvent::FileLoaded),
-            17 => Ok(BackendEvent::VideoReconfig),
+            17 => {
+                self.filter_reconfigured();
+                Ok(BackendEvent::VideoReconfig)
+            }
             18 => Ok(BackendEvent::Other),
             21 => {
                 self.video_started = true;
                 self.begin_audio_if_ready()?;
                 Ok(BackendEvent::PlaybackRestart)
             }
-            24 => Ok(BackendEvent::QueueOverflow),
+            24 => {
+                self.filter_lost(FilterConfirmationFailure::EvidenceLost);
+                if self.filter_observation.is_some() {
+                    self.finish_filter();
+                }
+                self.emitted.push_back(BackendEvent::QueueOverflow);
+                Ok(self.emitted.pop_front().expect("overflow event"))
+            }
             _ => Ok(BackendEvent::Other),
+        };
+        if raw_id != 0 {
+            self.filter_tick(Instant::now(), false)?;
         }
+        result
     }
     fn refresh_pause(&mut self) -> Result<Option<bool>, MediaError> {
         if self.pause_pending {
@@ -1597,17 +2473,13 @@ impl OwnerBackend for MpvBackend {
         Ok(None)
     }
     fn diagnostic(&self) -> Option<String> {
-        if self.diagnostics.is_empty() {
-            None
-        } else {
-            Some(
-                self.diagnostics
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-        }
+        (!self.filter_records.is_empty()).then(|| {
+            self.filter_records
+                .iter()
+                .map(|record| format!("{}/{}: {}", record.prefix, record.level, record.text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
     }
     fn audio_status(&self) -> AudioAvailability {
         self.audio_status.clone()
@@ -1617,6 +2489,13 @@ impl OwnerBackend for MpvBackend {
     }
     fn audio_epoch(&self) -> Option<AudioEpoch> {
         self.epoch
+    }
+    fn initial_filters(&mut self) -> Option<(FilterAttemptKey, CompiledFilterChain)> {
+        if self.playback == InitialPlayback::Live {
+            self.initial_filters.take()
+        } else {
+            None
+        }
     }
     fn shutdown(&mut self) -> Result<(), MediaError> {
         // Retain the video handle/native lease until actual child reap AND
@@ -1638,6 +2517,8 @@ impl OwnerBackend for MpvBackend {
         self.retirement = None;
         drop(self.handle.take()); // real mpv_terminate_destroy on its owner thread
         self.pending.clear();
+        self.filter_observation = None;
+        self.filter_health = None;
         outcome
     }
 }
@@ -1668,8 +2549,23 @@ pub(crate) enum FixtureMilestone {
 }
 
 #[cfg(test)]
-#[derive(Clone, Default)]
-pub(crate) struct FixtureRecorder(std::sync::Arc<std::sync::Mutex<Vec<FixtureMilestone>>>);
+#[derive(Clone)]
+pub(crate) struct FixtureRecorder(
+    std::sync::Arc<std::sync::Mutex<Vec<FixtureMilestone>>>,
+    std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    std::sync::Arc<Instant>,
+);
+
+#[cfg(test)]
+impl Default for FixtureRecorder {
+    fn default() -> Self {
+        Self(
+            Default::default(),
+            Default::default(),
+            std::sync::Arc::new(Instant::now()),
+        )
+    }
+}
 
 #[cfg(test)]
 impl FixtureRecorder {
@@ -1689,6 +2585,35 @@ impl FixtureRecorder {
             .map(|milestones| milestones.clone())
             .map_err(|_| MediaError::new("fixture_recorder", "fixture milestone recorder poisoned"))
     }
+    fn record_native(&self, mut event: serde_json::Value) {
+        event
+            .as_object_mut()
+            .expect("structured fixture record")
+            .insert(
+                "observed_us".into(),
+                serde_json::json!(self.2.elapsed().as_micros()),
+            );
+        eprintln!("FURAMI_FILTER_NATIVE {}", event);
+        self.1
+            .lock()
+            .expect("native evidence recorder poisoned")
+            .push(event);
+    }
+    pub(crate) fn native_snapshot(&self) -> Result<Vec<serde_json::Value>, MediaError> {
+        self.1
+            .lock()
+            .map(|events| events.clone())
+            .map_err(|_| MediaError::new("fixture_recorder", "native evidence recorder poisoned"))
+    }
+}
+
+/// Explicit native-adapter faults. They do not change production observation.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FixtureFault {
+    CommandSubmission(i32),
+    CreationRejected,
+    RuntimeGraph,
 }
 
 /// Finite-file qualification adapter. Only initialization and input selection
@@ -1744,6 +2669,57 @@ impl FixtureBackend {
             generation: None,
         })
     }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_filters(
+        prefix: String,
+        fixture: PathBuf,
+        input: InputSpec,
+        gain: PlaybackGain,
+        playback: InitialPlayback,
+        watch: WatchStamp,
+        filters: crate::domain::filters::FilterChain,
+        compiled: CompiledFilterChain,
+        key: FilterAttemptKey,
+        recorder: Option<FixtureRecorder>,
+    ) -> Result<Self, MediaError> {
+        if filters.entries().len() != compiled.entries.len()
+            || filters
+                .entries()
+                .iter()
+                .zip(&compiled.entries)
+                .enumerate()
+                .any(|(ordinal, (entry, metadata))| {
+                    metadata.ordinal != ordinal
+                        || metadata.label != entry.label()
+                        || metadata.enabled != entry.enabled()
+                })
+        {
+            return Err(MediaError::new(
+                "fixture_filters",
+                "compiled metadata differs from full chain",
+            ));
+        }
+        let mut backend = Self::new(prefix, fixture, input, gain, playback, watch, recorder)?;
+        backend.inner.initial_filters = Some((key, compiled));
+        backend.inner.fixture_recorder = backend.recorder.clone();
+        Ok(backend)
+    }
+
+    pub(crate) fn with_fault(mut self, fault: FixtureFault) -> Self {
+        match fault {
+            FixtureFault::CommandSubmission(error) => {
+                assert!(error < 0, "explicit fault must be negative")
+            }
+            FixtureFault::RuntimeGraph | FixtureFault::CreationRejected => {}
+        }
+        self.inner.filter_fault = Some(fault);
+        self
+    }
+    pub(crate) fn with_fault_for_pass(self, fault: FixtureFault, pass: FilterPass) -> Self {
+        let mut backend = self.with_fault(fault);
+        backend.inner.filter_fault_pass = Some(pass);
+        backend
+    }
 
     fn record(&self, milestone: FixtureMilestone) -> Result<(), MediaError> {
         self.recorder
@@ -1768,6 +2744,13 @@ impl OwnerBackend for FixtureBackend {
         self.record(FixtureMilestone::Created {
             generation: token.generation,
         })?;
+        let paused_vf = if self.inner.playback == InitialPlayback::Paused {
+            self.inner.initial_filters.take().map(|(_, compiled)| {
+                CString::new(compiled.vf).expect("compiler emits NUL-free syntax")
+            })
+        } else {
+            None
+        };
         let handle = self.inner.handle()?;
         const OPTIONS: &[(&CStr, &CStr)] = &[
             (c"config", c"no"),
@@ -1792,6 +2775,19 @@ impl OwnerBackend for FixtureBackend {
                 c"no"
             },
         )?;
+        if let Some(vf) = &paused_vf {
+            handle.option(c"vf", vf)?;
+            if let Some(recorder) = &self.recorder {
+                recorder.record_native(serde_json::json!({
+                    "event": "paused_filter_option", "generation": token.generation.get(),
+                    "vf": vf.to_str().expect("compiler emits UTF-8"),
+                }));
+            }
+        }
+        // The fixture exercises the same full native-log classifier as production.
+        let result =
+            unsafe { (handle.functions.request_logs)(handle.raw.as_ptr(), c"info".as_ptr()) };
+        handle.checked(result, "fixture request info logs")?;
         check_stop(stop)?;
         // SAFETY: The genuine owner-thread handle is live; options above were
         // checked before initialization; no native window or audio owner exists.
@@ -1859,6 +2855,9 @@ impl OwnerBackend for FixtureBackend {
     }
     fn initial_playback(&self) -> InitialPlayback {
         self.inner.playback
+    }
+    fn initial_filters(&mut self) -> Option<(FilterAttemptKey, CompiledFilterChain)> {
+        self.inner.initial_filters()
     }
 
     fn shutdown(&mut self) -> Result<(), MediaError> {
@@ -2363,6 +3362,1190 @@ mod reply_tests {
                 reason: crate::domain::output::OutputSilence::NoAvailableOutput,
             },
         )
+    }
+
+    fn filter_key(apply: u64, pass: FilterPass) -> FilterAttemptKey {
+        FilterAttemptKey {
+            apply: crate::domain::state::ApplyId::new(apply).unwrap(),
+            attempt: AttemptId::new(1).unwrap(),
+            pass,
+        }
+    }
+    fn ordered_filters() -> crate::domain::filters::FilterChain {
+        use crate::domain::filters::{
+            ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
+        };
+        FilterChain::new(
+            (0..3)
+                .map(|ordinal| {
+                    FilterEntry::new(
+                        format!("inert\nlabel {ordinal}"),
+                        Filter::Format(FormatParams::new(
+                            SdrMatrix::Auto,
+                            ColorLevels::Auto,
+                            SdrGamma::Auto,
+                        )),
+                        ordinal != 1,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+    fn compiled_filters(chain: &crate::domain::filters::FilterChain) -> CompiledFilterChain {
+        crate::media::filter_catalog::compile_chain(
+            chain,
+            &crate::media::filter_catalog::fixture_capabilities(),
+        )
+        .unwrap()
+    }
+    fn admitted_filter(chain: &crate::domain::filters::FilterChain) -> (MpvBackend, Instant) {
+        let mut backend = backend();
+        backend.property_requests = Some(Vec::new());
+        backend
+            .submit(
+                RequestId::for_test(17),
+                BackendCommand::ApplyFilters {
+                    key: filter_key(1, FilterPass::LiveCandidate),
+                    compiled: compiled_filters(chain),
+                },
+            )
+            .unwrap();
+        let now = backend.filter_observation.as_ref().unwrap().admitted;
+        (backend, now)
+    }
+    fn submitted_filter() -> (MpvBackend, Instant) {
+        let (mut backend, now) = admitted_filter(&ordered_filters());
+        // Unit seam immediately after the one native argv submission; command,
+        // property replies, classifier and settlement below are production code.
+        let observation = backend.filter_observation.as_mut().unwrap();
+        observation.submitted = true;
+        observation.command.take();
+        (backend, now)
+    }
+    fn command_reply(backend: &mut MpvBackend, error: i32, now: Instant) {
+        assert_eq!(
+            backend
+                .reply_at(17, ReplyKind::Command, error, None, None, now)
+                .unwrap(),
+            BackendEvent::Other
+        );
+    }
+    fn sample(backend: &mut MpvBackend, value: NodeValue, now: Instant) {
+        backend.filter_tick(now, false).unwrap();
+        let id = backend
+            .pending
+            .iter()
+            .find(|(_, pending)| matches!(pending, Pending::FilterProgress { .. }))
+            .unwrap()
+            .0;
+        assert_eq!(
+            backend
+                .reply_at(
+                    id,
+                    ReplyKind::Property,
+                    0,
+                    Some(c"time-pos".to_owned()),
+                    Some(value),
+                    now
+                )
+                .unwrap(),
+            BackendEvent::Other
+        );
+    }
+    fn complete_progress(backend: &mut MpvBackend, now: Instant) -> Instant {
+        sample(backend, NodeValue::Double(0.0), now);
+        let mut clock = now;
+        for position in 1..=32 {
+            clock += FilterConfirmation::SAMPLE_INTERVAL;
+            sample(backend, NodeValue::Double(f64::from(position)), clock);
+        }
+        clock
+    }
+    fn result_failure(backend: &mut MpvBackend) -> Box<FilterFailure> {
+        loop {
+            match backend.emitted.pop_front().expect("settled result") {
+                BackendEvent::FilterResult {
+                    result: Err(failure),
+                    ..
+                } => return failure,
+                BackendEvent::FilterFault { .. } => {}
+                other => panic!("expected failure, got {other:?}"),
+            }
+        }
+    }
+    fn confirmed_filter() -> MpvBackend {
+        let (mut backend, now) = submitted_filter();
+        command_reply(&mut backend, 0, now);
+        backend.filter_reconfigured();
+        let final_time = complete_progress(&mut backend, now);
+        backend.filter_tick(final_time, true).unwrap();
+        assert!(matches!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::FilterResult { result: Ok(_), .. })
+        ));
+        backend
+    }
+
+    #[test]
+    fn filter_predicate_requires_both_witnesses_32_advances_one_read_and_final_clean_drain() {
+        for reconfig_first in [true, false] {
+            let (mut backend, now) = submitted_filter();
+            if reconfig_first {
+                backend.filter_reconfigured();
+            } else {
+                command_reply(&mut backend, 0, now);
+            }
+            backend.filter_tick(now, false).unwrap();
+            assert!(
+                backend.property_requests.as_ref().unwrap().is_empty(),
+                "one witness cannot begin a baseline"
+            );
+            if reconfig_first {
+                command_reply(&mut backend, 0, now);
+            } else {
+                backend.filter_reconfigured();
+            }
+            backend.filter_tick(now, false).unwrap();
+            assert_eq!(backend.property_requests.as_ref().unwrap().len(), 1);
+            backend
+                .filter_tick(now + FilterConfirmation::SAMPLE_INTERVAL, false)
+                .unwrap();
+            assert_eq!(
+                backend.property_requests.as_ref().unwrap().len(),
+                1,
+                "one outstanding read"
+            );
+            let id = backend.pending[0].0;
+            backend
+                .reply_at(
+                    id,
+                    ReplyKind::Property,
+                    0,
+                    Some(c"time-pos".to_owned()),
+                    Some(NodeValue::Double(0.0)),
+                    now,
+                )
+                .unwrap();
+            backend
+                .filter_tick(
+                    now + FilterConfirmation::SAMPLE_INTERVAL - std::time::Duration::from_nanos(1),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                backend.property_requests.as_ref().unwrap().len(),
+                1,
+                "sample interval is not shortened"
+            );
+            let mut clock = now;
+            for position in 1..=31 {
+                clock += FilterConfirmation::SAMPLE_INTERVAL;
+                sample(&mut backend, NodeValue::Double(f64::from(position)), clock);
+            }
+            backend.filter_tick(clock, true).unwrap();
+            assert!(backend.emitted.is_empty(), "31 advances do not confirm");
+            clock += FilterConfirmation::SAMPLE_INTERVAL;
+            sample(&mut backend, NodeValue::Double(31.0), clock);
+            assert_eq!(
+                backend.filter_observation.as_ref().unwrap().advances,
+                31,
+                "equal samples do not count"
+            );
+            clock += FilterConfirmation::SAMPLE_INTERVAL;
+            sample(&mut backend, NodeValue::Double(32.0), clock);
+            backend.filter_tick(clock, false).unwrap();
+            assert!(
+                backend.emitted.is_empty(),
+                "progress must be followed by native NONE"
+            );
+            backend.filter_tick(clock, true).unwrap();
+            let Some(BackendEvent::FilterResult {
+                id,
+                key,
+                result: Ok(receipt),
+            }) = backend.emitted.pop_front()
+            else {
+                panic!("no confirmed result")
+            };
+            assert_eq!(id, 17);
+            assert_eq!(receipt.key(), key);
+            assert_eq!(receipt.baseline(), 0.0);
+            assert_eq!(receipt.last_position(), 32.0);
+            assert_eq!(receipt.advances(), 32);
+            assert!(!backend.filters_poisoned);
+        }
+    }
+
+    #[test]
+    fn filter_pre_submission_drain_is_bounded_and_flood_never_confirms() {
+        let (mut backend, now) = admitted_filter(&ordered_filters());
+        for _ in 0..64 {
+            backend.filter_tick(now, false).unwrap();
+            assert!(!backend.filter_observation.as_ref().unwrap().submitted);
+        }
+        backend
+            .filter_tick(now + FilterConfirmation::DEADLINE, false)
+            .unwrap();
+        let failure = result_failure(&mut backend);
+        assert_eq!(
+            failure.kind,
+            FilterErrorKind::Unconfirmed {
+                reason: FilterConfirmationFailure::Deadline
+            }
+        );
+        assert!(failure.requires_fresh_owner);
+        assert!(failure.diagnostics.native_evidence_lost);
+        assert!(backend.property_requests.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn filter_missing_reconfig_and_insufficient_progress_have_no_success_fallback() {
+        for reconfigured in [false, true] {
+            let (mut backend, now) = submitted_filter();
+            command_reply(&mut backend, 0, now);
+            if reconfigured {
+                backend.filter_reconfigured();
+                sample(&mut backend, NodeValue::Double(4.0), now);
+            }
+            backend
+                .filter_tick(now + FilterConfirmation::DEADLINE, true)
+                .unwrap();
+            let failure = result_failure(&mut backend);
+            assert_eq!(
+                failure.kind,
+                FilterErrorKind::Unconfirmed {
+                    reason: if reconfigured {
+                        FilterConfirmationFailure::Deadline
+                    } else {
+                        FilterConfirmationFailure::MissingReconfig
+                    }
+                }
+            );
+            assert!(
+                !failure.requires_fresh_owner,
+                "clean intact deadline permits one in-place restoration"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_progress_wrong_cookie_wrong_name_and_invalid_values_cannot_confirm() {
+        for value in [
+            NodeValue::Double(f64::NAN),
+            NodeValue::Double(f64::INFINITY),
+            NodeValue::None,
+            NodeValue::Flag(true),
+            NodeValue::String(c"1.0".to_owned()),
+        ] {
+            let (mut backend, now) = submitted_filter();
+            command_reply(&mut backend, 0, now);
+            backend.filter_reconfigured();
+            backend.filter_tick(now, false).unwrap();
+            let id = backend.pending[0].0;
+            backend
+                .reply_at(
+                    id + 100,
+                    ReplyKind::Property,
+                    0,
+                    Some(c"time-pos".to_owned()),
+                    Some(NodeValue::Double(1.0)),
+                    now,
+                )
+                .unwrap();
+            assert!(backend.filter_observation.as_ref().unwrap().outstanding);
+            backend
+                .reply_at(
+                    id,
+                    ReplyKind::Property,
+                    0,
+                    Some(c"time-pos".to_owned()),
+                    Some(value),
+                    now,
+                )
+                .unwrap();
+            backend.filter_tick(now, true).unwrap();
+            assert_eq!(
+                result_failure(&mut backend).kind,
+                FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::ProgressUnavailable
+                }
+            );
+        }
+        let (mut backend, now) = submitted_filter();
+        backend
+            .reply_at(18, ReplyKind::Command, 0, None, None, now)
+            .unwrap();
+        assert!(
+            backend
+                .filter_observation
+                .as_ref()
+                .unwrap()
+                .outcome
+                .is_none()
+        );
+        command_reply(&mut backend, 0, now);
+        backend.filter_reconfigured();
+        backend.filter_tick(now, false).unwrap();
+        let id = backend.pending[0].0;
+        backend
+            .reply_at(
+                id,
+                ReplyKind::Property,
+                0,
+                Some(c"vf".to_owned()),
+                Some(NodeValue::Double(1.0)),
+                now,
+            )
+            .unwrap();
+        backend.filter_tick(now, true).unwrap();
+        assert_eq!(
+            result_failure(&mut backend).kind,
+            FilterErrorKind::Unconfirmed {
+                reason: FilterConfirmationFailure::ProgressUnavailable
+            }
+        );
+    }
+
+    #[test]
+    fn filter_backwards_and_unavailable_progress_and_malformed_native_payload_fail_typed() {
+        for malformed in [false, true] {
+            let (mut backend, now) = submitted_filter();
+            command_reply(&mut backend, 0, now);
+            backend.filter_reconfigured();
+            sample(&mut backend, NodeValue::Double(3.0), now);
+            let next = now + FilterConfirmation::SAMPLE_INTERVAL;
+            backend.filter_tick(next, false).unwrap();
+            let id = backend.pending[0].0;
+            if malformed {
+                assert!(backend.invalidate_filter_progress(id));
+            } else {
+                backend
+                    .reply_at(
+                        id,
+                        ReplyKind::Property,
+                        0,
+                        Some(c"time-pos".to_owned()),
+                        Some(NodeValue::Double(2.0)),
+                        next,
+                    )
+                    .unwrap();
+            }
+            backend.filter_tick(next, true).unwrap();
+            assert_eq!(
+                result_failure(&mut backend).kind,
+                FilterErrorKind::Unconfirmed {
+                    reason: if malformed {
+                        FilterConfirmationFailure::ProgressUnavailable
+                    } else {
+                        FilterConfirmationFailure::TimeDiscontinuity
+                    }
+                }
+            );
+        }
+        let (mut backend, now) = submitted_filter();
+        command_reply(&mut backend, 0, now);
+        backend.filter_reconfigured();
+        backend.filter_tick(now, false).unwrap();
+        let id = backend.pending[0].0;
+        backend
+            .reply_at(
+                id,
+                ReplyKind::Property,
+                -10,
+                Some(c"time-pos".to_owned()),
+                None,
+                now,
+            )
+            .unwrap();
+        backend.filter_tick(now, true).unwrap();
+        assert_eq!(
+            result_failure(&mut backend).kind,
+            FilterErrorKind::Unconfirmed {
+                reason: FilterConfirmationFailure::ProgressUnavailable
+            }
+        );
+    }
+
+    #[test]
+    fn filter_negative_reply_owns_buffered_creation_logs_in_both_orders_without_poison() {
+        for logs_first in [false, true] {
+            let (mut backend, now) = submitted_filter();
+            if !logs_first {
+                command_reply(&mut backend, -12, now);
+            }
+            backend
+                .filter_log(
+                    "vf/furami_0".into(),
+                    "error".into(),
+                    "could not initialize filter pads".into(),
+                )
+                .unwrap();
+            backend.filter_tick(now, false).unwrap();
+            assert!(
+                backend.emitted.is_empty(),
+                "no early rejection settlement or false incumbent fault"
+            );
+            if logs_first {
+                command_reply(&mut backend, -12, now);
+            }
+            backend.filter_tick(now, true).unwrap();
+            let failure = result_failure(&mut backend);
+            assert_eq!(
+                failure.kind,
+                FilterErrorKind::CommandRejected { mpv_error: -12 }
+            );
+            assert_eq!(failure.attributed_ordinal, Some(0));
+            assert_eq!(failure.diagnostics.records.len(), 1);
+            assert!(!failure.requires_fresh_owner);
+            assert!(!backend.filters_poisoned);
+        }
+    }
+
+    #[test]
+    fn filter_direct_submission_error_settles_nonfatally_after_its_clean_log_drain() {
+        let (mut backend, now) = admitted_filter(&ordered_filters());
+        backend.filter_fault = Some(FixtureFault::CommandSubmission(-3));
+        backend.filter_tick(now, true).unwrap();
+        backend
+            .filter_log("vf".into(), "error".into(), "creation context".into())
+            .unwrap();
+        backend.filter_tick(now, false).unwrap();
+        assert!(backend.emitted.is_empty());
+        backend.filter_tick(now, true).unwrap();
+        let failure = result_failure(&mut backend);
+        assert_eq!(
+            failure.kind,
+            FilterErrorKind::CommandSubmission { mpv_error: -3 }
+        );
+        assert!(!failure.requires_fresh_owner);
+        assert_eq!(failure.diagnostics.records.len(), 1);
+        assert!(!backend.filters_poisoned);
+    }
+
+    #[test]
+    fn filter_rejected_candidate_with_incumbent_disable_keeps_rejection_and_revokes_health() {
+        use crate::domain::filters::{FilterChain, FilterEntry};
+        for logs_first in [false, true] {
+            let mut backend = confirmed_filter();
+            let candidate = FilterChain::new(
+                ordered_filters()
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, entry)| {
+                        FilterEntry::new(
+                            format!("new candidate label {ordinal}"),
+                            entry.filter().clone(),
+                            entry.enabled(),
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            backend
+                .submit(
+                    RequestId::for_test(18),
+                    BackendCommand::ApplyFilters {
+                        key: filter_key(2, FilterPass::LiveCandidate),
+                        compiled: compiled_filters(&candidate),
+                    },
+                )
+                .unwrap();
+            let now = Instant::now();
+            let observation = backend.filter_observation.as_mut().unwrap();
+            observation.submitted = true;
+            observation.command.take();
+            if !logs_first {
+                backend
+                    .reply_at(18, ReplyKind::Command, -12, None, None, now)
+                    .unwrap();
+            }
+            backend
+                .filter_log(
+                    "vf".into(),
+                    "error".into(),
+                    "Disabling filter furami_2 because it has failed.".into(),
+                )
+                .unwrap();
+            if logs_first {
+                backend
+                    .reply_at(18, ReplyKind::Command, -12, None, None, now)
+                    .unwrap();
+            }
+            backend.filter_tick(now, true).unwrap();
+            let Some(BackendEvent::FilterFault { key, failure }) = backend.emitted.pop_front()
+            else {
+                panic!("missing independent incumbent fault")
+            };
+            assert_eq!(key, filter_key(1, FilterPass::LiveCandidate));
+            assert_eq!(failure.kind, FilterErrorKind::RuntimeGraph);
+            assert_eq!(failure.attributed_ordinal, Some(2));
+            assert_eq!(failure.diagnostics.entries[2].label, "inert\nlabel 2");
+            let failure = result_failure(&mut backend);
+            assert_eq!(
+                failure.kind,
+                FilterErrorKind::CommandRejected { mpv_error: -12 }
+            );
+            assert_eq!(
+                failure.attributed_ordinal, None,
+                "incumbent disable cannot attribute the rejected candidate"
+            );
+            assert_eq!(
+                failure.diagnostics.entries[2].label,
+                "new candidate label 2"
+            );
+            assert!(failure.requires_fresh_owner);
+            assert!(backend.filters_poisoned);
+        }
+    }
+
+    #[test]
+    fn filter_successful_command_disable_attributes_only_the_installed_candidate() {
+        for logs_first in [false, true] {
+            let (mut backend, now) = submitted_filter();
+            if !logs_first {
+                command_reply(&mut backend, 0, now);
+            }
+            backend
+                .filter_log(
+                    "vf".into(),
+                    "error".into(),
+                    "Disabling filter furami_2 because it has failed.".into(),
+                )
+                .unwrap();
+            if logs_first {
+                command_reply(&mut backend, 0, now);
+            }
+            backend.filter_tick(now, true).unwrap();
+            let failure = result_failure(&mut backend);
+            assert_eq!(failure.kind, FilterErrorKind::RuntimeGraph);
+            assert_eq!(failure.attributed_ordinal, Some(2));
+            assert!(failure.requires_fresh_owner);
+            assert!(backend.filters_poisoned);
+        }
+    }
+
+    #[test]
+    fn filter_native_loss_supersedes_prior_progress_failure_and_clears_attribution() {
+        for prior in [
+            FilterConfirmationFailure::ProgressUnavailable,
+            FilterConfirmationFailure::TimeDiscontinuity,
+        ] {
+            let (mut backend, now) = submitted_filter();
+            command_reply(&mut backend, 0, now);
+            backend.filter_reconfigured();
+            sample(&mut backend, NodeValue::Double(3.0), now);
+            let next = now + FilterConfirmation::SAMPLE_INTERVAL;
+            sample(
+                &mut backend,
+                if prior == FilterConfirmationFailure::ProgressUnavailable {
+                    NodeValue::None
+                } else {
+                    NodeValue::Double(2.0)
+                },
+                next,
+            );
+            assert_eq!(
+                backend.filter_observation.as_ref().unwrap().failure,
+                Some(prior)
+            );
+            backend
+                .filter_log(
+                    "vf/furami_0".into(),
+                    "error".into(),
+                    "could not initialize filter pads".into(),
+                )
+                .unwrap();
+            assert_eq!(
+                backend
+                    .filter_observation
+                    .as_ref()
+                    .unwrap()
+                    .attributed_ordinal,
+                Some(0)
+            );
+            backend
+                .filter_log(
+                    "overflow".into(),
+                    "fatal".into(),
+                    "log message buffer overflow: native discarded messages".into(),
+                )
+                .unwrap();
+            backend
+                .filter_log(
+                    "vf".into(),
+                    "error".into(),
+                    "Disabling filter furami_2 because it has failed.".into(),
+                )
+                .unwrap();
+            backend.filter_tick(next, true).unwrap();
+            let failure = result_failure(&mut backend);
+            assert_eq!(
+                failure.kind,
+                FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::EvidenceLost
+                }
+            );
+            assert_eq!(
+                failure.attributed_ordinal, None,
+                "lost native evidence cannot regain attribution from later logs"
+            );
+            assert!(failure.diagnostics.native_evidence_lost);
+            assert!(failure.requires_fresh_owner);
+            assert!(backend.filters_poisoned);
+        }
+    }
+
+    #[test]
+    fn filter_native_loss_preserves_known_negative_causes_without_attribution() {
+        for submission in [false, true] {
+            let (mut backend, now) = if submission {
+                admitted_filter(&ordered_filters())
+            } else {
+                submitted_filter()
+            };
+            if submission {
+                backend.filter_fault = Some(FixtureFault::CommandSubmission(-3));
+                backend.filter_tick(now, true).unwrap();
+            } else {
+                command_reply(&mut backend, -12, now);
+            }
+            backend
+                .filter_log(
+                    "vf/furami_0".into(),
+                    "error".into(),
+                    "could not initialize filter pads".into(),
+                )
+                .unwrap();
+            backend
+                .filter_log(
+                    "overflow".into(),
+                    "fatal".into(),
+                    "log message buffer overflow: native discarded messages".into(),
+                )
+                .unwrap();
+            backend.filter_tick(now, true).unwrap();
+            let failure = result_failure(&mut backend);
+            assert_eq!(
+                failure.kind,
+                if submission {
+                    FilterErrorKind::CommandSubmission { mpv_error: -3 }
+                } else {
+                    FilterErrorKind::CommandRejected { mpv_error: -12 }
+                }
+            );
+            assert_eq!(failure.attributed_ordinal, None);
+            assert!(failure.diagnostics.native_evidence_lost);
+            assert!(failure.requires_fresh_owner);
+            assert!(backend.filters_poisoned);
+        }
+    }
+
+    #[test]
+    fn filter_pre_submission_native_loss_survives_later_labelled_and_unrelated_errors() {
+        for incumbent in [false, true] {
+            for (prefix, text) in [
+                ("vf/furami_0", "could not initialize filter pads"),
+                ("vf", "Disabling filter furami_2 because it has failed."),
+                ("vo/gpu-next", "unrelated rendering failure"),
+            ] {
+                let mut backend = if incumbent {
+                    confirmed_filter()
+                } else {
+                    backend()
+                };
+                let key = filter_key(2, FilterPass::LiveCandidate);
+                backend
+                    .submit(
+                        RequestId::for_test(18),
+                        BackendCommand::ApplyFilters {
+                            key,
+                            compiled: compiled_filters(&ordered_filters()),
+                        },
+                    )
+                    .unwrap();
+                let now = backend.filter_observation.as_ref().unwrap().admitted;
+                backend
+                    .filter_log(
+                        "overflow".into(),
+                        "fatal".into(),
+                        "log message buffer overflow: native discarded messages".into(),
+                    )
+                    .unwrap();
+                if incumbent {
+                    let Some(BackendEvent::FilterFault {
+                        key: prior,
+                        failure,
+                    }) = backend.emitted.pop_front()
+                    else {
+                        panic!("native loss did not revoke the confirmed incumbent")
+                    };
+                    assert_eq!(prior, filter_key(1, FilterPass::LiveCandidate));
+                    assert_eq!(
+                        failure.kind,
+                        FilterErrorKind::Unconfirmed {
+                            reason: FilterConfirmationFailure::EvidenceLost
+                        }
+                    );
+                    assert_eq!(failure.attributed_ordinal, None);
+                    assert!(failure.requires_fresh_owner);
+                }
+                backend
+                    .filter_log(prefix.into(), "error".into(), text.into())
+                    .unwrap();
+                assert!(
+                    backend.emitted.is_empty(),
+                    "later logs cannot fabricate an attributed incumbent fault"
+                );
+                assert!(!backend.filter_observation.as_ref().unwrap().submitted);
+                backend.filter_tick(now, true).unwrap();
+                let failure = result_failure(&mut backend);
+                assert_eq!(
+                    failure.kind,
+                    FilterErrorKind::Unconfirmed {
+                        reason: FilterConfirmationFailure::EvidenceLost
+                    }
+                );
+                assert_eq!(failure.attributed_ordinal, None);
+                assert_eq!(failure.diagnostics.key, Some(key));
+                assert!(failure.diagnostics.native_evidence_lost);
+                assert!(failure.requires_fresh_owner);
+                assert!(backend.filters_poisoned);
+                if incumbent {
+                    assert!(backend.filter_health.as_ref().unwrap().faulted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filter_native_loss_survives_malformed_outstanding_progress_reply_and_later_labels() {
+        for post_baseline in [false, true] {
+            let mut backend = confirmed_filter();
+            let key = filter_key(2, FilterPass::LiveCandidate);
+            backend
+                .submit(
+                    RequestId::for_test(18),
+                    BackendCommand::ApplyFilters {
+                        key,
+                        compiled: compiled_filters(&ordered_filters()),
+                    },
+                )
+                .unwrap();
+            let observation = backend.filter_observation.as_mut().unwrap();
+            let now = observation.admitted;
+            observation.submitted = true;
+            observation.command.take();
+            backend
+                .reply_at(18, ReplyKind::Command, 0, None, None, now)
+                .unwrap();
+            backend.filter_reconfigured();
+            if post_baseline {
+                sample(&mut backend, NodeValue::Double(0.0), now);
+            }
+            let read_time = now
+                + if post_baseline {
+                    FilterConfirmation::SAMPLE_INTERVAL
+                } else {
+                    std::time::Duration::ZERO
+                };
+            backend.filter_tick(read_time, false).unwrap();
+            let id = backend
+                .pending
+                .iter()
+                .find(|(_, pending)| matches!(pending, Pending::FilterProgress { .. }))
+                .unwrap()
+                .0;
+            assert!(backend.filter_observation.as_ref().unwrap().outstanding);
+            backend
+                .filter_log(
+                    "overflow".into(),
+                    "fatal".into(),
+                    "log message buffer overflow: native discarded messages".into(),
+                )
+                .unwrap();
+            let Some(BackendEvent::FilterFault {
+                key: prior,
+                failure,
+            }) = backend.emitted.pop_front()
+            else {
+                panic!("incumbent native loss fault missing")
+            };
+            assert_eq!(prior, filter_key(1, FilterPass::LiveCandidate));
+            assert_eq!(
+                failure.kind,
+                FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::EvidenceLost
+                }
+            );
+            assert_eq!(failure.attributed_ordinal, None);
+            assert!(backend.invalidate_filter_progress(id));
+            assert!(!backend.filter_observation.as_ref().unwrap().outstanding);
+            assert_eq!(
+                backend.filter_observation.as_ref().unwrap().failure,
+                Some(FilterConfirmationFailure::EvidenceLost)
+            );
+            backend
+                .filter_log(
+                    "vf/furami_0".into(),
+                    "error".into(),
+                    "could not initialize filter pads".into(),
+                )
+                .unwrap();
+            backend
+                .filter_log(
+                    "vf".into(),
+                    "error".into(),
+                    "Disabling filter furami_2 because it has failed.".into(),
+                )
+                .unwrap();
+            backend.filter_tick(read_time, true).unwrap();
+            let failure = result_failure(&mut backend);
+            assert_eq!(
+                failure.kind,
+                FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::EvidenceLost
+                }
+            );
+            assert_eq!(failure.attributed_ordinal, None);
+            assert_eq!(failure.diagnostics.key, Some(key));
+            assert!(failure.diagnostics.native_evidence_lost);
+            assert!(failure.requires_fresh_owner);
+            assert!(backend.filters_poisoned);
+            assert!(backend.emitted.is_empty());
+        }
+    }
+
+    #[test]
+    fn filter_malformed_log_flood_ticks_deadline_without_fabricating_clean_drain() {
+        for submitted in [false, true] {
+            let mut backend = confirmed_filter();
+            let recorder = FixtureRecorder::default();
+            backend.fixture_recorder = Some(recorder.clone());
+            let key = filter_key(2, FilterPass::LiveCandidate);
+            backend
+                .submit(
+                    RequestId::for_test(18),
+                    BackendCommand::ApplyFilters {
+                        key,
+                        compiled: compiled_filters(&ordered_filters()),
+                    },
+                )
+                .unwrap();
+            let observation = backend.filter_observation.as_mut().unwrap();
+            let now = observation.admitted;
+            if submitted {
+                observation.submitted = true;
+                observation.command.take();
+            }
+            for index in 0..64 {
+                let event = backend
+                    .malformed_filter_log(now + std::time::Duration::from_millis(index))
+                    .unwrap();
+                if index == 0 {
+                    let BackendEvent::FilterFault { failure, .. } = event else {
+                        panic!("incumbent loss fault missing")
+                    };
+                    assert_eq!(
+                        failure.kind,
+                        FilterErrorKind::Unconfirmed {
+                            reason: FilterConfirmationFailure::EvidenceLost
+                        }
+                    );
+                    assert_eq!(failure.attributed_ordinal, None);
+                } else {
+                    assert_eq!(event, BackendEvent::Other);
+                }
+                assert!(backend.filter_observation.is_some());
+            }
+            let event = backend
+                .malformed_filter_log(now + FilterConfirmation::DEADLINE)
+                .unwrap();
+            let BackendEvent::FilterResult {
+                id,
+                key: actual,
+                result: Err(failure),
+            } = event
+            else {
+                panic!("malformed raw-event flood did not settle at the admission deadline")
+            };
+            assert_eq!(id, 18);
+            assert_eq!(actual, key);
+            assert_eq!(
+                failure.kind,
+                FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::EvidenceLost
+                }
+            );
+            assert_eq!(failure.attributed_ordinal, None);
+            assert!(failure.requires_fresh_owner);
+            assert!(failure.diagnostics.native_evidence_lost);
+            assert!(backend.filter_observation.is_none());
+            assert!(backend.filters_poisoned);
+            assert!(
+                recorder
+                    .native_snapshot()
+                    .unwrap()
+                    .iter()
+                    .all(|event| event["event"] != "drain"),
+                "non-clean raw-event handling cannot invent a NONE milestone"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_final_progress_loses_to_graph_and_full_text_latches_survive_ring_eviction() {
+        let (mut backend, now) = submitted_filter();
+        command_reply(&mut backend, 0, now);
+        backend.filter_reconfigured();
+        let final_time = complete_progress(&mut backend, now);
+        backend
+            .filter_log(
+                "vf".into(),
+                "error".into(),
+                format!(
+                    "failed to configure the filter graph {} furami_2",
+                    "é".repeat(2500)
+                ),
+            )
+            .unwrap();
+        for _ in 0..32 {
+            backend
+                .filter_log("vf".into(), "warn".into(), "context only".into())
+                .unwrap();
+        }
+        backend.filter_tick(final_time, true).unwrap();
+        let failure = result_failure(&mut backend);
+        assert_eq!(failure.kind, FilterErrorKind::RuntimeGraph);
+        assert_eq!(failure.attributed_ordinal, Some(2));
+        assert!(failure.requires_fresh_owner);
+        assert!(failure.diagnostics.truncated);
+        assert!(failure.diagnostics.dropped_context > 0);
+        assert_eq!(failure.diagnostics.records.len(), 16);
+        assert!(
+            failure
+                .diagnostics
+                .records
+                .iter()
+                .all(|record| record.text == "context only")
+        );
+    }
+
+    #[test]
+    fn filter_native_log_loss_during_and_after_confirmation_is_not_retention_eviction() {
+        for late in [false, true] {
+            let mut backend = if late {
+                confirmed_filter()
+            } else {
+                submitted_filter().0
+            };
+            let key = filter_key(1, FilterPass::LiveCandidate);
+            if !late {
+                command_reply(&mut backend, 0, Instant::now());
+            }
+            backend
+                .filter_log(
+                    "overflow".into(),
+                    "fatal".into(),
+                    "log message buffer overflow: native discarded messages".into(),
+                )
+                .unwrap();
+            if !late {
+                backend.filter_tick(Instant::now(), true).unwrap();
+            }
+            let failure = if late {
+                let Some(BackendEvent::FilterFault {
+                    key: observed,
+                    failure,
+                }) = backend.emitted.pop_front()
+                else {
+                    panic!("late native loss did not revoke confirmation")
+                };
+                assert_eq!(observed, key);
+                failure
+            } else {
+                result_failure(&mut backend)
+            };
+            assert_eq!(
+                failure.kind,
+                FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::EvidenceLost
+                }
+            );
+            assert_eq!(failure.attributed_ordinal, None);
+            assert_eq!(failure.diagnostics.key, Some(key));
+            assert!(failure.diagnostics.native_evidence_lost);
+            assert!(failure.requires_fresh_owner);
+            assert!(backend.filters_poisoned);
+        }
+        let mut backend = confirmed_filter();
+        for _ in 0..64 {
+            backend
+                .filter_log(
+                    "vf".into(),
+                    "warn".into(),
+                    "retained context eviction".into(),
+                )
+                .unwrap();
+        }
+        assert!(backend.emitted.is_empty());
+        assert!(
+            !backend.filters_poisoned,
+            "Rust context eviction is not native loss"
+        );
+    }
+
+    #[test]
+    fn filter_poison_is_sticky_across_clear_and_identical_or_retained_entry_replays() {
+        for chain in [
+            crate::domain::filters::FilterChain::default(),
+            ordered_filters(),
+        ] {
+            let mut backend = confirmed_filter();
+            backend
+                .filter_log(
+                    "vf".into(),
+                    "error".into(),
+                    "Disabling filter furami_0 because it has failed.".into(),
+                )
+                .unwrap();
+            assert!(matches!(
+                backend.emitted.pop_front(),
+                Some(BackendEvent::FilterFault { .. })
+            ));
+            backend
+                .submit(
+                    RequestId::for_test(18),
+                    BackendCommand::ApplyFilters {
+                        key: filter_key(2, FilterPass::LiveCandidate),
+                        compiled: compiled_filters(&chain),
+                    },
+                )
+                .unwrap();
+            backend.filter_tick(Instant::now(), true).unwrap();
+            let failure = result_failure(&mut backend);
+            assert_eq!(
+                failure.kind,
+                FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::BackendUnavailable
+                }
+            );
+            assert!(failure.requires_fresh_owner);
+            assert!(backend.filters_poisoned);
+        }
+        assert!(
+            !confirmed_filter().filters_poisoned,
+            "a fresh owner independently proves the chain"
+        );
+    }
+
+    #[test]
+    fn filter_rejection_with_undrained_flood_keeps_known_cause_and_marks_lost_health() {
+        let (mut backend, now) = submitted_filter();
+        command_reply(&mut backend, -12, now);
+        for _ in 0..64 {
+            backend.filter_tick(now, false).unwrap();
+        }
+        backend
+            .filter_tick(now + FilterConfirmation::DEADLINE, false)
+            .unwrap();
+        let failure = result_failure(&mut backend);
+        assert_eq!(
+            failure.kind,
+            FilterErrorKind::CommandRejected { mpv_error: -12 }
+        );
+        assert!(failure.requires_fresh_owner);
+        assert!(failure.diagnostics.native_evidence_lost);
+    }
+
+    #[test]
+    fn filter_attribution_matches_only_whole_enabled_internal_tokens() {
+        let entries = compiled_filters(&ordered_filters()).entries;
+        for valid in [
+            "furami_0",
+            "[vf/furami_2]",
+            "Disabling filter furami_2 because it has failed.",
+        ] {
+            assert!(filter_ordinal(valid, &entries).is_some());
+        }
+        for invalid in [
+            "furami_1",
+            "furami_200",
+            "furami_02",
+            "furami_2suffix",
+            "furami_2-suffix",
+            "furami_2.other",
+            "x_furami_2",
+            "furami_2é",
+            "format",
+            "inert label 2",
+        ] {
+            assert_eq!(filter_ordinal(invalid, &entries), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn filter_terminal_and_queue_loss_latches_revoke_confirmation_without_attribution() {
+        for reason in [
+            FilterConfirmationFailure::BackendUnavailable,
+            FilterConfirmationFailure::EvidenceLost,
+        ] {
+            let (mut backend, now) = submitted_filter();
+            command_reply(&mut backend, 0, now);
+            backend.filter_reconfigured();
+            let clock = complete_progress(&mut backend, now);
+            backend.filter_lost(reason);
+            backend.filter_tick(clock, true).unwrap();
+            let failure = result_failure(&mut backend);
+            assert_eq!(failure.kind, FilterErrorKind::Unconfirmed { reason });
+            assert!(failure.requires_fresh_owner);
+            assert_eq!(failure.attributed_ordinal, None);
+        }
+    }
+
+    #[test]
+    fn filter_output_conversion_and_unrelated_errors_are_honest_chain_failures() {
+        for (prefix, level, text, expected) in [
+            (
+                "vf",
+                "fatal",
+                "Cannot convert decoder/filter output to any format supported by the output.",
+                FilterErrorKind::RuntimeGraph,
+            ),
+            (
+                "vo/gpu-next",
+                "error",
+                "unrelated rendering failure",
+                FilterErrorKind::Unconfirmed {
+                    reason: FilterConfirmationFailure::EvidenceLost,
+                },
+            ),
+        ] {
+            let (mut backend, now) = submitted_filter();
+            command_reply(&mut backend, 0, now);
+            backend
+                .filter_log(prefix.into(), level.into(), text.into())
+                .unwrap();
+            backend.filter_tick(now, true).unwrap();
+            let failure = result_failure(&mut backend);
+            assert_eq!(failure.kind, expected);
+            assert_eq!(failure.attributed_ordinal, None);
+            assert!(failure.requires_fresh_owner);
+        }
+    }
+
+    #[test]
+    fn filter_diagnostic_text_is_2048_unicode_scalars_not_bytes() {
+        let (mut backend, _) = submitted_filter();
+        backend
+            .filter_log("vf".into(), "warn".into(), "é".repeat(2049))
+            .unwrap();
+        let record = backend.filter_records.back().unwrap();
+        assert!(record.truncated);
+        assert_eq!(record.text.chars().count(), 2048);
+        assert_eq!(record.text.len(), 4096);
+        assert!(!backend.filters_poisoned);
     }
 
     #[test]
@@ -2983,6 +5166,7 @@ mod reply_tests {
         audio.output = initial.clone();
         let requested = audio.input.requested();
         let settings = crate::domain::state::DraftSettings {
+            filters: crate::domain::filters::FilterChain::default(),
             video: crate::domain::capture::ModeRequest {
                 identity: requested.identity.clone(),
                 mode: requested.mode,
@@ -2995,24 +5179,29 @@ mod reply_tests {
         audio.watch = prepared.stamp();
         let stamp = audio.watch;
         let (drivers_tx, drivers) = std::sync::mpsc::channel();
-        let mut gate = GateRunner::with_spawner(move |generation, session| {
-            let requested = session.video.requested();
-            let (driver, backend) = Driver::pair(Config::default());
-            driver.set_observed(ObservedFacts {
-                decoded_size: Some(Observation {
-                    value: requested.mode.size,
-                    source: Source::MpvDecodedParams,
-                }),
-                decoded_pixel_format: None,
-                nominal_rate: Some(Observation {
-                    value: f64::from(requested.mode.rate.numerator())
-                        / f64::from(requested.mode.rate.denominator()),
-                    source: Source::MpvContainerFps,
-                }),
-            });
-            drivers_tx.send(driver).unwrap();
-            OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
-        });
+        let mut gate = GateRunner::with_spawner(
+            Ok(crate::media::filter_catalog::fixture_capabilities()),
+            move |generation, session| {
+                let requested = session.video.requested();
+                let (driver, backend) = Driver::pair(Config::default());
+                let backend =
+                    backend.with_open_filters(session.filter_key, session.compiled_filters);
+                driver.set_observed(ObservedFacts {
+                    decoded_size: Some(Observation {
+                        value: requested.mode.size,
+                        source: Source::MpvDecodedParams,
+                    }),
+                    decoded_pixel_format: None,
+                    nominal_rate: Some(Observation {
+                        value: f64::from(requested.mode.rate.numerator())
+                            / f64::from(requested.mode.rate.denominator()),
+                        source: Source::MpvContainerFps,
+                    }),
+                });
+                drivers_tx.send(driver).unwrap();
+                OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
+            },
+        );
         let attempt = AttemptId::new(1).unwrap();
         let key = AttemptKey {
             apply: ApplyId::new(1).unwrap(),
@@ -3022,6 +5211,11 @@ mod reply_tests {
         gate.begin_open(
             key,
             prepared,
+            crate::media::filter_catalog::compile_chain(
+                &crate::domain::filters::FilterChain::default(),
+                &crate::media::filter_catalog::fixture_capabilities(),
+            )
+            .unwrap(),
             PlaybackGain::default(),
             InitialPlayback::Live,
             initial,
@@ -3051,6 +5245,7 @@ mod reply_tests {
         });
         driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
+        driver.confirm_open_filters();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if matches!(gate.poll(), Some(SessionEvent::OpenVerified { .. })) {

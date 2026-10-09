@@ -4,7 +4,6 @@ compile_error!("Furami requires Qt 6.8 or newer");
 // Keep the library's generated QML registration linked into the executable.
 extern crate furami as _;
 
-mod diagnostics;
 mod profiles;
 use furami::{
     app::settings::{PersistenceSession, decide_startup, resolve_settings_path},
@@ -256,6 +255,7 @@ fn run() -> Result<(), StartupError> {
                 })?;
             let requested = selection.requested();
             Ok::<_, StartupError>(DraftSettings {
+                filters: furami::domain::filters::FilterChain::default(),
                 video: furami::domain::capture::ModeRequest {
                     identity: requested.identity,
                     mode: requested.mode,
@@ -295,6 +295,9 @@ fn run() -> Result<(), StartupError> {
     if !prefix.is_absolute() || !prefix.is_dir() {
         return Err(StartupError::InvalidMediaPrefix);
     }
+    // Query once, before Qt starts. Apply uses only this immutable typed result;
+    // a query refusal remains visible without pretending capabilities exist.
+    let filter_capabilities = furami::media::filter_catalog::query_qualified_capabilities(prefix);
     tracing::info!(
         x11_display = x11_display.as_str(),
         media_prefix = media_prefix.as_str(),
@@ -302,6 +305,7 @@ fn run() -> Result<(), StartupError> {
     );
     furami::native_host::run_application(
         &media_prefix,
+        filter_capabilities,
         &x11_display,
         startup,
         persistence,

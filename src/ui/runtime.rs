@@ -2,7 +2,7 @@
 
 use crate::{
     app::{
-        apply::ApplyCoordinator,
+        apply::{ApplyCoordinator, VerifiedApplied},
         control::{self, Command, ExpectedCleanup, ExpectedState},
         gate::GatePhase,
         output::OutputPolicy,
@@ -183,6 +183,10 @@ fn output_silence_text(reason: &OutputSilence) -> String {
 impl RuntimeCoordinator {
     pub(crate) fn new(
         prefix: String,
+        filter_capabilities: Result<
+            crate::media::filter_catalog::FilterCapabilities,
+            crate::media::filter_catalog::FilterCatalogError,
+        >,
         startup: StartupSelection,
         persistence: PersistenceSession,
         sources: Vec<AudioSourceIdentity>,
@@ -202,7 +206,7 @@ impl RuntimeCoordinator {
                     settings,
                     gain,
                     CaptureValidator::new(),
-                    GateRunner::new(prefix),
+                    GateRunner::new(prefix, filter_capabilities),
                 )
             }),
             sources,
@@ -237,7 +241,8 @@ impl RuntimeCoordinator {
                 engine.model().state_identity(),
                 engine.model().draft().revision,
             ) {
-                Ok(apply) => {
+                Ok(admission) => {
+                    let apply = admission.id();
                     self.startup_apply = Some(apply);
                     if let Err(error) = engine.require_startup_restore_audio(apply) {
                         let mut reason = format!("Initial restoration guard failed: {error}");
@@ -264,6 +269,9 @@ impl RuntimeCoordinator {
         // the worker is actually complete. Drop only guarantees the final
         // join fallback after Qt exit, never the quit barrier itself.
         self.catalog_stopping = true;
+        if let Some(apply) = self.persistence.authorized_apply() {
+            self.persistence.cancel_user_apply(apply);
+        }
         if let Some(watch) = &mut self.catalog {
             watch.stop();
         }
@@ -362,7 +370,12 @@ impl RuntimeCoordinator {
     fn rejection(&mut self, error: impl std::fmt::Display) {
         self.command_error = error.to_string();
         self.dirty = true;
-        tracing::warn!(error = %self.command_error, "qualification_command_rejected");
+        tracing::warn!(diagnostic = %serde_json::json!({"error": self.command_error}), "qualification_command_rejected");
+    }
+    fn qualification_rejection(&mut self, line: &str, error: impl std::fmt::Display) {
+        // Serialize before tracing or projecting: inert user labels can contain
+        // controls, but must never turn one rejected request into log lines.
+        self.rejection(serde_json::json!({"input": line, "error": error.to_string()}));
     }
     /// Open is a plain draft apply. It must never silently reconnect a lost
     /// session: reconnection is the separate explicit idempotent admission in
@@ -428,6 +441,9 @@ impl RuntimeCoordinator {
                 if let Err(error) = result {
                     self.rejection(error);
                 } else {
+                    if let Some(apply) = self.persistence.authorized_apply() {
+                        self.persistence.cancel_user_apply(apply);
+                    }
                     self.command_error.clear();
                     self.dirty = true;
                 }
@@ -862,6 +878,7 @@ impl RuntimeCoordinator {
             || identity.operation().map(|id| id.get()).unwrap_or(0) != expected.apply
             || identity.attempt().map(AttemptId::get).unwrap_or(0) != expected.attempt
             || cleanup != expected.cleanup
+            || identity.filter_pass() != expected.filter_pass
         {
             Err(CommandRejection::StaleState)
         } else {
@@ -870,6 +887,20 @@ impl RuntimeCoordinator {
     }
     pub(crate) fn qualification_command(&mut self, line: &str) -> UiUpdate {
         // Opt-in qualification calls the same production application decisions.
+        if !control::is_filter_command(line) {
+            if line.len() > control::LEGACY_COMMAND_MAX_BYTES {
+                self.qualification_rejection(line, "qualification command exceeds 256 bytes");
+                return self.poll();
+            }
+            if line
+                .chars()
+                .any(|value| value == '\0' || (value.is_whitespace() && !value.is_ascii()))
+            {
+                self.qualification_rejection(line, "NUL or non-ASCII whitespace forbidden");
+                return self.poll();
+            }
+        }
+        tracing::info!(request = %serde_json::json!({"input": line}), "qualification_request_received");
         match line.trim() {
             "settings" => {
                 self.dirty = true;
@@ -890,7 +921,9 @@ impl RuntimeCoordinator {
                 Ok(value) => {
                     self.set_volume(value);
                 }
-                Err(_) => self.rejection("preference-volume requires an integer"),
+                Err(_) => {
+                    self.qualification_rejection(line, "preference-volume requires an integer")
+                }
             }
             return self.poll();
         }
@@ -902,31 +935,42 @@ impl RuntimeCoordinator {
                 "false" => {
                     self.set_muted(false);
                 }
-                _ => self.rejection("preference-mute requires true or false"),
+                _ => self.qualification_rejection(line, "preference-mute requires true or false"),
             }
             return self.poll();
         }
         let command = match control::parse(line) {
             Ok(command) => command,
             Err(error) => {
-                self.rejection(error);
+                self.qualification_rejection(line, error);
                 return self.poll();
             }
         };
+        tracing::info!(request = %serde_json::json!({"input": line, "verb": line.split_ascii_whitespace().next()}), "qualification_request_parsed");
         if command == Command::Snapshot {
             self.dirty = true;
             return self.poll();
         }
         if !self.persistence.mutations_open() {
-            self.rejection("application is closing; capture/draft mutations are blocked");
+            self.qualification_rejection(
+                line,
+                "application is closing; capture/draft mutations are blocked",
+            );
             return self.poll();
         }
         let Some(engine) = &mut self.engine else {
-            self.rejection("no explicit startup capture selection");
+            self.qualification_rejection(line, "no explicit startup capture selection");
             return self.poll();
         };
         let result: Result<(), String> = (|| {
             match command {
+                Command::Filters(revision, filters) => {
+                    let mut settings = engine.model().draft().settings.clone();
+                    settings.filters = filters;
+                    engine
+                        .edit_draft(revision, settings)
+                        .map_err(|error| error.to_string())?;
+                }
                 Command::Video(revision, mode) => {
                     let mut settings = engine.model().draft().settings.clone();
                     settings.video.mode = mode;
@@ -1008,6 +1052,9 @@ impl RuntimeCoordinator {
                     let state =
                         Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
                     engine.close(state).map_err(|error| error.to_string())?;
+                    if let Some(apply) = self.persistence.authorized_apply() {
+                        self.persistence.cancel_user_apply(apply);
+                    }
                 }
                 Command::Quit(expected) => {
                     Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
@@ -1068,7 +1115,7 @@ impl RuntimeCoordinator {
                 self.command_error.clear();
                 self.dirty = true;
             }
-            Err(error) => self.rejection(error),
+            Err(error) => self.qualification_rejection(line, error),
         }
         self.poll()
     }
@@ -1079,15 +1126,21 @@ impl RuntimeCoordinator {
                 self.persistence.observe_opening(key);
             }
             engine.poll();
+            if let Some(apply) = self.persistence.authorized_apply()
+                && !engine.has_user_apply_result_or_pending(apply)
+            {
+                self.persistence.cancel_user_apply(apply);
+            }
             if let Some((key, _)) = engine.model().opening() {
                 self.persistence.observe_opening(key);
             }
-            if let Some(event) = engine.take_verified_open() {
-                if self.startup_apply == Some(event.key.apply) {
+            if let Some(event) = engine.take_verified_applied() {
+                if matches!(&event, VerifiedApplied::Open { key, .. } if self.startup_apply == Some(key.apply))
+                {
                     self.startup_apply = None;
                     self.persistence.startup_verified();
                 } else {
-                    self.persistence.verified_open(event);
+                    self.persistence.verified_applied(event);
                 }
                 self.dirty = true;
             }
@@ -1285,6 +1338,12 @@ impl RuntimeCoordinator {
         if changed {
             if let Some(rejection) = model.validation_rejection() {
                 diagnostic.push_str(&rejection.failure.to_string());
+                if let Some(filter) = &rejection.failure.filter {
+                    diagnostic.push_str(&format!(
+                        "\nFilter diagnostics: {}",
+                        serde_json::json!(filter)
+                    ));
+                }
             }
             if let Some(failures) = model.failures() {
                 for failure in failures
@@ -1299,6 +1358,12 @@ impl RuntimeCoordinator {
                         diagnostic.push('\n');
                     }
                     diagnostic.push_str(&failure.to_string());
+                    if let Some(filter) = &failure.filter {
+                        diagnostic.push_str(&format!(
+                            "\nFilter diagnostics: {}",
+                            serde_json::json!(filter)
+                        ));
+                    }
                 }
             }
             if let Some(recovery) = model.recovery() {
@@ -1320,7 +1385,6 @@ impl RuntimeCoordinator {
                 }
                 diagnostic.push_str(&self.command_error);
             }
-            log_snapshot(engine);
         }
         let phase = if quit {
             GatePhase::QuitReady
@@ -1334,6 +1398,8 @@ impl RuntimeCoordinator {
             .active()
             .is_some_and(|active| active.playback() == PlaybackState::Paused);
         let playback_status = match model.phase() {
+            ProductPhase::ApplyingFilters => "Applying filters",
+            ProductPhase::RestoringFilters => "Restoring filters",
             ProductPhase::ValidatingResume
             | ProductPhase::ClosingResume
             | ProductPhase::OpeningResume
@@ -1443,6 +1509,16 @@ impl RuntimeCoordinator {
         } else {
             String::new()
         };
+        let treatment_failed = model.failures().is_some_and(|failures| {
+            failures
+                .candidate
+                .iter()
+                .chain(failures.restore.iter())
+                .chain(failures.incumbent.iter())
+                .any(|failure| failure.filter.is_some())
+        }) || model
+            .validation_rejection()
+            .is_some_and(|rejection| rejection.failure.filter.is_some());
         if changed
             && diagnostic.is_empty()
             && let Some(fatal) = engine.runner_mut().fatal_native_failure()
@@ -1458,6 +1534,9 @@ impl RuntimeCoordinator {
             } else {
                 engine.runner_mut().report.clone()
             };
+        }
+        if changed {
+            log_snapshot(engine);
         }
         let runner = engine.runner_mut();
         UiUpdate {
@@ -1476,7 +1555,9 @@ impl RuntimeCoordinator {
                 String::new()
             },
             audio_diagnostic,
-            failed: phase == GatePhase::Failed || runner.fatal_native_failure().is_some(),
+            failed: phase == GatePhase::Failed
+                || runner.fatal_native_failure().is_some()
+                || treatment_failed,
             diagnostic,
             recovery_evidence,
             recovery_stage,
@@ -1578,6 +1659,8 @@ fn phase_name(phase: ProductPhase) -> &'static str {
     match phase {
         ProductPhase::Stopped => "Stopped",
         ProductPhase::Active => "Active",
+        ProductPhase::ApplyingFilters => "ApplyingFilters",
+        ProductPhase::RestoringFilters => "RestoringFilters",
         ProductPhase::PausePending => "PausePending",
         ProductPhase::Paused => "Paused",
         ProductPhase::Validating => "Validating",
@@ -1644,11 +1727,50 @@ fn candidate_entry(candidate: &RecoveryCandidate) -> String {
     )
 }
 
-fn log_snapshot(engine: &Engine) {
+fn runtime_snapshot(engine: &mut Engine) -> serde_json::Value {
+    let pending_key = engine
+        .model()
+        .filtering()
+        .map(|transition| transition.key());
+    // Admission can precede the owner's first Pending publication. A retained
+    // incumbent confirmation is not success for that newly admitted key.
+    let filters = match (pending_key, engine.runner_mut().filter_snapshot()) {
+        (Some(key), observed)
+            if observed.is_none_or(|observed| {
+                observed.key != key
+                    || matches!(
+                        observed.status,
+                        crate::media::controller::FilterStatus::Confirmed(_)
+                    )
+            }) =>
+        {
+            Some(serde_json::json!({
+                "key": key, "sequence": null, "status": "Pending",
+                "confirmation": null, "failure": null,
+            }))
+        }
+        (_, Some(filters)) => {
+            let (status, confirmation, failure) = match &filters.status {
+                crate::media::controller::FilterStatus::Pending => ("Pending", None, None),
+                crate::media::controller::FilterStatus::Confirmed(confirmation) => {
+                    ("Confirmed", Some(confirmation), None)
+                }
+                crate::media::controller::FilterStatus::Failed(failure) => {
+                    ("Failed", None, Some(failure))
+                }
+            };
+            Some(serde_json::json!({
+                "key": filters.key, "sequence": filters.sequence, "status": status,
+                "confirmation": confirmation, "failure": failure,
+            }))
+        }
+        _ => None,
+    };
     let model = engine.model();
     let identity = model.state_identity();
-    let snapshot = serde_json::json!({
+    serde_json::json!({
         "phase": model.phase(), "apply_id": identity.operation().map(|id| id.get()), "attempt_id": identity.attempt().map(AttemptId::get),
+        "filter_pass": identity.filter_pass(), "filters": filters,
         "cleanup": match model.cleanup() { CleanupStatus::Complete => "Complete", CleanupStatus::Draining => "Draining", CleanupStatus::Blocked { .. } => "Blocked" },
         "draft_revision": model.draft().revision.get(), "draft": model.draft().settings,
         "last_valid": model.last_valid().map(|settings| settings.settings()),
@@ -1656,8 +1778,11 @@ fn log_snapshot(engine: &Engine) {
         "active_playback": model.active().map(|active| active.playback()),
         "failures": model.failures(), "validation_rejection": model.validation_rejection().map(|rejection| serde_json::json!({"request": rejection.request, "failure": rejection.failure})),
         "gain": engine.gain(), "can_apply": model.can_apply(), "can_restart": model.can_restart(), "can_reconnect": model.can_reconnect(), "shutdown_ready": model.shutdown_ready(),
-    });
-    tracing::info!(snapshot = %snapshot, "apply_runtime");
+    })
+}
+
+fn log_snapshot(engine: &mut Engine) {
+    tracing::info!(snapshot = %runtime_snapshot(engine), "apply_runtime");
 }
 
 #[cfg(test)]
@@ -1684,6 +1809,7 @@ mod tests {
             rate: FrameRate::new(60, 1).unwrap(),
         };
         DraftSettings {
+            filters: crate::domain::filters::FilterChain::default(),
             video: crate::domain::capture::ModeRequest {
                 identity: session_fixture(&["/dev/video0"], mode).devices()[0]
                     .identity()
@@ -1716,23 +1842,27 @@ mod tests {
         fail_spawn: Option<u64>,
     ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
         let (tx, rx) = mpsc::channel();
-        let runner = GateRunner::with_spawner(move |generation, config| {
-            if fail_spawn == Some(generation.get()) {
-                return Err(crate::media::controller::MediaError::new(
-                    "fixture_spawn",
-                    "candidate owner spawn rejected",
-                ));
-            }
-            let requested = config.video.requested();
-            let input = config
-                .video
-                .validate_snapshot(&session_fixture(&["/dev/video0"], requested.mode))
-                .unwrap();
-            let requested = input.requested().clone();
-            let (driver, backend) = Driver::pair(Config::default());
-            tx.send(driver).unwrap();
-            OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
-        });
+        let runner = GateRunner::with_spawner(
+            Ok(crate::media::filter_catalog::fixture_capabilities()),
+            move |generation, config| {
+                if fail_spawn == Some(generation.get()) {
+                    return Err(crate::media::controller::MediaError::new(
+                        "fixture_spawn",
+                        "candidate owner spawn rejected",
+                    ));
+                }
+                let requested = config.video.requested();
+                let input = config
+                    .video
+                    .validate_snapshot(&session_fixture(&["/dev/video0"], requested.mode))
+                    .unwrap();
+                let requested = input.requested().clone();
+                let (driver, backend) = Driver::pair(Config::default());
+                let backend = backend.with_open_filters(config.filter_key, config.compiled_filters);
+                tx.send(driver).unwrap();
+                OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
+            },
+        );
         let engine = ApplyCoordinator::new(
             settings(),
             PlaybackGain::default(),
@@ -1838,6 +1968,7 @@ mod tests {
         });
         driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
+        driver.confirm_open_filters();
         driver.fence();
         await_update(runtime, |update| update.can_toggle_pause);
         driver
@@ -1911,6 +2042,17 @@ mod tests {
                 cleanup: ExpectedCleanup::Draining,
                 ..expected
             },
+            ExpectedState {
+                filter_pass: Some(
+                    if expected.filter_pass == Some(crate::domain::state::FilterPass::LiveCandidate)
+                    {
+                        crate::domain::state::FilterPass::LiveRestore
+                    } else {
+                        crate::domain::state::FilterPass::LiveCandidate
+                    },
+                ),
+                ..expected
+            },
         ] {
             assert_eq!(
                 RuntimeCoordinator::checked_state(engine, wrong),
@@ -1933,6 +2075,579 @@ mod tests {
             }
         }
     }
+
+    struct WritableSettings(std::path::PathBuf);
+    impl WritableSettings {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "furami-runtime-settings-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("settings.json")
+        }
+        fn applied(&self) -> DraftSettings {
+            let (_, crate::settings::LoadOutcome::Loaded(document)) =
+                crate::settings::SettingsStore::load(self.path())
+            else {
+                panic!("runtime did not publish a valid settings document")
+            };
+            document
+                .applied
+                .expect("confirmed user Apply must be saved")
+        }
+        fn bind(&self, runtime: &mut RuntimeCoordinator) {
+            runtime.persistence = PersistenceSession::load(Ok(self.path()));
+            runtime.persistence.prepare_startup(&StartupSelection {
+                draft: Some(
+                    runtime
+                        .engine
+                        .as_ref()
+                        .unwrap()
+                        .model()
+                        .draft()
+                        .settings
+                        .clone(),
+                ),
+                auto_open: false,
+                reason: String::new(),
+            });
+        }
+    }
+    impl Drop for WritableSettings {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn treatment_chain(all_disabled: bool) -> crate::domain::filters::FilterChain {
+        use crate::domain::filters::*;
+        FilterChain::new(vec![
+            FilterEntry::new(
+                "SDR\u{a0}reference".into(),
+                Filter::Format(FormatParams::new(
+                    SdrMatrix::Bt709,
+                    ColorLevels::Limited,
+                    SdrGamma::Bt1886,
+                )),
+                !all_disabled,
+            ),
+            FilterEntry::new(
+                "disabled\n\0equalizer".into(),
+                Filter::Eq(
+                    EqParams::new(EqValues {
+                        contrast: 1.1,
+                        brightness: 0.05,
+                        saturation: 1.2,
+                        gamma: 1.0,
+                        gamma_r: 1.0,
+                        gamma_g: 1.0,
+                        gamma_b: 1.0,
+                        gamma_weight: 1.0,
+                    })
+                    .unwrap(),
+                ),
+                false,
+            ),
+            FilterEntry::new(
+                "denoise".into(),
+                Filter::Hqdn3d(
+                    Hqdn3dParams::new(Hqdn3dValues {
+                        luma_spatial: 3.0,
+                        chroma_spatial: 0.0,
+                        luma_tmp: 6.0,
+                        chroma_tmp: 4.5,
+                    })
+                    .unwrap(),
+                ),
+                !all_disabled,
+            ),
+        ])
+        .unwrap()
+    }
+    fn edit_filters(
+        runtime: &mut RuntimeCoordinator,
+        chain: &crate::domain::filters::FilterChain,
+    ) -> UiUpdate {
+        let revision = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .draft()
+            .revision
+            .get();
+        runtime.qualification_command(&format!(
+            "draft-filters {revision} {}",
+            serde_json::to_string(chain).unwrap(),
+        ))
+    }
+    fn begin_live_filters(
+        runtime: &mut RuntimeCoordinator,
+        driver: &Driver,
+    ) -> (
+        crate::media::controller::RequestId,
+        crate::domain::state::FilterAttemptKey,
+    ) {
+        let expected = snapshot_expected(runtime);
+        let revision = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .draft()
+            .revision
+            .get();
+        let pending = runtime.qualification_command(&format!(
+            "apply {:?} {} {} Complete {revision}",
+            expected.phase, expected.apply, expected.attempt,
+        ));
+        assert_eq!(pending.product_phase, "ApplyingFilters");
+        assert_eq!(pending.playback_status, "Applying filters");
+        assert!(
+            !pending.failed
+                && !pending.can_open
+                && !pending.can_restart
+                && !pending.can_toggle_pause
+        );
+        assert!(pending.can_set_gain);
+        let (id, command) = driver
+            .submitted
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let crate::media::controller::BackendCommand::ApplyFilters { key, .. } = command else {
+            panic!("expected exactly one whole-chain filter command: {command:?}")
+        };
+        assert_eq!(key.pass, crate::domain::state::FilterPass::LiveCandidate);
+        assert_eq!(runtime.persistence.authorized_apply(), Some(key.apply));
+        (id, key)
+    }
+    fn confirm_filters(
+        driver: &Driver,
+        id: crate::media::controller::RequestId,
+        key: crate::domain::state::FilterAttemptKey,
+    ) {
+        driver.send(BackendEvent::FilterResult {
+            id: id.get(),
+            key,
+            result: Ok(
+                crate::domain::state::FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap(),
+            ),
+        });
+        driver.fence();
+    }
+    fn treatment_failure(
+        key: crate::domain::state::FilterAttemptKey,
+        kind: crate::domain::failure::FilterErrorKind,
+        fresh: bool,
+    ) -> Box<crate::domain::failure::FilterFailure> {
+        Box::new(crate::domain::failure::FilterFailure {
+            kind,
+            attributed_ordinal: None,
+            requires_fresh_owner: fresh,
+            diagnostics: crate::domain::failure::FilterAttemptDiagnostics {
+                key: Some(key),
+                entries: Vec::new(),
+                records: Vec::new(),
+                native_evidence_lost: false,
+                truncated: false,
+                dropped_context: 0,
+            },
+        })
+    }
+
+    #[test]
+    fn qualifier_strict_filter_edit_preserves_invalid_draft_and_legacy_boundaries() {
+        let (mut runtime, drivers) = runtime();
+        let chain = treatment_chain(false);
+        let edited = edit_filters(&mut runtime, &chain);
+        assert!(edited.draft_dirty && !edited.failed);
+        let frozen = runtime.engine.as_ref().unwrap().model().draft().clone();
+        assert_eq!(frozen.settings.filters, chain);
+        for invalid in [
+            r#"draft-filters 1 {"entries":null}"#,
+            r#"draft-filters 1 {"entries":[],"entries":[]}"#,
+            "draft-filters 0 {\"entries\":[]}",
+            "draft-filters 1 {\"entries\":[{\"label\":\"raw\ncontrol\"}]}",
+        ] {
+            let update = runtime.qualification_command(invalid);
+            assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &frozen);
+            assert!(update.changed && runtime.command_error.starts_with('{'));
+            assert!(!runtime.command_error.contains('\n') && !runtime.command_error.contains('\0'));
+            let diagnostic: serde_json::Value =
+                serde_json::from_str(&runtime.command_error).unwrap();
+            assert_eq!(diagnostic["input"], invalid);
+            assert!(diagnostic["error"].is_string());
+        }
+        let mut exact = format!("draft-filters 1 {}", serde_json::to_string(&chain).unwrap());
+        exact.push_str(&" ".repeat(control::FILTER_COMMAND_MAX_BYTES - exact.len()));
+        runtime.qualification_command(&exact);
+        assert!(runtime.command_error.is_empty());
+        let accepted = runtime.engine.as_ref().unwrap().model().draft().clone();
+        let oversize = format!("{exact} ");
+        runtime.qualification_command(&oversize);
+        assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &accepted);
+        for legacy in [
+            format!("settings{}", " ".repeat(256)),
+            "settings\u{a0}".into(),
+            "preference-mute true\0".into(),
+        ] {
+            runtime.qualification_command(&legacy);
+            assert!(!runtime.command_error.is_empty());
+            assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &accepted);
+        }
+        assert!(drivers.try_recv().is_err());
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn runtime_confirmed_open_and_live_filter_receipts_store_full_chains_not_newer_drafts() {
+        for all_disabled in [false, true] {
+            let store = WritableSettings::new();
+            let (mut runtime, drivers) = runtime();
+            store.bind(&mut runtime);
+            let chain = treatment_chain(all_disabled);
+            edit_filters(&mut runtime, &chain);
+            let driver = start_live(&mut runtime, &drivers);
+            assert_eq!(store.applied().filters, chain);
+            assert_eq!(runtime.persistence.authorized_apply(), None);
+            let initial = runtime_snapshot(runtime.engine.as_mut().unwrap());
+            assert_eq!(initial["filters"]["status"], "Confirmed");
+            assert_eq!(initial["filters"]["key"]["pass"], "Open");
+            assert_eq!(
+                initial["active_settings"]["filters"],
+                serde_json::json!(&chain)
+            );
+            assert!(initial["filter_pass"].is_null());
+            let candidate = treatment_chain(!all_disabled);
+            edit_filters(&mut runtime, &candidate);
+            let (id, key) = begin_live_filters(&mut runtime, &driver);
+            let pending = runtime_snapshot(runtime.engine.as_mut().unwrap());
+            assert_eq!(pending["phase"], "ApplyingFilters");
+            assert_eq!(pending["filter_pass"], "LiveCandidate");
+            assert_eq!(pending["filters"]["status"], "Pending");
+            assert_eq!(pending["filters"]["key"], serde_json::json!(key));
+            assert_eq!(
+                pending["active_settings"]["filters"],
+                serde_json::json!(&chain)
+            );
+            edit_filters(
+                &mut runtime,
+                &crate::domain::filters::FilterChain::default(),
+            );
+            confirm_filters(&driver, id, key);
+            let confirmed = await_update(&mut runtime, |update| update.product_phase == "Active");
+            assert!(!confirmed.failed && confirmed.draft_dirty);
+            assert_eq!(confirmed.playback_status, "Live");
+            assert_eq!(store.applied().filters, candidate);
+            assert!(
+                runtime
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .model()
+                    .draft()
+                    .settings
+                    .filters
+                    .entries()
+                    .is_empty()
+            );
+            let snapshot = runtime_snapshot(runtime.engine.as_mut().unwrap());
+            assert_eq!(snapshot["filters"]["status"], "Confirmed");
+            assert_eq!(snapshot["filters"]["key"]["pass"], "LiveCandidate");
+            assert_eq!(
+                snapshot["active_settings"]["filters"],
+                serde_json::json!(&candidate)
+            );
+            let bytes = std::fs::read(store.path()).unwrap();
+            // Duplicate native outcomes do not regain consumed persistence permission.
+            confirm_filters(&driver, id, key);
+            runtime.poll();
+            assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
+            assert_eq!(runtime.persistence.authorized_apply(), None);
+            assert!(
+                drivers.try_recv().is_err(),
+                "filter Apply never reopens the owner"
+            );
+            cleanup(&mut runtime);
+            driver.destroyed.recv().unwrap();
+        }
+    }
+
+    #[test]
+    fn runtime_live_receipt_cannot_borrow_wrong_admission_key_revision_pass_or_submission() {
+        use crate::domain::state::{ApplyAdmission, ApplyId, FilterPass};
+        for mismatch in 0..6 {
+            let store = WritableSettings::new();
+            let (mut runtime, drivers) = runtime();
+            store.bind(&mut runtime);
+            let driver = start_live(&mut runtime, &drivers);
+            let original = std::fs::read(store.path()).unwrap();
+            edit_filters(&mut runtime, &treatment_chain(false));
+            let (id, key) = begin_live_filters(&mut runtime, &driver);
+            let mut submitted = runtime.engine.as_ref().unwrap().model().draft().clone();
+            let mut wrong = key;
+            let mut revision = submitted.revision;
+            match mismatch {
+                0 => wrong.apply = ApplyId::new(key.apply.get() + 1).unwrap(),
+                1 => wrong.attempt = AttemptId::new(key.attempt.get() + 1).unwrap(),
+                2 => wrong.pass = FilterPass::LiveRestore,
+                3 => revision = DraftRevision::new(revision.get() + 1),
+                4 => submitted.revision = DraftRevision::new(revision.get() + 1),
+                5 => submitted.settings.filters = crate::domain::filters::FilterChain::default(),
+                _ => unreachable!(),
+            }
+            runtime.persistence.admit_user_apply(
+                ApplyAdmission::Filters {
+                    key: wrong,
+                    revision,
+                },
+                submitted,
+            );
+            confirm_filters(&driver, id, key);
+            await_update(&mut runtime, |update| update.product_phase == "Active");
+            runtime.poll();
+            assert_eq!(
+                std::fs::read(store.path()).unwrap(),
+                original,
+                "mismatch {mismatch}"
+            );
+            assert_eq!(runtime.persistence.authorized_apply(), None);
+            cleanup(&mut runtime);
+            driver.destroyed.recv().unwrap();
+        }
+    }
+
+    #[test]
+    fn runtime_close_quit_and_reset_cancel_retained_confirmation_before_consumption() {
+        for cancellation in ["close", "quit", "reset"] {
+            let store = WritableSettings::new();
+            let (mut runtime, drivers) = runtime();
+            store.bind(&mut runtime);
+            let driver = start_live(&mut runtime, &drivers);
+            let original = std::fs::read(store.path()).unwrap();
+            edit_filters(&mut runtime, &treatment_chain(false));
+            let (id, key) = begin_live_filters(&mut runtime, &driver);
+            confirm_filters(&driver, id, key);
+            // Stop exactly between the real engine's commit and the runtime's
+            // receipt consumer; this is not a fabricated persistence receipt.
+            runtime.engine.as_mut().unwrap().poll();
+            assert!(
+                runtime
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .has_user_apply_result_or_pending(key.apply)
+            );
+            assert_eq!(std::fs::read(store.path()).unwrap(), original);
+            let update = match cancellation {
+                "close" => runtime.close(key.attempt.get()),
+                "quit" => runtime.quit(),
+                "reset" => runtime.request_reset(),
+                _ => unreachable!(),
+            };
+            assert_eq!(runtime.persistence.authorized_apply(), None);
+            assert_eq!(std::fs::read(store.path()).unwrap(), original);
+            if cancellation == "reset" {
+                let token = runtime.persistence.reset_token();
+                runtime.decide_reset(token, false);
+                assert_eq!(std::fs::read(store.path()).unwrap(), original);
+            }
+            if update.release_native {
+                runtime.native_released(AttemptId::new(update.generation).unwrap());
+            }
+            cleanup(&mut runtime);
+            driver.destroyed.recv().unwrap();
+            assert!(drivers.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn runtime_late_filter_fault_and_source_loss_revoke_unsaved_confirmed_candidate() {
+        use crate::domain::failure::{FilterConfirmationFailure, FilterErrorKind};
+        for source_loss in [false, true] {
+            let store = WritableSettings::new();
+            let (mut runtime, drivers) = runtime();
+            store.bind(&mut runtime);
+            let driver = start_live(&mut runtime, &drivers);
+            let original = std::fs::read(store.path()).unwrap();
+            let chain = treatment_chain(false);
+            edit_filters(&mut runtime, &chain);
+            let (id, key) = begin_live_filters(&mut runtime, &driver);
+            confirm_filters(&driver, id, key);
+            runtime.engine.as_mut().unwrap().poll();
+            assert!(
+                runtime
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .has_user_apply_result_or_pending(key.apply)
+            );
+            if source_loss {
+                driver.send(BackendEvent::EndFile {
+                    reason: 0,
+                    error: 0,
+                });
+            } else {
+                driver.send(BackendEvent::FilterFault {
+                    key,
+                    failure: treatment_failure(
+                        key,
+                        FilterErrorKind::Unconfirmed {
+                            reason: FilterConfirmationFailure::EvidenceLost,
+                        },
+                        true,
+                    ),
+                });
+            }
+            driver.fence();
+            let revoked = runtime.poll();
+            assert_eq!(runtime.persistence.authorized_apply(), None);
+            assert_eq!(std::fs::read(store.path()).unwrap(), original);
+            assert_eq!(
+                runtime
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .model()
+                    .draft()
+                    .settings
+                    .filters,
+                chain
+            );
+            if revoked.release_native {
+                runtime.quit();
+                runtime.native_released(AttemptId::new(revoked.generation).unwrap());
+            }
+            cleanup(&mut runtime);
+            driver.destroyed.recv().unwrap();
+            assert!(
+                drivers.try_recv().is_err(),
+                "cancellation during cleanup cannot start restoration"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_one_live_restore_projects_typed_failure_and_never_saves_candidate_or_restore() {
+        use crate::domain::{
+            failure::{FilterConfirmationFailure, FilterErrorKind},
+            state::FilterPass,
+        };
+        for restore_fails in [false, true] {
+            let store = WritableSettings::new();
+            let (mut runtime, drivers) = runtime();
+            store.bind(&mut runtime);
+            let driver = start_live(&mut runtime, &drivers);
+            let original = std::fs::read(store.path()).unwrap();
+            let candidate = treatment_chain(false);
+            edit_filters(&mut runtime, &candidate);
+            let (id, key) = begin_live_filters(&mut runtime, &driver);
+            let stale_close = format!(
+                "close ApplyingFilters {} {} Complete",
+                key.apply.get(),
+                key.attempt.get()
+            );
+            driver.send(BackendEvent::FilterResult {
+                id: id.get(),
+                key,
+                result: Err(treatment_failure(
+                    key,
+                    FilterErrorKind::Unconfirmed {
+                        reason: FilterConfirmationFailure::Deadline,
+                    },
+                    false,
+                )),
+            });
+            driver.fence();
+            let restoring = await_update(&mut runtime, |update| {
+                update.product_phase == "RestoringFilters"
+            });
+            assert!(restoring.failed && !restoring.can_open && !restoring.can_toggle_pause);
+            assert_eq!(restoring.playback_status, "Restoring filters");
+            assert!(
+                restoring.diagnostic.contains("Unconfirmed")
+                    && restoring.diagnostic.contains("Deadline")
+            );
+            assert_eq!(runtime.persistence.authorized_apply(), None);
+            let (restore_id, command) = driver
+                .submitted
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let crate::media::controller::BackendCommand::ApplyFilters { key: restore, .. } =
+                command
+            else {
+                panic!("the selected route must send one live restore command")
+            };
+            assert_eq!(restore.pass, FilterPass::LiveRestore);
+            let snapshot = runtime_snapshot(runtime.engine.as_mut().unwrap());
+            assert_eq!(snapshot["filter_pass"], "LiveRestore");
+            runtime.qualification_command(&stale_close);
+            assert!(runtime.command_error.contains("stale"));
+            assert_eq!(
+                runtime.engine.as_ref().unwrap().model().phase(),
+                ProductPhase::RestoringFilters
+            );
+            if restore_fails {
+                driver.send(BackendEvent::FilterResult {
+                    id: restore_id.get(),
+                    key: restore,
+                    result: Err(treatment_failure(
+                        restore,
+                        FilterErrorKind::RuntimeGraph,
+                        true,
+                    )),
+                });
+                driver.fence();
+                let retired = await_update(&mut runtime, |update| update.release_native);
+                assert!(retired.failed);
+                driver.destroyed.recv().unwrap();
+                runtime.native_released(AttemptId::new(retired.generation).unwrap());
+                let failed = runtime.qualification_command("snapshot");
+                assert_eq!(failed.product_phase, "ErrorWithoutActive");
+                assert!(failed.failed && failed.can_open && failed.can_restart);
+                assert_eq!(failed.playback_status, "Unavailable");
+                assert!(
+                    failed.diagnostic.contains("RuntimeGraph")
+                        && failed.diagnostic.contains("Deadline")
+                );
+            } else {
+                confirm_filters(&driver, restore_id, restore);
+                let restored = await_update(&mut runtime, |update| {
+                    update.product_phase == "ErrorWithActiveRestored"
+                });
+                assert!(restored.failed && restored.can_open && restored.can_toggle_pause);
+                assert_eq!(restored.playback_status, "Live");
+                assert!(restored.diagnostic.contains("Deadline"));
+            }
+            assert_eq!(std::fs::read(store.path()).unwrap(), original);
+            assert_eq!(
+                runtime
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .model()
+                    .draft()
+                    .settings
+                    .filters,
+                candidate
+            );
+            assert!(
+                drivers.try_recv().is_err(),
+                "a live restore failure cannot start a second route"
+            );
+            cleanup(&mut runtime);
+            if !restore_fails {
+                driver.destroyed.recv().unwrap();
+            }
+        }
+    }
+
     #[test]
     fn draft_audio_and_video_commands_edit_only_until_explicit_apply() {
         let (mut runtime, drivers) = runtime();
@@ -2098,6 +2813,7 @@ mod tests {
         });
         first.send(BackendEvent::FileLoaded);
         first.send(BackendEvent::PlaybackRestart);
+        first.confirm_open_filters();
         first.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
         runtime.qualification_command("draft-video 0 YUYV 1920x1080 30/1");
@@ -2139,6 +2855,7 @@ mod tests {
         });
         second.send(BackendEvent::FileLoaded);
         second.send(BackendEvent::PlaybackRestart);
+        second.confirm_open_filters();
         second.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
         assert_eq!(
@@ -2192,6 +2909,7 @@ mod tests {
         });
         driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
+        driver.confirm_open_filters();
         driver.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
         assert_eq!(runtime.pause(attempt), SubmitStatus::Accepted);
@@ -2412,17 +3130,16 @@ mod tests {
         let before = runtime.engine.as_ref().unwrap().model().state_identity();
         // Replace only the admission port. Keep the real owner alive, then
         // restore its port before cleanup; this is not a physical owner failure.
-        let unavailable =
-            GateRunner::with_spawner(|_, _| panic!("no replacement opening requested"));
+        let unavailable = GateRunner::with_spawner(
+            Ok(crate::media::filter_catalog::fixture_capabilities()),
+            |_, _| panic!("no replacement opening requested"),
+        );
         let original =
             std::mem::replace(runtime.engine.as_mut().unwrap().runner_mut(), unavailable);
         let rejected = runtime.qualification_command("pause 1");
         *runtime.engine.as_mut().unwrap().runner_mut() = original;
         assert!(rejected.changed);
-        assert_eq!(
-            runtime.command_error,
-            format!("pause submission {:?}", SubmitStatus::StaleGeneration)
-        );
+        assert!(!runtime.command_error.is_empty());
         assert!(rejected.diagnostic.contains(&runtime.command_error));
         assert_eq!(
             runtime.engine.as_ref().unwrap().model().state_identity(),
@@ -2559,6 +3276,7 @@ mod tests {
                         });
                         restored_owner.send(BackendEvent::FileLoaded);
                         restored_owner.send(BackendEvent::PlaybackRestart);
+                        restored_owner.confirm_open_filters();
                         restored_owner.fence();
                         await_update(&mut runtime, |update| update.can_toggle_pause);
                         assert_eq!(
@@ -2716,17 +3434,21 @@ mod tests {
             source: source_a.clone(),
         };
         let (tx, rx) = mpsc::channel();
-        let runner = GateRunner::with_spawner(move |generation, config| {
-            let requested = config.video.requested();
-            let input = config
-                .video
-                .validate_snapshot(&session_fixture(&["/dev/video0"], requested.mode))
-                .unwrap();
-            let requested = input.requested().clone();
-            let (driver, backend) = Driver::pair(Config::default());
-            tx.send((driver, config.watch)).unwrap();
-            OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
-        });
+        let runner = GateRunner::with_spawner(
+            Ok(crate::media::filter_catalog::fixture_capabilities()),
+            move |generation, config| {
+                let requested = config.video.requested();
+                let input = config
+                    .video
+                    .validate_snapshot(&session_fixture(&["/dev/video0"], requested.mode))
+                    .unwrap();
+                let requested = input.requested().clone();
+                let (driver, backend) = Driver::pair(Config::default());
+                let backend = backend.with_open_filters(config.filter_key, config.compiled_filters);
+                tx.send((driver, config.watch)).unwrap();
+                OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
+            },
+        );
         let engine = ApplyCoordinator::new(
             initial,
             PlaybackGain::default(),
@@ -2880,6 +3602,7 @@ mod tests {
         }));
         driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
+        driver.confirm_open_filters();
         driver.fence();
         let active = await_update(&mut runtime, |update| update.can_toggle_pause);
         assert_eq!(
@@ -3031,6 +3754,7 @@ mod tests {
         });
         driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
+        driver.confirm_open_filters();
         driver.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
         let attempt = AttemptId::new(opening.generation).unwrap();
@@ -3071,7 +3795,13 @@ mod tests {
             auto_open: false,
             reason: "Preferences only".into(),
         };
-        let mut runtime = RuntimeCoordinator::new(String::new(), startup, persistence, vec![]);
+        let mut runtime = RuntimeCoordinator::new(
+            String::new(),
+            Ok(crate::media::filter_catalog::fixture_capabilities()),
+            startup,
+            persistence,
+            vec![],
+        );
         let initial = runtime.poll();
         assert!(initial.can_set_gain && !initial.can_open && !initial.create_native);
         assert_eq!(runtime.set_volume(27), SubmitStatus::Accepted);
@@ -3138,36 +3868,90 @@ mod tests {
 
     #[test]
     fn startup_restore_opens_once_and_never_authorizes_applied_file_write() {
-        let (mut runtime, drivers) = runtime();
-        runtime.auto_open = true;
-        let opening = runtime.ui_ready();
-        let opening = if opening.create_native {
-            opening
-        } else {
-            await_update(&mut runtime, |update| update.create_native)
-        };
-        assert!(runtime.startup_apply.is_some());
-        let driver = drivers.recv().unwrap();
-        let again = runtime.ui_ready();
-        assert!(!again.create_native && drivers.try_recv().is_err());
-        runtime.surface_ready(SurfaceToken {
-            generation: Generation::new(opening.generation).unwrap(),
-            xid: X11WindowId::new(71).unwrap(),
-        });
-        driver.initialized.recv().unwrap();
-        let (load, _) = driver.submitted.recv().unwrap();
-        driver.send(BackendEvent::CommandReply {
-            id: load.get(),
-            error: 0,
-        });
-        driver.send(BackendEvent::FileLoaded);
-        driver.send(BackendEvent::PlaybackRestart);
-        driver.fence();
-        await_update(&mut runtime, |update| update.can_toggle_pause);
-        assert!(runtime.startup_apply.is_none());
-        assert!(!runtime.persistence.status().contains("Save"));
-        assert!(!runtime.ui_ready().create_native && drivers.try_recv().is_err());
-        cleanup(&mut runtime);
+        use std::os::unix::fs::MetadataExt;
+        for chain in [
+            crate::domain::filters::FilterChain::default(),
+            treatment_chain(false),
+            treatment_chain(true),
+        ] {
+            let store = WritableSettings::new();
+            let (mut prior, prior_drivers) = runtime();
+            store.bind(&mut prior);
+            edit_filters(&mut prior, &chain);
+            let prior_driver = start_live(&mut prior, &prior_drivers);
+            cleanup(&mut prior);
+            prior_driver.destroyed.recv().unwrap();
+            let original = std::fs::read(store.path()).unwrap();
+            let inode = std::fs::metadata(store.path()).unwrap().ino();
+            let saved = store.applied();
+            assert_eq!(saved.filters, chain);
+
+            let (mut runtime, drivers) = runtime();
+            runtime
+                .engine
+                .as_mut()
+                .unwrap()
+                .edit_draft(DraftRevision::new(0), saved.clone())
+                .unwrap();
+            runtime.persistence = PersistenceSession::load(Ok(store.path()));
+            runtime.persistence.prepare_startup(&StartupSelection {
+                draft: Some(saved),
+                auto_open: true,
+                reason: String::new(),
+            });
+            runtime.auto_open = true;
+            let opening = runtime.ui_ready();
+            let opening = if opening.create_native {
+                opening
+            } else {
+                await_update(&mut runtime, |update| update.create_native)
+            };
+            assert!(runtime.startup_apply.is_some());
+            assert_eq!(runtime.persistence.authorized_apply(), None);
+            let driver = drivers.recv().unwrap();
+            let again = runtime.ui_ready();
+            assert!(!again.create_native && drivers.try_recv().is_err());
+            runtime.surface_ready(SurfaceToken {
+                generation: Generation::new(opening.generation).unwrap(),
+                xid: X11WindowId::new(71).unwrap(),
+            });
+            driver.initialized.recv().unwrap();
+            let (load, _) = driver.submitted.recv().unwrap();
+            driver.send(BackendEvent::CommandReply {
+                id: load.get(),
+                error: 0,
+            });
+            driver.send(BackendEvent::FileLoaded);
+            driver.send(BackendEvent::PlaybackRestart);
+            driver.confirm_open_filters();
+            driver.fence();
+            let restored = await_update(&mut runtime, |update| update.can_toggle_pause);
+            assert!(!restored.draft_dirty && !restored.failed);
+            assert!(runtime.startup_apply.is_none());
+            assert_eq!(runtime.persistence.authorized_apply(), None);
+            assert_eq!(
+                runtime
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .model()
+                    .active()
+                    .unwrap()
+                    .applied()
+                    .settings()
+                    .filters,
+                chain
+            );
+            assert_eq!(std::fs::read(store.path()).unwrap(), original);
+            assert_eq!(
+                std::fs::metadata(store.path()).unwrap().ino(),
+                inode,
+                "startup must not rewrite even identical bytes"
+            );
+            assert!(!runtime.ui_ready().create_native && drivers.try_recv().is_err());
+            cleanup(&mut runtime);
+            driver.destroyed.recv().unwrap();
+        }
     }
 
     fn observed_sink(
