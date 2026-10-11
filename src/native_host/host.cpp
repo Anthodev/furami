@@ -425,7 +425,7 @@ bool FuramiBridge::enableQualificationInput(QString &diagnostic)
     m_qualificationInput = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read, this);
     connect(m_qualificationInput.data(), &QSocketNotifier::activated, this,
         [this](QSocketDescriptor, QSocketNotifier::Type) { readQualificationInput(); });
-    qInfo().noquote() << "qualification_stdin_enabled grammar=snapshot|draft-video|draft-identity|draft-audio|draft-source|draft-filters|open|apply|restart|reconnect|volume|mute|close|quit state=phase,apply,attempt,cleanup revision=required_for_draft_apply filter_json=strict_FilterChain limits=legacy:256,filter:65536_bytes";
+    qInfo().noquote() << "qualification_stdin_enabled grammar=snapshot|draft-video|draft-identity|draft-audio|draft-source|draft-filters|draft-renderer|open|apply|restart|reconnect|volume|mute|close|quit state=phase,apply,attempt,cleanup revision=required_for_draft_apply filter_json=strict_FilterChain limits=legacy:256,filter:65536_bytes";
     return true;
 }
 

@@ -5,6 +5,7 @@ pub mod controller;
 mod ffi;
 pub mod filter_catalog;
 pub(crate) mod gate;
+pub mod render_catalog;
 pub mod session;
 
 /// One host-helper audio owner plus application-lifetime output observation.

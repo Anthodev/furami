@@ -5,11 +5,11 @@ use crate::domain::{
         AudioAvailability, AudioEpoch, AudioError, AudioSilence, AudioSourceIdentity, PlaybackGain,
         RecoveryCandidate, RecoveryObservation, RecoveryWatchTarget, SelectionToken, WatchStamp,
     },
-    failure::{ApplyFailure, FilterFailure},
+    failure::{ApplyFailure, TreatmentFailure},
     output::OutputPlan,
     state::{
-        AttemptId, AttemptKey, DraftSettings, FilterAttemptKey, FilterConfirmation, FilterPass,
-        InitialPlayback, PauseRequestId, ValidationKey, ValidationRequest,
+        AttemptId, AttemptKey, DraftSettings, InitialPlayback, PauseRequestId, TreatmentAttemptKey,
+        TreatmentConfirmation, TreatmentPass, ValidationKey, ValidationRequest,
     },
 };
 
@@ -101,17 +101,17 @@ pub enum SubmitStatus {
 
 pub trait SessionRunner {
     type Prepared;
-    type PreparedFilters;
+    type PreparedTreatments;
     /// Pure compilation against capabilities observed at startup, without I/O.
-    fn prepare_filters(
+    fn prepare_treatments(
         &mut self,
         settings: &DraftSettings,
-    ) -> Result<Self::PreparedFilters, ApplyFailure>;
+    ) -> Result<Self::PreparedTreatments, ApplyFailure>;
     fn begin_open(
         &mut self,
         key: AttemptKey,
         prepared: Self::Prepared,
-        filters: Self::PreparedFilters,
+        treatments: Self::PreparedTreatments,
         gain: PlaybackGain,
         playback: InitialPlayback,
         output: OutputPlan,
@@ -120,10 +120,10 @@ pub trait SessionRunner {
     /// Terminal acknowledgement/failure must precede coalesced readiness.
     fn poll(&mut self) -> Option<SessionEvent>;
     fn submit_immediate(&mut self, attempt: AttemptId, intent: ImmediateIntent) -> SubmitStatus;
-    fn submit_filters(
+    fn submit_treatments(
         &mut self,
-        key: FilterAttemptKey,
-        filters: Self::PreparedFilters,
+        key: TreatmentAttemptKey,
+        treatments: Self::PreparedTreatments,
     ) -> SubmitStatus;
 }
 
@@ -158,18 +158,12 @@ pub enum AudioOutcome {
     },
 }
 #[derive(Clone, Debug, PartialEq)]
-pub enum FilterOpenReceipt {
-    Confirmed(FilterConfirmation),
-    /// Frozen previously verified configuration installed before paused load.
-    PreparedPaused,
-}
-#[derive(Clone, Debug, PartialEq)]
 pub struct OpenReceipt {
     pub settings: DraftSettings,
     pub verification: VerificationSummary,
     pub audio: AudioOutcome,
     pub readiness: OpenReadiness,
-    pub filters: FilterOpenReceipt,
+    pub treatments: TreatmentConfirmation,
 }
 impl OpenReceipt {
     pub fn matches(&self, settings: &DraftSettings) -> bool {
@@ -191,31 +185,31 @@ impl OpenReceipt {
             _ => false,
         }
     }
-    pub fn matches_filters(&self, key: AttemptKey) -> bool {
-        match (&self.filters, self.readiness) {
-            (FilterOpenReceipt::Confirmed(confirmation), OpenReadiness::Live) => {
-                confirmation.key()
-                    == FilterAttemptKey {
-                        apply: key.apply,
-                        attempt: key.attempt,
-                        pass: FilterPass::Open,
-                    }
+    pub fn matches_treatments(&self, key: AttemptKey) -> bool {
+        self.treatments.key()
+            == TreatmentAttemptKey {
+                apply: key.apply,
+                attempt: key.attempt,
+                pass: TreatmentPass::Open,
             }
-            (FilterOpenReceipt::PreparedPaused, OpenReadiness::PausedPrepared) => true,
-            _ => false,
-        }
+            && self.treatments.renderer().settings() == &self.settings.renderer
+            && matches!(
+                (self.readiness, self.treatments.playback()),
+                (OpenReadiness::Live, InitialPlayback::Live)
+                    | (OpenReadiness::PausedPrepared, InitialPlayback::Paused)
+            )
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionEvent {
-    FilterResult {
-        key: FilterAttemptKey,
-        result: Result<FilterConfirmation, Box<FilterFailure>>,
+    TreatmentResult {
+        key: TreatmentAttemptKey,
+        result: Result<TreatmentConfirmation, Box<TreatmentFailure>>,
     },
-    FilterFault {
-        key: FilterAttemptKey,
-        failure: Box<FilterFailure>,
+    TreatmentFault {
+        key: TreatmentAttemptKey,
+        failure: Box<TreatmentFailure>,
     },
     OpenVerified {
         key: AttemptKey,
@@ -259,4 +253,142 @@ pub enum SessionEvent {
         epoch: AudioEpoch,
         outcome: Result<(), AudioError>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{
+        capture::{
+            AudioSelection, CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize,
+            ModeRequest, UsbTopology,
+        },
+        render::RendererSettings,
+        state::{
+            ApplyId, AttemptKey, AttemptPurpose, FilterConfirmation, FilterTreatmentProof,
+            InitialPlayback, RendererConfirmation, TreatmentAttemptKey, TreatmentConfirmation,
+            TreatmentPass,
+        },
+    };
+
+    fn settings() -> DraftSettings {
+        DraftSettings {
+            filters: crate::domain::filters::FilterChain::default(),
+            video: ModeRequest {
+                identity: DeviceIdentity::new(
+                    0x32ed,
+                    0x3701,
+                    UsbTopology::new(
+                        "controller".into(),
+                        vec![std::num::NonZeroU8::new(1).unwrap()],
+                    )
+                    .unwrap(),
+                    Some("serial".into()),
+                )
+                .unwrap(),
+                mode: CaptureMode {
+                    captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
+                    size: FrameSize::new(1280, 720).unwrap(),
+                    rate: FrameRate::new(60, 1).unwrap(),
+                },
+            },
+            audio: AudioSelection::default(),
+            renderer: RendererSettings::default(),
+        }
+    }
+
+    fn key() -> AttemptKey {
+        AttemptKey {
+            apply: ApplyId::new(1).unwrap(),
+            attempt: AttemptId::new(2).unwrap(),
+            purpose: AttemptPurpose::Recovery,
+        }
+    }
+
+    fn aggregate(open: AttemptKey, playback: InitialPlayback) -> TreatmentConfirmation {
+        let treatment = TreatmentAttemptKey {
+            apply: open.apply,
+            attempt: open.attempt,
+            pass: TreatmentPass::Open,
+        };
+        let (vf_changed, filters) = match playback {
+            InitialPlayback::Live => (
+                true,
+                FilterTreatmentProof::Reconfigured(
+                    FilterConfirmation::checked(treatment, 0.0, 2.0, 32).unwrap(),
+                ),
+            ),
+            InitialPlayback::Paused => (
+                false,
+                FilterTreatmentProof::PreparedPaused { key: treatment },
+            ),
+        };
+        TreatmentConfirmation::checked(
+            treatment,
+            playback,
+            vf_changed,
+            filters,
+            RendererConfirmation::checked(treatment, settings().renderer.clone()),
+        )
+        .unwrap()
+    }
+
+    fn receipt(open: AttemptKey, playback: InitialPlayback) -> OpenReceipt {
+        OpenReceipt {
+            settings: settings(),
+            verification: VerificationSummary {
+                captured_fourcc: FactStatus::Unverified,
+                decoded_size: FactStatus::ObservedCompatible,
+                nominal_rate: FactStatus::Approximate,
+            },
+            audio: AudioOutcome::Disabled,
+            readiness: match playback {
+                InitialPlayback::Live => OpenReadiness::Live,
+                InitialPlayback::Paused => OpenReadiness::PausedPrepared,
+            },
+            treatments: aggregate(open, playback),
+        }
+    }
+
+    #[test]
+    fn matches_treatments_requires_exact_open_key_renderer_and_playback() {
+        let open = key();
+        assert!(receipt(open, InitialPlayback::Live).matches_treatments(open));
+        assert!(receipt(open, InitialPlayback::Paused).matches_treatments(open));
+
+        // A different apply/attempt is never the requested opening.
+        let other = AttemptKey {
+            attempt: AttemptId::new(open.attempt.get() + 1).unwrap(),
+            ..open
+        };
+        assert!(!receipt(other, InitialPlayback::Live).matches_treatments(open));
+        assert!(!receipt(other, InitialPlayback::Paused).matches_treatments(open));
+    }
+
+    #[test]
+    fn matches_treatments_rejects_renderer_and_readiness_mismatch() {
+        let open = key();
+        let mut wrong_renderer = receipt(open, InitialPlayback::Live);
+        let mut values = settings().renderer.values();
+        values.interpolation = !values.interpolation;
+        wrong_renderer.settings.renderer = RendererSettings::new(values).unwrap();
+        assert!(
+            !wrong_renderer.matches_treatments(open),
+            "renderer proof must agree with the requested settings"
+        );
+
+        let mut wrong_readiness = receipt(open, InitialPlayback::Live);
+        wrong_readiness.readiness = OpenReadiness::PausedPrepared;
+        assert!(
+            !wrong_readiness.matches_treatments(open),
+            "readiness must agree with the aggregate playback"
+        );
+
+        let mut wrong_paused_readiness = receipt(open, InitialPlayback::Paused);
+        wrong_paused_readiness.readiness = OpenReadiness::Live;
+        assert!(
+            !wrong_paused_readiness.matches_treatments(open),
+            "readiness must agree with the aggregate playback"
+        );
+    }
 }

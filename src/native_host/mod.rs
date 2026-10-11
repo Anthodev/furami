@@ -10,10 +10,7 @@ pub struct NativeLaunchError {
 
 pub fn run_application(
     media_prefix: &str,
-    filter_capabilities: Result<
-        crate::media::filter_catalog::FilterCapabilities,
-        crate::media::filter_catalog::FilterCatalogError,
-    >,
+    treatment_capabilities: crate::media::render_catalog::QualifiedTreatmentCapabilities,
     display: &str,
     startup: crate::app::settings::StartupSelection,
     persistence: crate::app::settings::PersistenceSession,
@@ -22,7 +19,7 @@ pub fn run_application(
 ) -> Result<(), NativeLaunchError> {
     let gate = Box::new(crate::ui::runtime::RuntimeCoordinator::new(
         media_prefix.to_owned(),
-        filter_capabilities,
+        treatment_capabilities,
         startup,
         persistence,
         sources,

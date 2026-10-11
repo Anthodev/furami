@@ -8,6 +8,9 @@
 mod schema;
 mod store;
 
+#[cfg(test)]
+mod store_tests;
+
 pub use schema::SettingsValidationError;
 #[doc(hidden)]
 pub use store::WriteFaultPoint;

@@ -1,0 +1,1 @@
+{"scale":"ewa_lanczossharp","cscale":"ewa_lanczossharp","dscale":"mitchell","scale_antiring":0.7,"dither":"error-diffusion","deband":{"enabled":true,"iterations":2,"grain":16},"interpolation":false}

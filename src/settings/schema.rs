@@ -21,6 +21,7 @@ use crate::domain::capture::{
 };
 use crate::domain::filters::FilterChain;
 use crate::domain::output::{PersistentOutputChoice, SinkIdentity};
+use crate::domain::render::RendererSettings;
 use crate::domain::state::DraftSettings;
 
 /// On-disk schema version this module reads and writes.
@@ -144,18 +145,19 @@ struct DocumentV1 {
     preferences: PreferencesV1,
 }
 
-/// The applied section. `video` and `audio` stay mandatory; `filters` is the
-/// complete applied chain and is absent-by-default for backward compatibility
-/// with pre-filter v1 documents. A present `filters` is decoded straight into
-/// the validated [`FilterChain`] (never through an intermediate `Value`), so an
-/// explicit `null` is a schema violation rather than the empty chain. The
-/// custom deserializer below replaces the `object_dto!` derive for exactly that
-/// reason.
+/// The applied section. `video` and `audio` stay mandatory; `filters` and
+/// `renderer` are absent-by-default for backward compatibility with documents
+/// written before those settings existed. A present `filters`/`renderer` is
+/// decoded straight into the validated domain value (never through an
+/// intermediate `Value`), so an explicit `null` is a schema violation rather
+/// than the default. The custom deserializer below replaces the `object_dto!`
+/// derive for exactly that reason.
 #[derive(Debug)]
 struct AppliedV1 {
     video: VideoV1,
     audio: AudioV1,
     filters: FilterChain,
+    renderer: RendererSettings,
 }
 
 object_dto! {
@@ -252,7 +254,7 @@ object_dto! {
 // ---------------------------------------------------------------------------
 
 const DOCUMENT_FIELDS: &[&str] = &["schema_version", "applied", "preferences"];
-const APPLIED_FIELDS: &[&str] = &["video", "audio", "filters"];
+const APPLIED_FIELDS: &[&str] = &["video", "audio", "filters", "renderer"];
 const IDENTITY_FIELDS: &[&str] = &["vendor_id", "product_id", "topology", "serial"];
 const AUDIO_FIELDS: &[&str] = &["kind", "source", "retained"];
 const PREFS_FIELDS: &[&str] = &["volume_percent", "muted", "fullscreen", "output"];
@@ -278,7 +280,9 @@ impl<'de> Visitor<'de> for AppliedVisitor {
     type Value = AppliedV1;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an applied settings object with video, audio and optional filters")
+        formatter.write_str(
+            "an applied settings object with video, audio and optional filters and renderer",
+        )
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -288,6 +292,7 @@ impl<'de> Visitor<'de> for AppliedVisitor {
         let mut video: Option<VideoV1> = None;
         let mut audio: Option<AudioV1> = None;
         let mut filters: Option<FilterChain> = None;
+        let mut renderer: Option<RendererSettings> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -312,6 +317,15 @@ impl<'de> Visitor<'de> for AppliedVisitor {
                     // absent key defaults to the empty chain.
                     filters = Some(map.next_value::<FilterChain>()?);
                 }
+                "renderer" => {
+                    if renderer.is_some() {
+                        return Err(de::Error::duplicate_field("renderer"));
+                    }
+                    // Present field decodes the validated renderer directly;
+                    // an explicit null is refused (map-only), so only the
+                    // absent key defaults to the baseline.
+                    renderer = Some(map.next_value::<RendererSettings>()?);
+                }
                 other => return Err(de::Error::unknown_field(other, APPLIED_FIELDS)),
             }
         }
@@ -320,6 +334,7 @@ impl<'de> Visitor<'de> for AppliedVisitor {
             video: video.ok_or_else(|| de::Error::missing_field("video"))?,
             audio: audio.ok_or_else(|| de::Error::missing_field("audio"))?,
             filters: filters.unwrap_or_default(),
+            renderer: renderer.unwrap_or_default(),
         })
     }
 }
@@ -757,6 +772,11 @@ struct AppliedWrite<'a> {
     /// chain is serialized exactly.
     #[serde(skip_serializing_if = "chain_is_empty")]
     filters: &'a FilterChain,
+    /// Borrowed, validated renderer. Omitted only when it is exactly the baseline
+    /// so a pre-renderer v1 document re-encodes byte-for-byte; any deviation
+    /// (including the reference fixture) is serialized in full.
+    #[serde(skip_serializing_if = "renderer_is_baseline")]
+    renderer: &'a RendererSettings,
 }
 
 #[derive(Serialize)]
@@ -823,6 +843,12 @@ fn chain_is_empty(chain: &FilterChain) -> bool {
     chain.entries().is_empty()
 }
 
+/// `skip_serializing_if` predicate for the applied renderer section: only the
+/// exact behaviour-preserving baseline is omitted.
+fn renderer_is_baseline(renderer: &RendererSettings) -> bool {
+    renderer.is_baseline()
+}
+
 /// Validate public mutable preferences before serialization. Identity, topology,
 /// source properties, size and rational rate are private constructor-validated
 /// domain values: their borrowed wire views preserve those invariants without
@@ -848,6 +874,7 @@ fn applied_to_dto(applied: &DraftSettings) -> AppliedWrite<'_> {
         video: video_to_dto(&applied.video),
         audio: audio_to_dto(&applied.audio),
         filters: &applied.filters,
+        renderer: &applied.renderer,
     }
 }
 
@@ -856,6 +883,7 @@ fn applied_from_dto(applied: AppliedV1) -> Result<DraftSettings, SettingsValidat
         filters: applied.filters,
         video: video_from_dto(applied.video)?,
         audio: audio_from_dto(applied.audio)?,
+        renderer: applied.renderer,
     })
 }
 

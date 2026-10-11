@@ -1,0 +1,109 @@
+{
+  "captured_utc": "2026-10-11T05:54:46Z",
+  "probe_environment": {
+    "cleared": "yes (env -i / env_clear equivalent)",
+    "LD_LIBRARY_PATH": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/lib",
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin",
+    "XDG/user config": "--no-config passed for option probes; version also captured with config loaded (see version.stdout/config-error) and clean (version-clean.*)"
+  },
+  "prefix": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix",
+  "binaries": {
+    "mpv": {
+      "path": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/mpv",
+      "sha256": "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2"
+    },
+    "libmpv": {
+      "path": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/lib/libmpv.so.2.5.0",
+      "sha256": "801c9dcd8e87516249d05a11dc76a1cbc30c3e792d442762c8fe79e73746e85c",
+      "soname": "libmpv.so.2"
+    },
+    "ffmpeg": {
+      "path": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/bin/ffmpeg",
+      "sha256": "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e"
+    },
+    "libplacebo": {
+      "path": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/lib/libplacebo.so.360",
+      "sha256": "095aa42ad966f2fc942723029d31a38a967b1a134191795417c1d50e500f267f"
+    }
+  },
+  "reported_versions": {
+    "mpv": "v0.41.0",
+    "libplacebo": "v7.360.1",
+    "ffmpeg": "8.1.2",
+    "ffmpeg_libs": {
+      "libavcodec": "62.28.102",
+      "libavutil": "60.26.102",
+      "libavfilter": "11.14.102"
+    },
+    "client_api": "2.5.0"
+  },
+  "runtime_linkage_ldd": {
+    "libavcodec.so.62": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/lib/libavcodec.so.62",
+    "libavutil.so.60": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/lib/libavutil.so.60",
+    "libplacebo.so.360": "/home/anthodev/.cache/furami/FUR-002/build-G/prefix/lib/libplacebo.so.360"
+  },
+  "pins_from_packaging_media_stack_lock": {
+    "mpv_commit": "41f6a645068483470267271e1d09966ca3b9f413",
+    "mpv_sha256_archive": "ee21092a5ee427353392360929dc64645c54479aefdb5babc5cfbb5fad626209",
+    "libplacebo_commit": "cee9b076f2c63104ccfd497fa79c39a867293ec4",
+    "libplacebo_sha256_archive": "d05fdf90bea2f629eaa2d115e909fd356388ac639e54f77b87a018a6d76224bd",
+    "ffmpeg_version": "8.1.2",
+    "match": "EXACT \u2014 qualified build matches contract pins (mpv v0.41.0 / libplacebo v7.360.1 / ffmpeg 8.1.2)"
+  },
+  "probe_commands": [
+    [
+      "mpv",
+      "--version"
+    ],
+    [
+      "mpv",
+      "--no-config",
+      "--list-options"
+    ],
+    [
+      "mpv",
+      "--no-config",
+      "--scale=help"
+    ],
+    [
+      "mpv",
+      "--no-config",
+      "--cscale=help"
+    ],
+    [
+      "mpv",
+      "--no-config",
+      "--dscale=help"
+    ],
+    [
+      "mpv",
+      "--no-config",
+      "--dither=help"
+    ]
+  ],
+  "artifacts": [
+    "cscale-help.exit",
+    "cscale-help.stderr",
+    "cscale-help.stdout",
+    "dither-help.exit",
+    "dither-help.stderr",
+    "dither-help.stdout",
+    "dscale-help.exit",
+    "dscale-help.stderr",
+    "dscale-help.stdout",
+    "list-options.exit",
+    "list-options.stderr",
+    "list-options.stdout",
+    "nine-property-inventory.json",
+    "scale-help.exit",
+    "scale-help.stderr",
+    "scale-help.stdout",
+    "version-clean.exit",
+    "version-clean.stderr",
+    "version-clean.stdout",
+    "version.exit",
+    "version.stderr",
+    "version.stdout"
+  ]
+}

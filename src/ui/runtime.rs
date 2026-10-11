@@ -137,6 +137,13 @@ pub(crate) struct RuntimeCoordinator {
 /// catalogued sinks always get opaque revision-scoped keys.
 const AUTO_ROW_KEY: &str = "auto";
 
+/// Exact product-limitation notice surfaced through the existing bounded
+/// `diagnostic` presentation bridge whenever interpolation is selected/applied.
+/// Interpolation is stored and applied but inactive under the current
+/// low-latency timing; the timing options are deliberately unchanged.
+const INTERPOLATION_INACTIVE_TEXT: &str =
+    "Interpolation is stored but inactive with the current low-latency timing.";
+
 /// One selector row. `identity` stays runtime-side (never serialized): the
 /// opaque `key` is the only thing the UI echoes back for actions. `name` is
 /// serialized so the UI can match a saved manual choice against observed
@@ -183,10 +190,7 @@ fn output_silence_text(reason: &OutputSilence) -> String {
 impl RuntimeCoordinator {
     pub(crate) fn new(
         prefix: String,
-        filter_capabilities: Result<
-            crate::media::filter_catalog::FilterCapabilities,
-            crate::media::filter_catalog::FilterCatalogError,
-        >,
+        treatment_capabilities: crate::media::render_catalog::QualifiedTreatmentCapabilities,
         startup: StartupSelection,
         persistence: PersistenceSession,
         sources: Vec<AudioSourceIdentity>,
@@ -206,7 +210,7 @@ impl RuntimeCoordinator {
                     settings,
                     gain,
                     CaptureValidator::new(),
-                    GateRunner::new(prefix, filter_capabilities),
+                    GateRunner::new(prefix, treatment_capabilities),
                 )
             }),
             sources,
@@ -878,7 +882,7 @@ impl RuntimeCoordinator {
             || identity.operation().map(|id| id.get()).unwrap_or(0) != expected.apply
             || identity.attempt().map(AttemptId::get).unwrap_or(0) != expected.attempt
             || cleanup != expected.cleanup
-            || identity.filter_pass() != expected.filter_pass
+            || identity.treatment_pass() != expected.treatment_pass
         {
             Err(CommandRejection::StaleState)
         } else {
@@ -887,7 +891,7 @@ impl RuntimeCoordinator {
     }
     pub(crate) fn qualification_command(&mut self, line: &str) -> UiUpdate {
         // Opt-in qualification calls the same production application decisions.
-        if !control::is_filter_command(line) {
+        if !control::is_structured_json_command(line) {
             if line.len() > control::LEGACY_COMMAND_MAX_BYTES {
                 self.qualification_rejection(line, "qualification command exceeds 256 bytes");
                 return self.poll();
@@ -967,6 +971,15 @@ impl RuntimeCoordinator {
                 Command::Filters(revision, filters) => {
                     let mut settings = engine.model().draft().settings.clone();
                     settings.filters = filters;
+                    engine
+                        .edit_draft(revision, settings)
+                        .map_err(|error| error.to_string())?;
+                }
+                Command::Renderer(revision, renderer) => {
+                    // Editing stores the requested renderer only; nothing is
+                    // applied until an explicit Apply/Open.
+                    let mut settings = engine.model().draft().settings.clone();
+                    settings.renderer = renderer;
                     engine
                         .edit_draft(revision, settings)
                         .map_err(|error| error.to_string())?;
@@ -1338,10 +1351,10 @@ impl RuntimeCoordinator {
         if changed {
             if let Some(rejection) = model.validation_rejection() {
                 diagnostic.push_str(&rejection.failure.to_string());
-                if let Some(filter) = &rejection.failure.filter {
+                if let Some(treatment) = &rejection.failure.treatment {
                     diagnostic.push_str(&format!(
-                        "\nFilter diagnostics: {}",
-                        serde_json::json!(filter)
+                        "\nTreatment diagnostics: {}",
+                        serde_json::json!(treatment)
                     ));
                 }
             }
@@ -1358,10 +1371,10 @@ impl RuntimeCoordinator {
                         diagnostic.push('\n');
                     }
                     diagnostic.push_str(&failure.to_string());
-                    if let Some(filter) = &failure.filter {
+                    if let Some(treatment) = &failure.treatment {
                         diagnostic.push_str(&format!(
-                            "\nFilter diagnostics: {}",
-                            serde_json::json!(filter)
+                            "\nTreatment diagnostics: {}",
+                            serde_json::json!(treatment)
                         ));
                     }
                 }
@@ -1398,8 +1411,8 @@ impl RuntimeCoordinator {
             .active()
             .is_some_and(|active| active.playback() == PlaybackState::Paused);
         let playback_status = match model.phase() {
-            ProductPhase::ApplyingFilters => "Applying filters",
-            ProductPhase::RestoringFilters => "Restoring filters",
+            ProductPhase::ApplyingTreatments => "Applying treatments",
+            ProductPhase::RestoringTreatments => "Restoring treatments",
             ProductPhase::ValidatingResume
             | ProductPhase::ClosingResume
             | ProductPhase::OpeningResume
@@ -1515,10 +1528,10 @@ impl RuntimeCoordinator {
                 .iter()
                 .chain(failures.restore.iter())
                 .chain(failures.incumbent.iter())
-                .any(|failure| failure.filter.is_some())
+                .any(|failure| failure.treatment.is_some())
         }) || model
             .validation_rejection()
-            .is_some_and(|rejection| rejection.failure.filter.is_some());
+            .is_some_and(|rejection| rejection.failure.treatment.is_some());
         if changed
             && diagnostic.is_empty()
             && let Some(fatal) = engine.runner_mut().fatal_native_failure()
@@ -1534,6 +1547,12 @@ impl RuntimeCoordinator {
             } else {
                 engine.runner_mut().report.clone()
             };
+        }
+        if changed && renderer_interpolation_inactive(engine.model()) {
+            if !diagnostic.is_empty() {
+                diagnostic.push('\n');
+            }
+            diagnostic.push_str(INTERPOLATION_INACTIVE_TEXT);
         }
         if changed {
             log_snapshot(engine);
@@ -1652,6 +1671,16 @@ fn prepared_paused_presentation(model: &ProductModel, attempt: Option<AttemptId>
         })
 }
 
+/// Whether interpolation is requested by the stored draft or already applied
+/// by the active session. Either way the setting is inactive under the current
+/// low-latency timing and the presentation carries the exact limitation note.
+fn renderer_interpolation_inactive(model: &ProductModel) -> bool {
+    model.draft().settings.renderer.values().interpolation
+        || model
+            .active()
+            .is_some_and(|active| active.applied().settings().renderer.values().interpolation)
+}
+
 /// Human-readable product phase: the reducer-level truth, projected next to
 /// the media gate phase so disconnected/recovering/selection states stay
 /// visible even while no media window exists.
@@ -1659,8 +1688,8 @@ fn phase_name(phase: ProductPhase) -> &'static str {
     match phase {
         ProductPhase::Stopped => "Stopped",
         ProductPhase::Active => "Active",
-        ProductPhase::ApplyingFilters => "ApplyingFilters",
-        ProductPhase::RestoringFilters => "RestoringFilters",
+        ProductPhase::ApplyingTreatments => "ApplyingTreatments",
+        ProductPhase::RestoringTreatments => "RestoringTreatments",
         ProductPhase::PausePending => "PausePending",
         ProductPhase::Paused => "Paused",
         ProductPhase::Validating => "Validating",
@@ -1728,19 +1757,16 @@ fn candidate_entry(candidate: &RecoveryCandidate) -> String {
 }
 
 fn runtime_snapshot(engine: &mut Engine) -> serde_json::Value {
-    let pending_key = engine
-        .model()
-        .filtering()
-        .map(|transition| transition.key());
+    let pending_key = engine.model().treating().map(|transition| transition.key());
     // Admission can precede the owner's first Pending publication. A retained
     // incumbent confirmation is not success for that newly admitted key.
-    let filters = match (pending_key, engine.runner_mut().filter_snapshot()) {
+    let treatments = match (pending_key, engine.runner_mut().treatment_snapshot()) {
         (Some(key), observed)
             if observed.is_none_or(|observed| {
                 observed.key != key
                     || matches!(
                         observed.status,
-                        crate::media::controller::FilterStatus::Confirmed(_)
+                        crate::media::controller::TreatmentStatus::Confirmed(_)
                     )
             }) =>
         {
@@ -1749,18 +1775,18 @@ fn runtime_snapshot(engine: &mut Engine) -> serde_json::Value {
                 "confirmation": null, "failure": null,
             }))
         }
-        (_, Some(filters)) => {
-            let (status, confirmation, failure) = match &filters.status {
-                crate::media::controller::FilterStatus::Pending => ("Pending", None, None),
-                crate::media::controller::FilterStatus::Confirmed(confirmation) => {
+        (_, Some(treatments)) => {
+            let (status, confirmation, failure) = match &treatments.status {
+                crate::media::controller::TreatmentStatus::Pending => ("Pending", None, None),
+                crate::media::controller::TreatmentStatus::Confirmed(confirmation) => {
                     ("Confirmed", Some(confirmation), None)
                 }
-                crate::media::controller::FilterStatus::Failed(failure) => {
+                crate::media::controller::TreatmentStatus::Failed(failure) => {
                     ("Failed", None, Some(failure))
                 }
             };
             Some(serde_json::json!({
-                "key": filters.key, "sequence": filters.sequence, "status": status,
+                "key": treatments.key, "sequence": treatments.sequence, "status": status,
                 "confirmation": confirmation, "failure": failure,
             }))
         }
@@ -1770,7 +1796,7 @@ fn runtime_snapshot(engine: &mut Engine) -> serde_json::Value {
     let identity = model.state_identity();
     serde_json::json!({
         "phase": model.phase(), "apply_id": identity.operation().map(|id| id.get()), "attempt_id": identity.attempt().map(AttemptId::get),
-        "filter_pass": identity.filter_pass(), "filters": filters,
+        "treatment_pass": identity.treatment_pass(), "treatments": treatments,
         "cleanup": match model.cleanup() { CleanupStatus::Complete => "Complete", CleanupStatus::Draining => "Draining", CleanupStatus::Blocked { .. } => "Blocked" },
         "draft_revision": model.draft().revision.get(), "draft": model.draft().settings,
         "last_valid": model.last_valid().map(|settings| settings.settings()),
@@ -1802,6 +1828,15 @@ mod tests {
     };
     use std::sync::mpsc;
 
+    /// Legitimate cfg(test) fixture bundle: real captured filter inventory plus
+    /// the real captured renderer inventory (owner keeps the production query).
+    fn fixture_treatment_capabilities()
+    -> crate::media::render_catalog::QualifiedTreatmentCapabilities {
+        crate::media::render_catalog::QualifiedTreatmentCapabilities {
+            filters: Ok(crate::media::filter_catalog::fixture_capabilities()),
+            renderer: Ok(crate::media::render_catalog::fixture_capabilities()),
+        }
+    }
     fn settings() -> DraftSettings {
         let mode = CaptureMode {
             captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
@@ -1817,6 +1852,7 @@ mod tests {
                 mode,
             },
             audio: AudioSelection::default(),
+            renderer: crate::domain::render::RendererSettings::default(),
         }
     }
     fn validate(
@@ -1843,7 +1879,7 @@ mod tests {
     ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
         let (tx, rx) = mpsc::channel();
         let runner = GateRunner::with_spawner(
-            Ok(crate::media::filter_catalog::fixture_capabilities()),
+            fixture_treatment_capabilities(),
             move |generation, config| {
                 if fail_spawn == Some(generation.get()) {
                     return Err(crate::media::controller::MediaError::new(
@@ -1858,7 +1894,7 @@ mod tests {
                     .unwrap();
                 let requested = input.requested().clone();
                 let (driver, backend) = Driver::pair(Config::default());
-                let backend = backend.with_open_filters(config.filter_key, config.compiled_filters);
+                let backend = backend.with_open_treatments(config.treatment_key, config.treatments);
                 tx.send(driver).unwrap();
                 OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
             },
@@ -1968,7 +2004,7 @@ mod tests {
         });
         driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
-        driver.confirm_open_filters();
+        driver.confirm_open_treatments();
         driver.fence();
         await_update(runtime, |update| update.can_toggle_pause);
         driver
@@ -2043,12 +2079,13 @@ mod tests {
                 ..expected
             },
             ExpectedState {
-                filter_pass: Some(
-                    if expected.filter_pass == Some(crate::domain::state::FilterPass::LiveCandidate)
+                treatment_pass: Some(
+                    if expected.treatment_pass
+                        == Some(crate::domain::state::TreatmentPass::Candidate)
                     {
-                        crate::domain::state::FilterPass::LiveRestore
+                        crate::domain::state::TreatmentPass::Restore
                     } else {
-                        crate::domain::state::FilterPass::LiveCandidate
+                        crate::domain::state::TreatmentPass::Candidate
                     },
                 ),
                 ..expected
@@ -2187,12 +2224,12 @@ mod tests {
             serde_json::to_string(chain).unwrap(),
         ))
     }
-    fn begin_live_filters(
+    fn begin_live_treatments(
         runtime: &mut RuntimeCoordinator,
         driver: &Driver,
     ) -> (
         crate::media::controller::RequestId,
-        crate::domain::state::FilterAttemptKey,
+        crate::domain::state::TreatmentAttemptKey,
     ) {
         let expected = snapshot_expected(runtime);
         let revision = runtime
@@ -2207,8 +2244,8 @@ mod tests {
             "apply {:?} {} {} Complete {revision}",
             expected.phase, expected.apply, expected.attempt,
         ));
-        assert_eq!(pending.product_phase, "ApplyingFilters");
-        assert_eq!(pending.playback_status, "Applying filters");
+        assert_eq!(pending.product_phase, "ApplyingTreatments");
+        assert_eq!(pending.playback_status, "Applying treatments");
         assert!(
             !pending.failed
                 && !pending.can_open
@@ -2220,43 +2257,91 @@ mod tests {
             .submitted
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        let crate::media::controller::BackendCommand::ApplyFilters { key, .. } = command else {
-            panic!("expected exactly one whole-chain filter command: {command:?}")
+        let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
+            panic!("expected exactly one whole-chain treatment command: {command:?}")
         };
-        assert_eq!(key.pass, crate::domain::state::FilterPass::LiveCandidate);
+        assert_eq!(key.pass, crate::domain::state::TreatmentPass::Candidate);
         assert_eq!(runtime.persistence.authorized_apply(), Some(key.apply));
         (id, key)
     }
-    fn confirm_filters(
+    /// Open aggregate keyed to the physical opening: the media owner returns it
+    /// only after nine native renderer readbacks plus its vf proof.
+    fn verify_open(model: &mut ProductModel, key: crate::domain::state::AttemptKey) {
+        use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
+        let request = model.opening_request().expect("opening request for proof");
+        let treatment = TreatmentAttemptKey {
+            apply: key.apply,
+            attempt: key.attempt,
+            pass: TreatmentPass::Open,
+        };
+        let confirmation = crate::media::controller::test_support::treatment_confirmation(
+            treatment,
+            request.playback,
+            request.settings.renderer.clone(),
+        );
+        model.open_verified(key, confirmation);
+    }
+    /// A live-origin confirmation binding the real submitted key to the
+    /// default renderer the draft carries; the vf graph is treated as
+    /// reconfigured, which is what a genuinely changed compiled chain proves.
+    fn treatment_confirmation(
+        key: crate::domain::state::TreatmentAttemptKey,
+    ) -> crate::domain::state::TreatmentConfirmation {
+        use crate::domain::state::{
+            FilterConfirmation, FilterTreatmentProof, RendererConfirmation, TreatmentConfirmation,
+        };
+        let filter = FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap();
+        let renderer =
+            RendererConfirmation::checked(key, crate::domain::render::RendererSettings::default());
+        TreatmentConfirmation::checked(
+            key,
+            crate::domain::state::InitialPlayback::Live,
+            true,
+            FilterTreatmentProof::Reconfigured(filter),
+            renderer,
+        )
+        .unwrap()
+    }
+    fn confirm_treatments(
         driver: &Driver,
         id: crate::media::controller::RequestId,
-        key: crate::domain::state::FilterAttemptKey,
+        key: crate::domain::state::TreatmentAttemptKey,
     ) {
-        driver.send(BackendEvent::FilterResult {
+        driver.send(BackendEvent::TreatmentResult {
             id: id.get(),
             key,
-            result: Ok(
-                crate::domain::state::FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap(),
-            ),
+            result: Ok(treatment_confirmation(key)),
         });
         driver.fence();
     }
     fn treatment_failure(
-        key: crate::domain::state::FilterAttemptKey,
+        key: crate::domain::state::TreatmentAttemptKey,
         kind: crate::domain::failure::FilterErrorKind,
         fresh: bool,
-    ) -> Box<crate::domain::failure::FilterFailure> {
-        Box::new(crate::domain::failure::FilterFailure {
-            kind,
-            attributed_ordinal: None,
-            requires_fresh_owner: fresh,
-            diagnostics: crate::domain::failure::FilterAttemptDiagnostics {
-                key: Some(key),
-                entries: Vec::new(),
-                records: Vec::new(),
-                native_evidence_lost: false,
-                truncated: false,
-                dropped_context: 0,
+    ) -> Box<crate::domain::failure::TreatmentFailure> {
+        use crate::domain::failure::{
+            FilterAttemptDiagnostics, FilterFailure, TreatmentErrorKind, TreatmentFailure,
+            TreatmentFailureDisposition,
+        };
+        Box::new(TreatmentFailure {
+            key: Some(key),
+            kind: TreatmentErrorKind::Filter(FilterFailure {
+                kind,
+                attributed_ordinal: None,
+                requires_fresh_owner: fresh,
+                diagnostics: FilterAttemptDiagnostics {
+                    key: Some(key),
+                    entries: Vec::new(),
+                    records: Vec::new(),
+                    native_evidence_lost: false,
+                    truncated: false,
+                    dropped_context: 0,
+                },
+            }),
+            disposition: if fresh {
+                TreatmentFailureDisposition::RestoreFreshOwner
+            } else {
+                TreatmentFailureDisposition::RestoreSameOwner
             },
         })
     }
@@ -2285,7 +2370,7 @@ mod tests {
             assert!(diagnostic["error"].is_string());
         }
         let mut exact = format!("draft-filters 1 {}", serde_json::to_string(&chain).unwrap());
-        exact.push_str(&" ".repeat(control::FILTER_COMMAND_MAX_BYTES - exact.len()));
+        exact.push_str(&" ".repeat(control::STRUCTURED_COMMAND_MAX_BYTES - exact.len()));
         runtime.qualification_command(&exact);
         assert!(runtime.command_error.is_empty());
         let accepted = runtime.engine.as_ref().unwrap().model().draft().clone();
@@ -2317,21 +2402,21 @@ mod tests {
             assert_eq!(store.applied().filters, chain);
             assert_eq!(runtime.persistence.authorized_apply(), None);
             let initial = runtime_snapshot(runtime.engine.as_mut().unwrap());
-            assert_eq!(initial["filters"]["status"], "Confirmed");
-            assert_eq!(initial["filters"]["key"]["pass"], "Open");
+            assert_eq!(initial["treatments"]["status"], "Confirmed");
+            assert_eq!(initial["treatments"]["key"]["pass"], "Open");
             assert_eq!(
                 initial["active_settings"]["filters"],
                 serde_json::json!(&chain)
             );
-            assert!(initial["filter_pass"].is_null());
+            assert!(initial["treatment_pass"].is_null());
             let candidate = treatment_chain(!all_disabled);
             edit_filters(&mut runtime, &candidate);
-            let (id, key) = begin_live_filters(&mut runtime, &driver);
+            let (id, key) = begin_live_treatments(&mut runtime, &driver);
             let pending = runtime_snapshot(runtime.engine.as_mut().unwrap());
-            assert_eq!(pending["phase"], "ApplyingFilters");
-            assert_eq!(pending["filter_pass"], "LiveCandidate");
-            assert_eq!(pending["filters"]["status"], "Pending");
-            assert_eq!(pending["filters"]["key"], serde_json::json!(key));
+            assert_eq!(pending["phase"], "ApplyingTreatments");
+            assert_eq!(pending["treatment_pass"], "Candidate");
+            assert_eq!(pending["treatments"]["status"], "Pending");
+            assert_eq!(pending["treatments"]["key"], serde_json::json!(key));
             assert_eq!(
                 pending["active_settings"]["filters"],
                 serde_json::json!(&chain)
@@ -2340,7 +2425,7 @@ mod tests {
                 &mut runtime,
                 &crate::domain::filters::FilterChain::default(),
             );
-            confirm_filters(&driver, id, key);
+            confirm_treatments(&driver, id, key);
             let confirmed = await_update(&mut runtime, |update| update.product_phase == "Active");
             assert!(!confirmed.failed && confirmed.draft_dirty);
             assert_eq!(confirmed.playback_status, "Live");
@@ -2358,21 +2443,21 @@ mod tests {
                     .is_empty()
             );
             let snapshot = runtime_snapshot(runtime.engine.as_mut().unwrap());
-            assert_eq!(snapshot["filters"]["status"], "Confirmed");
-            assert_eq!(snapshot["filters"]["key"]["pass"], "LiveCandidate");
+            assert_eq!(snapshot["treatments"]["status"], "Confirmed");
+            assert_eq!(snapshot["treatments"]["key"]["pass"], "Candidate");
             assert_eq!(
                 snapshot["active_settings"]["filters"],
                 serde_json::json!(&candidate)
             );
             let bytes = std::fs::read(store.path()).unwrap();
             // Duplicate native outcomes do not regain consumed persistence permission.
-            confirm_filters(&driver, id, key);
+            confirm_treatments(&driver, id, key);
             runtime.poll();
             assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
             assert_eq!(runtime.persistence.authorized_apply(), None);
             assert!(
                 drivers.try_recv().is_err(),
-                "filter Apply never reopens the owner"
+                "treatment Apply never reopens the owner"
             );
             cleanup(&mut runtime);
             driver.destroyed.recv().unwrap();
@@ -2381,7 +2466,7 @@ mod tests {
 
     #[test]
     fn runtime_live_receipt_cannot_borrow_wrong_admission_key_revision_pass_or_submission() {
-        use crate::domain::state::{ApplyAdmission, ApplyId, FilterPass};
+        use crate::domain::state::{ApplyAdmission, ApplyId, TreatmentPass};
         for mismatch in 0..6 {
             let store = WritableSettings::new();
             let (mut runtime, drivers) = runtime();
@@ -2389,27 +2474,27 @@ mod tests {
             let driver = start_live(&mut runtime, &drivers);
             let original = std::fs::read(store.path()).unwrap();
             edit_filters(&mut runtime, &treatment_chain(false));
-            let (id, key) = begin_live_filters(&mut runtime, &driver);
+            let (id, key) = begin_live_treatments(&mut runtime, &driver);
             let mut submitted = runtime.engine.as_ref().unwrap().model().draft().clone();
             let mut wrong = key;
             let mut revision = submitted.revision;
             match mismatch {
                 0 => wrong.apply = ApplyId::new(key.apply.get() + 1).unwrap(),
                 1 => wrong.attempt = AttemptId::new(key.attempt.get() + 1).unwrap(),
-                2 => wrong.pass = FilterPass::LiveRestore,
+                2 => wrong.pass = TreatmentPass::Restore,
                 3 => revision = DraftRevision::new(revision.get() + 1),
                 4 => submitted.revision = DraftRevision::new(revision.get() + 1),
                 5 => submitted.settings.filters = crate::domain::filters::FilterChain::default(),
                 _ => unreachable!(),
             }
             runtime.persistence.admit_user_apply(
-                ApplyAdmission::Filters {
+                ApplyAdmission::Treatments {
                     key: wrong,
                     revision,
                 },
                 submitted,
             );
-            confirm_filters(&driver, id, key);
+            confirm_treatments(&driver, id, key);
             await_update(&mut runtime, |update| update.product_phase == "Active");
             runtime.poll();
             assert_eq!(
@@ -2432,8 +2517,8 @@ mod tests {
             let driver = start_live(&mut runtime, &drivers);
             let original = std::fs::read(store.path()).unwrap();
             edit_filters(&mut runtime, &treatment_chain(false));
-            let (id, key) = begin_live_filters(&mut runtime, &driver);
-            confirm_filters(&driver, id, key);
+            let (id, key) = begin_live_treatments(&mut runtime, &driver);
+            confirm_treatments(&driver, id, key);
             // Stop exactly between the real engine's commit and the runtime's
             // receipt consumer; this is not a fabricated persistence receipt.
             runtime.engine.as_mut().unwrap().poll();
@@ -2478,8 +2563,8 @@ mod tests {
             let original = std::fs::read(store.path()).unwrap();
             let chain = treatment_chain(false);
             edit_filters(&mut runtime, &chain);
-            let (id, key) = begin_live_filters(&mut runtime, &driver);
-            confirm_filters(&driver, id, key);
+            let (id, key) = begin_live_treatments(&mut runtime, &driver);
+            confirm_treatments(&driver, id, key);
             runtime.engine.as_mut().unwrap().poll();
             assert!(
                 runtime
@@ -2494,7 +2579,7 @@ mod tests {
                     error: 0,
                 });
             } else {
-                driver.send(BackendEvent::FilterFault {
+                driver.send(BackendEvent::TreatmentFault {
                     key,
                     failure: treatment_failure(
                         key,
@@ -2537,7 +2622,7 @@ mod tests {
     fn runtime_one_live_restore_projects_typed_failure_and_never_saves_candidate_or_restore() {
         use crate::domain::{
             failure::{FilterConfirmationFailure, FilterErrorKind},
-            state::FilterPass,
+            state::TreatmentPass,
         };
         for restore_fails in [false, true] {
             let store = WritableSettings::new();
@@ -2547,13 +2632,13 @@ mod tests {
             let original = std::fs::read(store.path()).unwrap();
             let candidate = treatment_chain(false);
             edit_filters(&mut runtime, &candidate);
-            let (id, key) = begin_live_filters(&mut runtime, &driver);
+            let (id, key) = begin_live_treatments(&mut runtime, &driver);
             let stale_close = format!(
-                "close ApplyingFilters {} {} Complete",
+                "close ApplyingTreatments {} {} Complete",
                 key.apply.get(),
                 key.attempt.get()
             );
-            driver.send(BackendEvent::FilterResult {
+            driver.send(BackendEvent::TreatmentResult {
                 id: id.get(),
                 key,
                 result: Err(treatment_failure(
@@ -2566,10 +2651,10 @@ mod tests {
             });
             driver.fence();
             let restoring = await_update(&mut runtime, |update| {
-                update.product_phase == "RestoringFilters"
+                update.product_phase == "RestoringTreatments"
             });
             assert!(restoring.failed && !restoring.can_open && !restoring.can_toggle_pause);
-            assert_eq!(restoring.playback_status, "Restoring filters");
+            assert_eq!(restoring.playback_status, "Restoring treatments");
             assert!(
                 restoring.diagnostic.contains("Unconfirmed")
                     && restoring.diagnostic.contains("Deadline")
@@ -2579,22 +2664,22 @@ mod tests {
                 .submitted
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
-            let crate::media::controller::BackendCommand::ApplyFilters { key: restore, .. } =
+            let crate::media::controller::BackendCommand::ApplyTreatments { key: restore, .. } =
                 command
             else {
                 panic!("the selected route must send one live restore command")
             };
-            assert_eq!(restore.pass, FilterPass::LiveRestore);
+            assert_eq!(restore.pass, TreatmentPass::Restore);
             let snapshot = runtime_snapshot(runtime.engine.as_mut().unwrap());
-            assert_eq!(snapshot["filter_pass"], "LiveRestore");
+            assert_eq!(snapshot["treatment_pass"], "Restore");
             runtime.qualification_command(&stale_close);
             assert!(runtime.command_error.contains("stale"));
             assert_eq!(
                 runtime.engine.as_ref().unwrap().model().phase(),
-                ProductPhase::RestoringFilters
+                ProductPhase::RestoringTreatments
             );
             if restore_fails {
-                driver.send(BackendEvent::FilterResult {
+                driver.send(BackendEvent::TreatmentResult {
                     id: restore_id.get(),
                     key: restore,
                     result: Err(treatment_failure(
@@ -2617,7 +2702,7 @@ mod tests {
                         && failed.diagnostic.contains("Deadline")
                 );
             } else {
-                confirm_filters(&driver, restore_id, restore);
+                confirm_treatments(&driver, restore_id, restore);
                 let restored = await_update(&mut runtime, |update| {
                     update.product_phase == "ErrorWithActiveRestored"
                 });
@@ -2716,7 +2801,7 @@ mod tests {
             panic!("initial physical opening missing");
         };
         assert!(!prepared_paused_presentation(&model, Some(old.attempt)));
-        model.open_verified(old);
+        verify_open(&mut model, old);
         let pause = model.prepare_pause(old.attempt).unwrap();
         assert!(model.pause_admitted(old.attempt, pause));
         assert!(model.pause_observed(old.attempt, pause, true));
@@ -2756,7 +2841,7 @@ mod tests {
         ));
         assert!(!prepared_paused_presentation(&model, Some(old.attempt)));
         assert!(!prepared_paused_presentation(&model, None));
-        model.open_verified(recovered);
+        verify_open(&mut model, recovered);
         assert_eq!(model.phase(), ProductPhase::Paused);
         assert!(prepared_paused_presentation(
             &model,
@@ -2785,7 +2870,7 @@ mod tests {
         };
         assert_eq!(request.playback, InitialPlayback::Live);
         assert!(!prepared_paused_presentation(&model, Some(live.attempt)));
-        model.open_verified(live);
+        verify_open(&mut model, live);
         assert!(!prepared_paused_presentation(&model, Some(live.attempt)));
     }
 
@@ -2813,7 +2898,7 @@ mod tests {
         });
         first.send(BackendEvent::FileLoaded);
         first.send(BackendEvent::PlaybackRestart);
-        first.confirm_open_filters();
+        first.confirm_open_treatments();
         first.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
         runtime.qualification_command("draft-video 0 YUYV 1920x1080 30/1");
@@ -2855,7 +2940,7 @@ mod tests {
         });
         second.send(BackendEvent::FileLoaded);
         second.send(BackendEvent::PlaybackRestart);
-        second.confirm_open_filters();
+        second.confirm_open_treatments();
         second.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
         assert_eq!(
@@ -2909,7 +2994,7 @@ mod tests {
         });
         driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
-        driver.confirm_open_filters();
+        driver.confirm_open_treatments();
         driver.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
         assert_eq!(runtime.pause(attempt), SubmitStatus::Accepted);
@@ -3130,10 +3215,9 @@ mod tests {
         let before = runtime.engine.as_ref().unwrap().model().state_identity();
         // Replace only the admission port. Keep the real owner alive, then
         // restore its port before cleanup; this is not a physical owner failure.
-        let unavailable = GateRunner::with_spawner(
-            Ok(crate::media::filter_catalog::fixture_capabilities()),
-            |_, _| panic!("no replacement opening requested"),
-        );
+        let unavailable = GateRunner::with_spawner(fixture_treatment_capabilities(), |_, _| {
+            panic!("no replacement opening requested")
+        });
         let original =
             std::mem::replace(runtime.engine.as_mut().unwrap().runner_mut(), unavailable);
         let rejected = runtime.qualification_command("pause 1");
@@ -3276,7 +3360,7 @@ mod tests {
                         });
                         restored_owner.send(BackendEvent::FileLoaded);
                         restored_owner.send(BackendEvent::PlaybackRestart);
-                        restored_owner.confirm_open_filters();
+                        restored_owner.confirm_open_treatments();
                         restored_owner.fence();
                         await_update(&mut runtime, |update| update.can_toggle_pause);
                         assert_eq!(
@@ -3435,7 +3519,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel();
         let runner = GateRunner::with_spawner(
-            Ok(crate::media::filter_catalog::fixture_capabilities()),
+            fixture_treatment_capabilities(),
             move |generation, config| {
                 let requested = config.video.requested();
                 let input = config
@@ -3444,7 +3528,7 @@ mod tests {
                     .unwrap();
                 let requested = input.requested().clone();
                 let (driver, backend) = Driver::pair(Config::default());
-                let backend = backend.with_open_filters(config.filter_key, config.compiled_filters);
+                let backend = backend.with_open_treatments(config.treatment_key, config.treatments);
                 tx.send((driver, config.watch)).unwrap();
                 OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
             },
@@ -3602,7 +3686,7 @@ mod tests {
         }));
         driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
-        driver.confirm_open_filters();
+        driver.confirm_open_treatments();
         driver.fence();
         let active = await_update(&mut runtime, |update| update.can_toggle_pause);
         assert_eq!(
@@ -3754,7 +3838,7 @@ mod tests {
         });
         driver.send(BackendEvent::FileLoaded);
         driver.send(BackendEvent::PlaybackRestart);
-        driver.confirm_open_filters();
+        driver.confirm_open_treatments();
         driver.fence();
         await_update(&mut runtime, |update| update.phase == GatePhase::Ready);
         let attempt = AttemptId::new(opening.generation).unwrap();
@@ -3797,7 +3881,7 @@ mod tests {
         };
         let mut runtime = RuntimeCoordinator::new(
             String::new(),
-            Ok(crate::media::filter_catalog::fixture_capabilities()),
+            fixture_treatment_capabilities(),
             startup,
             persistence,
             vec![],
@@ -3923,7 +4007,7 @@ mod tests {
             });
             driver.send(BackendEvent::FileLoaded);
             driver.send(BackendEvent::PlaybackRestart);
-            driver.confirm_open_filters();
+            driver.confirm_open_treatments();
             driver.fence();
             let restored = await_update(&mut runtime, |update| update.can_toggle_pause);
             assert!(!restored.draft_dirty && !restored.failed);
@@ -4136,5 +4220,74 @@ mod tests {
         assert!(quitting.quit, "catalog retirement must authorize quit");
         assert!(quitting.changed, "quit authorization must set changed");
         assert!(runtime.catalog_join_error.is_none());
+    }
+
+    fn renderer_settings_with_interpolation(
+        interpolation: bool,
+    ) -> crate::domain::render::RendererSettings {
+        let mut values = crate::domain::render::RendererSettings::default().values();
+        values.interpolation = interpolation;
+        crate::domain::render::RendererSettings::new(values).unwrap()
+    }
+
+    #[test]
+    fn runtime_renderer_edit_is_stored_in_the_draft_until_an_explicit_apply() {
+        let (mut runtime, drivers) = runtime();
+        let before = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .draft()
+            .revision
+            .get();
+        let requested = renderer_settings_with_interpolation(true);
+        let update = runtime.qualification_command(&format!(
+            "draft-renderer {before} {}",
+            serde_json::to_string(&requested).unwrap(),
+        ));
+        assert!(update.changed);
+        assert!(
+            update.diagnostic.contains(INTERPOLATION_INACTIVE_TEXT),
+            "interpolation notice must ride the existing bounded diagnostic bridge: {}",
+            update.diagnostic
+        );
+        {
+            let model = runtime.engine.as_ref().unwrap().model();
+            assert_eq!(model.draft().settings.renderer, requested);
+            assert!(model.draft().revision.get() > before);
+            // Editing stores the request only: nothing is applied or opened.
+            assert!(model.active().is_none());
+            assert!(model.last_valid().is_none());
+        }
+        assert!(
+            drivers.try_recv().is_err(),
+            "a draft renderer edit never opens a backend owner"
+        );
+        let snapshot = runtime_snapshot(runtime.engine.as_mut().unwrap());
+        assert_eq!(snapshot["draft"]["renderer"], serde_json::json!(&requested));
+        assert_eq!(snapshot["active_settings"], serde_json::Value::Null);
+        assert_eq!(snapshot["treatments"], serde_json::Value::Null);
+        // A stale revision is refused without moving the stored draft.
+        let stale = runtime.qualification_command(&format!(
+            "draft-renderer {before} {}",
+            serde_json::to_string(&renderer_settings_with_interpolation(false)).unwrap(),
+        ));
+        assert!(
+            stale.diagnostic.contains("draft revision is stale"),
+            "stale revision must be refused: {}",
+            stale.diagnostic
+        );
+        assert_eq!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .draft()
+                .settings
+                .renderer,
+            requested
+        );
     }
 }

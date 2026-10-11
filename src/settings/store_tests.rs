@@ -8,17 +8,20 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use furami::domain::capture::{
+use crate::domain::capture::{
     AudioSelection, AudioSourceIdentity, CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate,
     FrameSize, ModeRequest, PlaybackGain, UsbTopology,
 };
-use furami::domain::filters::{
+use crate::domain::filters::{
     ColorLevels, EqParams, EqValues, Filter, FilterChain, FilterEntry, FormatParams, Hqdn3dParams,
     Hqdn3dValues, SdrGamma, SdrMatrix,
 };
-use furami::domain::output::{PersistentOutputChoice, SinkIdentity};
-use furami::domain::state::{AppliedSettings, DraftSettings, ModelEffect, ProductModel};
-use furami::settings::{
+use crate::domain::output::{PersistentOutputChoice, SinkIdentity};
+use crate::domain::render::{
+    DebandValues, DitherMode, RendererSettings, RendererValues, ScalerChoice, ScalerKernel,
+};
+use crate::domain::state::{AppliedSettings, DraftSettings, ModelEffect, ProductModel};
+use crate::settings::{
     Durability, LoadOutcome, LocalPreferences, SettingsLoadError, SettingsStore,
     SettingsWriteError, WriteFaultPoint, WriteOutcome,
 };
@@ -91,7 +94,7 @@ fn source_identity() -> AudioSourceIdentity {
 
 fn draft_settings() -> DraftSettings {
     DraftSettings {
-        filters: furami::domain::filters::FilterChain::default(),
+        filters: crate::domain::filters::FilterChain::default(),
         video: ModeRequest {
             identity: identity(),
             mode: mode(0x3231_564E, 1920, 1080, 60000, 1001),
@@ -99,6 +102,7 @@ fn draft_settings() -> DraftSettings {
         audio: AudioSelection::Enabled {
             source: source_identity(),
         },
+        renderer: crate::domain::render::RendererSettings::default(),
     }
 }
 
@@ -111,7 +115,8 @@ fn preferences() -> LocalPreferences {
 }
 
 /// Mints an `AppliedSettings` through the only legitimate producer: a full
-/// verified open on the product model.
+/// verified open on the product model. The aggregate is keyed to the model's
+/// actual opening request and built with the pub(crate) checked fixture proof.
 fn applied_settings(settings: DraftSettings) -> AppliedSettings {
     let mut model = ProductModel::new(settings);
     model
@@ -121,8 +126,26 @@ fn applied_settings(settings: DraftSettings) -> AppliedSettings {
     let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
         panic!("initial open effect missing");
     };
-    model.open_verified(key);
+    open_verified(&mut model, key);
     model.last_valid().unwrap().clone()
+}
+
+/// Open aggregate keyed to the physical opening: the media owner returns it
+/// only after nine native renderer readbacks plus its vf proof.
+fn open_verified(model: &mut ProductModel, key: crate::domain::state::AttemptKey) {
+    use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
+    let request = model.opening_request().expect("opening request for proof");
+    let treatment = TreatmentAttemptKey {
+        apply: key.apply,
+        attempt: key.attempt,
+        pass: TreatmentPass::Open,
+    };
+    let confirmation = crate::media::controller::test_support::treatment_confirmation(
+        treatment,
+        request.playback,
+        request.settings.renderer.clone(),
+    );
+    model.open_verified(key, confirmation);
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +710,7 @@ fn stored_fps_is_exact_integer_rational() {
     // Write a 120/2 request: it must land normalized as 60/1, never as a
     // float, and 60000/1001 must survive untouched.
     let draft = DraftSettings {
-        filters: furami::domain::filters::FilterChain::default(),
+        filters: crate::domain::filters::FilterChain::default(),
         video: ModeRequest {
             identity: DeviceIdentity::new(
                 0x1234,
@@ -699,6 +722,7 @@ fn stored_fps_is_exact_integer_rational() {
             mode: mode(0x3231_564E, 1280, 720, 120, 2),
         },
         audio: AudioSelection::Disabled { retained: None },
+        renderer: crate::domain::render::RendererSettings::default(),
     };
     let applied = applied_settings(draft);
     let (mut store, outcome) = SettingsStore::load(path.clone());
@@ -1833,5 +1857,319 @@ fn full_chain_rename_fault_preserves_the_original_and_reports_persistence_separa
         stored.applied.as_ref().unwrap().filters,
         three_entry_chain()
     );
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Renderer persistence (FUR-016)
+// ---------------------------------------------------------------------------
+
+/// The complete non-baseline renderer pinned by the product reference fixture.
+const REFERENCE_RENDERER_JSON: &str =
+    include_str!("../../tests/fixtures/FUR-016/reference-renderer.json");
+
+fn reference_renderer_json() -> &'static str {
+    REFERENCE_RENDERER_JSON.trim()
+}
+
+/// The reference fixture rebuilt through the validating domain constructor.
+fn reference_renderer() -> RendererSettings {
+    RendererSettings::new(RendererValues {
+        scale: ScalerKernel::EwaLanczosSharp,
+        cscale: ScalerChoice::Kernel(ScalerKernel::EwaLanczosSharp),
+        dscale: ScalerChoice::Kernel(ScalerKernel::Mitchell),
+        scale_antiring: 0.7,
+        dither: DitherMode::ErrorDiffusion,
+        deband: DebandValues {
+            enabled: true,
+            iterations: 2,
+            grain: 16.0,
+        },
+        interpolation: false,
+    })
+    .unwrap()
+}
+
+/// Inject a `renderer` member into the object-form `APPLIED` fixture.
+fn applied_with_renderer(renderer_json: &str) -> String {
+    let inner = APPLIED
+        .strip_suffix('}')
+        .expect("APPLIED fixture is an object");
+    format!(r#"{inner},"renderer":{renderer_json}}}"#)
+}
+
+fn draft_with_renderer(renderer: RendererSettings) -> DraftSettings {
+    DraftSettings {
+        renderer,
+        ..draft_settings()
+    }
+}
+
+#[test]
+fn pre_renderer_v1_document_loads_baseline_and_reencodes_byte_for_byte() {
+    let directory = temp_dir("renderer-parity");
+    let path = settings_path(&directory);
+    let original = canonical_document();
+    fs::write(&path, &original).unwrap();
+
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("pre-renderer v1 document must load, got {outcome:?}");
+    };
+    let loaded = document.applied.as_ref().expect("applied present");
+    assert_eq!(loaded.renderer, RendererSettings::default());
+    assert!(loaded.renderer.is_baseline());
+
+    store
+        .save_applied(&applied_settings(draft_settings()), preferences())
+        .unwrap();
+
+    let written = fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        written,
+        format!("{original}\n"),
+        "a baseline renderer must not add a renderer key"
+    );
+    assert!(
+        !written.contains("renderer"),
+        "no renderer key on a baseline document: {written}"
+    );
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn reference_renderer_round_trips_exactly_through_the_store() {
+    let directory = temp_dir("renderer-roundtrip");
+    let path = settings_path(&directory);
+    let reference = reference_renderer_json();
+    fs::write(
+        &path,
+        document_with_applied(&applied_with_renderer(reference)),
+    )
+    .unwrap();
+
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("reference renderer document must load, got {outcome:?}");
+    };
+    let loaded = document.applied.as_ref().expect("applied present");
+    assert_eq!(loaded.renderer, reference_renderer());
+    assert!(!loaded.renderer.is_baseline());
+
+    let applied = applied_settings(draft_with_renderer(reference_renderer()));
+    store.save_applied(&applied, preferences()).unwrap();
+
+    let written = fs::read_to_string(&path).unwrap();
+    let expected = serde_json::to_string(&reference_renderer()).unwrap();
+    assert!(
+        written.contains(&format!(r#""renderer":{expected}"#)),
+        "a non-baseline renderer is persisted in full: {written}"
+    );
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(reloaded) = outcome else {
+        panic!("re-encoded reference must load");
+    };
+    assert_eq!(
+        reloaded.applied.as_ref().unwrap().renderer,
+        reference_renderer()
+    );
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn malformed_renderer_json_refuses_the_complete_original_and_blocks_saves_until_reset() {
+    let base = concat!(
+        r#"{"scale":"lanczos","cscale":"auto","dscale":"hermite","scale_antiring":0.0,"#,
+        r#""dither":"fruit","deband":{"enabled":false,"iterations":1,"grain":32},"interpolation":false}"#,
+    );
+    let duplicate_renderer_key = {
+        let inner = APPLIED
+            .strip_suffix('}')
+            .expect("APPLIED fixture is an object");
+        let r = reference_renderer_json();
+        let applied = format!(r#"{inner},"renderer":{r},"renderer":{r}}}"#);
+        format!(r#"{{"schema_version":1,"applied":{applied},"preferences":{PREFS}}}"#)
+    };
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "renderer null",
+            document_with_applied(&applied_with_renderer("null")),
+        ),
+        (
+            "renderer array",
+            document_with_applied(&applied_with_renderer("[]")),
+        ),
+        (
+            "renderer string",
+            document_with_applied(&applied_with_renderer("\"lanczos\"")),
+        ),
+        (
+            "renderer number",
+            document_with_applied(&applied_with_renderer("1")),
+        ),
+        (
+            "renderer missing field",
+            document_with_applied(&applied_with_renderer(
+                r#"{"scale":"lanczos","cscale":"auto"}"#,
+            )),
+        ),
+        (
+            "renderer empty object",
+            document_with_applied(&applied_with_renderer("{}")),
+        ),
+        (
+            "renderer unknown field",
+            document_with_applied(&applied_with_renderer(
+                r#"{"scale":"lanczos","cscale":"auto","dscale":"hermite","scale_antiring":0.0,"dither":"fruit","deband":{"enabled":false,"iterations":1,"grain":32},"interpolation":false,"extra":1}"#,
+            )),
+        ),
+        (
+            "scale auto refused",
+            document_with_applied(&applied_with_renderer(
+                &base.replace(r#""scale":"lanczos""#, r#""scale":"auto""#),
+            )),
+        ),
+        (
+            "unknown kernel token",
+            document_with_applied(&applied_with_renderer(
+                &base.replace(r#""scale":"lanczos""#, r#""scale":"sharpen""#),
+            )),
+        ),
+        (
+            "non-string kernel",
+            document_with_applied(&applied_with_renderer(
+                &base.replace(r#""scale":"lanczos""#, r#""scale":1"#),
+            )),
+        ),
+        (
+            "null kernel",
+            document_with_applied(&applied_with_renderer(
+                &base.replace(r#""scale":"lanczos""#, r#""scale":null"#),
+            )),
+        ),
+        (
+            "antiring out of range",
+            document_with_applied(&applied_with_renderer(
+                &base.replace(r#""scale_antiring":0.0"#, r#""scale_antiring":1.5"#),
+            )),
+        ),
+        (
+            "iterations out of range",
+            document_with_applied(&applied_with_renderer(&base.replace(
+                r#""enabled":false,"iterations":1"#,
+                r#""enabled":false,"iterations":17"#,
+            ))),
+        ),
+        (
+            "grain out of range",
+            document_with_applied(&applied_with_renderer(&base.replace(
+                r#""iterations":1,"grain":32"#,
+                r#""iterations":1,"grain":4097"#,
+            ))),
+        ),
+        (
+            "disabled deband still validated",
+            document_with_applied(&applied_with_renderer(&base.replace(
+                r#""enabled":false,"iterations":1,"grain":32"#,
+                r#""enabled":false,"iterations":1,"grain":5000"#,
+            ))),
+        ),
+        (
+            "deband positional array",
+            document_with_applied(&applied_with_renderer(&base.replace(
+                r#"{"enabled":false,"iterations":1,"grain":32}"#,
+                r#"[false,1,32]"#,
+            ))),
+        ),
+        (
+            "deband unknown field",
+            document_with_applied(&applied_with_renderer(&base.replace(
+                r#"{"enabled":false,"iterations":1,"grain":32}"#,
+                r#"{"enabled":false,"iterations":1,"grain":32,"extra":1}"#,
+            ))),
+        ),
+        (
+            "deband missing field",
+            document_with_applied(&applied_with_renderer(&base.replace(
+                r#"{"enabled":false,"iterations":1,"grain":32}"#,
+                r#"{"enabled":false}"#,
+            ))),
+        ),
+        (
+            "interpolation non-bool",
+            document_with_applied(&applied_with_renderer(
+                &base.replace(r#""interpolation":false"#, r#""interpolation":"no""#),
+            )),
+        ),
+        (
+            "unknown dither",
+            document_with_applied(&applied_with_renderer(
+                &base.replace(r#""dither":"fruit""#, r#""dither":"floyd""#),
+            )),
+        ),
+        (
+            "duplicate scale",
+            document_with_applied(&applied_with_renderer(&base.replace(
+                r#""scale":"lanczos""#,
+                r#""scale":"lanczos","scale":"mitchell""#,
+            ))),
+        ),
+        (
+            "duplicate scale order-reversed",
+            document_with_applied(&applied_with_renderer(&base.replace(
+                r#""interpolation":false}"#,
+                r#""interpolation":false,"scale":"lanczos","scale":"mitchell"}"#,
+            ))),
+        ),
+        ("duplicate renderer key", duplicate_renderer_key),
+    ];
+
+    let directory = temp_dir("renderer-violations");
+    let path = settings_path(&directory);
+    let applied = applied_settings(draft_with_renderer(reference_renderer()));
+    for (label, json) in cases {
+        fs::write(&path, &json).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let (mut store, outcome) = SettingsStore::load(path.clone());
+        assert!(
+            matches!(
+                outcome,
+                LoadOutcome::Refused(SettingsLoadError::Schema { .. })
+            ),
+            "{label}: expected schema refusal, got {outcome:?}"
+        );
+        assert!(store.is_refused(), "{label}");
+        assert!(store.snapshot().is_none(), "{label}");
+        assert!(
+            matches!(
+                store.save_applied(&applied, preferences()),
+                Err(SettingsWriteError::RefusedOriginal { .. })
+            ),
+            "{label}: applied write must stay blocked"
+        );
+        assert!(
+            matches!(
+                store.save_preferences(preferences()),
+                Err(SettingsWriteError::RefusedOriginal { .. })
+            ),
+            "{label}: preference write must stay blocked"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "{label}: the complete original must be preserved"
+        );
+        assert_no_temp_files(&directory);
+
+        // Only an explicit reset clears the refusal.
+        store.reset(preferences()).unwrap();
+        assert!(!store.is_refused(), "{label}");
+        let (_, outcome) = SettingsStore::load(path.clone());
+        assert!(
+            matches!(outcome, LoadOutcome::Loaded(_)),
+            "{label}: reset must produce a loadable document"
+        );
+    }
     fs::remove_dir_all(&directory).unwrap();
 }

@@ -5,22 +5,22 @@ use crate::domain::{
     failure::{
         FilterAttemptDiagnostics, FilterDiagnosticRecord, FilterEntryMetadata, FilterFailure,
     },
-    state::{FilterAttemptKey, FilterConfirmation},
+    state::{FilterConfirmation, TreatmentAttemptKey},
 };
 
 /// Structured serialization escapes inert labels and native log controls.
-pub(crate) fn filter_begin(key: FilterAttemptKey, entries: &[FilterEntryMetadata]) {
+pub(crate) fn filter_begin(key: TreatmentAttemptKey, entries: &[FilterEntryMetadata]) {
     let event = serde_json::json!({"key": key, "entries": entries});
     tracing::info!(event = %event, "filter_attempt_begin");
 }
 
-pub(crate) fn filter_record(key: FilterAttemptKey, record: &FilterDiagnosticRecord) {
+pub(crate) fn filter_record(key: TreatmentAttemptKey, record: &FilterDiagnosticRecord) {
     let event = serde_json::json!({"key": key, "record": record});
     tracing::info!(event = %event, "filter_mpv_record");
 }
 
 pub(crate) fn filter_end(
-    key: FilterAttemptKey,
+    key: TreatmentAttemptKey,
     result: Result<&FilterConfirmation, &FilterFailure>,
     diagnostics: &FilterAttemptDiagnostics,
 ) {

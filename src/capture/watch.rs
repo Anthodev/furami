@@ -794,6 +794,7 @@ fn settings(target: &RecoveryWatchTarget) -> DraftSettings {
         filters: crate::domain::filters::FilterChain::default(),
         video: target.video.clone(),
         audio: target.audio.clone(),
+        renderer: crate::domain::render::RendererSettings::default(),
     }
 }
 pub(super) fn observation_failure(
@@ -1759,6 +1760,26 @@ mod tests {
         key
     }
 
+    /// Open aggregate keyed to the physical opening: the media owner returns it
+    /// only after nine native renderer readbacks plus its vf proof.
+    fn verify_open(
+        model: &mut crate::domain::state::ProductModel,
+        key: crate::domain::state::AttemptKey,
+    ) {
+        let request = model.opening_request().expect("opening request for proof");
+        let treatment = crate::domain::state::TreatmentAttemptKey {
+            apply: key.apply,
+            attempt: key.attempt,
+            pass: crate::domain::state::TreatmentPass::Open,
+        };
+        let confirmation = crate::media::controller::test_support::treatment_confirmation(
+            treatment,
+            request.playback,
+            request.settings.renderer.clone(),
+        );
+        model.open_verified(key, confirmation);
+    }
+
     fn active_model(
         identity: DeviceIdentity,
         devices: &[(DeviceIdentity, &str, &str, &str)],
@@ -1775,6 +1796,7 @@ mod tests {
                 mode: mode(),
             },
             audio: AudioSelection::default(),
+            renderer: crate::domain::render::RendererSettings::default(),
         };
         let mut model = ProductModel::new(settings);
         let (_, effect) = model
@@ -1785,7 +1807,7 @@ mod tests {
         let first = scan(&mut inventory, snapshot(devices));
         model.recovery_observed(&first.observation);
         let key = open_model_from_scan(&mut model, &first, None);
-        model.open_verified(key);
+        verify_open(&mut model, key);
         assert!(model.active().is_some());
         (model, inventory, key)
     }

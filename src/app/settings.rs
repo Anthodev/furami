@@ -87,7 +87,7 @@ enum CloseState {
     Open,
     ConfirmDraft {
         revision: DraftRevision,
-        settings: DraftSettings,
+        settings: Box<DraftSettings>,
     },
     Draining,
     SaveFailed,
@@ -238,22 +238,23 @@ impl PersistenceSession {
                     && self.user_open == Some(key)
                     && applied.settings().video.mode == submitted.settings.video.mode
                     && applied.settings().audio == submitted.settings.audio
-                    && applied.settings().filters == submitted.settings.filters =>
+                    && applied.settings().filters == submitted.settings.filters
+                    && applied.settings().renderer == submitted.settings.renderer =>
             {
                 applied
             }
             (
-                ApplyAdmission::Filters {
+                ApplyAdmission::Treatments {
                     key: admitted,
                     revision: admitted_revision,
                 },
-                VerifiedApplied::Filters {
+                VerifiedApplied::Treatments {
                     key,
                     revision,
                     applied,
                 },
             ) if *admitted == key
-                && key.pass == crate::domain::state::FilterPass::LiveCandidate
+                && key.pass == crate::domain::state::TreatmentPass::Candidate
                 && *admitted_revision == revision
                 && submitted.revision == revision
                 && applied.settings() == &submitted.settings =>
@@ -324,7 +325,7 @@ impl PersistenceSession {
         {
             self.close = CloseState::ConfirmDraft {
                 revision,
-                settings: settings.clone(),
+                settings: Box::new(settings.clone()),
             };
             false
         } else {
@@ -352,10 +353,10 @@ impl PersistenceSession {
         let Some((current, current_revision)) = draft else {
             return false;
         };
-        if revision != *expected || current_revision != *expected || current != settings {
+        if revision != *expected || current_revision != *expected || current != settings.as_ref() {
             self.close = CloseState::ConfirmDraft {
                 revision: current_revision,
-                settings: current.clone(),
+                settings: Box::new(current.clone()),
             };
             return false;
         }
@@ -524,7 +525,27 @@ mod tests {
                 },
             },
             audio: AudioSelection::default(),
+            renderer: crate::domain::render::RendererSettings::default(),
         }
+    }
+    fn reference_renderer() -> crate::domain::render::RendererSettings {
+        use crate::domain::render::{
+            DebandValues, DitherMode, RendererSettings, RendererValues, ScalerChoice, ScalerKernel,
+        };
+        RendererSettings::new(RendererValues {
+            scale: ScalerKernel::EwaLanczosSharp,
+            cscale: ScalerChoice::Kernel(ScalerKernel::EwaLanczosSharp),
+            dscale: ScalerChoice::Kernel(ScalerKernel::Mitchell),
+            scale_antiring: 0.7,
+            dither: DitherMode::ErrorDiffusion,
+            deband: DebandValues {
+                enabled: true,
+                iterations: 2,
+                grain: 16.0,
+            },
+            interpolation: false,
+        })
+        .unwrap()
     }
     fn source(serial: &str) -> AudioSourceIdentity {
         AudioSourceIdentity::new(
@@ -532,6 +553,22 @@ mod tests {
             vec![("device.serial".into(), serial.into())],
         )
         .unwrap()
+    }
+    /// Open aggregate keyed to the physical opening: the media owner returns it
+    /// only after nine native renderer readbacks plus its vf proof.
+    fn verify_open(model: &mut ProductModel, key: crate::domain::state::AttemptKey) {
+        let request = model.opening_request().expect("opening request for proof");
+        let treatment = crate::domain::state::TreatmentAttemptKey {
+            apply: key.apply,
+            attempt: key.attempt,
+            pass: crate::domain::state::TreatmentPass::Open,
+        };
+        let confirmation = crate::media::controller::test_support::treatment_confirmation(
+            treatment,
+            request.playback,
+            request.settings.renderer.clone(),
+        );
+        model.open_verified(key, confirmation);
     }
     fn event(settings: DraftSettings) -> VerifiedApplied {
         let mut model = ProductModel::new(settings);
@@ -542,7 +579,7 @@ mod tests {
         let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
             panic!("opening")
         };
-        model.open_verified(key);
+        verify_open(&mut model, key);
         VerifiedApplied::Open {
             key,
             applied: model.last_valid().unwrap().clone(),
@@ -666,7 +703,7 @@ mod tests {
             ColorLevels, EqParams, EqValues, Filter, FilterChain, FilterEntry, FormatParams,
             Hqdn3dParams, Hqdn3dValues, SdrGamma, SdrMatrix,
         };
-        use crate::domain::state::{FilterAttemptKey, FilterPass};
+        use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
         for live_filters in [false, true] {
             for all_disabled in [false, true] {
                 let temp = Temp::new();
@@ -719,17 +756,17 @@ mod tests {
                 };
                 let revision = DraftRevision::new(1);
                 let (admission, receipt) = if live_filters {
-                    let filters = FilterAttemptKey {
+                    let filters = TreatmentAttemptKey {
                         apply: key.apply,
                         attempt: key.attempt,
-                        pass: FilterPass::LiveCandidate,
+                        pass: TreatmentPass::Candidate,
                     };
                     (
-                        ApplyAdmission::Filters {
+                        ApplyAdmission::Treatments {
                             key: filters,
                             revision,
                         },
-                        VerifiedApplied::Filters {
+                        VerifiedApplied::Treatments {
                             key: filters,
                             revision,
                             applied,
@@ -766,20 +803,20 @@ mod tests {
     #[test]
     fn immutable_filter_admission_cannot_authorize_an_open_receipt_and_cancel_consumes_permission()
     {
-        use crate::domain::state::{FilterAttemptKey, FilterPass};
+        use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
         let temp = Temp::new();
         let mut session = PersistenceSession::load(Ok(temp.file()));
         let receipt = event(selection(60000));
         let VerifiedApplied::Open { key: open, .. } = &receipt else {
             panic!("Open fixture")
         };
-        let key = FilterAttemptKey {
+        let key = TreatmentAttemptKey {
             apply: open.apply,
             attempt: open.attempt,
-            pass: FilterPass::LiveCandidate,
+            pass: TreatmentPass::Candidate,
         };
         session.admit_user_apply(
-            ApplyAdmission::Filters {
+            ApplyAdmission::Treatments {
                 key,
                 revision: DraftRevision::new(3),
             },
@@ -811,21 +848,21 @@ mod tests {
 
     #[test]
     fn immutable_filter_receipts_require_exact_key_revision_and_complete_submission() {
-        use crate::domain::state::{AttemptId, FilterAttemptKey, FilterPass};
+        use crate::domain::state::{AttemptId, TreatmentAttemptKey, TreatmentPass};
         let VerifiedApplied::Open { key: open, applied } = event(selection(60000)) else {
             panic!("fixture")
         };
-        let key = FilterAttemptKey {
+        let key = TreatmentAttemptKey {
             apply: open.apply,
             attempt: open.attempt,
-            pass: FilterPass::LiveCandidate,
+            pass: TreatmentPass::Candidate,
         };
         let revision = DraftRevision::new(3);
-        for mismatch in 0..7 {
+        for mismatch in 0..8 {
             let temp = Temp::new();
             let mut session = PersistenceSession::load(Ok(temp.file()));
             session.admit_user_apply(
-                ApplyAdmission::Filters { key, revision },
+                ApplyAdmission::Treatments { key, revision },
                 Draft {
                     revision: if mismatch == 5 {
                         DraftRevision::new(4)
@@ -841,8 +878,8 @@ mod tests {
             match mismatch {
                 0 => received.apply = ApplyId::new(key.apply.get() + 1).unwrap(),
                 1 => received.attempt = AttemptId::new(key.attempt.get() + 1).unwrap(),
-                2 => received.pass = FilterPass::LiveRestore,
-                3 => received.pass = FilterPass::Open,
+                2 => received.pass = TreatmentPass::Restore,
+                3 => received.pass = TreatmentPass::Open,
                 4 => received_revision = DraftRevision::new(4),
                 5 => {}
                 6 => {
@@ -852,9 +889,19 @@ mod tests {
                     };
                     received_applied = other;
                 }
+                7 => {
+                    // Only the renderer differs from the submitted selection:
+                    // the immutable admission still refuses to authorize it.
+                    let mut different = selection(60000);
+                    different.renderer = reference_renderer();
+                    let VerifiedApplied::Open { applied: other, .. } = event(different) else {
+                        panic!("fixture")
+                    };
+                    received_applied = other;
+                }
                 _ => unreachable!(),
             }
-            session.verified_applied(VerifiedApplied::Filters {
+            session.verified_applied(VerifiedApplied::Treatments {
                 key: received,
                 revision: received_revision,
                 applied: received_applied,
@@ -866,17 +913,17 @@ mod tests {
     }
     #[test]
     fn exact_filter_receipt_saves_once_keeps_newer_draft_dirty_and_cancellation_revokes_it() {
-        use crate::domain::state::{FilterAttemptKey, FilterPass};
+        use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
         let VerifiedApplied::Open { key: open, applied } = event(selection(60000)) else {
             panic!("fixture")
         };
-        let key = FilterAttemptKey {
+        let key = TreatmentAttemptKey {
             apply: open.apply,
             attempt: open.attempt,
-            pass: FilterPass::LiveCandidate,
+            pass: TreatmentPass::Candidate,
         };
         let revision = DraftRevision::new(3);
-        let receipt = VerifiedApplied::Filters {
+        let receipt = VerifiedApplied::Treatments {
             key,
             revision,
             applied,
@@ -885,7 +932,7 @@ mod tests {
             let temp = Temp::new();
             let mut session = PersistenceSession::load(Ok(temp.file()));
             session.admit_user_apply(
-                ApplyAdmission::Filters { key, revision },
+                ApplyAdmission::Treatments { key, revision },
                 Draft {
                     revision,
                     settings: selection(60000),
@@ -1096,7 +1143,7 @@ mod tests {
                     ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma,
                     SdrMatrix,
                 },
-                state::{FilterAttemptKey, FilterPass},
+                state::{TreatmentAttemptKey, TreatmentPass},
             },
             settings::WriteFaultPoint,
         };
@@ -1124,23 +1171,24 @@ mod tests {
                 false,
             )])
             .unwrap();
+            submitted.renderer = reference_renderer();
             let VerifiedApplied::Open { key: open, applied } = event(submitted.clone()) else {
                 panic!("fixture")
             };
-            let key = FilterAttemptKey {
+            let key = TreatmentAttemptKey {
                 apply: open.apply,
                 attempt: open.attempt,
-                pass: FilterPass::LiveCandidate,
+                pass: TreatmentPass::Candidate,
             };
             let revision = DraftRevision::new(2);
             session.admit_user_apply(
-                ApplyAdmission::Filters { key, revision },
+                ApplyAdmission::Treatments { key, revision },
                 Draft {
                     revision,
                     settings: submitted.clone(),
                 },
             );
-            session.verified_applied(VerifiedApplied::Filters {
+            session.verified_applied(VerifiedApplied::Treatments {
                 key,
                 revision,
                 applied,
@@ -1168,15 +1216,30 @@ mod tests {
             session.retry_close_save();
             assert!(session.quit_allowed());
             let document = load_document(temp.file());
-            assert_eq!(document.applied, Some(submitted));
+            assert_eq!(document.applied, Some(submitted.clone()));
             assert_eq!(document.preferences, preferences(23));
+            // The frozen candidate's renderer is what persists; a newer renderer
+            // draft stays unpublished and dirty.
+            assert_eq!(
+                document.applied.as_ref().unwrap().renderer,
+                reference_renderer()
+            );
+            let mut newer = submitted.clone();
+            newer.renderer = crate::domain::render::RendererSettings::default();
+            assert!(session.draft_dirty(Some(&newer)));
         }
     }
 
     #[test]
     fn observed_open_key_cannot_authorize_changed_or_dropped_full_submission() {
-        use crate::domain::filters::{
-            ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
+        use crate::domain::{
+            filters::{
+                ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
+            },
+            render::{
+                DebandValues, DitherMode, RendererSettings, RendererValues, ScalerChoice,
+                ScalerKernel,
+            },
         };
         let mut submitted = selection(60000);
         submitted.filters = FilterChain::new(vec![FilterEntry::new(
@@ -1189,7 +1252,7 @@ mod tests {
             false,
         )])
         .unwrap();
-        for mismatch in 0..3 {
+        for mismatch in 0..4 {
             let temp = Temp::new();
             let mut session = PersistenceSession::load(Ok(temp.file()));
             let mut wrong = submitted.clone();
@@ -1200,6 +1263,22 @@ mod tests {
                     wrong.audio = AudioSelection::Enabled {
                         source: source("unexpected"),
                     }
+                }
+                3 => {
+                    wrong.renderer = RendererSettings::new(RendererValues {
+                        scale: ScalerKernel::Mitchell,
+                        cscale: ScalerChoice::Inherit,
+                        dscale: ScalerChoice::Inherit,
+                        scale_antiring: 0.5,
+                        dither: DitherMode::Ordered,
+                        deband: DebandValues {
+                            enabled: true,
+                            iterations: 2,
+                            grain: 16.0,
+                        },
+                        interpolation: false,
+                    })
+                    .unwrap()
                 }
                 _ => unreachable!(),
             }
@@ -1257,7 +1336,7 @@ mod tests {
             panic!("opening")
         };
         session.observe_opening(key);
-        model.open_verified(key);
+        verify_open(&mut model, key);
         session.verified_applied(VerifiedApplied::Open {
             key,
             applied: model.last_valid().unwrap().clone(),
