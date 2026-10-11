@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use super::state::{DraftSettings, FilterAttemptKey};
+use super::state::{DraftSettings, TreatmentAttemptKey};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum Stage {
@@ -45,6 +45,7 @@ pub enum ValidationLayer {
     Audio,
     Discovery,
     Filters,
+    Renderer,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum LifecycleFailure {
@@ -74,7 +75,7 @@ pub struct ApplyFailure {
     pub requested: Box<DraftSettings>,
     pub operation: String,
     pub evidence: Option<BackendEvidence>,
-    pub filter: Option<Box<FilterFailure>>,
+    pub treatment: Option<Box<TreatmentFailure>>,
     pub diagnostic: String,
 }
 impl ApplyFailure {
@@ -93,7 +94,7 @@ impl ApplyFailure {
             requested: Box::new(requested),
             operation: operation.into(),
             evidence: None,
-            filter: None,
+            treatment: None,
             diagnostic: diagnostic.into(),
         }
     }
@@ -103,8 +104,8 @@ impl ApplyFailure {
         self
     }
 
-    pub fn with_filter(mut self, failure: FilterFailure) -> Self {
-        self.filter = Some(Box::new(failure));
+    pub fn with_treatment(mut self, failure: TreatmentFailure) -> Self {
+        self.treatment = Some(Box::new(failure));
         self
     }
 }
@@ -153,7 +154,7 @@ pub struct FilterDiagnosticRecord {
 pub struct FilterAttemptDiagnostics {
     /// Absent only for prevalidation before a physical owner has been allocated.
     /// Native observation and fault snapshots always retain their exact key.
-    pub key: Option<FilterAttemptKey>,
+    pub key: Option<TreatmentAttemptKey>,
     pub entries: Vec<FilterEntryMetadata>,
     pub records: Vec<FilterDiagnosticRecord>,
     pub native_evidence_lost: bool,
@@ -167,6 +168,75 @@ pub struct FilterFailure {
     pub attributed_ordinal: Option<usize>,
     pub requires_fresh_owner: bool,
     pub diagnostics: FilterAttemptDiagnostics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum RendererOperation {
+    Snapshot,
+    Set,
+    Readback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum RendererErrorKind {
+    CatalogUnavailable,
+    UnsupportedValue,
+    Submission {
+        operation: RendererOperation,
+        mpv_error: i32,
+    },
+    Rejected {
+        mpv_error: i32,
+    },
+    PropertyUnavailable {
+        operation: RendererOperation,
+        mpv_error: i32,
+    },
+    MalformedReadback,
+    ReadbackMismatch,
+    IncumbentMismatch,
+    Deadline {
+        operation: RendererOperation,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RendererFailure {
+    pub property: super::render::RendererProperty,
+    pub kind: RendererErrorKind,
+    pub diagnostic: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum TreatmentFailureDisposition {
+    Untouched,
+    RestoreSameOwner,
+    RestoreFreshOwner,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum TreatmentConfirmationFailure {
+    Deadline,
+    EvidenceLost,
+    BackendUnavailable,
+    PlaybackChanged,
+    ProofMismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum TreatmentErrorKind {
+    Filter(FilterFailure),
+    Renderer(RendererFailure),
+    Unconfirmed {
+        reason: TreatmentConfirmationFailure,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TreatmentFailure {
+    pub key: Option<TreatmentAttemptKey>,
+    pub kind: TreatmentErrorKind,
+    pub disposition: TreatmentFailureDisposition,
 }
 
 /// Owner diagnostic retention bounds. Native loss and failure latches are

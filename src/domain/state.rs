@@ -10,8 +10,9 @@ use super::{
         RecoveryObservation, RecoveryWatchTarget, SelectionToken, VideoPresence, WatchId,
         WatchStamp,
     },
-    failure::{ApplyFailure, FilterErrorKind},
+    failure::ApplyFailure,
     filters::FilterChain,
+    render::RendererSettings,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -19,6 +20,7 @@ pub struct DraftSettings {
     pub video: ModeRequest,
     pub audio: AudioSelection,
     pub filters: FilterChain,
+    pub renderer: RendererSettings,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DraftRevision(u64);
@@ -80,17 +82,17 @@ pub struct AttemptKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub enum FilterPass {
-    LiveCandidate,
-    LiveRestore,
+pub enum TreatmentPass {
+    Candidate,
+    Restore,
     Open,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct FilterAttemptKey {
+pub struct TreatmentAttemptKey {
     pub apply: ApplyId,
     pub attempt: AttemptId,
-    pub pass: FilterPass,
+    pub pass: TreatmentPass,
 }
 
 /// Immutable authorization supplied before any owner work is submitted.
@@ -99,8 +101,8 @@ pub enum ApplyAdmission {
     Open {
         apply: ApplyId,
     },
-    Filters {
-        key: FilterAttemptKey,
+    Treatments {
+        key: TreatmentAttemptKey,
         revision: DraftRevision,
     },
 }
@@ -108,7 +110,7 @@ impl ApplyAdmission {
     pub fn id(&self) -> ApplyId {
         match self {
             Self::Open { apply } => *apply,
-            Self::Filters { key, .. } => key.apply,
+            Self::Treatments { key, .. } => key.apply,
         }
     }
 }
@@ -116,7 +118,7 @@ impl ApplyAdmission {
 /// Only media observation may construct this value; it is never deserialized.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct FilterConfirmation {
-    key: FilterAttemptKey,
+    key: TreatmentAttemptKey,
     baseline: f64,
     last_position: f64,
     advances: u16,
@@ -127,7 +129,7 @@ impl FilterConfirmation {
     pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     pub const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-    pub fn key(&self) -> FilterAttemptKey {
+    pub fn key(&self) -> TreatmentAttemptKey {
         self.key
     }
     pub fn baseline(&self) -> f64 {
@@ -147,7 +149,7 @@ impl FilterConfirmation {
     /// reads or elapsed intervals. This boundary checks the numeric summary;
     /// the keyed media observer owns the event-ordering proof.
     pub(crate) fn checked(
-        key: FilterAttemptKey,
+        key: TreatmentAttemptKey,
         baseline: f64,
         last_position: f64,
         advances: u16,
@@ -167,6 +169,121 @@ impl FilterConfirmation {
             baseline,
             last_position,
             advances,
+        })
+    }
+}
+
+/// Native vf provenance survives renderer-only treatment commits.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub enum FilterEvidence {
+    Confirmed(FilterConfirmation),
+    PreparedPaused { key: TreatmentAttemptKey },
+}
+impl FilterEvidence {
+    pub fn key(&self) -> TreatmentAttemptKey {
+        match self {
+            Self::Confirmed(confirmation) => confirmation.key(),
+            Self::PreparedPaused { key } => *key,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub enum FilterTreatmentProof {
+    Reconfigured(FilterConfirmation),
+    Preserved { origin: FilterEvidence },
+    PreparedPaused { key: TreatmentAttemptKey },
+}
+impl FilterTreatmentProof {
+    pub fn origin(&self) -> FilterEvidence {
+        match self {
+            Self::Reconfigured(confirmation) => FilterEvidence::Confirmed(*confirmation),
+            Self::Preserved { origin } => *origin,
+            Self::PreparedPaused { key } => FilterEvidence::PreparedPaused { key: *key },
+        }
+    }
+}
+
+/// Constructed by media only after all nine native readbacks and a clean drain.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RendererConfirmation {
+    key: TreatmentAttemptKey,
+    settings: RendererSettings,
+}
+impl RendererConfirmation {
+    pub fn key(&self) -> TreatmentAttemptKey {
+        self.key
+    }
+    pub fn settings(&self) -> &RendererSettings {
+        &self.settings
+    }
+    pub(crate) fn checked(key: TreatmentAttemptKey, settings: RendererSettings) -> Self {
+        Self { key, settings }
+    }
+}
+
+/// One indivisible applied result; neither constituent proof commits alone.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TreatmentConfirmation {
+    key: TreatmentAttemptKey,
+    playback: InitialPlayback,
+    filters: FilterTreatmentProof,
+    renderer: RendererConfirmation,
+}
+impl TreatmentConfirmation {
+    pub fn key(&self) -> TreatmentAttemptKey {
+        self.key
+    }
+    pub fn playback(&self) -> InitialPlayback {
+        self.playback
+    }
+    pub fn filters(&self) -> &FilterTreatmentProof {
+        &self.filters
+    }
+    pub fn renderer(&self) -> &RendererConfirmation {
+        &self.renderer
+    }
+    pub(crate) fn checked(
+        key: TreatmentAttemptKey,
+        playback: InitialPlayback,
+        vf_changed: bool,
+        filters: FilterTreatmentProof,
+        renderer: RendererConfirmation,
+    ) -> Result<Self, super::failure::TreatmentConfirmationFailure> {
+        use super::failure::TreatmentConfirmationFailure::ProofMismatch;
+        if renderer.key() != key {
+            return Err(ProofMismatch);
+        }
+        let valid = match &filters {
+            FilterTreatmentProof::Reconfigured(confirmation) => {
+                vf_changed && playback == InitialPlayback::Live && confirmation.key() == key
+            }
+            FilterTreatmentProof::Preserved { origin } => {
+                !vf_changed
+                    && key.pass != TreatmentPass::Open
+                    && origin.key().attempt == key.attempt
+                    && match origin {
+                        FilterEvidence::Confirmed(_) => true,
+                        FilterEvidence::PreparedPaused { key: origin } => {
+                            origin.pass == TreatmentPass::Open
+                                && playback == InitialPlayback::Paused
+                        }
+                    }
+            }
+            FilterTreatmentProof::PreparedPaused { key: prepared } => {
+                *prepared == key
+                    && key.pass == TreatmentPass::Open
+                    && playback == InitialPlayback::Paused
+            }
+        };
+        if !valid {
+            return Err(ProofMismatch);
+        }
+        Ok(Self {
+            key,
+            playback,
+            filters,
+            renderer,
         })
     }
 }
@@ -247,8 +364,8 @@ pub enum CleanupStatus {
 pub enum ProductPhase {
     Stopped,
     Active,
-    ApplyingFilters,
-    RestoringFilters,
+    ApplyingTreatments,
+    RestoringTreatments,
     PausePending,
     Paused,
     Validating,
@@ -278,7 +395,7 @@ pub struct StateIdentity {
     cleanup: u8,
     playback: Option<PlaybackState>,
     observation: Option<WatchStamp>,
-    filter_pass: Option<FilterPass>,
+    treatment_pass: Option<TreatmentPass>,
 }
 impl StateIdentity {
     pub fn phase(self) -> ProductPhase {
@@ -290,8 +407,8 @@ impl StateIdentity {
     pub fn attempt(self) -> Option<AttemptId> {
         self.attempt
     }
-    pub fn filter_pass(self) -> Option<FilterPass> {
-        self.filter_pass
+    pub fn treatment_pass(self) -> Option<TreatmentPass> {
+        self.treatment_pass
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,8 +426,8 @@ pub enum StopIntent {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelEffect {
     Validate(ValidationRequest),
-    ApplyFilters {
-        key: FilterAttemptKey,
+    ApplyTreatments {
+        key: TreatmentAttemptKey,
     },
     Open {
         key: AttemptKey,
@@ -387,29 +504,29 @@ pub struct Transition {
     requested_target: DraftSettings,
     prior: Option<AppliedSettings>,
     prior_owner: Option<PriorOwner>,
-    filter_restore: bool,
+    treatment_restore: bool,
     origin: Origin,
     step: Step,
     failures: FailureReport,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FilterRestoreRoute {
-    Live,
+pub enum TreatmentRestoreRoute {
+    SameOwner,
     FreshOwner,
 }
 #[derive(Clone, Debug, PartialEq)]
-pub struct FilterTransition {
-    key: FilterAttemptKey,
+pub struct TreatmentTransition {
+    key: TreatmentAttemptKey,
     revision: DraftRevision,
     incumbent: Active,
     prior: AppliedSettings,
     candidate: DraftSettings,
     failures: FailureReport,
-    route: Option<FilterRestoreRoute>,
+    route: Option<TreatmentRestoreRoute>,
 }
-impl FilterTransition {
-    pub fn key(&self) -> FilterAttemptKey {
+impl TreatmentTransition {
+    pub fn key(&self) -> TreatmentAttemptKey {
         self.key
     }
     pub fn revision(&self) -> DraftRevision {
@@ -421,7 +538,7 @@ impl FilterTransition {
     pub fn prior(&self) -> &AppliedSettings {
         &self.prior
     }
-    pub fn route(&self) -> Option<FilterRestoreRoute> {
+    pub fn route(&self) -> Option<TreatmentRestoreRoute> {
         self.route
     }
 }
@@ -431,7 +548,7 @@ pub enum ProductState {
     Active(Active),
     Applying(Transition),
     Recovering(Transition),
-    Filtering(FilterTransition),
+    Treating(TreatmentTransition),
     ErrorWithActiveRestored {
         active: Active,
         failed_candidate: DraftSettings,
@@ -456,9 +573,9 @@ impl ProductState {
                 PlaybackState::PausePending { .. } => ProductPhase::PausePending,
                 PlaybackState::Paused => ProductPhase::Paused,
             },
-            Self::Filtering(transition) => match transition.key.pass {
-                FilterPass::LiveCandidate => ProductPhase::ApplyingFilters,
-                FilterPass::LiveRestore | FilterPass::Open => ProductPhase::RestoringFilters,
+            Self::Treating(transition) => match transition.key.pass {
+                TreatmentPass::Candidate => ProductPhase::ApplyingTreatments,
+                TreatmentPass::Restore | TreatmentPass::Open => ProductPhase::RestoringTreatments,
             },
             Self::Applying(transition) | Self::Recovering(transition) => {
                 if transition.request.key.purpose == AttemptPurpose::Recovery {
@@ -517,7 +634,7 @@ pub struct ProductModel {
     next_watch: u64,
     consumed_removal: Option<ObservationEpoch>,
     recovery: Option<RecoveryLoss>,
-    recovery_filter_transaction: bool,
+    recovery_treatment_transaction: bool,
     recovery_candidates: Vec<RecoveryCandidate>,
     loss_attempt: Option<AttemptId>,
     recovery_attempted: Option<WatchStamp>,
@@ -525,7 +642,7 @@ pub struct ProductModel {
     // Fallback reconnect intent when no frozen RecoveryLoss exists. Pause
     // admission retains Paused; a validated fresh Resume open replaces it.
     last_playback: InitialPlayback,
-    confirmed_filters: Option<FilterAttemptKey>,
+    confirmed_treatments: Option<TreatmentConfirmation>,
 }
 impl ProductModel {
     pub fn new(settings: DraftSettings) -> Self {
@@ -551,13 +668,13 @@ impl ProductModel {
             next_watch: 0,
             consumed_removal: None,
             recovery: None,
-            recovery_filter_transaction: false,
+            recovery_treatment_transaction: false,
             recovery_candidates: Vec::new(),
             loss_attempt: None,
             recovery_attempted: None,
             recovery_apply: None,
             last_playback: InitialPlayback::Live,
-            confirmed_filters: None,
+            confirmed_treatments: None,
         }
     }
     pub fn draft(&self) -> &Draft {
@@ -587,9 +704,9 @@ impl ProductModel {
                 step: Step::Validating { incumbent },
                 ..
             }) => incumbent.as_ref(),
-            // This is the last-verified configuration, not proof that the
-            // provisional native chain still executes.
-            ProductState::Filtering(transition) => Some(&transition.incumbent),
+            // Last-verified selection, not evidence that the provisional native
+            // treatments are still healthy.
+            ProductState::Treating(transition) => Some(&transition.incumbent),
             _ => None,
         }
     }
@@ -598,7 +715,7 @@ impl ProductModel {
             ProductState::Applying(transition) | ProductState::Recovering(transition) => {
                 Some(&transition.failures)
             }
-            ProductState::Filtering(transition) => Some(&transition.failures),
+            ProductState::Treating(transition) => Some(&transition.failures),
             ProductState::ErrorWithActiveRestored { failures, .. }
             | ProductState::ErrorWithoutActive { failures } => Some(failures),
             ProductState::Disconnected
@@ -614,7 +731,7 @@ impl ProductModel {
             phase: self.phase(),
             operation: self.last_operation,
             attempt: self.owned_attempt,
-            filter_pass: self.filtering().map(|transition| transition.key.pass),
+            treatment_pass: self.treating().map(|transition| transition.key.pass),
             cleanup: match self.cleanup {
                 CleanupStatus::Complete => 0,
                 CleanupStatus::Draining => 1,
@@ -645,7 +762,7 @@ impl ProductModel {
     }
     pub fn can_reconnect(&self) -> bool {
         !self.quitting
-            && self.filtering().is_none()
+            && self.treating().is_none()
             && !matches!(
                 self.state,
                 ProductState::Stopping { .. } | ProductState::ShutdownReady
@@ -657,22 +774,32 @@ impl ProductModel {
     pub fn can_restart(&self) -> bool {
         self.can_apply() && self.last_valid.is_some()
     }
-    pub fn filtering(&self) -> Option<&FilterTransition> {
+    pub fn treating(&self) -> Option<&TreatmentTransition> {
         match &self.state {
-            ProductState::Filtering(transition) => Some(transition),
+            ProductState::Treating(transition) => Some(transition),
             _ => None,
         }
     }
-    pub fn confirmed_filter_key(&self) -> Option<FilterAttemptKey> {
-        self.confirmed_filters
+    pub fn confirmed_treatment_key(&self) -> Option<TreatmentAttemptKey> {
+        self.confirmed_treatments
+            .as_ref()
+            .map(TreatmentConfirmation::key)
+    }
+    pub fn confirmed_treatments(&self) -> Option<&TreatmentConfirmation> {
+        self.confirmed_treatments.as_ref()
+    }
+    pub fn confirmed_filter_origin(&self) -> Option<TreatmentAttemptKey> {
+        self.confirmed_treatments
+            .as_ref()
+            .map(|confirmation| confirmation.filters().origin().key())
     }
     pub fn has_pending_user_apply(&self, apply: ApplyId) -> bool {
         if self.quitting || matches!(self.cleanup, CleanupStatus::Blocked { .. }) {
             return false;
         }
         match &self.state {
-            ProductState::Filtering(transition) => {
-                transition.key.apply == apply && transition.key.pass == FilterPass::LiveCandidate
+            ProductState::Treating(transition) => {
+                transition.key.apply == apply && transition.key.pass == TreatmentPass::Candidate
             }
             ProductState::Applying(transition) => {
                 transition.request.key.apply == apply
@@ -821,6 +948,7 @@ impl ProductModel {
             || settings.video.mode != request.settings.video.mode
             || settings.audio != request.settings.audio
             || settings.filters != request.settings.filters
+            || settings.renderer != request.settings.renderer
         {
             return None;
         }
@@ -918,7 +1046,7 @@ impl ProductModel {
             return None;
         }
         if let Some(active) = self.active().cloned() {
-            self.recovery_filter_transaction = self.filtering().is_some();
+            self.recovery_treatment_transaction = self.treating().is_some();
             let stamp = self
                 .observation
                 .as_ref()
@@ -983,7 +1111,7 @@ impl ProductModel {
         }
         None
     }
-    fn filter_restore_source_lost(
+    fn treatment_restore_source_lost(
         &mut self,
         mut transition: Transition,
         stamp: WatchStamp,
@@ -992,7 +1120,7 @@ impl ProductModel {
         let prior = transition
             .prior
             .take()
-            .expect("filter restoration retains verified prior");
+            .expect("treatment restoration retains verified prior");
         let playback = transition.request.playback;
         let failure = ApplyFailure::new(
             super::failure::FailureCategory::Session,
@@ -1000,17 +1128,18 @@ impl ProductModel {
             super::failure::Cause::Generic,
             prior.settings.clone(),
             "video_removed",
-            "matching capture device removal cancelled filter restoration",
+            "matching capture device removal cancelled treatment restoration",
         );
+        transition.failures.incumbent = Some(failure.clone());
         self.last_playback = playback;
         self.recovery = Some(RecoveryLoss {
             applied: prior,
             playback,
             evidence: LossEvidence::Removed { stamp },
-            failure: failure.clone(),
+            failure,
             stamp: latest,
         });
-        self.recovery_filter_transaction = true;
+        self.recovery_treatment_transaction = true;
         self.recovery_attempted = None;
         self.recovery_candidates.clear();
         self.prepared_pause = None;
@@ -1021,7 +1150,6 @@ impl ProductModel {
             self.recovery_apply = Some(apply);
             self.last_operation = Some(apply);
         }
-        transition.failures.incumbent = Some(failure);
         self.completed_failures = Some(transition.failures);
         self.state = ProductState::Disconnected;
         if let Some(attempt) = self.owned_attempt {
@@ -1105,8 +1233,8 @@ impl ProductModel {
                 if transition.request.watch.watch == stamp.watch
                     && epoch.get() >= transition.request.watch.epoch.get()
                 {
-                    if transition.filter_restore {
-                        return self.filter_restore_source_lost(
+                    if transition.treatment_restore {
+                        return self.treatment_restore_source_lost(
                             transition,
                             stamp,
                             observation.stamp,
@@ -1342,7 +1470,7 @@ impl ProductModel {
         }
         if matches!(
             self.state,
-            ProductState::Applying(_) | ProductState::Recovering(_) | ProductState::Filtering(_)
+            ProductState::Applying(_) | ProductState::Recovering(_) | ProductState::Treating(_)
         ) {
             return Err(CommandRejection::ApplyInProgress);
         }
@@ -1362,7 +1490,7 @@ impl ProductModel {
         }
     }
     /// Freeze a complete LIVE treatment request before compilation/submission.
-    pub fn apply_filters(
+    pub fn apply_treatments(
         &mut self,
         expected: StateIdentity,
         revision: DraftRevision,
@@ -1372,7 +1500,10 @@ impl ProductModel {
             return Err(CommandRejection::StaleRevision);
         }
         let active = self.active().ok_or(CommandRejection::PlaybackUnavailable)?;
-        if active.playback != PlaybackState::Live {
+        if !matches!(active.playback, PlaybackState::Live | PlaybackState::Paused)
+            || (active.playback == PlaybackState::Paused
+                && active.applied.settings.filters != self.draft.settings.filters)
+        {
             return Err(CommandRejection::PlaybackUnavailable);
         }
         if self.prepared_pause.is_some() {
@@ -1393,12 +1524,12 @@ impl ProductModel {
             .ok_or(CommandRejection::CounterExhausted)?;
         let apply = ApplyId::new(value).ok_or(CommandRejection::CounterExhausted)?;
         let incumbent = active.clone();
-        let key = FilterAttemptKey {
+        let key = TreatmentAttemptKey {
             apply,
             attempt: incumbent.attempt(),
-            pass: FilterPass::LiveCandidate,
+            pass: TreatmentPass::Candidate,
         };
-        self.state = ProductState::Filtering(FilterTransition {
+        self.state = ProductState::Treating(TreatmentTransition {
             key,
             revision,
             prior: incumbent.applied.clone(),
@@ -1411,28 +1542,48 @@ impl ProductModel {
         self.last_operation = Some(apply);
         self.validation_rejection = None;
         self.completed_failures = None;
-        Ok(ApplyAdmission::Filters { key, revision })
+        Ok(ApplyAdmission::Treatments { key, revision })
     }
-    pub fn filter_confirmed(&mut self, confirmation: FilterConfirmation) -> bool {
+    pub fn treatment_confirmed(&mut self, confirmation: TreatmentConfirmation) -> bool {
         let key = confirmation.key();
         if self
-            .filtering()
+            .treating()
             .is_none_or(|transition| transition.key != key)
             || self.owned_attempt != Some(key.attempt)
             || !matches!(self.cleanup, CleanupStatus::Complete)
-            || self
-                .filtering()
-                .is_some_and(|transition| transition.route == Some(FilterRestoreRoute::FreshOwner))
+            || self.treating().is_some_and(|transition| {
+                transition.route == Some(TreatmentRestoreRoute::FreshOwner)
+            })
+            || self.treating().is_some_and(|transition| {
+                let expected = if key.pass == TreatmentPass::Candidate {
+                    &transition.candidate
+                } else {
+                    transition.prior.settings()
+                };
+                confirmation.renderer().settings() != &expected.renderer
+                    || !matches!(
+                        (transition.incumbent.playback(), confirmation.playback()),
+                        (PlaybackState::Live, InitialPlayback::Live)
+                            | (PlaybackState::Paused, InitialPlayback::Paused)
+                    )
+            })
+            || matches!(
+                confirmation.filters(),
+                FilterTreatmentProof::Preserved { origin }
+                    if self.confirmed_treatments.as_ref().is_none_or(
+                        |current| current.filters().origin() != *origin
+                    )
+            )
         {
             return false;
         }
-        let ProductState::Filtering(mut transition) =
+        let ProductState::Treating(mut transition) =
             std::mem::replace(&mut self.state, ProductState::Stopped)
         else {
             return false;
         };
-        self.confirmed_filters = Some(key);
-        if key.pass == FilterPass::LiveCandidate {
+        self.confirmed_treatments = Some(confirmation);
+        if key.pass == TreatmentPass::Candidate {
             let applied = AppliedSettings {
                 settings: transition.candidate,
             };
@@ -1449,21 +1600,21 @@ impl ProductModel {
         true
     }
     /// Queue refusal is not candidate acceptance and cannot justify restoration.
-    pub fn filter_submission_refused(
+    pub fn treatment_submission_refused(
         &mut self,
-        key: FilterAttemptKey,
+        key: TreatmentAttemptKey,
         failure: ApplyFailure,
     ) -> Option<ModelEffect> {
         if self
-            .filtering()
+            .treating()
             .is_none_or(|transition| transition.key != key)
         {
             return None;
         }
-        if key.pass == FilterPass::LiveRestore {
-            return self.filter_failed(key, failure, false);
+        if key.pass == TreatmentPass::Restore {
+            return self.treatment_failed(key, failure, false);
         }
-        let ProductState::Filtering(mut transition) =
+        let ProductState::Treating(mut transition) =
             std::mem::replace(&mut self.state, ProductState::Stopped)
         else {
             return None;
@@ -1476,26 +1627,26 @@ impl ProductModel {
         };
         None
     }
-    /// A selected route never changes. A failure on LiveRestore drains only.
-    pub fn filter_failed(
+    /// A selected route never changes. A failure on Restore drains only.
+    pub fn treatment_failed(
         &mut self,
-        key: FilterAttemptKey,
+        key: TreatmentAttemptKey,
         failure: ApplyFailure,
         force_fresh: bool,
     ) -> Option<ModelEffect> {
-        let current = self.filtering()?.key;
+        let current = self.treating()?.key;
         if current != key {
             return None;
         }
-        if self.filtering()?.route == Some(FilterRestoreRoute::FreshOwner) {
+        if self.treating()?.route == Some(TreatmentRestoreRoute::FreshOwner) {
             return None;
         }
-        let ProductState::Filtering(mut transition) =
+        let ProductState::Treating(mut transition) =
             std::mem::replace(&mut self.state, ProductState::Stopped)
         else {
             return None;
         };
-        if key.pass == FilterPass::LiveRestore {
+        if key.pass == TreatmentPass::Restore {
             transition.failures.restore = Some(failure);
             self.state = ProductState::ErrorWithoutActive {
                 failures: transition.failures,
@@ -1506,20 +1657,15 @@ impl ProductModel {
                 reason: StopIntent::Failed,
             });
         }
-        let fresh = force_fresh
-            || failure
-                .filter
-                .as_ref()
-                .is_some_and(|filter| filter.requires_fresh_owner);
-        let rejected = failure.filter.as_ref().is_some_and(|filter| {
-            matches!(
-                filter.kind,
-                FilterErrorKind::Prevalidation
-                    | FilterErrorKind::CatalogUnavailable
-                    | FilterErrorKind::CommandSubmission { .. }
-                    | FilterErrorKind::CommandRejected { .. }
-            )
-        });
+        use super::failure::TreatmentFailureDisposition;
+        let disposition = failure
+            .treatment
+            .as_ref()
+            .map_or(TreatmentFailureDisposition::RestoreFreshOwner, |failure| {
+                failure.disposition
+            });
+        let fresh = force_fresh || disposition == TreatmentFailureDisposition::RestoreFreshOwner;
+        let rejected = disposition == TreatmentFailureDisposition::Untouched;
         transition.failures.candidate = Some(failure);
         if rejected && !fresh {
             self.state = ProductState::ErrorWithActiveRestored {
@@ -1529,11 +1675,11 @@ impl ProductModel {
             };
             return None;
         }
-        transition.key.pass = FilterPass::LiveRestore;
+        transition.key.pass = TreatmentPass::Restore;
         transition.route = Some(if fresh {
-            FilterRestoreRoute::FreshOwner
+            TreatmentRestoreRoute::FreshOwner
         } else {
-            FilterRestoreRoute::Live
+            TreatmentRestoreRoute::SameOwner
         });
         let effect = if fresh {
             self.cleanup = CleanupStatus::Draining;
@@ -1542,27 +1688,27 @@ impl ProductModel {
                 reason: StopIntent::Failed,
             }
         } else {
-            ModelEffect::ApplyFilters {
+            ModelEffect::ApplyTreatments {
                 key: transition.key,
             }
         };
-        self.state = ProductState::Filtering(transition);
+        self.state = ProductState::Treating(transition);
         Some(effect)
     }
-    pub fn filter_incumbent_failed(&mut self, failure: ApplyFailure) {
-        if let ProductState::Filtering(transition) = &mut self.state {
+    pub fn treatment_incumbent_failed(&mut self, failure: ApplyFailure) {
+        if let ProductState::Treating(transition) = &mut self.state {
             transition.failures.incumbent = Some(failure);
         }
     }
     /// A late native fault restores the then-last-verified chain once, never
     /// older history. The poisoned owner is always physically retired first.
-    pub fn late_filter_failed(
+    pub fn late_treatment_failed(
         &mut self,
-        key: FilterAttemptKey,
+        key: TreatmentAttemptKey,
         failure: ApplyFailure,
     ) -> Option<ModelEffect> {
-        if self.confirmed_filters != Some(key)
-            || self.filtering().is_some()
+        if self.confirmed_treatment_key() != Some(key)
+            || self.treating().is_some()
             || self.quitting
             || matches!(self.cleanup, CleanupStatus::Blocked { .. })
         {
@@ -1572,9 +1718,11 @@ impl ProductModel {
             // This proof belongs to the owner already revoked by source loss.
             // Keep the native evidence without replacing removal truth, frozen
             // recovery settings/playback, or the existing source transition.
-            if let Some(filter) = failure.filter {
+            if let Some(treatment) = failure.treatment {
                 if let Some(loss) = &mut self.recovery {
-                    loss.failure.filter.get_or_insert_with(|| filter.clone());
+                    loss.failure
+                        .treatment
+                        .get_or_insert_with(|| treatment.clone());
                 }
                 let report = match &mut self.state {
                     ProductState::Applying(transition) | ProductState::Recovering(transition) => {
@@ -1585,7 +1733,7 @@ impl ProductModel {
                     _ => self.completed_failures.as_mut(),
                 };
                 if let Some(incumbent) = report.and_then(|report| report.incumbent.as_mut()) {
-                    incumbent.filter.get_or_insert(filter);
+                    incumbent.treatment.get_or_insert(treatment);
                 }
             }
             return None;
@@ -1622,7 +1770,7 @@ impl ProductModel {
         };
         let required = if overlap.is_some() { 1 } else { 2 };
         if self.next_attempt.checked_add(required).is_none() {
-            return self.late_filter_capacity_failed(key.attempt, incumbent.applied, failure);
+            return self.late_treatment_capacity_failed(key.attempt, incumbent.applied, failure);
         }
         // A superseded source operation already reserved its single Restore.
         // Reuse that operation identity, but revoke its Candidate authorization.
@@ -1630,32 +1778,46 @@ impl ProductModel {
             overlap
         } else {
             let Some(value) = self.next_apply.checked_add(1) else {
-                return self.late_filter_capacity_failed(key.attempt, incumbent.applied, failure);
+                return self.late_treatment_capacity_failed(
+                    key.attempt,
+                    incumbent.applied,
+                    failure,
+                );
             };
             let apply = ApplyId::new(value).expect("positive checked apply counter");
             self.next_apply = value;
             (apply, self.draft.revision)
         };
-        let candidate = incumbent.applied.settings.clone();
+        let (candidate, mut failures) = match &self.state {
+            ProductState::ErrorWithActiveRestored {
+                failed_candidate,
+                failures,
+                ..
+            } => (failed_candidate.clone(), failures.clone()),
+            _ => (
+                incumbent.applied.settings.clone(),
+                FailureReport {
+                    candidate: Some(failure.clone()),
+                    ..FailureReport::default()
+                },
+            ),
+        };
+        failures.incumbent = Some(failure);
         self.last_operation = Some(apply);
         self.prepared_pause = None;
         self.validation_rejection = None;
-        self.state = ProductState::Filtering(FilterTransition {
-            key: FilterAttemptKey {
+        self.state = ProductState::Treating(TreatmentTransition {
+            key: TreatmentAttemptKey {
                 apply,
                 attempt: key.attempt,
-                pass: FilterPass::LiveRestore,
+                pass: TreatmentPass::Restore,
             },
             revision,
             prior: incumbent.applied.clone(),
             incumbent,
             candidate,
-            route: Some(FilterRestoreRoute::FreshOwner),
-            failures: FailureReport {
-                candidate: Some(failure.clone()),
-                incumbent: Some(failure),
-                ..FailureReport::default()
-            },
+            route: Some(TreatmentRestoreRoute::FreshOwner),
+            failures,
         });
         self.cleanup = CleanupStatus::Draining;
         Some(ModelEffect::Stop {
@@ -1663,7 +1825,7 @@ impl ProductModel {
             reason: StopIntent::Failed,
         })
     }
-    fn late_filter_capacity_failed(
+    fn late_treatment_capacity_failed(
         &mut self,
         attempt: AttemptId,
         prior: AppliedSettings,
@@ -1674,7 +1836,7 @@ impl ProductModel {
             super::failure::Stage::Prevalidation,
             super::failure::Cause::Generic,
             prior.settings,
-            "filter_restore_capacity",
+            "treatment_restore_capacity",
             "monotonic counter exhausted",
         );
         self.state = ProductState::ErrorWithoutActive {
@@ -1712,7 +1874,7 @@ impl ProductModel {
         if expected != self.state_identity() {
             return Err(CommandRejection::StaleState);
         }
-        if self.filtering().is_some() {
+        if self.treating().is_some() {
             return Err(CommandRejection::ApplyInProgress);
         }
         if let ProductState::Applying(transition) | ProductState::Recovering(transition) =
@@ -1964,10 +2126,11 @@ impl ProductModel {
             requested_target: request.settings.clone(),
             prior: self.last_valid.clone(),
             prior_owner,
-            filter_restore: false,
+            treatment_restore: false,
             origin,
             step: Step::Validating { incumbent },
-            failures: if purpose == AttemptPurpose::Recovery && self.recovery_filter_transaction {
+            failures: if purpose == AttemptPurpose::Recovery && self.recovery_treatment_transaction
+            {
                 self.completed_failures.clone().unwrap_or_default()
             } else {
                 self.recovery
@@ -2140,8 +2303,20 @@ impl ProductModel {
         self.put_transition(transition, recovering);
         Some(ModelEffect::Open { key, request })
     }
-    pub fn open_verified(&mut self, key: AttemptKey) {
-        if self.opening().map(|(current, _)| current) != Some(key) {
+    pub fn open_verified(&mut self, key: AttemptKey, confirmation: TreatmentConfirmation) {
+        let expected_key = TreatmentAttemptKey {
+            apply: key.apply,
+            attempt: key.attempt,
+            pass: TreatmentPass::Open,
+        };
+        if self.opening().is_none_or(|(current, settings)| {
+            current != key
+                || confirmation.key() != expected_key
+                || confirmation.renderer().settings() != &settings.renderer
+        }) || self
+            .opening_request()
+            .is_none_or(|request| request.playback != confirmation.playback())
+        {
             return;
         }
         let Some((transition, recovering)) = self.take_transition() else {
@@ -2160,15 +2335,11 @@ impl ProductModel {
             initial_playback: transition.request.playback,
         };
         self.last_valid = Some(applied);
-        self.confirmed_filters = Some(FilterAttemptKey {
-            apply: key.apply,
-            attempt: key.attempt,
-            pass: FilterPass::Open,
-        });
+        self.confirmed_treatments = Some(confirmation);
         self.last_playback = transition.request.playback;
         self.recovery_apply = None;
         self.recovery = None;
-        self.recovery_filter_transaction = false;
+        self.recovery_treatment_transaction = false;
         self.recovery_candidates.clear();
         self.loss_attempt = None;
         self.recovery_attempted = None;
@@ -2256,9 +2427,10 @@ impl ProductModel {
                     transition.failures.incumbent = Some(failure);
                 }
                 _ => {
-                    self.completed_failures
-                        .get_or_insert_with(FailureReport::default)
-                        .incumbent = Some(failure);
+                    let report = self
+                        .completed_failures
+                        .get_or_insert_with(FailureReport::default);
+                    report.incumbent = Some(failure);
                 }
             }
             return None;
@@ -2266,14 +2438,14 @@ impl ProductModel {
         if self.owned_attempt != Some(attempt) {
             return None;
         }
-        if let Some(transition) = self.filtering() {
+        if let Some(transition) = self.treating() {
             let key = transition.key;
-            let waiting_fresh = transition.route == Some(FilterRestoreRoute::FreshOwner);
-            self.filter_incumbent_failed(failure.clone());
+            let waiting_fresh = transition.route == Some(TreatmentRestoreRoute::FreshOwner);
+            self.treatment_incumbent_failed(failure.clone());
             if waiting_fresh {
                 return None;
             }
-            return self.filter_failed(key, failure, true);
+            return self.treatment_failed(key, failure, true);
         }
         if let Some((key, _)) = self.opening() {
             return self.open_failed(key, failure);
@@ -2307,7 +2479,7 @@ impl ProductModel {
             ProductState::Applying(transition) | ProductState::Recovering(transition) => {
                 Some(&mut transition.failures)
             }
-            ProductState::Filtering(transition) => Some(&mut transition.failures),
+            ProductState::Treating(transition) => Some(&mut transition.failures),
             ProductState::ErrorWithoutActive { failures } => Some(failures),
             ProductState::Disconnected
             | ProductState::SelectionRequired
@@ -2348,13 +2520,13 @@ impl ProductModel {
             return None;
         }
         self.cleanup = CleanupStatus::Complete;
-        if let ProductState::Filtering(transition) = &self.state {
-            if transition.route != Some(FilterRestoreRoute::FreshOwner) {
+        if let ProductState::Treating(transition) = &self.state {
+            if transition.route != Some(TreatmentRestoreRoute::FreshOwner) {
                 let failures = transition.failures.clone();
                 self.state = ProductState::ErrorWithoutActive { failures };
                 return None;
             }
-            let ProductState::Filtering(transition) =
+            let ProductState::Treating(transition) =
                 std::mem::replace(&mut self.state, ProductState::Stopped)
             else {
                 return None;
@@ -2371,7 +2543,7 @@ impl ProductModel {
                         super::failure::Stage::Prevalidation,
                         super::failure::Cause::Generic,
                         settings,
-                        "filter_restore_watch",
+                        "treatment_restore_watch",
                         error.to_string(),
                     ));
                     self.state = ProductState::ErrorWithoutActive { failures };
@@ -2401,7 +2573,7 @@ impl ProductModel {
                     prior: Some(transition.prior),
                     origin: Origin::Active,
                     prior_owner: None,
-                    filter_restore: true,
+                    treatment_restore: true,
                     step: Step::Validating { incumbent: None },
                     failures: transition.failures,
                 },
@@ -2496,7 +2668,7 @@ impl ProductModel {
         self.prepared_pause = None;
         self.recovery_apply = None;
         self.recovery = None;
-        self.recovery_filter_transaction = false;
+        self.recovery_treatment_transaction = false;
         self.recovery_candidates.clear();
         self.recovery_attempted = None;
         self.loss_attempt = None;
@@ -2506,7 +2678,7 @@ impl ProductModel {
         if matches!(
             self.state,
             ProductState::Applying(_)
-                | ProductState::Filtering(_)
+                | ProductState::Treating(_)
                 | ProductState::Recovering(_)
                 | ProductState::ErrorWithActiveRestored { .. }
                 | ProductState::ErrorWithoutActive { .. }
@@ -2592,11 +2764,11 @@ mod tests {
         let revision = model
             .edit_draft(model.draft().revision, candidate.clone())
             .unwrap();
-        let ApplyAdmission::Filters {
+        let ApplyAdmission::Treatments {
             key,
             revision: admitted_revision,
         } = model
-            .apply_filters(model.state_identity(), revision)
+            .apply_treatments(model.state_identity(), revision)
             .unwrap()
         else {
             panic!("filter admission")
@@ -2604,7 +2776,7 @@ mod tests {
         assert_eq!(key.attempt, owner.attempt);
         assert_eq!(admitted_revision, revision);
         let pending = model.state_identity();
-        assert_eq!(pending.filter_pass(), Some(FilterPass::LiveCandidate));
+        assert_eq!(pending.treatment_pass(), Some(TreatmentPass::Candidate));
         assert!(!model.can_apply());
         assert!(!model.can_restart());
         assert!(!model.can_reconnect());
@@ -2617,18 +2789,204 @@ mod tests {
             Err(CommandRejection::ApplyInProgress)
         );
         assert_eq!(
-            model.apply_filters(pending, revision),
+            model.apply_treatments(pending, revision),
             Err(CommandRejection::ApplyInProgress)
         );
         model.edit_draft(revision, settings(30)).unwrap();
-        assert_eq!(model.filtering().unwrap().candidate(), &candidate);
-        assert!(model.filter_confirmed(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()));
+        assert_eq!(model.treating().unwrap().candidate(), &candidate);
+        let proof = candidate_treatments(&model, key);
+        assert!(model.treatment_confirmed(proof.clone()));
         assert_eq!(model.last_valid().unwrap().settings(), &candidate);
         assert_eq!(model.draft().settings, settings(30));
         assert_eq!(model.active().unwrap().attempt(), owner.attempt);
-        assert_eq!(model.state_identity().filter_pass(), None);
-        assert!(!model.filter_confirmed(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()));
+        assert_eq!(model.state_identity().treatment_pass(), None);
+        assert!(!model.treatment_confirmed(proof));
     }
+
+    #[test]
+    fn complete_proof_rejects_key_attempt_renderer_playback_and_vf_provenance_mismatch() {
+        let mut model = ProductModel::new(settings(60));
+        let owner = initial_active(&mut model);
+        let mut candidate = settings(60);
+        candidate.filters = treatments();
+        candidate.renderer = altered_renderer(&candidate.renderer);
+        let revision = model
+            .edit_draft(model.draft().revision, candidate.clone())
+            .unwrap();
+        let ApplyAdmission::Treatments { key, .. } = model
+            .apply_treatments(model.state_identity(), revision)
+            .unwrap()
+        else {
+            panic!("filter admission")
+        };
+        assert_eq!(key.attempt, owner.attempt);
+
+        let reconfirmed = |proof_key: TreatmentAttemptKey| {
+            FilterTreatmentProof::Reconfigured(
+                FilterConfirmation::checked(proof_key, 0.0, 2.0, 32).unwrap(),
+            )
+        };
+        let build = |pass, playback, vf_changed, filters, renderer| {
+            let proof_key = TreatmentAttemptKey { pass, ..key };
+            TreatmentConfirmation::checked(
+                proof_key,
+                playback,
+                vf_changed,
+                filters,
+                RendererConfirmation::checked(proof_key, renderer),
+            )
+            .unwrap()
+        };
+
+        let restore_key = TreatmentAttemptKey {
+            pass: TreatmentPass::Restore,
+            ..key
+        };
+        // The aggregate constructor refuses an incoherent constituent key, so
+        // the wrong-pass fixture below must itself be coherent to reach the model.
+        assert!(
+            TreatmentConfirmation::checked(
+                restore_key,
+                InitialPlayback::Live,
+                true,
+                reconfirmed(key),
+                RendererConfirmation::checked(restore_key, candidate.renderer.clone()),
+            )
+            .is_err()
+        );
+
+        // A different pass is not the frozen candidate identity.
+        let wrong_pass = build(
+            TreatmentPass::Restore,
+            InitialPlayback::Live,
+            true,
+            reconfirmed(restore_key),
+            candidate.renderer.clone(),
+        );
+        assert!(!model.treatment_confirmed(wrong_pass));
+
+        // A renderer proof for anything but the frozen candidate is refused.
+        let wrong_renderer = build(
+            TreatmentPass::Candidate,
+            InitialPlayback::Live,
+            true,
+            reconfirmed(key),
+            settings(60).renderer.clone(),
+        );
+        assert!(!model.treatment_confirmed(wrong_renderer));
+
+        // Preserved vf provenance that no committed transaction ever established.
+        let unprovenanced = build(
+            TreatmentPass::Candidate,
+            InitialPlayback::Live,
+            false,
+            FilterTreatmentProof::Preserved {
+                origin: FilterEvidence::Confirmed(
+                    FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap(),
+                ),
+            },
+            candidate.renderer.clone(),
+        );
+        assert!(!model.treatment_confirmed(unprovenanced));
+        assert!(model.treating().is_some(), "refusals never commit");
+
+        // Only the exact frozen aggregate commits, exactly once.
+        let proof = build(
+            TreatmentPass::Candidate,
+            InitialPlayback::Live,
+            true,
+            reconfirmed(key),
+            candidate.renderer.clone(),
+        );
+        assert!(model.treatment_confirmed(proof.clone()));
+        assert!(!model.treatment_confirmed(proof));
+        assert_eq!(model.last_valid().unwrap().settings(), &candidate);
+    }
+
+    #[test]
+    fn open_verified_rejects_wrong_key_attempt_playback_and_renderer_aggregate() {
+        let mut model = ProductModel::new(settings(60));
+        model
+            .apply(model.state_identity(), model.draft().revision)
+            .unwrap();
+        let request = model.validation_request().unwrap().clone();
+        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+            panic!("open effect missing");
+        };
+        let open_key = key;
+        let build = |target: AttemptKey, playback, vf_changed, filters, renderer| {
+            let treatment = TreatmentAttemptKey {
+                apply: target.apply,
+                attempt: target.attempt,
+                pass: TreatmentPass::Open,
+            };
+            TreatmentConfirmation::checked(
+                treatment,
+                playback,
+                vf_changed,
+                filters,
+                RendererConfirmation::checked(treatment, renderer),
+            )
+            .unwrap()
+        };
+        let live = |target: AttemptKey, renderer| {
+            build(
+                target,
+                InitialPlayback::Live,
+                true,
+                FilterTreatmentProof::Reconfigured(
+                    FilterConfirmation::checked(
+                        TreatmentAttemptKey {
+                            apply: target.apply,
+                            attempt: target.attempt,
+                            pass: TreatmentPass::Open,
+                        },
+                        0.0,
+                        2.0,
+                        32,
+                    )
+                    .unwrap(),
+                ),
+                renderer,
+            )
+        };
+
+        // A renderer proof that disagrees with the requested renderer cannot open.
+        model.open_verified(
+            open_key,
+            live(open_key, altered_renderer(&request.settings.renderer)),
+        );
+        assert!(model.active().is_none());
+
+        // A paused preparation cannot satisfy a live opening.
+        let paused = build(
+            open_key,
+            InitialPlayback::Paused,
+            false,
+            FilterTreatmentProof::PreparedPaused {
+                key: TreatmentAttemptKey {
+                    apply: open_key.apply,
+                    attempt: open_key.attempt,
+                    pass: TreatmentPass::Open,
+                },
+            },
+            request.settings.renderer.clone(),
+        );
+        model.open_verified(open_key, paused);
+        assert!(model.active().is_none());
+
+        // A different attempt never matches the current opening.
+        let stale = AttemptKey {
+            attempt: AttemptId::new(open_key.attempt.get() + 1).unwrap(),
+            ..open_key
+        };
+        model.open_verified(stale, live(stale, request.settings.renderer.clone()));
+        assert!(model.active().is_none());
+
+        verify_open(&mut model, open_key);
+        assert_eq!(model.active().unwrap().attempt(), open_key.attempt);
+    }
+
     #[test]
     fn refused_pause_reservation_cancellation_is_exact_and_never_rewinds_counter() {
         let mut model = ProductModel::new(settings(60));
@@ -2638,7 +2996,7 @@ mod tests {
         assert!(current.get() > old.get());
         assert!(!model.cancel_prepared_pause(owner.attempt, old));
         assert_eq!(
-            model.apply_filters(model.state_identity(), model.draft().revision),
+            model.apply_treatments(model.state_identity(), model.draft().revision),
             Err(CommandRejection::PlaybackBusy)
         );
         assert!(model.cancel_prepared_pause(owner.attempt, current));
@@ -2663,7 +3021,7 @@ mod tests {
             model.next_attempt = attempt_counter;
             let identity = model.state_identity();
             assert_eq!(
-                model.apply_filters(identity, model.draft().revision),
+                model.apply_treatments(identity, model.draft().revision),
                 Err(CommandRejection::CounterExhausted)
             );
             assert_eq!(model.state_identity(), identity);
@@ -2675,7 +3033,7 @@ mod tests {
             .edit_draft(model.draft().revision, settings(30))
             .unwrap();
         assert_eq!(
-            model.apply_filters(model.state_identity(), model.draft().revision),
+            model.apply_treatments(model.state_identity(), model.draft().revision),
             Err(CommandRejection::CaptureDraftChanged)
         );
         model
@@ -2683,13 +3041,30 @@ mod tests {
             .unwrap();
         let pause = model.prepare_pause(owner.attempt).unwrap();
         assert_eq!(
-            model.apply_filters(model.state_identity(), model.draft().revision),
+            model.apply_treatments(model.state_identity(), model.draft().revision),
             Err(CommandRejection::PlaybackBusy)
         );
         assert!(model.pause_admitted(owner.attempt, pause));
         assert!(model.pause_observed(owner.attempt, pause, true));
+        // PAUSED with unchanged capture/audio and vf is now admitted as a
+        // no-op treatment route (renderer-only), not rejected.
+        assert!(matches!(
+            model.apply_treatments(model.state_identity(), model.draft().revision),
+            Ok(ApplyAdmission::Treatments { .. })
+        ));
+
+        // PAUSED with a changed filter chain keeps the dedicated vf Open
+        // boundary: the aggregate treatment route stays unavailable.
+        let mut model = ProductModel::new(settings(60));
+        let owner = initial_active(&mut model);
+        let pause = model.prepare_pause(owner.attempt).unwrap();
+        assert!(model.pause_admitted(owner.attempt, pause));
+        assert!(model.pause_observed(owner.attempt, pause, true));
+        let mut altered = settings(60);
+        altered.filters = treatments();
+        model.edit_draft(model.draft().revision, altered).unwrap();
         assert_eq!(
-            model.apply_filters(model.state_identity(), model.draft().revision),
+            model.apply_treatments(model.state_identity(), model.draft().revision),
             Err(CommandRejection::PlaybackUnavailable)
         );
     }
@@ -2716,6 +3091,17 @@ mod tests {
             model
                 .accept_prepared(&request, changed, request.watch)
                 .is_none()
+        );
+        let mut rerendered = submitted.clone();
+        let mut values = rerendered.renderer.values();
+        values.interpolation = true;
+        rerendered.renderer = RendererSettings::new(values).unwrap();
+        assert_ne!(rerendered.renderer, submitted.renderer);
+        assert!(
+            model
+                .accept_prepared(&request, rerendered, request.watch)
+                .is_none(),
+            "renderer is indivisible from the frozen candidate"
         );
         assert_eq!(model.validation_request(), Some(&request));
         let accepted = model
@@ -2744,10 +3130,10 @@ mod tests {
     #[test]
     fn confirmation_requires_finite_forward_progress_and_full_margin() {
         use crate::domain::failure::FilterConfirmationFailure;
-        let key = FilterAttemptKey {
+        let key = TreatmentAttemptKey {
             apply: ApplyId::new(1).unwrap(),
             attempt: AttemptId::new(2).unwrap(),
-            pass: FilterPass::LiveCandidate,
+            pass: TreatmentPass::Candidate,
         };
         for (baseline, last) in [
             (f64::NAN, 1.0),
@@ -2776,6 +3162,69 @@ mod tests {
         assert_eq!(confirmation.advances(), 32);
     }
 
+    /// Complete Open aggregate a media owner returns after nine native renderer
+    /// readbacks plus its vf proof, keyed to the exact opening.
+    fn open_confirmation(model: &ProductModel, key: AttemptKey) -> TreatmentConfirmation {
+        let request = model.opening_request().expect("opening request for proof");
+        let playback = request.playback;
+        let treatment = TreatmentAttemptKey {
+            apply: key.apply,
+            attempt: key.attempt,
+            pass: TreatmentPass::Open,
+        };
+        let renderer = RendererConfirmation::checked(treatment, request.settings.renderer.clone());
+        let filters = match playback {
+            InitialPlayback::Live => FilterTreatmentProof::Reconfigured(
+                FilterConfirmation::checked(treatment, 0.0, 2.0, 32).unwrap(),
+            ),
+            InitialPlayback::Paused => FilterTreatmentProof::PreparedPaused { key: treatment },
+        };
+        TreatmentConfirmation::checked(
+            treatment,
+            playback,
+            playback == InitialPlayback::Live,
+            filters,
+            renderer,
+        )
+        .unwrap()
+    }
+
+    fn verify_open(model: &mut ProductModel, key: AttemptKey) {
+        if model.opening_request().is_none() {
+            return;
+        }
+        let confirmation = open_confirmation(model, key);
+        model.open_verified(key, confirmation);
+    }
+
+    fn candidate_treatments(
+        model: &ProductModel,
+        key: TreatmentAttemptKey,
+    ) -> TreatmentConfirmation {
+        let candidate = model
+            .treating()
+            .expect("admitted candidate")
+            .candidate()
+            .clone();
+        let renderer = RendererConfirmation::checked(key, candidate.renderer.clone());
+        TreatmentConfirmation::checked(
+            key,
+            InitialPlayback::Live,
+            true,
+            FilterTreatmentProof::Reconfigured(
+                FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap(),
+            ),
+            renderer,
+        )
+        .unwrap()
+    }
+
+    fn altered_renderer(base: &RendererSettings) -> RendererSettings {
+        let mut values = base.values();
+        values.interpolation = !values.interpolation;
+        RendererSettings::new(values).unwrap()
+    }
+
     pub(super) fn settings(rate: u32) -> DraftSettings {
         DraftSettings {
             filters: crate::domain::filters::FilterChain::default(),
@@ -2798,6 +3247,7 @@ mod tests {
                 },
             },
             audio: AudioSelection::default(),
+            renderer: RendererSettings::default(),
         }
     }
 
@@ -2861,7 +3311,7 @@ mod tests {
         let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
             panic!("initial open effect missing");
         };
-        model.open_verified(key);
+        verify_open(model, key);
         key
     }
 
@@ -2879,7 +3329,7 @@ mod tests {
         let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
             panic!("open missing");
         };
-        model.open_verified(key);
+        verify_open(&mut model, key);
         assert_eq!(model.last_valid().unwrap().settings(), &settings(60));
         assert_eq!(model.draft().settings, settings(30));
         assert_eq!(model.active().unwrap().attempt(), key.attempt);
@@ -2982,7 +3432,7 @@ mod tests {
         let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
             panic!("restore open missing");
         };
-        model.open_verified(key);
+        verify_open(model, key);
         key
     }
 
@@ -3143,9 +3593,9 @@ mod tests {
         assert_eq!(request.settings, settings(60));
         assert_eq!(model.phase(), ProductPhase::OpeningResume);
         assert_eq!(model.barrier_complete(old.attempt), None);
-        model.open_verified(old);
+        verify_open(&mut model, old);
         assert_eq!(model.phase(), ProductPhase::OpeningResume);
-        model.open_verified(key);
+        verify_open(&mut model, key);
         assert_eq!(model.phase(), ProductPhase::Active);
         assert_eq!(model.active().unwrap().playback(), PlaybackState::Live);
         assert_eq!(model.active().unwrap().applied().settings(), &settings(60));
@@ -3284,7 +3734,7 @@ mod tests {
             else {
                 panic!("paused reconnect open missing");
             };
-            model.open_verified(key);
+            verify_open(&mut model, key);
             assert_eq!(model.active().unwrap().playback(), PlaybackState::Paused);
             assert_eq!(
                 model.active().unwrap().initial_playback(),
@@ -3329,7 +3779,7 @@ mod tests {
                 else {
                     panic!("replacement open missing");
                 };
-                model.open_verified(key);
+                verify_open(&mut model, key);
                 assert_eq!(model.active().unwrap().playback(), PlaybackState::Live);
                 assert_eq!(
                     model.active().unwrap().applied().settings(),
@@ -3363,7 +3813,7 @@ mod tests {
         assert!(model.failures().unwrap().restore.is_none());
         assert!(!model.can_reconnect());
         assert_eq!(model.barrier_complete(old.attempt), None);
-        model.open_verified(key);
+        verify_open(&mut model, key);
         assert_eq!(model.phase(), ProductPhase::CleaningFailedResume);
         assert_eq!(model.barrier_complete(key.attempt), None);
         assert_eq!(model.barrier_complete(key.attempt), None);
@@ -3383,7 +3833,7 @@ mod tests {
         else {
             panic!("explicit reconnect open missing");
         };
-        model.open_verified(reconnect);
+        verify_open(&mut model, reconnect);
         assert_eq!(model.active().unwrap().playback(), PlaybackState::Live);
     }
 
@@ -3435,7 +3885,7 @@ mod tests {
         let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
             panic!("loss reconnect open missing");
         };
-        model.open_verified(key);
+        verify_open(&mut model, key);
         assert_eq!(model.active().unwrap().playback(), PlaybackState::Paused);
     }
 
@@ -3552,7 +4002,7 @@ mod tests {
                     playback_failure(crate::domain::failure::FailureCategory::Session),
                 );
                 if let Some(key) = opening {
-                    model.open_verified(key);
+                    verify_open(&mut model, key);
                 }
                 model.drain_complete(true, true);
                 assert_eq!(model.phase(), ProductPhase::Stopping);
@@ -3623,7 +4073,7 @@ mod tests {
         let key = resume_open(&mut model, old.attempt);
         assert_eq!(key.attempt.get(), u64::MAX);
         assert_eq!(model.cutover_validation(key), None);
-        model.open_verified(key);
+        verify_open(&mut model, key);
         assert_eq!(model.active().unwrap().playback(), PlaybackState::Live);
         let request = model.prepare_pause(key.attempt).unwrap();
         assert!(model.pause_admitted(key.attempt, request));
@@ -3663,7 +4113,7 @@ mod tests {
         let Some(ModelEffect::Open { key: old, .. }) = model.validation_succeeded(&request) else {
             panic!("relocated initial open missing");
         };
-        model.open_verified(old);
+        verify_open(&mut model, old);
         // Before the consumer installs committed_watch, the saved complete
         // identity differs from the watch that validated the original request.
         let pause = model.prepare_pause(old.attempt).unwrap();
@@ -3693,9 +4143,9 @@ mod tests {
         };
         assert_eq!(key.attempt.get(), u64::MAX);
         assert_eq!(key.apply, reserved.apply);
-        model.open_verified(reserved);
+        verify_open(&mut model, reserved);
         assert_eq!(model.phase(), ProductPhase::OpeningResume);
-        model.open_verified(key);
+        verify_open(&mut model, key);
         assert_eq!(model.active().unwrap().attempt(), key.attempt);
         assert_eq!(model.active().unwrap().applied().settings(), &relocated);
         assert_eq!(model.active().unwrap().playback(), PlaybackState::Live);

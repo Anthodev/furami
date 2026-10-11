@@ -875,6 +875,7 @@ mod tests {
                 mode,
             },
             audio,
+            renderer: crate::domain::render::RendererSettings::default(),
         }
     }
 

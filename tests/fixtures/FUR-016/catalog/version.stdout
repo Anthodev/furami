@@ -1,0 +1,14 @@
+Option gpu-context: 'waylandvk' isn't supported.
+Error parsing option gpu-context (option parameter could not be parsed)
+/home/anthodev/.config/mpv/mpv.conf:22: setting option gpu-context='waylandvk' failed.
+mpv v0.41.0 Copyright © 2000-2025 mpv/MPlayer/mplayer2 projects
+libplacebo version: v7.360.1
+FFmpeg version: 8.1.2
+FFmpeg library versions:
+   libavcodec      62.28.102
+   libavdevice     62.3.102
+   libavfilter     11.14.102
+   libavformat     62.12.102
+   libavutil       60.26.102
+   libswresample   6.3.102
+   libswscale      9.5.102

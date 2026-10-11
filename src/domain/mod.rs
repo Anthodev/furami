@@ -5,4 +5,5 @@ pub mod capture;
 pub mod failure;
 pub mod filters;
 pub mod output;
+pub mod render;
 pub mod state;

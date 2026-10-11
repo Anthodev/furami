@@ -5,18 +5,14 @@ use crate::domain::{
         AudioAvailability, AudioEpoch, AudioSelection, AudioSilence, LossEvidence, PlaybackGain,
         RecoveryObservation, RecoveryWatchTarget, SelectionToken, SourcePresence, WatchStamp,
     },
-    failure::{
-        ApplyFailure, Cause, FailureCategory, FilterAttemptDiagnostics, FilterConfirmationFailure,
-        FilterEntryMetadata, FilterErrorKind, FilterFailure, LifecycleFailure, Stage,
-        ValidationLayer,
-    },
+    failure::{ApplyFailure, Cause, FailureCategory, LifecycleFailure, Stage, ValidationLayer},
     output::{OutputPlan, OutputRevision, OutputSilence},
     state::{
         AppliedSettings, ApplyAdmission, ApplyId, AttemptId, AttemptKey, AttemptPurpose,
-        CleanupStatus, CommandRejection, DraftRevision, DraftSettings, FilterAttemptKey,
-        FilterConfirmation, FilterPass, FilterRestoreRoute, InitialPlayback, ModelEffect,
-        PlaybackState, ProductModel, ProductPhase, ReconnectAdmission, StateIdentity, StopIntent,
-        ValidationRequest,
+        CleanupStatus, CommandRejection, DraftRevision, DraftSettings, InitialPlayback,
+        ModelEffect, PlaybackState, ProductModel, ProductPhase, ReconnectAdmission, StateIdentity,
+        StopIntent, TreatmentAttemptKey, TreatmentConfirmation, TreatmentPass,
+        TreatmentRestoreRoute, ValidationRequest,
     },
 };
 
@@ -34,8 +30,8 @@ pub enum VerifiedApplied {
         key: AttemptKey,
         applied: AppliedSettings,
     },
-    Filters {
-        key: FilterAttemptKey,
+    Treatments {
+        key: TreatmentAttemptKey,
         revision: DraftRevision,
         applied: AppliedSettings,
     },
@@ -60,8 +56,8 @@ struct Lease {
     choice: Option<SelectionToken>,
 }
 
-struct PreparedFilterApply<F> {
-    key: FilterAttemptKey,
+struct PreparedTreatmentApply<F> {
+    key: TreatmentAttemptKey,
     candidate: Option<F>,
     prior: Option<F>,
 }
@@ -78,7 +74,7 @@ where
     output: OutputPlan,
     output_initialized: bool,
     validation: Option<ValidationRequest>,
-    prepared: Option<(ValidationRequest, V::Prepared, R::PreparedFilters)>,
+    prepared: Option<(ValidationRequest, V::Prepared, R::PreparedTreatments)>,
     lease: Option<Lease>,
     audio: Option<AudioAvailability>,
     validator_shutdown: bool,
@@ -88,7 +84,7 @@ where
     verified_applied: Option<VerifiedApplied>,
     admitted_apply: Option<ApplyId>,
     strict_startup_apply: Option<ApplyId>,
-    filter_apply: Option<PreparedFilterApply<R::PreparedFilters>>,
+    treatment_apply: Option<PreparedTreatmentApply<R::PreparedTreatments>>,
     // One-owner event arbitration may record model failures before blockers,
     // but adapter effects (including resource-free retirement) wait for them.
     defer_effects: bool,
@@ -121,7 +117,7 @@ where
             verified_applied: None,
             admitted_apply: None,
             strict_startup_apply: None,
-            filter_apply: None,
+            treatment_apply: None,
             defer_effects: false,
             deferred_effect: None,
         }
@@ -250,11 +246,13 @@ where
         self.check_drain()?;
         let draft = &self.model.draft().settings;
         if self.model.active().is_some_and(|active| {
-            active.playback() == PlaybackState::Live
-                && active.applied().settings().video == draft.video
+            active.applied().settings().video == draft.video
                 && active.applied().settings().audio == draft.audio
+                && (active.playback() == PlaybackState::Live
+                    || (active.playback() == PlaybackState::Paused
+                        && active.applied().settings().filters == draft.filters))
         }) {
-            return self.apply_filters(expected_state, expected_revision);
+            return self.apply_treatments(expected_state, expected_revision);
         }
         let (apply, effect) = self.model.apply(expected_state, expected_revision)?;
         self.verified_applied = None;
@@ -262,7 +260,7 @@ where
         self.drive(Some(effect))?;
         Ok(ApplyAdmission::Open { apply })
     }
-    pub fn apply_filters(
+    pub fn apply_treatments(
         &mut self,
         expected_state: StateIdentity,
         expected_revision: DraftRevision,
@@ -287,37 +285,37 @@ where
         }
         let admission = self
             .model
-            .apply_filters(expected_state, expected_revision)?;
-        let ApplyAdmission::Filters { key, .. } = admission else {
+            .apply_treatments(expected_state, expected_revision)?;
+        let ApplyAdmission::Treatments { key, .. } = admission else {
             unreachable!()
         };
         self.verified_applied = None;
         self.admitted_apply = Some(admission.id());
-        let transition = self.model.filtering().expect("admitted filter transition");
+        let transition = self.model.treating().expect("admitted filter transition");
         let candidate = transition.candidate().clone();
         let prior = transition.prior().settings().clone();
         let prepared = self
             .runner
-            .prepare_filters(&candidate)
+            .prepare_treatments(&candidate)
             .and_then(|candidate| {
                 self.runner
-                    .prepare_filters(&prior)
+                    .prepare_treatments(&prior)
                     .map(|prior| (candidate, prior))
             });
         match prepared {
             Ok((candidate, prior)) => {
-                self.filter_apply = Some(PreparedFilterApply {
+                self.treatment_apply = Some(PreparedTreatmentApply {
                     key,
                     candidate: Some(candidate),
                     prior: Some(prior),
                 });
-                self.drive(Some(ModelEffect::ApplyFilters { key }))?;
+                self.drive(Some(ModelEffect::ApplyTreatments { key }))?;
             }
             Err(mut failure) => {
-                if let Some(filter) = &mut failure.filter {
-                    filter.diagnostics.key = Some(key);
+                if let Some(treatment) = &mut failure.treatment {
+                    treatment.key = Some(key);
                 }
-                self.model.filter_submission_refused(key, failure);
+                self.model.treatment_submission_refused(key, failure);
             }
         }
         Ok(admission)
@@ -329,7 +327,7 @@ where
                 || self.verified_applied.as_ref().is_some_and(|event| {
                     let id = match event {
                         VerifiedApplied::Open { key, .. } => key.apply,
-                        VerifiedApplied::Filters { key, .. } => key.apply,
+                        VerifiedApplied::Treatments { key, .. } => key.apply,
                     };
                     id == apply && self.positive_is_valid(event)
                 }))
@@ -337,22 +335,22 @@ where
     fn positive_is_valid(&self, event: &VerifiedApplied) -> bool {
         let (key, applied) = match event {
             VerifiedApplied::Open { key, applied } if key.purpose == AttemptPurpose::Candidate => (
-                FilterAttemptKey {
+                TreatmentAttemptKey {
                     apply: key.apply,
                     attempt: key.attempt,
-                    pass: FilterPass::Open,
+                    pass: TreatmentPass::Open,
                 },
                 applied,
             ),
-            VerifiedApplied::Filters { key, applied, .. }
-                if key.pass == FilterPass::LiveCandidate =>
+            VerifiedApplied::Treatments { key, applied, .. }
+                if key.pass == TreatmentPass::Candidate =>
             {
                 (*key, applied)
             }
             _ => return false,
         };
-        self.model.confirmed_filter_key() == Some(key)
-            && self.model.filtering().is_none()
+        self.model.confirmed_treatment_key() == Some(key)
+            && self.model.treating().is_none()
             && self.model.cleanup() == &CleanupStatus::Complete
             && self.model.active().is_some_and(|active| {
                 active.attempt() == key.attempt && active.applied() == applied
@@ -468,7 +466,7 @@ where
     }
     fn cancel_validation(&mut self) {
         self.prepared = None;
-        self.filter_apply = None;
+        self.treatment_apply = None;
         self.verified_applied = None;
         self.admitted_apply = None;
         self.pending_validation = None;
@@ -758,66 +756,56 @@ where
             self.validator.retire_selection(token);
         }
     }
-    fn filter_failure(settings: DraftSettings, failure: FilterFailure) -> ApplyFailure {
+    fn treatment_failure(
+        settings: DraftSettings,
+        failure: crate::domain::failure::TreatmentFailure,
+    ) -> ApplyFailure {
         ApplyFailure::new(
             FailureCategory::Session,
             Stage::Verification,
             Cause::Generic,
             settings,
-            "filter_verification",
-            format!("{:?}", failure.kind),
+            "treatment_verification",
+            match &failure.kind {
+                crate::domain::failure::TreatmentErrorKind::Renderer(renderer) => {
+                    renderer.diagnostic.clone()
+                }
+                _ => format!("{:?}", failure.kind),
+            },
         )
-        .with_filter(failure)
+        .with_treatment(failure)
     }
-    fn filter_unavailable(
-        key: FilterAttemptKey,
+    fn treatment_unavailable(
+        key: TreatmentAttemptKey,
         settings: DraftSettings,
         detail: &str,
     ) -> ApplyFailure {
-        let entries = settings
-            .filters
-            .entries()
-            .iter()
-            .enumerate()
-            .map(|(ordinal, entry)| FilterEntryMetadata {
-                ordinal,
-                label: entry.label().to_owned(),
-                enabled: entry.enabled(),
-            })
-            .collect();
-        let mut failure = Self::filter_failure(
+        let mut failure = Self::treatment_failure(
             settings,
-            FilterFailure {
-                kind: FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::BackendUnavailable,
+            crate::domain::failure::TreatmentFailure {
+                key: Some(key),
+                kind: crate::domain::failure::TreatmentErrorKind::Unconfirmed {
+                    reason:
+                        crate::domain::failure::TreatmentConfirmationFailure::BackendUnavailable,
                 },
-                attributed_ordinal: None,
-                requires_fresh_owner: true,
-                diagnostics: FilterAttemptDiagnostics {
-                    key: Some(key),
-                    entries,
-                    records: Vec::new(),
-                    native_evidence_lost: false,
-                    truncated: false,
-                    dropped_context: 0,
-                },
+                disposition: crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner,
             },
         );
         failure.diagnostic = detail.to_owned();
         failure
     }
-    fn current_filter_key(&self, key: FilterAttemptKey) -> bool {
+    fn current_treatment_key(&self, key: TreatmentAttemptKey) -> bool {
         if !self.known_attempt(key.attempt) {
             return false;
         }
-        if let Some(transition) = self.model.filtering() {
+        if let Some(transition) = self.model.treating() {
             return transition.key() == key
-                || self.model.confirmed_filter_key() == Some(key)
-                || (transition.route() == Some(FilterRestoreRoute::FreshOwner)
+                || self.model.confirmed_treatment_key() == Some(key)
+                || (transition.route() == Some(TreatmentRestoreRoute::FreshOwner)
                     && transition.key().apply == key.apply
-                    && key.pass == FilterPass::LiveCandidate);
+                    && key.pass == TreatmentPass::Candidate);
         }
-        if key.pass == FilterPass::Open
+        if key.pass == TreatmentPass::Open
             && self
                 .model
                 .opening()
@@ -827,7 +815,7 @@ where
         }
         // Previous-owner proof is diagnostic-only once source loss is frozen.
         // A fresh owner's exact Open key remains eligible above.
-        self.model.confirmed_filter_key() == Some(key)
+        self.model.confirmed_treatment_key() == Some(key)
             && self.model.recovery().is_none()
             && matches!(
                 self.model.phase(),
@@ -841,24 +829,18 @@ where
                     | ProductPhase::ClosingResume
             )
     }
-    fn event_filter_key(&self, event: &SessionEvent) -> Option<FilterAttemptKey> {
+    fn event_treatment_key(&self, event: &SessionEvent) -> Option<TreatmentAttemptKey> {
         let key = match event {
-            SessionEvent::FilterResult {
+            SessionEvent::TreatmentResult {
                 key,
                 result: Err(failure),
-            }
-            | SessionEvent::FilterFault { key, failure }
-                if failure.diagnostics.key == Some(*key) =>
-            {
-                *key
-            }
+            } if failure.key == Some(*key) => *key,
+            SessionEvent::TreatmentFault { key, failure } if failure.key == Some(*key) => *key,
             SessionEvent::SessionFailed { failure, .. }
-            | SessionEvent::OpenFailed { failure, .. } => {
-                failure.filter.as_ref()?.diagnostics.key?
-            }
+            | SessionEvent::OpenFailed { failure, .. } => failure.treatment.as_ref()?.key?,
             _ => return None,
         };
-        self.current_filter_key(key).then_some(key)
+        self.current_treatment_key(key).then_some(key)
     }
     fn handle_stream_ended(
         &mut self,
@@ -883,13 +865,13 @@ where
             format!("capture stream ended: reason={reason}, error={error}"),
         );
         self.verified_applied = None;
-        let effect = if let Some(transition) = self.model.filtering().filter(|transition| {
-            treatment_terminal || transition.key().pass == FilterPass::LiveRestore
+        let effect = if let Some(transition) = self.model.treating().filter(|transition| {
+            treatment_terminal || transition.key().pass == TreatmentPass::Restore
         }) {
-            let failure = if transition.route() == Some(FilterRestoreRoute::FreshOwner) {
+            let failure = if transition.route() == Some(TreatmentRestoreRoute::FreshOwner) {
                 failure
             } else {
-                Self::filter_unavailable(
+                Self::treatment_unavailable(
                     transition.key(),
                     transition.prior().settings().clone(),
                     &failure.diagnostic,
@@ -898,7 +880,7 @@ where
             self.model.session_failed(attempt, failure)
         } else if treatment_terminal {
             // The exact keyed negative already failed an opening/restore or
-            // revoked this owner. Its EndFile is not a second source-recovery trigger.
+            // revoked this owner. Its EndFile is not a second recovery trigger.
             None
         } else {
             self.model.video_lost(
@@ -909,73 +891,76 @@ where
         };
         let _ = self.drive(effect);
     }
-    fn handle_filter_failure(
+    fn handle_treatment_failure(
         &mut self,
-        key: FilterAttemptKey,
-        failure: FilterFailure,
+        key: TreatmentAttemptKey,
+        failure: crate::domain::failure::TreatmentFailure,
         fault: bool,
     ) {
-        if failure.diagnostics.key != Some(key) || !self.known_attempt(key.attempt) {
+        if failure.key != Some(key) || !self.known_attempt(key.attempt) {
             return;
         }
-        let transition = self.model.filtering();
+        let transition = self.model.treating();
         let effect = if let Some(transition) = transition {
             if key.attempt != transition.key().attempt {
                 return;
             }
-            if !fault && transition.route() == Some(FilterRestoreRoute::FreshOwner) {
+            if !fault && transition.route() == Some(TreatmentRestoreRoute::FreshOwner) {
                 return;
             }
             let current = transition.key();
             let matching = key == current
                 || (fault
                     && key.apply == current.apply
-                    && key.pass == FilterPass::LiveCandidate
-                    && transition.route() == Some(FilterRestoreRoute::FreshOwner));
-            let incumbent_fault = fault && self.model.confirmed_filter_key() == Some(key);
+                    && key.pass == TreatmentPass::Candidate
+                    && transition.route() == Some(TreatmentRestoreRoute::FreshOwner));
+            let incumbent_fault = fault && self.model.confirmed_treatment_key() == Some(key);
             if !matching && !incumbent_fault {
                 return;
             }
-            if fault && transition.route() == Some(FilterRestoreRoute::FreshOwner) {
-                let settings =
-                    if key.pass == FilterPass::LiveCandidate && key.apply == current.apply {
-                        transition.candidate().clone()
-                    } else {
-                        transition.prior().settings().clone()
-                    };
+            if fault && transition.route() == Some(TreatmentRestoreRoute::FreshOwner) {
+                let settings = if key.pass == TreatmentPass::Candidate && key.apply == current.apply
+                {
+                    transition.candidate().clone()
+                } else {
+                    transition.prior().settings().clone()
+                };
                 self.model
-                    .filter_incumbent_failed(Self::filter_failure(settings, failure));
+                    .treatment_incumbent_failed(Self::treatment_failure(settings, failure));
                 return;
             }
-            let settings = if key.pass == FilterPass::LiveCandidate && !incumbent_fault {
+            let settings = if key.pass == TreatmentPass::Candidate && !incumbent_fault {
                 transition.candidate().clone()
             } else {
                 transition.prior().settings().clone()
             };
-            let failure = Self::filter_failure(settings, failure);
+            let failure = Self::treatment_failure(settings, failure);
             if incumbent_fault {
-                let requested = if current.pass == FilterPass::LiveCandidate {
+                let requested = if current.pass == TreatmentPass::Candidate {
                     self.model
-                        .filtering()
+                        .treating()
                         .expect("current transition")
                         .candidate()
                         .clone()
                 } else {
                     self.model
-                        .filtering()
+                        .treating()
                         .expect("current transition")
                         .prior()
                         .settings()
                         .clone()
                 };
-                self.model.filter_incumbent_failed(failure);
-                let failure =
-                    Self::filter_unavailable(current, requested, "incumbent filter health revoked");
-                self.model.filter_failed(current, failure, true)
+                self.model.treatment_incumbent_failed(failure);
+                let failure = Self::treatment_unavailable(
+                    current,
+                    requested,
+                    "incumbent filter health revoked",
+                );
+                self.model.treatment_failed(current, failure, true)
             } else {
-                self.model.filter_failed(key, failure, fault)
+                self.model.treatment_failed(key, failure, fault)
             }
-        } else if self.model.confirmed_filter_key() == Some(key) {
+        } else if self.model.confirmed_treatment_key() == Some(key) {
             self.verified_applied = None;
             let settings = self
                 .model
@@ -985,29 +970,29 @@ where
                 .clone();
             let effect = self
                 .model
-                .late_filter_failed(key, Self::filter_failure(settings, failure));
+                .late_treatment_failed(key, Self::treatment_failure(settings, failure));
             if effect.is_some() {
                 self.cancel_validation();
             }
             effect
-        } else if key.pass == FilterPass::Open
+        } else if key.pass == TreatmentPass::Open
             && self
                 .model
                 .opening()
                 .is_some_and(|(open, _)| open.apply == key.apply && open.attempt == key.attempt)
         {
             let (open, settings) = self.model.opening().expect("matched opening");
-            let failure = Self::filter_failure(settings.clone(), failure);
+            let failure = Self::treatment_failure(settings.clone(), failure);
             self.model.open_failed(open, failure)
         } else {
             return;
         };
         let _ = self.drive(effect);
     }
-    fn commit_filter_confirmation(
+    fn commit_treatment_confirmation(
         &mut self,
-        key: FilterAttemptKey,
-        confirmation: FilterConfirmation,
+        key: TreatmentAttemptKey,
+        confirmation: TreatmentConfirmation,
     ) {
         if key != confirmation.key() {
             return;
@@ -1022,15 +1007,15 @@ where
         }
         let revision = self
             .model
-            .filtering()
+            .treating()
             .map(|transition| transition.revision());
-        if self.model.filter_confirmed(confirmation) {
+        if self.model.treatment_confirmed(confirmation) {
             if let (Some(lease), Some(active)) = (&mut self.lease, self.model.active()) {
                 lease.settings = active.applied().settings().clone();
             }
-            self.filter_apply = None;
+            self.treatment_apply = None;
             self.verified_applied = self.model.active().and_then(|active| {
-                (key.pass == FilterPass::LiveCandidate).then(|| VerifiedApplied::Filters {
+                (key.pass == TreatmentPass::Candidate).then(|| VerifiedApplied::Treatments {
                     key,
                     revision: revision.expect("confirmed frozen filter transition"),
                     applied: active.applied().clone(),
@@ -1060,7 +1045,7 @@ where
         // can advance through the single rollback, never create an unbounded retry.
         while let Some(next) = effect.take() {
             match next {
-                ModelEffect::ApplyFilters { key } => {
+                ModelEffect::ApplyTreatments { key } => {
                     let usable = self.lease.as_ref().is_some_and(|lease| {
                         lease.key.attempt == key.attempt
                             && lease.verified
@@ -1068,8 +1053,8 @@ where
                             && !lease.owner_stopped
                             && !lease.blocked
                     });
-                    let settings = self.model.filtering().map(|transition| {
-                        if key.pass == FilterPass::LiveCandidate {
+                    let settings = self.model.treating().map(|transition| {
+                        if key.pass == TreatmentPass::Candidate {
                             transition.candidate().clone()
                         } else {
                             transition.prior().settings().clone()
@@ -1077,59 +1062,63 @@ where
                     });
                     let Some(settings) = settings else { continue };
                     if !usable {
-                        let failure = Self::filter_unavailable(
+                        let failure = Self::treatment_unavailable(
                             key,
                             settings,
                             "selected filter owner unavailable",
                         );
-                        effect = self.model.filter_failed(key, failure, true);
+                        effect = self.model.treatment_failed(key, failure, true);
                         continue;
                     }
                     let prepared = self
-                        .filter_apply
+                        .treatment_apply
                         .as_mut()
                         .filter(|slot| {
                             slot.key.apply == key.apply && slot.key.attempt == key.attempt
                         })
                         .and_then(|slot| match key.pass {
-                            FilterPass::LiveCandidate => slot.candidate.take(),
-                            FilterPass::LiveRestore => slot.prior.take(),
-                            FilterPass::Open => None,
+                            TreatmentPass::Candidate => slot.candidate.take(),
+                            TreatmentPass::Restore => slot.prior.take(),
+                            TreatmentPass::Open => None,
                         });
                     let Some(prepared) = prepared else {
-                        let failure = Self::filter_unavailable(
+                        let failure = Self::treatment_unavailable(
                             key,
                             settings,
                             "matching prepared filter request unavailable",
                         );
-                        effect = self.model.filter_submission_refused(key, failure);
+                        effect = self.model.treatment_submission_refused(key, failure);
                         continue;
                     };
-                    let status = self.runner.submit_filters(key, prepared);
+                    let status = self.runner.submit_treatments(key, prepared);
                     if status != SubmitStatus::Accepted {
-                        let mut failure = Self::filter_unavailable(
+                        let mut failure = Self::treatment_unavailable(
                             key,
                             settings,
                             &format!("filter admission: {status:?}"),
                         );
-                        if let Some(filter) = &mut failure.filter {
-                            filter.requires_fresh_owner = matches!(
+                        if let Some(treatment) = &mut failure.treatment {
+                            treatment.disposition = if matches!(
                                 status,
                                 SubmitStatus::StaleGeneration
                                     | SubmitStatus::NotReady
                                     | SubmitStatus::Closing
-                            );
+                            ) {
+                                crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner
+                            } else {
+                                crate::domain::failure::TreatmentFailureDisposition::Untouched
+                            };
                         }
-                        effect = if key.pass == FilterPass::LiveCandidate
+                        effect = if key.pass == TreatmentPass::Candidate
                             && matches!(
                                 status,
                                 SubmitStatus::StaleGeneration
                                     | SubmitStatus::NotReady
                                     | SubmitStatus::Closing
                             ) {
-                            self.model.filter_failed(key, failure, true)
+                            self.model.treatment_failed(key, failure, true)
                         } else {
-                            self.model.filter_submission_refused(key, failure)
+                            self.model.treatment_submission_refused(key, failure)
                         };
                     }
                 }
@@ -1289,20 +1278,20 @@ where
     }
     fn handle_event(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::FilterResult {
+            SessionEvent::TreatmentResult {
                 key,
                 result: Err(failure),
             } => {
-                self.handle_filter_failure(key, *failure, false);
+                self.handle_treatment_failure(key, *failure, false);
             }
-            SessionEvent::FilterFault { key, failure } => {
-                self.handle_filter_failure(key, *failure, true);
+            SessionEvent::TreatmentFault { key, failure } => {
+                self.handle_treatment_failure(key, *failure, true);
             }
-            SessionEvent::FilterResult {
+            SessionEvent::TreatmentResult {
                 key,
                 result: Ok(confirmation),
             } => {
-                self.commit_filter_confirmation(key, confirmation);
+                self.commit_treatment_confirmation(key, confirmation);
             }
             SessionEvent::OpenVerified { key, receipt } => self.commit_receipt(key, *receipt),
             SessionEvent::OpenFailed { key, mut failure } => {
@@ -1310,15 +1299,16 @@ where
                     return;
                 }
                 if let Some(filter_key) = failure
-                    .filter
+                    .treatment
                     .as_ref()
-                    .and_then(|filter| filter.diagnostics.key)
-                    && (self.current_filter_key(filter_key)
-                        || self.model.confirmed_filter_key() == Some(filter_key))
+                    .and_then(|treatment| treatment.key)
+                    && (self.current_treatment_key(filter_key)
+                        || self.model.confirmed_treatment_key() == Some(filter_key))
                 {
-                    let mut filter = failure.filter.take().expect("keyed filter failure");
-                    filter.requires_fresh_owner = true;
-                    self.handle_filter_failure(filter_key, *filter, false);
+                    let mut filter = failure.treatment.take().expect("keyed treatment failure");
+                    filter.disposition =
+                        crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner;
+                    self.handle_treatment_failure(filter_key, *filter, false);
                     return;
                 }
                 let effect = self.model.open_failed(key, failure);
@@ -1333,32 +1323,31 @@ where
                 }
                 self.verified_applied = None;
                 if let Some(filter_key) = failure
-                    .filter
+                    .treatment
                     .as_ref()
-                    .and_then(|filter| filter.diagnostics.key)
-                    && (self.current_filter_key(filter_key)
-                        || self.model.confirmed_filter_key() == Some(filter_key))
+                    .and_then(|treatment| treatment.key)
+                    && (self.current_treatment_key(filter_key)
+                        || self.model.confirmed_treatment_key() == Some(filter_key))
                 {
-                    let mut filter = failure.filter.take().expect("keyed filter failure");
-                    filter.requires_fresh_owner = true;
-                    let fault = self.model.confirmed_filter_key() == Some(filter_key);
-                    self.handle_filter_failure(filter_key, *filter, fault);
+                    let mut filter = failure.treatment.take().expect("keyed treatment failure");
+                    filter.disposition =
+                        crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner;
+                    let fault = self.model.confirmed_treatment_key() == Some(filter_key);
+                    self.handle_treatment_failure(filter_key, *filter, fault);
                     return;
                 }
-                if let Some(transition) = self
-                    .model
-                    .filtering()
-                    .filter(|transition| transition.route() != Some(FilterRestoreRoute::FreshOwner))
-                {
+                if let Some(transition) = self.model.treating().filter(|transition| {
+                    transition.route() != Some(TreatmentRestoreRoute::FreshOwner)
+                }) {
                     let key = transition.key();
-                    let settings = if key.pass == FilterPass::LiveCandidate {
+                    let settings = if key.pass == TreatmentPass::Candidate {
                         transition.candidate().clone()
                     } else {
                         transition.prior().settings().clone()
                     };
-                    if failure.filter.is_none() {
+                    if failure.treatment.is_none() {
                         let mut typed =
-                            Self::filter_unavailable(key, settings, &failure.diagnostic);
+                            Self::treatment_unavailable(key, settings, &failure.diagnostic);
                         typed.category = failure.category;
                         failure = typed;
                     }
@@ -1408,14 +1397,14 @@ where
                         "owner stopped before product requested cleanup",
                     );
                     self.verified_applied = None;
-                    if let Some(transition) = self.model.filtering() {
+                    if let Some(transition) = self.model.treating() {
                         let key = transition.key();
-                        let settings = if key.pass == FilterPass::LiveCandidate {
+                        let settings = if key.pass == TreatmentPass::Candidate {
                             transition.candidate().clone()
                         } else {
                             transition.prior().settings().clone()
                         };
-                        failure = Self::filter_unavailable(key, settings, &failure.diagnostic);
+                        failure = Self::treatment_unavailable(key, settings, &failure.diagnostic);
                     }
                     // Owner already retired. Revoke live product state, without
                     // submitting another command to the destroyed owner.
@@ -1632,7 +1621,7 @@ where
                 .observation()
                 .is_some_and(|observation| observation.audio == SourcePresence::Present));
         if !receipt.matches(settings)
-            || !receipt.matches_filters(key)
+            || !receipt.matches_treatments(key)
             || !readiness_matches
             || !audio_matches
             || !startup_audio_matches
@@ -1650,7 +1639,7 @@ where
             let _ = self.drive(effect);
             return;
         }
-        self.model.open_verified(key);
+        self.model.open_verified(key, receipt.treatments.clone());
         if !self
             .model
             .active()
@@ -1727,8 +1716,8 @@ where
             if !matches!(
                 slot,
                 Some(
-                    SessionEvent::FilterResult { .. }
-                        | SessionEvent::FilterFault { .. }
+                    SessionEvent::TreatmentResult { .. }
+                        | SessionEvent::TreatmentFault { .. }
                         | SessionEvent::OpenVerified { .. }
                         | SessionEvent::NativeReleased { .. }
                         | SessionEvent::OpenFailed { .. }
@@ -1746,33 +1735,46 @@ where
         let treatment_terminal = events
             .iter()
             .flatten()
-            .find_map(|event| self.event_filter_key(event))
+            .find_map(|event| self.event_treatment_key(event))
             .map(|key| key.attempt)
             .or_else(|| {
                 self.model
-                    .filtering()
-                    .filter(|transition| transition.route() == Some(FilterRestoreRoute::FreshOwner))
+                    .treating()
+                    .filter(|transition| {
+                        transition.route() == Some(TreatmentRestoreRoute::FreshOwner)
+                    })
                     .map(|transition| transition.key().attempt)
             });
         for index in 0..events.len() {
-            if let Some(SessionEvent::FilterResult {
+            if let Some(SessionEvent::TreatmentResult {
                 key,
                 result: Err(mut failure),
-            }) = events[index]
-                .take_if(|event| matches!(event, SessionEvent::FilterResult { result: Err(_), .. }))
-            {
-                let fault = events.iter().any(|event| matches!(event,
-                    Some(SessionEvent::FilterFault { key: fault_key, failure })
-                        if fault_key.attempt == key.attempt && failure.diagnostics.key == Some(*fault_key)
-                            && (*fault_key == key || self.model.confirmed_filter_key() == Some(*fault_key))
-                ));
+            }) = events[index].take_if(|event| {
+                matches!(event, SessionEvent::TreatmentResult { result: Err(_), .. })
+            }) {
+                let fault = events.iter().any(|event| {
+                    let Some(SessionEvent::TreatmentFault {
+                        key: fault_key,
+                        failure,
+                    }) = event
+                    else {
+                        return false;
+                    };
+                    if failure.key != Some(*fault_key) {
+                        return false;
+                    }
+                    fault_key.attempt == key.attempt
+                        && (*fault_key == key
+                            || self.model.confirmed_treatment_key() == Some(*fault_key))
+                });
                 let terminal = events.iter().any(|event| matches!(event,
                     Some(SessionEvent::SessionFailed { attempt, .. } | SessionEvent::OwnerStopped { attempt, .. }
                         | SessionEvent::StreamEnded { attempt, .. })
                         if *attempt == key.attempt
                 ));
                 if fault || terminal {
-                    failure.requires_fresh_owner = true;
+                    failure.disposition =
+                        crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner;
                 }
                 if events.iter().any(|event| {
                     matches!(event,
@@ -1780,7 +1782,7 @@ where
                     )
                 }) && let Some(lease) = self.lease.as_ref().filter(|lease| !lease.stopping)
                 {
-                    self.model.filter_incumbent_failed(ApplyFailure::new(
+                    self.model.treatment_incumbent_failed(ApplyFailure::new(
                         FailureCategory::Lifecycle(LifecycleFailure::Acknowledgement),
                         Stage::Unknown,
                         Cause::Generic,
@@ -1789,11 +1791,11 @@ where
                         "owner retired during filter settlement",
                     ));
                 }
-                self.handle_filter_failure(key, *failure, false);
+                self.handle_treatment_failure(key, *failure, false);
             }
         }
         for slot in &mut events {
-            if matches!(slot, Some(SessionEvent::FilterFault { .. }))
+            if matches!(slot, Some(SessionEvent::TreatmentFault { .. }))
                 && let Some(event) = slot.take()
             {
                 self.handle_event(event);
@@ -1915,7 +1917,7 @@ where
                             } else if let Some(accepted) =
                                 self.model.accept_prepared(&request, settings, stamp)
                             {
-                                match self.runner.prepare_filters(&accepted.settings) {
+                                match self.runner.prepare_treatments(&accepted.settings) {
                                     Ok(filters) => {
                                         self.prepared = Some((accepted.clone(), prepared, filters));
                                         let effect = self.model.validation_succeeded(&accepted);
@@ -1974,10 +1976,10 @@ where
         self.retire_startup_restore_guard();
         if self
             .model
-            .filtering()
-            .is_none_or(|transition| transition.route() == Some(FilterRestoreRoute::FreshOwner))
+            .treating()
+            .is_none_or(|transition| transition.route() == Some(TreatmentRestoreRoute::FreshOwner))
         {
-            self.filter_apply = None;
+            self.treatment_apply = None;
         }
         if self
             .verified_applied
@@ -2042,10 +2044,15 @@ mod tests {
             AudioSelection, CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize,
             UsbTopology,
         },
-        failure::{Cause, FailureCategory, Stage, ValidationLayer},
+        failure::{
+            Cause, FailureCategory, FilterAttemptDiagnostics, FilterConfirmationFailure,
+            FilterErrorKind, FilterFailure, RendererErrorKind, RendererFailure, Stage,
+            TreatmentErrorKind, TreatmentFailure, TreatmentFailureDisposition, ValidationLayer,
+        },
+        render::{RendererProperty, RendererSettings},
         state::{
-            AttemptPurpose, CleanupStatus, PauseRequestId, PlaybackState, ProductPhase,
-            ValidationKey,
+            AttemptPurpose, CleanupStatus, FilterConfirmation, FilterTreatmentProof,
+            PauseRequestId, PlaybackState, ProductPhase, RendererConfirmation, ValidationKey,
         },
     };
 
@@ -2095,6 +2102,7 @@ mod tests {
                 },
             },
             audio: AudioSelection::default(),
+            renderer: crate::domain::render::RendererSettings::default(),
         }
     }
     fn failure(
@@ -2111,7 +2119,45 @@ mod tests {
             diagnostic,
         )
     }
+    fn live_treatments(key: AttemptKey, settings: &DraftSettings) -> TreatmentConfirmation {
+        let treatment = TreatmentAttemptKey {
+            apply: key.apply,
+            attempt: key.attempt,
+            pass: TreatmentPass::Open,
+        };
+        TreatmentConfirmation::checked(
+            treatment,
+            InitialPlayback::Live,
+            true,
+            FilterTreatmentProof::Reconfigured(
+                FilterConfirmation::checked(treatment, 0.0, 2.0, 32).unwrap(),
+            ),
+            RendererConfirmation::checked(treatment, settings.renderer.clone()),
+        )
+        .unwrap()
+    }
+    fn paused_treatments(key: AttemptKey, settings: &DraftSettings) -> TreatmentConfirmation {
+        let treatment = TreatmentAttemptKey {
+            apply: key.apply,
+            attempt: key.attempt,
+            pass: TreatmentPass::Open,
+        };
+        TreatmentConfirmation::checked(
+            treatment,
+            InitialPlayback::Paused,
+            false,
+            FilterTreatmentProof::PreparedPaused { key: treatment },
+            RendererConfirmation::checked(treatment, settings.renderer.clone()),
+        )
+        .unwrap()
+    }
+    fn altered_renderer(base: &RendererSettings) -> RendererSettings {
+        let mut values = base.values();
+        values.interpolation = !values.interpolation;
+        RendererSettings::new(values).unwrap()
+    }
     fn receipt(settings: DraftSettings, key: AttemptKey) -> OpenReceipt {
+        let treatments = live_treatments(key, &settings);
         OpenReceipt {
             settings,
             verification: VerificationSummary {
@@ -2121,19 +2167,7 @@ mod tests {
             },
             audio: AudioOutcome::Disabled,
             readiness: OpenReadiness::Live,
-            filters: crate::app::ports::FilterOpenReceipt::Confirmed(
-                crate::domain::state::FilterConfirmation::checked(
-                    crate::domain::state::FilterAttemptKey {
-                        apply: key.apply,
-                        attempt: key.attempt,
-                        pass: crate::domain::state::FilterPass::Open,
-                    },
-                    0.0,
-                    2.0,
-                    32,
-                )
-                .unwrap(),
-            ),
+            treatments,
         }
     }
     #[derive(Clone)]
@@ -2283,12 +2317,9 @@ mod tests {
         stop_failure: Option<StopSubmission>,
         playback: Vec<InitialPlayback>,
         outputs: Vec<OutputPlan>,
-        filter_intents: Vec<(
-            crate::domain::state::FilterAttemptKey,
-            crate::domain::filters::FilterChain,
-        )>,
-        filter_prepare_failure: Option<ApplyFailure>,
-        filter_preparations: Vec<DraftSettings>,
+        treatment_intents: Vec<(TreatmentAttemptKey, DraftSettings)>,
+        treatment_prepare_failure: Option<ApplyFailure>,
+        treatment_preparations: Vec<DraftSettings>,
     }
     impl Runner {
         fn verified(&mut self) {
@@ -2299,7 +2330,7 @@ mod tests {
                 InitialPlayback::Paused => OpenReadiness::PausedPrepared,
             };
             if receipt.readiness == OpenReadiness::PausedPrepared {
-                receipt.filters = crate::app::ports::FilterOpenReceipt::PreparedPaused;
+                receipt.treatments = paused_treatments(*key, settings);
             }
             self.events.push_back(SessionEvent::OpenVerified {
                 key: *key,
@@ -2324,27 +2355,27 @@ mod tests {
     }
     impl SessionRunner for Runner {
         type Prepared = TestPrepared;
-        type PreparedFilters = crate::domain::filters::FilterChain;
-        fn prepare_filters(
+        type PreparedTreatments = DraftSettings;
+        fn prepare_treatments(
             &mut self,
             settings: &DraftSettings,
-        ) -> Result<Self::PreparedFilters, ApplyFailure> {
-            self.filter_preparations.push(settings.clone());
-            if let Some(failure) = self.filter_prepare_failure.take() {
+        ) -> Result<Self::PreparedTreatments, ApplyFailure> {
+            self.treatment_preparations.push(settings.clone());
+            if let Some(failure) = self.treatment_prepare_failure.take() {
                 return Err(failure);
             }
-            Ok(settings.filters.clone())
+            Ok(settings.clone())
         }
         fn begin_open(
             &mut self,
             key: AttemptKey,
             prepared: TestPrepared,
-            filters: Self::PreparedFilters,
+            treatments: Self::PreparedTreatments,
             gain: PlaybackGain,
             playback: InitialPlayback,
             output: OutputPlan,
         ) -> Result<(), StartFailure> {
-            assert_eq!(filters, prepared.settings.filters);
+            assert_eq!(treatments, prepared.settings);
             self.opens.push((key, prepared.settings, gain));
             self.playback.push(playback);
             self.outputs.push(output);
@@ -2365,12 +2396,12 @@ mod tests {
             self.intents.push((attempt, intent));
             self.immediate.take().unwrap_or(SubmitStatus::Accepted)
         }
-        fn submit_filters(
+        fn submit_treatments(
             &mut self,
-            key: crate::domain::state::FilterAttemptKey,
-            filters: Self::PreparedFilters,
+            key: TreatmentAttemptKey,
+            treatments: Self::PreparedTreatments,
         ) -> SubmitStatus {
-            self.filter_intents.push((key, filters));
+            self.treatment_intents.push((key, treatments));
             self.immediate.take().unwrap_or(SubmitStatus::Accepted)
         }
     }
@@ -2429,10 +2460,10 @@ mod tests {
                 if paused || route == 0 {
                     confirm_pause(&mut engine, old);
                     assert!(
-                        engine.runner.filter_intents.is_empty(),
+                        engine.runner.treatment_intents.is_empty(),
                         "ordinary pause sends no filter command"
                     );
-                    assert_eq!(engine.runner.filter_preparations.len(), 1);
+                    assert_eq!(engine.runner.treatment_preparations.len(), 1);
                 }
                 let mut newer = complete_treatments("newer draft");
                 newer.video.mode = settings(30).video.mode;
@@ -2497,14 +2528,14 @@ mod tests {
                         1,
                         "preparation precedes incumbent retirement"
                     );
-                    assert_eq!(engine.runner.filter_preparations.last(), Some(&target));
+                    assert_eq!(engine.runner.treatment_preparations.last(), Some(&target));
                     engine.runner.barrier(old);
                     engine.poll();
                 }
                 let (key, opened, _) = engine.runner.opens.last().unwrap().clone();
                 assert_ne!(key.attempt, old);
                 assert_eq!(opened, target);
-                assert_eq!(engine.runner.filter_preparations.last(), Some(&target));
+                assert_eq!(engine.runner.treatment_preparations.last(), Some(&target));
                 let prepared_paused = paused && route >= 3;
                 assert_eq!(
                     *engine.runner.playback.last().unwrap(),
@@ -2575,7 +2606,7 @@ mod tests {
                 },
             );
             if catalog {
-                engine.runner.filter_prepare_failure = Some(refusal.clone());
+                engine.runner.treatment_prepare_failure = Some(refusal.clone());
                 validate(&mut engine);
             } else {
                 engine.validator.finish(Err(refusal.clone()));
@@ -2594,11 +2625,11 @@ mod tests {
             assert!(!engine.has_user_apply_result_or_pending(apply));
         }
     }
-    fn admit_filters(engine: &mut Engine, candidate: DraftSettings) -> FilterAttemptKey {
+    fn admit_treatments(engine: &mut Engine, candidate: DraftSettings) -> TreatmentAttemptKey {
         let revision = engine
             .edit_draft(engine.model().draft().revision, candidate)
             .unwrap();
-        let ApplyAdmission::Filters {
+        let ApplyAdmission::Treatments {
             key,
             revision: frozen,
         } = engine
@@ -2611,7 +2642,7 @@ mod tests {
         key
     }
     fn filter_error(
-        key: FilterAttemptKey,
+        key: TreatmentAttemptKey,
         kind: FilterErrorKind,
         fresh: bool,
     ) -> Box<FilterFailure> {
@@ -2635,28 +2666,149 @@ mod tests {
             },
         })
     }
-    fn filter_success(engine: &mut Engine, key: FilterAttemptKey) {
-        engine.runner.events.push_back(SessionEvent::FilterResult {
-            key,
-            result: Ok(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()),
-        });
+    fn disposition_for(kind: &FilterErrorKind, fresh: bool) -> TreatmentFailureDisposition {
+        let rejected = matches!(
+            kind,
+            FilterErrorKind::Prevalidation
+                | FilterErrorKind::CatalogUnavailable
+                | FilterErrorKind::CommandSubmission { .. }
+                | FilterErrorKind::CommandRejected { .. }
+        );
+        if rejected && !fresh {
+            TreatmentFailureDisposition::Untouched
+        } else if fresh {
+            TreatmentFailureDisposition::RestoreFreshOwner
+        } else {
+            TreatmentFailureDisposition::RestoreSameOwner
+        }
     }
-    fn filter_failed(
+    fn treatment_error(
+        key: TreatmentAttemptKey,
+        kind: FilterErrorKind,
+        fresh: bool,
+    ) -> Box<TreatmentFailure> {
+        let disposition = disposition_for(&kind, fresh);
+        Box::new(TreatmentFailure {
+            key: Some(key),
+            kind: TreatmentErrorKind::Filter(*filter_error(key, kind, fresh)),
+            disposition,
+        })
+    }
+    fn applied_vf_fault(
+        origin: TreatmentAttemptKey,
+        applied: TreatmentAttemptKey,
+    ) -> Box<TreatmentFailure> {
+        Box::new(TreatmentFailure {
+            key: Some(applied),
+            kind: TreatmentErrorKind::Filter(*filter_error(
+                origin,
+                FilterErrorKind::RuntimeGraph,
+                true,
+            )),
+            disposition: TreatmentFailureDisposition::RestoreFreshOwner,
+        })
+    }
+    fn renderer_error(
+        key: TreatmentAttemptKey,
+        property: RendererProperty,
+        kind: RendererErrorKind,
+        fresh: bool,
+    ) -> Box<TreatmentFailure> {
+        Box::new(TreatmentFailure {
+            key: Some(key),
+            kind: TreatmentErrorKind::Renderer(RendererFailure {
+                property,
+                kind,
+                diagnostic: format!("renderer {} rejected", property.as_str()),
+            }),
+            disposition: if fresh {
+                TreatmentFailureDisposition::RestoreFreshOwner
+            } else {
+                TreatmentFailureDisposition::Untouched
+            },
+        })
+    }
+    fn renderer_property_of(failure: &ApplyFailure) -> Option<RendererProperty> {
+        match &failure.treatment.as_deref()?.kind {
+            TreatmentErrorKind::Renderer(failure) => Some(failure.property),
+            _ => None,
+        }
+    }
+    fn filter_of(failure: &ApplyFailure) -> Option<&FilterFailure> {
+        match &failure.treatment.as_deref()?.kind {
+            TreatmentErrorKind::Filter(filter) => Some(filter),
+            _ => None,
+        }
+    }
+    fn filter_success(engine: &mut Engine, key: TreatmentAttemptKey) {
+        // A live transaction derives its proof from the frozen candidate/prior.
+        // A stale or duplicate success (no transition) still needs a well-formed
+        // aggregate; it is rejected downstream by the exact key correlation.
+        let (settings, playback, vf_changed, origin) = match engine.model().treating() {
+            Some(transition) => {
+                let incumbent_playback = engine
+                    .model()
+                    .active()
+                    .map_or(PlaybackState::Live, |active| active.playback());
+                let settings = match key.pass {
+                    TreatmentPass::Candidate => transition.candidate().clone(),
+                    _ => transition.prior().settings().clone(),
+                };
+                let vf_changed =
+                    transition.candidate().filters != transition.prior().settings().filters;
+                let origin = engine
+                    .model()
+                    .confirmed_treatments()
+                    .map(|confirmed| confirmed.filters().origin());
+                (settings, incumbent_playback, vf_changed, origin)
+            }
+            None => (settings(60), PlaybackState::Live, true, None),
+        };
+        let playback = match playback {
+            PlaybackState::Live => InitialPlayback::Live,
+            PlaybackState::Paused => InitialPlayback::Paused,
+            PlaybackState::PausePending { .. } => panic!("pending playback cannot confirm"),
+        };
+        let filters = if vf_changed {
+            FilterTreatmentProof::Reconfigured(
+                FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap(),
+            )
+        } else {
+            FilterTreatmentProof::Preserved {
+                origin: origin.expect("preserved vf requires a committed origin"),
+            }
+        };
+        let renderer = RendererConfirmation::checked(key, settings.renderer.clone());
+        let confirmation =
+            TreatmentConfirmation::checked(key, playback, vf_changed, filters, renderer).unwrap();
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::TreatmentResult {
+                key,
+                result: Ok(confirmation),
+            });
+    }
+    fn treatment_failed(
         engine: &mut Engine,
-        key: FilterAttemptKey,
+        key: TreatmentAttemptKey,
         kind: FilterErrorKind,
         fresh: bool,
     ) {
-        engine.runner.events.push_back(SessionEvent::FilterResult {
-            key,
-            result: Err(filter_error(key, kind, fresh)),
-        });
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::TreatmentResult {
+                key,
+                result: Err(treatment_error(key, kind, fresh)),
+            });
     }
     fn deadline() -> FilterErrorKind {
         FilterErrorKind::Unconfirmed {
             reason: FilterConfirmationFailure::Deadline,
         }
     }
+
     #[test]
     fn correlated_stream_terminal_keeps_exact_candidate_cause_and_frozen_settings_in_both_orders() {
         for ended_first in [false, true] {
@@ -2664,7 +2816,7 @@ mod tests {
                 let mut engine = engine();
                 let old = initial(&mut engine);
                 let candidate = filter_settings("frozen failing candidate");
-                let key = admit_filters(&mut engine, candidate.clone());
+                let key = admit_treatments(&mut engine, candidate.clone());
                 if ended_first {
                     engine.runner.events.push_back(SessionEvent::StreamEnded {
                         attempt: old,
@@ -2674,16 +2826,16 @@ mod tests {
                 }
                 if typed_session {
                     // Gate's original Open snapshot is intentionally different.
-                    let terminal = Engine::filter_failure(
+                    let terminal = Engine::treatment_failure(
                         settings(60),
-                        *filter_error(key, FilterErrorKind::RuntimeGraph, true),
+                        *treatment_error(key, FilterErrorKind::RuntimeGraph, true),
                     );
                     engine.runner.events.push_back(SessionEvent::SessionFailed {
                         attempt: old,
                         failure: terminal,
                     });
                 } else {
-                    filter_failed(&mut engine, key, FilterErrorKind::RuntimeGraph, true);
+                    treatment_failed(&mut engine, key, FilterErrorKind::RuntimeGraph, true);
                 }
                 if !ended_first {
                     engine.runner.events.push_back(SessionEvent::StreamEnded {
@@ -2694,8 +2846,8 @@ mod tests {
                 }
                 engine.poll();
                 assert_eq!(
-                    engine.model().filtering().unwrap().route(),
-                    Some(FilterRestoreRoute::FreshOwner)
+                    engine.model().treating().unwrap().route(),
+                    Some(TreatmentRestoreRoute::FreshOwner)
                 );
                 assert!(engine.model().recovery().is_none());
                 let cause = engine
@@ -2706,9 +2858,9 @@ mod tests {
                     .as_ref()
                     .unwrap();
                 assert_eq!(cause.requested.as_ref(), &candidate);
-                assert_eq!(cause.filter.as_ref().unwrap().diagnostics.key, Some(key));
+                assert_eq!(filter_of(cause).unwrap().diagnostics.key, Some(key));
                 assert_eq!(
-                    cause.filter.as_ref().unwrap().kind,
+                    filter_of(cause).unwrap().kind,
                     FilterErrorKind::RuntimeGraph
                 );
                 engine.runner.barrier(old);
@@ -2744,16 +2896,20 @@ mod tests {
                     engine.take_verified_applied();
                     let apply = if paused {
                         confirm_pause(&mut engine, old);
-                        let key = engine.model().confirmed_filter_key().unwrap();
-                        engine.runner.events.push_back(SessionEvent::FilterFault {
-                            key,
-                            failure: filter_error(key, FilterErrorKind::RuntimeGraph, true),
-                        });
+                        let key = engine.model().confirmed_treatment_key().unwrap();
+                        engine
+                            .runner
+                            .events
+                            .push_back(SessionEvent::TreatmentFault {
+                                key,
+                                failure: treatment_error(key, FilterErrorKind::RuntimeGraph, true),
+                            });
                         engine.poll();
                         engine.model().state_identity().operation().unwrap()
                     } else {
-                        let key = admit_filters(&mut engine, filter_settings("failed candidate"));
-                        filter_failed(&mut engine, key, FilterErrorKind::RuntimeGraph, true);
+                        let key =
+                            admit_treatments(&mut engine, filter_settings("failed candidate"));
+                        treatment_failed(&mut engine, key, FilterErrorKind::RuntimeGraph, true);
                         engine.poll();
                         key.apply
                     };
@@ -2897,7 +3053,7 @@ mod tests {
                         if operation == 2 {
                             confirm_pause(&mut engine, old);
                         }
-                        let confirmed = engine.model().confirmed_filter_key().unwrap();
+                        let confirmed = engine.model().confirmed_treatment_key().unwrap();
                         let superseded = match operation {
                             0 => {
                                 let mut changed = settings(30);
@@ -2926,18 +3082,25 @@ mod tests {
                         engine
                             .edit_draft(engine.model().draft().revision, newer.clone())
                             .unwrap();
-                        engine.runner.events.push_back(SessionEvent::FilterFault {
-                            key: confirmed,
-                            failure: filter_error(confirmed, FilterErrorKind::RuntimeGraph, true),
-                        });
+                        engine
+                            .runner
+                            .events
+                            .push_back(SessionEvent::TreatmentFault {
+                                key: confirmed,
+                                failure: treatment_error(
+                                    confirmed,
+                                    FilterErrorKind::RuntimeGraph,
+                                    true,
+                                ),
+                            });
                         engine.poll();
-                        assert_eq!(engine.model().phase(), ProductPhase::RestoringFilters);
+                        assert_eq!(engine.model().phase(), ProductPhase::RestoringTreatments);
                         assert_eq!(
-                            engine.model().filtering().unwrap().route(),
-                            Some(FilterRestoreRoute::FreshOwner)
+                            engine.model().treating().unwrap().route(),
+                            Some(TreatmentRestoreRoute::FreshOwner)
                         );
                         assert_eq!(
-                            engine.model().filtering().unwrap().prior().settings(),
+                            engine.model().treating().unwrap().prior().settings(),
                             &prior
                         );
                         assert!(engine.prepared.is_none() && engine.pending_validation.is_none());
@@ -2953,10 +3116,7 @@ mod tests {
                             .clone()
                             .unwrap();
                         assert_eq!(cause.requested.as_ref(), &prior);
-                        assert_eq!(
-                            cause.filter.as_ref().unwrap().diagnostics.key,
-                            Some(confirmed)
-                        );
+                        assert_eq!(filter_of(&cause).unwrap().diagnostics.key, Some(confirmed));
                         if barrier_first {
                             engine.runner.barrier(old);
                             engine.poll();
@@ -3047,7 +3207,7 @@ mod tests {
                 actual.model().state_identity(),
                 ordinary.model().state_identity()
             );
-            assert!(actual.model().filtering().is_none());
+            assert!(actual.model().treating().is_none());
             assert_eq!(actual.model().active(), ordinary.model().active());
             assert_eq!(actual.model().last_valid(), ordinary.model().last_valid());
             assert_eq!(actual.model().draft(), ordinary.model().draft());
@@ -3066,12 +3226,12 @@ mod tests {
             );
             let mut loss = actual.model().recovery().cloned();
             if let Some(loss) = &mut loss {
-                loss.failure.filter = None;
+                loss.failure.treatment = None;
             }
             assert_eq!(loss.as_ref(), ordinary.model().recovery());
             let mut report = actual.model().failures().cloned();
             if let Some(incumbent) = report.as_mut().and_then(|report| report.incumbent.as_mut()) {
-                incumbent.filter = None;
+                incumbent.treatment = None;
             }
             assert_eq!(report.as_ref(), ordinary.model().failures());
             assert_eq!(actual.validator.cancelled, ordinary.validator.cancelled);
@@ -3079,11 +3239,11 @@ mod tests {
             assert_eq!(actual.runner.opens, ordinary.runner.opens);
             assert_eq!(actual.runner.stops, ordinary.runner.stops);
             assert_eq!(
-                actual.runner.filter_preparations,
-                ordinary.runner.filter_preparations
+                actual.runner.treatment_preparations,
+                ordinary.runner.treatment_preparations
             );
             assert!(
-                actual.runner.filter_intents.is_empty(),
+                actual.runner.treatment_intents.is_empty(),
                 "source-loss evidence cannot submit filter work"
             );
         }
@@ -3142,7 +3302,7 @@ mod tests {
                                     .edit_draft(engine.model().draft().revision, newer.clone())
                                     .unwrap();
                             }
-                            let key = actual.model().confirmed_filter_key().unwrap();
+                            let key = actual.model().confirmed_treatment_key().unwrap();
                             let old = key.attempt;
                             let request = actual.model().validation_request().unwrap().clone();
                             let admitted = request.key.apply;
@@ -3156,15 +3316,15 @@ mod tests {
                             let fault = if typed_terminal {
                                 SessionEvent::SessionFailed {
                                     attempt: old,
-                                    failure: Engine::filter_failure(
+                                    failure: Engine::treatment_failure(
                                         prior.clone(),
-                                        *filter_error(key, kind.clone(), true),
+                                        *treatment_error(key, kind.clone(), true),
                                     ),
                                 }
                             } else {
-                                SessionEvent::FilterFault {
+                                SessionEvent::TreatmentFault {
                                     key,
-                                    failure: filter_error(key, kind.clone(), true),
+                                    failure: treatment_error(key, kind.clone(), true),
                                 }
                             };
                             if fault_timing == 0 {
@@ -3185,7 +3345,7 @@ mod tests {
                                 observe(engine, removal);
                             }
                             assert!(
-                                !actual.current_filter_key(key),
+                                !actual.current_treatment_key(key),
                                 "lost proof is diagnostic-only, never treatment terminal correlation"
                             );
                             if fault_timing == 2 {
@@ -3225,7 +3385,7 @@ mod tests {
                                 }
                             );
                             assert!(matches!(loss.evidence, LossEvidence::Removed { .. }));
-                            let retained = loss.failure.filter.as_ref();
+                            let retained = filter_of(&loss.failure);
                             if fault_timing == 3 {
                                 assert!(retained.is_none(), "retired-owner evidence is stale");
                             } else {
@@ -3235,15 +3395,15 @@ mod tests {
                                 assert_eq!(retained.diagnostics.key, Some(key));
                                 assert_eq!(retained.kind, kind);
                                 assert_eq!(
-                                    actual
-                                        .model()
-                                        .failures()
-                                        .unwrap()
-                                        .incumbent
-                                        .as_ref()
-                                        .unwrap()
-                                        .filter
-                                        .as_ref(),
+                                    filter_of(
+                                        actual
+                                            .model()
+                                            .failures()
+                                            .unwrap()
+                                            .incumbent
+                                            .as_ref()
+                                            .unwrap()
+                                    ),
                                     Some(retained)
                                 );
                             }
@@ -3342,7 +3502,7 @@ mod tests {
         let old = initial(&mut engine);
         engine.take_verified_applied();
         let candidate = complete_treatments("candidate\ninert");
-        let key = admit_filters(&mut engine, candidate.clone());
+        let key = admit_treatments(&mut engine, candidate.clone());
         let revision = engine.model().draft().revision;
         let admitted_state = engine.model().state_identity();
         assert_eq!(
@@ -3350,12 +3510,12 @@ mod tests {
             Err(CommandRejection::ApplyInProgress)
         );
         assert!(engine.take_verified_applied().is_none());
-        assert_eq!(engine.runner.filter_preparations.len(), 3);
-        assert_eq!(engine.runner.filter_preparations[1], candidate);
-        assert_eq!(engine.runner.filter_preparations[2], settings(60));
+        assert_eq!(engine.runner.treatment_preparations.len(), 3);
+        assert_eq!(engine.runner.treatment_preparations[1], candidate);
+        assert_eq!(engine.runner.treatment_preparations[2], settings(60));
         assert_eq!(
-            engine.runner.filter_intents,
-            vec![(key, candidate.filters.clone())]
+            engine.runner.treatment_intents,
+            vec![(key, candidate.clone())]
         );
         assert_eq!(
             engine.model().last_valid().unwrap().settings(),
@@ -3377,7 +3537,7 @@ mod tests {
         assert_eq!(engine.runner.opens.len(), 1);
         assert!(engine.runner.stops.is_empty());
         assert!(engine.has_user_apply_result_or_pending(key.apply));
-        let VerifiedApplied::Filters {
+        let VerifiedApplied::Treatments {
             key: received,
             revision: frozen,
             applied,
@@ -3399,22 +3559,507 @@ mod tests {
             "duplicates cannot replace the consumed slot"
         );
     }
+
+    #[test]
+    fn renderer_only_live_treatment_keeps_owner_attempt_and_vf_without_open() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        engine.take_verified_applied();
+        let mut candidate = engine.model().draft().settings.clone();
+        candidate.renderer = altered_renderer(&candidate.renderer);
+        let revision = engine
+            .edit_draft(engine.model().draft().revision, candidate.clone())
+            .unwrap();
+        let ApplyAdmission::Treatments {
+            key,
+            revision: frozen,
+        } = engine
+            .apply(engine.model().state_identity(), revision)
+            .unwrap()
+        else {
+            panic!("renderer-only live apply must use the hot treatment route")
+        };
+        assert_eq!(frozen, revision);
+        assert_eq!(key.pass, TreatmentPass::Candidate);
+        assert_eq!(key.attempt, old, "the same owner executes the hot route");
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+        assert_eq!(
+            engine.runner.treatment_intents,
+            vec![(key, candidate.clone())],
+            "the submitted bundle carries the requested renderer and vf"
+        );
+        assert_eq!(
+            engine.model().active().unwrap().attempt(),
+            old,
+            "the incumbent remains the last-verified configuration while treating"
+        );
+        filter_success(&mut engine, key);
+        engine.poll();
+        assert_eq!(engine.model().active().unwrap().attempt(), old);
+        assert_eq!(
+            engine
+                .model()
+                .active()
+                .unwrap()
+                .applied()
+                .settings()
+                .renderer,
+            candidate.renderer
+        );
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+        let VerifiedApplied::Treatments {
+            key: received,
+            applied,
+            ..
+        } = engine
+            .take_verified_applied()
+            .expect("renderer-only receipt")
+        else {
+            panic!("renderer-only receipt is a treatment, never an open")
+        };
+        assert_eq!(received, key);
+        assert_eq!(applied.settings().renderer, candidate.renderer);
+    }
+
+    #[test]
+    fn renderer_only_paused_treatment_preserves_pause_and_never_opens() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        engine.take_verified_applied();
+        confirm_pause(&mut engine, old);
+        let mut candidate = engine.model().draft().settings.clone();
+        candidate.renderer = altered_renderer(&candidate.renderer);
+        let revision = engine
+            .edit_draft(engine.model().draft().revision, candidate.clone())
+            .unwrap();
+        let ApplyAdmission::Treatments { key, .. } = engine
+            .apply(engine.model().state_identity(), revision)
+            .unwrap()
+        else {
+            panic!("renderer-only paused apply must keep the hot treatment route")
+        };
+        assert_eq!(key.attempt, old);
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+        filter_success(&mut engine, key);
+        engine.poll();
+        let active = engine.model().active().unwrap();
+        assert_eq!(active.attempt(), old);
+        assert_eq!(active.playback(), PlaybackState::Paused);
+        assert_eq!(active.applied().settings().renderer, candidate.renderer);
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.runner.stops.is_empty());
+    }
+
+    #[test]
+    fn paused_filter_change_uses_open_route_not_hot_treatment() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        engine.take_verified_applied();
+        confirm_pause(&mut engine, old);
+        let mut candidate = engine.model().draft().settings.clone();
+        candidate.filters = filter_settings("paused vf change").filters;
+        let revision = engine
+            .edit_draft(engine.model().draft().revision, candidate)
+            .unwrap();
+        assert!(matches!(
+            engine
+                .apply(engine.model().state_identity(), revision)
+                .unwrap(),
+            ApplyAdmission::Open { .. }
+        ));
+        assert!(
+            engine.runner.treatment_intents.is_empty(),
+            "a paused vf change is a full owner open, never a hot treatment"
+        );
+    }
+
+    #[test]
+    fn combined_renderer_and_vf_candidate_restores_prior_bundle_once() {
+        let mut engine = engine();
+        initial(&mut engine);
+        engine.take_verified_applied();
+        let mut candidate = engine.model().draft().settings.clone();
+        candidate.renderer = altered_renderer(&candidate.renderer);
+        candidate.filters = filter_settings("combined renderer+vf").filters;
+        let revision = engine
+            .edit_draft(engine.model().draft().revision, candidate.clone())
+            .unwrap();
+        let ApplyAdmission::Treatments { key, .. } = engine
+            .apply(engine.model().state_identity(), revision)
+            .unwrap()
+        else {
+            panic!("combined live apply uses the hot treatment route")
+        };
+        assert_eq!(engine.runner.treatment_intents[0], (key, candidate.clone()));
+        treatment_failed(&mut engine, key, FilterErrorKind::RuntimeGraph, false);
+        engine.poll();
+        let restore = engine.model().treating().unwrap().key();
+        assert_eq!(restore.pass, TreatmentPass::Restore);
+        assert_eq!(
+            engine.runner.treatment_intents.len(),
+            2,
+            "exactly one same-owner restore of the frozen prior"
+        );
+        assert_eq!(engine.runner.treatment_intents[1].1, settings(60));
+        assert!(engine.runner.stops.is_empty());
+        filter_success(&mut engine, restore);
+        engine.poll();
+        assert_eq!(
+            engine.model().phase(),
+            ProductPhase::ErrorWithActiveRestored
+        );
+        assert_eq!(
+            engine.model().last_valid().unwrap().settings(),
+            &settings(60)
+        );
+        assert_eq!(engine.runner.opens.len(), 1);
+        assert!(engine.take_verified_applied().is_none());
+    }
+
+    #[test]
+    fn late_vf_fault_after_renderer_only_revokes_current_treatment_via_original_key() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        engine.take_verified_applied();
+        let vf_origin = engine.model().confirmed_filter_origin().unwrap();
+        assert_eq!(vf_origin.attempt, old);
+        // A renderer-only hot commit keeps the same owner but changes the
+        // aggregate treatment key while retaining the original vf provenance.
+        let mut candidate = engine.model().draft().settings.clone();
+        candidate.renderer = altered_renderer(&candidate.renderer);
+        let revision = engine
+            .edit_draft(engine.model().draft().revision, candidate)
+            .unwrap();
+        let ApplyAdmission::Treatments { key, .. } = engine
+            .apply(engine.model().state_identity(), revision)
+            .unwrap()
+        else {
+            panic!("renderer-only hot route")
+        };
+        filter_success(&mut engine, key);
+        engine.poll();
+        assert!(engine.model().active().is_some());
+        let applied = engine.model().last_valid().unwrap().settings().clone();
+        assert_eq!(engine.model().confirmed_treatment_key(), Some(key));
+        assert_eq!(
+            engine.model().confirmed_filter_origin(),
+            Some(vf_origin),
+            "renderer-only keeps the true vf key"
+        );
+        // A late native vf fault still keyed to the original provenance must
+        // revoke the current renderer-only treatment, not be dropped.
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::TreatmentFault {
+                key,
+                failure: applied_vf_fault(vf_origin, key),
+            });
+        engine.poll();
+        // active() deliberately reports the frozen last-verified selection
+        // while Treating rather than provisional native health, so the
+        // consumer-visible revocation is the model leaving Active for exactly
+        // one fresh-owner restoration of the whole frozen prior, with no
+        // reusable receipt and no new open before the owner barrier.
+        let restore = engine
+            .model()
+            .treating()
+            .expect("the late origin vf fault selects exactly one restoration");
+        assert!(!engine.has_user_apply_result_or_pending(key.apply));
+        assert_eq!(engine.model().phase(), ProductPhase::RestoringTreatments);
+        assert_eq!(restore.route(), Some(TreatmentRestoreRoute::FreshOwner));
+        assert_eq!(restore.key().pass, TreatmentPass::Restore);
+        assert_eq!(restore.prior().settings(), &applied);
+        assert_eq!(engine.runner.stops.len(), 1);
+        assert!(engine.take_verified_applied().is_none());
+        assert_eq!(engine.runner.opens.len(), 1);
+    }
+
+    #[test]
+    fn same_drain_renderer_rejection_and_origin_vf_fault_normalize_to_current_and_restore_once() {
+        for fault_first in [false, true] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            engine.take_verified_applied();
+            // A renderer-only hot commit advances the aggregate treatment key
+            // while retaining the original vf provenance.
+            let mut renderer_only = engine.model().draft().settings.clone();
+            renderer_only.renderer = altered_renderer(&renderer_only.renderer);
+            let renderer_key = admit_treatments(&mut engine, renderer_only.clone());
+            filter_success(&mut engine, renderer_key);
+            engine.poll();
+            let applied = engine.model().confirmed_treatment_key().unwrap();
+            assert_eq!(applied, renderer_key);
+            let origin = engine.model().confirmed_filter_origin().unwrap();
+            assert_eq!(origin.attempt, old);
+            assert_ne!(
+                origin, applied,
+                "the aggregate key advanced past the vf origin"
+            );
+
+            // Candidate B is a new renderer-only attempt whose first SET is
+            // definitively rejected without a prior mutation.
+            let mut candidate = renderer_only.clone();
+            candidate.renderer = altered_renderer(&candidate.renderer);
+            let key = admit_treatments(&mut engine, candidate);
+            let rejection = SessionEvent::TreatmentResult {
+                key,
+                result: Err(renderer_error(
+                    key,
+                    RendererProperty::Scale,
+                    RendererErrorKind::Rejected { mpv_error: -5 },
+                    false,
+                )),
+            };
+            // An actual incumbent vf runtime fault still keyed to the original
+            // provenance arrives in the same drain.
+            let origin_fault = SessionEvent::TreatmentFault {
+                key: applied,
+                failure: applied_vf_fault(origin, applied),
+            };
+            if fault_first {
+                engine.runner.events.push_back(origin_fault);
+                engine.runner.events.push_back(rejection);
+            } else {
+                engine.runner.events.push_back(rejection);
+                engine.runner.events.push_back(origin_fault);
+            }
+            engine.poll();
+            assert_eq!(
+                engine.model().treating().unwrap().route(),
+                Some(TreatmentRestoreRoute::FreshOwner)
+            );
+            assert_eq!(engine.runner.stops.len(), 1, "exactly one fresh route");
+            assert_eq!(engine.runner.treatment_intents.len(), 2);
+            let failures = engine.model().failures().unwrap();
+            // The candidate keeps its typed renderer diagnostic as the primary
+            // failure rather than being overwritten by the vf origin fault.
+            assert_eq!(
+                renderer_property_of(failures.candidate.as_ref().unwrap()),
+                Some(RendererProperty::Scale)
+            );
+            let incumbent = failures.incumbent.as_ref().unwrap();
+            assert_eq!(
+                incumbent.treatment.as_deref().unwrap().key,
+                Some(applied),
+                "the origin fault normalizes to the current applied aggregate"
+            );
+            let nested =
+                filter_of(incumbent).expect("the normalized fault keeps its vf diagnostic");
+            assert_eq!(nested.kind, FilterErrorKind::RuntimeGraph);
+            assert_eq!(
+                nested.diagnostics.key,
+                Some(origin),
+                "the nested vf origin is preserved, never rewritten"
+            );
+
+            engine.runner.barrier(old);
+            engine.poll();
+            assert_eq!(
+                engine.model().validation_request().unwrap().key.purpose,
+                AttemptPurpose::Restore
+            );
+            assert_eq!(
+                engine.model().validation_request().unwrap().settings,
+                renderer_only
+            );
+            validate(&mut engine);
+            engine.runner.verified();
+            engine.poll();
+            assert_eq!(
+                engine.model().phase(),
+                ProductPhase::ErrorWithActiveRestored
+            );
+            assert_eq!(
+                engine.model().last_valid().unwrap().settings(),
+                &renderer_only
+            );
+            assert_eq!(
+                engine
+                    .model()
+                    .confirmed_treatments()
+                    .unwrap()
+                    .renderer()
+                    .settings(),
+                &renderer_only.renderer
+            );
+            assert_eq!(
+                engine.model().confirmed_treatment_key().unwrap().pass,
+                TreatmentPass::Open
+            );
+            assert_eq!(engine.runner.opens.len(), 2);
+        }
+    }
+
+    #[test]
+    fn late_origin_vf_fault_after_untouched_rejection_preserves_primary_and_restores_prior_once() {
+        for restore_ok in [true, false] {
+            let mut engine = engine();
+            let old = initial(&mut engine);
+            engine.take_verified_applied();
+            let mut renderer_only = engine.model().draft().settings.clone();
+            renderer_only.renderer = altered_renderer(&renderer_only.renderer);
+            let renderer_key = admit_treatments(&mut engine, renderer_only.clone());
+            filter_success(&mut engine, renderer_key);
+            engine.poll();
+            let origin = engine.model().confirmed_filter_origin().unwrap();
+            assert_eq!(origin.attempt, old);
+
+            // First SET rejection B is untouched: the prior stays active and B
+            // remains the primary failure.
+            let mut candidate = renderer_only.clone();
+            candidate.renderer = altered_renderer(&candidate.renderer);
+            let key = admit_treatments(&mut engine, candidate);
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::TreatmentResult {
+                    key,
+                    result: Err(renderer_error(
+                        key,
+                        RendererProperty::Dither,
+                        RendererErrorKind::Rejected { mpv_error: -5 },
+                        false,
+                    )),
+                });
+            engine.poll();
+            assert_eq!(
+                engine.model().phase(),
+                ProductPhase::ErrorWithActiveRestored
+            );
+            assert_eq!(
+                engine.model().active().unwrap().applied().settings(),
+                &renderer_only
+            );
+            assert_eq!(
+                renderer_property_of(
+                    engine
+                        .model()
+                        .failures()
+                        .unwrap()
+                        .candidate
+                        .as_ref()
+                        .unwrap()
+                ),
+                Some(RendererProperty::Dither)
+            );
+
+            // A later genuine vf runtime fault on the applied graph must not be
+            // dropped just because a newer unsuccessful attempt is on record.
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::TreatmentFault {
+                    key: renderer_key,
+                    failure: applied_vf_fault(origin, renderer_key),
+                });
+            engine.poll();
+            assert_eq!(
+                engine.model().treating().unwrap().route(),
+                Some(TreatmentRestoreRoute::FreshOwner)
+            );
+            assert_eq!(engine.runner.stops.len(), 1);
+            let failures = engine.model().failures().unwrap();
+            assert_eq!(
+                renderer_property_of(failures.candidate.as_ref().unwrap()),
+                Some(RendererProperty::Dither),
+                "B stays the primary failure report"
+            );
+            let incumbent = failures.incumbent.as_ref().unwrap();
+            assert_eq!(
+                incumbent.treatment.as_deref().unwrap().key,
+                Some(renderer_key)
+            );
+            assert_eq!(filter_of(incumbent).unwrap().diagnostics.key, Some(origin));
+
+            engine.runner.barrier(old);
+            engine.poll();
+            assert_eq!(
+                engine.model().validation_request().unwrap().key.purpose,
+                AttemptPurpose::Restore
+            );
+            assert_eq!(
+                engine.model().validation_request().unwrap().settings,
+                renderer_only
+            );
+            validate(&mut engine);
+            let restore = engine.model().opening().unwrap().0;
+            if restore_ok {
+                engine.runner.verified();
+                engine.poll();
+                assert_eq!(
+                    engine.model().phase(),
+                    ProductPhase::ErrorWithActiveRestored
+                );
+                assert_eq!(
+                    engine.model().last_valid().unwrap().settings(),
+                    &renderer_only
+                );
+                assert_eq!(
+                    engine
+                        .model()
+                        .confirmed_treatments()
+                        .unwrap()
+                        .renderer()
+                        .settings(),
+                    &renderer_only.renderer
+                );
+                let report = engine.model().failures().unwrap();
+                assert_eq!(
+                    renderer_property_of(report.candidate.as_ref().unwrap()),
+                    Some(RendererProperty::Dither)
+                );
+                assert!(report.incumbent.is_some());
+            } else {
+                engine
+                    .runner
+                    .fail("restore of the renderer-only prior failed");
+                engine.poll();
+                engine.runner.barrier(restore.attempt);
+                engine.poll();
+                assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
+                let report = engine.model().failures().unwrap();
+                assert_eq!(
+                    report
+                        .candidate
+                        .as_ref()
+                        .unwrap()
+                        .treatment
+                        .as_deref()
+                        .unwrap()
+                        .key,
+                    Some(key),
+                    "the primary untouched failure survives an unavailable restore"
+                );
+                assert!(report.restore.is_some());
+                assert!(report.incumbent.is_some());
+            }
+            assert_eq!(engine.runner.opens.len(), 2);
+        }
+    }
+
     #[test]
     fn retained_filter_positive_is_revoked_by_later_health_loss_and_lifecycle_cancellation() {
         for cancellation in 0..5 {
             let mut engine = engine();
             initial(&mut engine);
             engine.take_verified_applied();
-            let key = admit_filters(&mut engine, filter_settings("verified candidate"));
+            let key = admit_treatments(&mut engine, filter_settings("verified candidate"));
             filter_success(&mut engine, key);
             engine.poll();
             assert!(engine.has_user_apply_result_or_pending(key.apply));
             match cancellation {
                 0 => {
-                    engine.runner.events.push_back(SessionEvent::FilterFault {
-                        key,
-                        failure: filter_error(key, FilterErrorKind::RuntimeGraph, true),
-                    });
+                    engine
+                        .runner
+                        .events
+                        .push_back(SessionEvent::TreatmentFault {
+                            key,
+                            failure: treatment_error(key, FilterErrorKind::RuntimeGraph, true),
+                        });
                     engine.poll();
                 }
                 1 => engine.close(engine.model().state_identity()).unwrap(),
@@ -3448,7 +4093,7 @@ mod tests {
     fn identical_empty_apply_is_filter_transaction_but_explicit_dirty_capture_is_rejected() {
         let mut engine = engine();
         let old = initial(&mut engine);
-        let ApplyAdmission::Filters { key, .. } = engine
+        let ApplyAdmission::Treatments { key, .. } = engine
             .apply(
                 engine.model().state_identity(),
                 engine.model().draft().revision,
@@ -3457,8 +4102,14 @@ mod tests {
         else {
             panic!("empty replay must use live filters")
         };
-        assert_eq!(engine.runner.filter_intents.len(), 1);
-        assert!(engine.runner.filter_intents[0].1.entries().is_empty());
+        assert_eq!(engine.runner.treatment_intents.len(), 1);
+        assert!(
+            engine.runner.treatment_intents[0]
+                .1
+                .filters
+                .entries()
+                .is_empty()
+        );
         assert_eq!(
             engine.restart(engine.model().state_identity()),
             Err(CommandRejection::ApplyInProgress)
@@ -3468,7 +4119,7 @@ mod tests {
             Err(CommandRejection::ApplyInProgress)
         );
         assert_eq!(
-            engine.apply_filters(
+            engine.apply_treatments(
                 engine.model().state_identity(),
                 engine.model().draft().revision
             ),
@@ -3481,11 +4132,11 @@ mod tests {
             .unwrap();
         let identity = engine.model().state_identity();
         assert_eq!(
-            engine.apply_filters(identity, engine.model().draft().revision),
+            engine.apply_treatments(identity, engine.model().draft().revision),
             Err(CommandRejection::CaptureDraftChanged)
         );
         assert_eq!(engine.model().state_identity(), identity);
-        assert_eq!(engine.runner.filter_intents.len(), 1);
+        assert_eq!(engine.runner.treatment_intents.len(), 1);
         assert!(engine.runner.stops.is_empty());
     }
     #[test]
@@ -3494,16 +4145,16 @@ mod tests {
         let old = initial(&mut engine);
         let candidate = filter_settings("unsupported");
         let mut typed = filter_error(
-            FilterAttemptKey {
+            TreatmentAttemptKey {
                 apply: ApplyId::new(99).unwrap(),
                 attempt: old,
-                pass: FilterPass::LiveCandidate,
+                pass: TreatmentPass::Candidate,
             },
             FilterErrorKind::CatalogUnavailable,
             false,
         );
         typed.diagnostics.key = None;
-        engine.runner.filter_prepare_failure = Some(
+        engine.runner.treatment_prepare_failure = Some(
             ApplyFailure::new(
                 FailureCategory::Validation(ValidationLayer::Filters),
                 Stage::Prevalidation,
@@ -3512,9 +4163,13 @@ mod tests {
                 "filter_prepare",
                 "qualified catalog unavailable",
             )
-            .with_filter(*typed),
+            .with_treatment(TreatmentFailure {
+                key: None,
+                kind: TreatmentErrorKind::Filter(*typed),
+                disposition: TreatmentFailureDisposition::Untouched,
+            }),
         );
-        let key = admit_filters(&mut engine, candidate.clone());
+        let key = admit_treatments(&mut engine, candidate.clone());
         let failure = engine
             .model()
             .failures()
@@ -3522,7 +4177,8 @@ mod tests {
             .candidate
             .as_ref()
             .unwrap();
-        assert_eq!(failure.filter.as_ref().unwrap().diagnostics.key, Some(key));
+        assert_eq!(failure.treatment.as_ref().unwrap().key, Some(key));
+        assert_eq!(filter_of(failure).unwrap().diagnostics.key, None);
         assert_eq!(
             failure.category,
             FailureCategory::Validation(ValidationLayer::Filters)
@@ -3531,7 +4187,7 @@ mod tests {
         assert_eq!(engine.model().draft().settings, candidate);
         assert_eq!(engine.runner.opens.len(), 1);
         assert!(engine.runner.stops.is_empty());
-        assert!(engine.runner.filter_intents.is_empty());
+        assert!(engine.runner.treatment_intents.is_empty());
         assert!(!engine.has_user_apply_result_or_pending(key.apply));
     }
     #[test]
@@ -3543,8 +4199,8 @@ mod tests {
             let mut engine = engine();
             let old = initial(&mut engine);
             let candidate = filter_settings("rejected");
-            let key = admit_filters(&mut engine, candidate.clone());
-            filter_failed(&mut engine, key, kind.clone(), false);
+            let key = admit_treatments(&mut engine, candidate.clone());
+            treatment_failed(&mut engine, key, kind.clone(), false);
             engine.poll();
             assert_eq!(
                 engine.model().phase(),
@@ -3556,21 +4212,21 @@ mod tests {
                 &settings(60)
             );
             assert_eq!(engine.model().draft().settings, candidate);
-            assert_eq!(engine.runner.filter_intents.len(), 1);
+            assert_eq!(engine.runner.treatment_intents.len(), 1);
             assert!(engine.runner.stops.is_empty());
             assert_eq!(engine.runner.opens.len(), 1);
             assert_eq!(
-                engine
-                    .model()
-                    .failures()
-                    .unwrap()
-                    .candidate
-                    .as_ref()
-                    .unwrap()
-                    .filter
-                    .as_ref()
-                    .unwrap()
-                    .kind,
+                filter_of(
+                    engine
+                        .model()
+                        .failures()
+                        .unwrap()
+                        .candidate
+                        .as_ref()
+                        .unwrap()
+                )
+                .unwrap()
+                .kind,
                 kind
             );
         }
@@ -3580,29 +4236,35 @@ mod tests {
         let mut engine = engine();
         initial(&mut engine);
         let candidate = filter_settings("failed");
-        let key = admit_filters(&mut engine, candidate.clone());
+        let key = admit_treatments(&mut engine, candidate.clone());
         let candidate_identity = engine.model().state_identity();
-        filter_failed(&mut engine, key, deadline(), false);
+        treatment_failed(&mut engine, key, deadline(), false);
         engine.poll();
-        let restore = engine.model().filtering().unwrap().key();
-        assert_eq!(restore.pass, FilterPass::LiveRestore);
+        let restore = engine.model().treating().unwrap().key();
+        assert_eq!(restore.pass, TreatmentPass::Restore);
         assert_eq!(
-            engine.model().state_identity().filter_pass(),
-            Some(FilterPass::LiveRestore)
+            engine.model().state_identity().treatment_pass(),
+            Some(TreatmentPass::Restore)
         );
         assert_eq!(
             engine.close(candidate_identity),
             Err(CommandRejection::StaleState)
         );
-        assert_eq!(engine.runner.filter_intents.len(), 2);
-        assert!(engine.runner.filter_intents[1].1.entries().is_empty());
+        assert_eq!(engine.runner.treatment_intents.len(), 2);
+        assert!(
+            engine.runner.treatment_intents[1]
+                .1
+                .filters
+                .entries()
+                .is_empty()
+        );
         assert!(engine.runner.stops.is_empty());
         engine
             .edit_draft(engine.model().draft().revision, filter_settings("newer"))
             .unwrap();
         filter_success(&mut engine, key);
         engine.poll();
-        assert_eq!(engine.model().phase(), ProductPhase::RestoringFilters);
+        assert_eq!(engine.model().phase(), ProductPhase::RestoringTreatments);
         filter_success(&mut engine, restore);
         engine.poll();
         assert_eq!(
@@ -3623,23 +4285,25 @@ mod tests {
         for failure_mode in 0..7 {
             let mut engine = engine();
             let old = initial(&mut engine);
-            let key = admit_filters(&mut engine, filter_settings("failed"));
+            let key = admit_treatments(&mut engine, filter_settings("failed"));
             if failure_mode == 0 {
                 engine.runner.immediate = Some(SubmitStatus::CapacityExceeded);
             }
-            filter_failed(&mut engine, key, deadline(), false);
+            treatment_failed(&mut engine, key, deadline(), false);
             engine.poll();
             if failure_mode != 0 {
-                let restore = engine.model().filtering().unwrap().key();
+                let restore = engine.model().treating().unwrap().key();
                 match failure_mode {
-                    1 => filter_failed(
+                    1 => treatment_failed(
                         &mut engine,
                         restore,
                         FilterErrorKind::CommandRejected { mpv_error: -5 },
                         false,
                     ),
-                    2 => filter_failed(&mut engine, restore, FilterErrorKind::RuntimeGraph, true),
-                    3 => filter_failed(&mut engine, restore, deadline(), false),
+                    2 => {
+                        treatment_failed(&mut engine, restore, FilterErrorKind::RuntimeGraph, true)
+                    }
+                    3 => treatment_failed(&mut engine, restore, deadline(), false),
                     4 => engine.runner.events.push_back(SessionEvent::SessionFailed {
                         attempt: old,
                         failure: failure(
@@ -3671,7 +4335,7 @@ mod tests {
             engine.poll();
             assert!(engine.model().validation_request().is_none());
             assert_eq!(engine.runner.opens.len(), 1);
-            assert_eq!(engine.runner.filter_intents.len(), 2);
+            assert_eq!(engine.runner.treatment_intents.len(), 2);
             assert!(engine.model().can_reconnect());
         }
     }
@@ -3680,42 +4344,40 @@ mod tests {
         for fault_first in [false, true] {
             let mut engine = engine();
             let old = initial(&mut engine);
-            let incumbent = engine.model().confirmed_filter_key().unwrap();
-            let key = admit_filters(&mut engine, filter_settings("rejected"));
-            let fault = SessionEvent::FilterFault {
+            let incumbent = engine.model().confirmed_treatment_key().unwrap();
+            let key = admit_treatments(&mut engine, filter_settings("rejected"));
+            let fault = SessionEvent::TreatmentFault {
                 key: incumbent,
-                failure: filter_error(incumbent, FilterErrorKind::RuntimeGraph, true),
+                failure: treatment_error(incumbent, FilterErrorKind::RuntimeGraph, true),
             };
             if fault_first {
                 engine.runner.events.push_back(fault);
             }
-            filter_failed(
+            treatment_failed(
                 &mut engine,
                 key,
                 FilterErrorKind::CommandRejected { mpv_error: -5 },
                 false,
             );
             if !fault_first {
-                engine.runner.events.push_back(SessionEvent::FilterFault {
-                    key: incumbent,
-                    failure: filter_error(incumbent, FilterErrorKind::RuntimeGraph, true),
-                });
+                engine
+                    .runner
+                    .events
+                    .push_back(SessionEvent::TreatmentFault {
+                        key: incumbent,
+                        failure: treatment_error(incumbent, FilterErrorKind::RuntimeGraph, true),
+                    });
             }
             engine.poll();
             assert_eq!(
-                engine.model().filtering().unwrap().route(),
-                Some(FilterRestoreRoute::FreshOwner)
+                engine.model().treating().unwrap().route(),
+                Some(TreatmentRestoreRoute::FreshOwner)
             );
             assert_eq!(engine.runner.stops.len(), 1);
-            assert_eq!(engine.runner.filter_intents.len(), 1);
+            assert_eq!(engine.runner.treatment_intents.len(), 1);
             let failures = engine.model().failures().unwrap();
             assert_eq!(
-                failures
-                    .candidate
-                    .as_ref()
-                    .unwrap()
-                    .filter
-                    .as_ref()
+                filter_of(failures.candidate.as_ref().unwrap())
                     .unwrap()
                     .kind,
                 FilterErrorKind::CommandRejected { mpv_error: -5 }
@@ -3747,16 +4409,16 @@ mod tests {
         ] {
             let mut engine = engine();
             let old = initial(&mut engine);
-            let key = admit_filters(&mut engine, filter_settings("failed"));
+            let key = admit_treatments(&mut engine, filter_settings("failed"));
             engine.runner.immediate = Some(status);
-            filter_failed(&mut engine, key, deadline(), false);
+            treatment_failed(&mut engine, key, deadline(), false);
             engine.poll();
             assert_eq!(engine.model().phase(), ProductPhase::ErrorWithoutActive);
             assert!(engine.model().failures().unwrap().restore.is_some());
             engine.runner.barrier(old);
             engine.poll();
             assert_eq!(engine.runner.opens.len(), 1);
-            assert_eq!(engine.runner.filter_intents.len(), 2);
+            assert_eq!(engine.runner.treatment_intents.len(), 2);
             assert!(engine.model().validation_request().is_none());
         }
     }
@@ -3800,37 +4462,46 @@ mod tests {
                                 .unwrap();
                             let old = initial(&mut engine);
                             engine.take_verified_applied();
-                            let confirmed = engine.model().confirmed_filter_key().unwrap();
+                            let confirmed = engine.model().confirmed_treatment_key().unwrap();
                             let expected_candidate = if cause_mode == 2 {
                                 let native =
-                                    filter_error(confirmed, FilterErrorKind::RuntimeGraph, true);
+                                    treatment_error(confirmed, FilterErrorKind::RuntimeGraph, true);
                                 let expected =
-                                    Engine::filter_failure(prior.clone(), *native.clone());
-                                engine.runner.events.push_back(SessionEvent::FilterFault {
-                                    key: confirmed,
-                                    failure: native,
-                                });
+                                    Engine::treatment_failure(prior.clone(), *native.clone());
+                                engine
+                                    .runner
+                                    .events
+                                    .push_back(SessionEvent::TreatmentFault {
+                                        key: confirmed,
+                                        failure: native,
+                                    });
                                 expected
                             } else {
                                 let candidate =
                                     filter_settings("frozen candidate before retirement");
-                                let key = admit_filters(&mut engine, candidate.clone());
+                                let key = admit_treatments(&mut engine, candidate.clone());
                                 let kind = if cause_mode == 0 {
                                     FilterErrorKind::CommandRejected { mpv_error: -5 }
                                 } else {
                                     FilterErrorKind::RuntimeGraph
                                 };
-                                let expected = Engine::filter_failure(
-                                    candidate,
-                                    *filter_error(key, kind.clone(), true),
-                                );
-                                filter_failed(&mut engine, key, kind, cause_mode != 0);
+                                // The native rejection keeps its genuine
+                                // requires_fresh_owner flag; only the aggregate
+                                // disposition is promoted by the independent
+                                // terminal/incumbent evidence in this drain.
+                                let mut expected_native =
+                                    treatment_error(key, kind.clone(), cause_mode != 0);
+                                expected_native.disposition =
+                                    TreatmentFailureDisposition::RestoreFreshOwner;
+                                let expected =
+                                    Engine::treatment_failure(candidate, *expected_native);
+                                treatment_failed(&mut engine, key, kind, cause_mode != 0);
                                 expected
                             };
                             let incumbent = if typed_incumbent {
-                                Engine::filter_failure(
+                                Engine::treatment_failure(
                                     prior.clone(),
-                                    *filter_error(
+                                    *treatment_error(
                                         confirmed,
                                         FilterErrorKind::Unconfirmed {
                                             reason: FilterConfirmationFailure::EvidenceLost,
@@ -3885,14 +4556,9 @@ mod tests {
                                 Some(&incumbent),
                                 "logical cleanup cannot manufacture a different incumbent error"
                             );
-                            if let Some(filter) = &incumbent.filter {
+                            if let Some(filter) = filter_of(&incumbent) {
                                 assert_eq!(
-                                    report
-                                        .incumbent
-                                        .as_ref()
-                                        .unwrap()
-                                        .filter
-                                        .as_ref()
+                                    filter_of(report.incumbent.as_ref().unwrap())
                                         .unwrap()
                                         .diagnostics
                                         .key,
@@ -3996,8 +4662,8 @@ mod tests {
     fn candidate_rejection_survives_terminal_and_release_in_same_drain() {
         let mut engine = engine();
         let old = initial(&mut engine);
-        let key = admit_filters(&mut engine, filter_settings("rejected"));
-        filter_failed(
+        let key = admit_treatments(&mut engine, filter_settings("rejected"));
+        treatment_failed(
             &mut engine,
             key,
             FilterErrorKind::CommandRejected { mpv_error: -5 },
@@ -4008,17 +4674,17 @@ mod tests {
         let request = engine.model().validation_request().unwrap();
         assert_eq!(request.key.purpose, AttemptPurpose::Restore);
         assert_eq!(
-            engine
-                .model()
-                .failures()
-                .unwrap()
-                .candidate
-                .as_ref()
-                .unwrap()
-                .filter
-                .as_ref()
-                .unwrap()
-                .kind,
+            filter_of(
+                engine
+                    .model()
+                    .failures()
+                    .unwrap()
+                    .candidate
+                    .as_ref()
+                    .unwrap()
+            )
+            .unwrap()
+            .kind,
             FilterErrorKind::CommandRejected { mpv_error: -5 }
         );
         assert_eq!(engine.runner.opens.len(), 1);
@@ -4027,12 +4693,12 @@ mod tests {
     fn graph_failure_awaits_both_barriers_and_failed_fresh_restore_never_retries() {
         let mut engine = engine();
         let old = initial(&mut engine);
-        let key = admit_filters(&mut engine, filter_settings("graph failure"));
-        filter_failed(&mut engine, key, FilterErrorKind::RuntimeGraph, true);
+        let key = admit_treatments(&mut engine, filter_settings("graph failure"));
+        treatment_failed(&mut engine, key, FilterErrorKind::RuntimeGraph, true);
         filter_success(&mut engine, key);
         engine.poll();
         assert_eq!(engine.runner.stops.len(), 1);
-        assert_eq!(engine.runner.filter_intents.len(), 1);
+        assert_eq!(engine.runner.treatment_intents.len(), 1);
         assert!(engine.model().validation_request().is_none());
         engine
             .runner
@@ -4064,25 +4730,28 @@ mod tests {
         let mut engine = engine();
         let old = initial(&mut engine);
         let applied = filter_settings("verified");
-        let key = admit_filters(&mut engine, applied.clone());
+        let key = admit_treatments(&mut engine, applied.clone());
         filter_success(&mut engine, key);
         engine.poll();
         engine
             .edit_draft(engine.model().draft().revision, filter_settings("newer"))
             .unwrap();
-        engine.runner.events.push_back(SessionEvent::FilterFault {
-            key,
-            failure: filter_error(
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::TreatmentFault {
                 key,
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::EvidenceLost,
-                },
-                true,
-            ),
-        });
+                failure: treatment_error(
+                    key,
+                    FilterErrorKind::Unconfirmed {
+                        reason: FilterConfirmationFailure::EvidenceLost,
+                    },
+                    true,
+                ),
+            });
         engine.poll();
         assert_eq!(
-            engine.model().filtering().unwrap().prior().settings(),
+            engine.model().treating().unwrap().prior().settings(),
             &applied
         );
         assert_eq!(engine.runner.stops.len(), 1);
@@ -4102,27 +4771,30 @@ mod tests {
         assert_eq!(engine.model().last_valid().unwrap().settings(), &applied);
         assert_eq!(engine.model().draft().settings, filter_settings("newer"));
         assert_eq!(engine.runner.opens.len(), 2);
-        assert_eq!(engine.runner.filter_intents.len(), 1);
+        assert_eq!(engine.runner.treatment_intents.len(), 1);
     }
     #[test]
     fn late_fault_and_terminal_same_drain_fail_one_fresh_restore_without_older_fallback() {
         let mut engine = engine();
         let old = initial(&mut engine);
         let applied = filter_settings("then verified");
-        let key = admit_filters(&mut engine, applied.clone());
+        let key = admit_treatments(&mut engine, applied.clone());
         filter_success(&mut engine, key);
         engine.poll();
         engine.runner.events.push_back(SessionEvent::SessionFailed {
             attempt: old,
             failure: failure(applied.clone(), FailureCategory::Session, "terminal owner"),
         });
-        engine.runner.events.push_back(SessionEvent::FilterFault {
-            key,
-            failure: filter_error(key, FilterErrorKind::RuntimeGraph, true),
-        });
+        engine
+            .runner
+            .events
+            .push_back(SessionEvent::TreatmentFault {
+                key,
+                failure: treatment_error(key, FilterErrorKind::RuntimeGraph, true),
+            });
         engine.poll();
         assert_eq!(
-            engine.model().filtering().unwrap().prior().settings(),
+            engine.model().treating().unwrap().prior().settings(),
             &applied
         );
         assert_eq!(engine.runner.stops.len(), 1);
@@ -4157,8 +4829,8 @@ mod tests {
                     .edit_draft(engine.model().draft().revision, prior.clone())
                     .unwrap();
                 let old = initial(&mut engine);
-                let key = admit_filters(&mut engine, filter_settings("failed candidate"));
-                filter_failed(
+                let key = admit_treatments(&mut engine, filter_settings("failed candidate"));
+                treatment_failed(
                     &mut engine,
                     key,
                     if fresh {
@@ -4169,8 +4841,8 @@ mod tests {
                     fresh,
                 );
                 engine.poll();
-                let restore = engine.model().filtering().unwrap().key();
-                let submitted = engine.runner.filter_intents.len();
+                let restore = engine.model().treating().unwrap().key();
+                let submitted = engine.runner.treatment_intents.len();
                 filter_success(&mut engine, restore);
                 match cancellation {
                     0 => engine.close(engine.model().state_identity()).unwrap(),
@@ -4188,8 +4860,8 @@ mod tests {
                 }
                 engine.poll();
                 assert_eq!(engine.model().last_valid().unwrap().settings(), &prior);
-                assert!(engine.model().filtering().is_none());
-                assert_eq!(engine.runner.filter_intents.len(), submitted);
+                assert!(engine.model().treating().is_none());
+                assert_eq!(engine.runner.treatment_intents.len(), submitted);
                 engine.runner.barrier(old);
                 engine.poll();
                 assert!(
@@ -4220,7 +4892,7 @@ mod tests {
                 .edit_draft(engine.model().draft().revision, prior.clone())
                 .unwrap();
             let old = initial(&mut engine);
-            let key = admit_filters(&mut engine, filter_settings("provisional"));
+            let key = admit_treatments(&mut engine, filter_settings("provisional"));
             filter_success(&mut engine, key);
             match cancellation {
                 0 => engine.close(engine.model().state_identity()).unwrap(),
@@ -4245,7 +4917,7 @@ mod tests {
             assert_eq!(engine.model().last_valid().unwrap().settings(), &prior);
             assert!(!engine.has_user_apply_result_or_pending(key.apply));
             assert!(engine.take_verified_applied().is_none());
-            assert_eq!(engine.runner.filter_intents.len(), 1);
+            assert_eq!(engine.runner.treatment_intents.len(), 1);
             assert_eq!(engine.runner.opens.len(), 1);
             if cancellation >= 2 {
                 assert_eq!(
@@ -4260,34 +4932,42 @@ mod tests {
         for mismatch in 0..4 {
             let mut engine = engine();
             initial(&mut engine);
-            let key = admit_filters(&mut engine, filter_settings("pending"));
+            let key = admit_treatments(&mut engine, filter_settings("pending"));
             let mut wrong = key;
             match mismatch {
                 0 => wrong.apply = ApplyId::new(key.apply.get() + 1).unwrap(),
                 1 => wrong.attempt = AttemptId::new(key.attempt.get() + 1).unwrap(),
-                2 => wrong.pass = FilterPass::LiveRestore,
+                2 => wrong.pass = TreatmentPass::Restore,
                 3 => {}
                 _ => unreachable!(),
             }
-            engine.runner.events.push_back(SessionEvent::FilterResult {
-                key: wrong,
-                result: Ok(FilterConfirmation::checked(
-                    if mismatch == 3 {
-                        FilterAttemptKey {
-                            pass: FilterPass::Open,
-                            ..key
-                        }
-                    } else {
-                        wrong
-                    },
-                    0.0,
-                    2.0,
-                    32,
-                )
-                .unwrap()),
-            });
+            let proof_key = if mismatch == 3 {
+                TreatmentAttemptKey {
+                    pass: TreatmentPass::Open,
+                    ..key
+                }
+            } else {
+                wrong
+            };
+            let proof = TreatmentConfirmation::checked(
+                proof_key,
+                InitialPlayback::Live,
+                true,
+                FilterTreatmentProof::Reconfigured(
+                    FilterConfirmation::checked(proof_key, 0.0, 2.0, 32).unwrap(),
+                ),
+                RendererConfirmation::checked(proof_key, settings(60).renderer.clone()),
+            )
+            .unwrap();
+            engine
+                .runner
+                .events
+                .push_back(SessionEvent::TreatmentResult {
+                    key: wrong,
+                    result: Ok(proof),
+                });
             engine.poll();
-            assert_eq!(engine.model().phase(), ProductPhase::ApplyingFilters);
+            assert_eq!(engine.model().phase(), ProductPhase::ApplyingTreatments);
             assert_eq!(
                 engine.model().last_valid().unwrap().settings(),
                 &settings(60)
@@ -4324,24 +5004,28 @@ mod tests {
             "filter_prepare",
             "catalog unavailable",
         )
-        .with_filter(crate::domain::failure::FilterFailure {
-            kind: crate::domain::failure::FilterErrorKind::CatalogUnavailable,
-            attributed_ordinal: None,
-            requires_fresh_owner: false,
-            diagnostics: crate::domain::failure::FilterAttemptDiagnostics {
-                key: None,
-                entries: vec![crate::domain::failure::FilterEntryMetadata {
-                    ordinal: 0,
-                    label: "retained disabled".into(),
-                    enabled: false,
-                }],
-                records: Vec::new(),
-                native_evidence_lost: false,
-                truncated: false,
-                dropped_context: 0,
-            },
+        .with_treatment(TreatmentFailure {
+            key: None,
+            kind: TreatmentErrorKind::Filter(crate::domain::failure::FilterFailure {
+                kind: crate::domain::failure::FilterErrorKind::CatalogUnavailable,
+                attributed_ordinal: None,
+                requires_fresh_owner: false,
+                diagnostics: crate::domain::failure::FilterAttemptDiagnostics {
+                    key: None,
+                    entries: vec![crate::domain::failure::FilterEntryMetadata {
+                        ordinal: 0,
+                        label: "retained disabled".into(),
+                        enabled: false,
+                    }],
+                    records: Vec::new(),
+                    native_evidence_lost: false,
+                    truncated: false,
+                    dropped_context: 0,
+                },
+            }),
+            disposition: TreatmentFailureDisposition::Untouched,
         });
-        engine.runner.filter_prepare_failure = Some(failure.clone());
+        engine.runner.treatment_prepare_failure = Some(failure.clone());
         apply(&mut engine);
         validate(&mut engine);
         assert_eq!(engine.model().active().unwrap().attempt(), old);
@@ -4349,7 +5033,10 @@ mod tests {
         assert_eq!(engine.model().draft().settings, candidate);
         assert!(engine.runner.stops.is_empty());
         assert_eq!(engine.runner.opens.len(), 1);
-        assert_eq!(engine.runner.filter_preparations.last(), Some(&candidate));
+        assert_eq!(
+            engine.runner.treatment_preparations.last(),
+            Some(&candidate)
+        );
         assert_eq!(
             engine.model().validation_rejection().unwrap().failure,
             failure
@@ -4357,8 +5044,6 @@ mod tests {
     }
     #[test]
     fn source_open_refuses_wrong_filter_operation_owner_pass_or_paused_preparation() {
-        use crate::app::ports::FilterOpenReceipt;
-        use crate::domain::state::{FilterAttemptKey, FilterConfirmation, FilterPass};
         for mismatch in 0..6 {
             let mut engine = engine();
             let requested = complete_treatments("full Open chain");
@@ -4368,28 +5053,47 @@ mod tests {
             apply(&mut engine);
             validate(&mut engine);
             let key = engine.model().opening().unwrap().0;
-            let mut received = receipt(requested, key);
-            if mismatch == 3 || mismatch == 5 {
-                received.filters = FilterOpenReceipt::PreparedPaused;
-                if mismatch == 5 {
+            let mut received = receipt(requested.clone(), key);
+            let open_key = TreatmentAttemptKey {
+                apply: key.apply,
+                attempt: key.attempt,
+                pass: TreatmentPass::Open,
+            };
+            match mismatch {
+                3 => {
+                    let preparation = paused_treatments(key, &received.settings);
+                    received.treatments = preparation;
+                }
+                5 => {
+                    let preparation = paused_treatments(key, &received.settings);
+                    received.treatments = preparation;
                     received.readiness = OpenReadiness::PausedPrepared;
                 }
-            } else {
-                let mut observed = FilterAttemptKey {
-                    apply: key.apply,
-                    attempt: key.attempt,
-                    pass: FilterPass::Open,
-                };
-                match mismatch {
-                    0 => observed.apply = ApplyId::new(key.apply.get() + 1).unwrap(),
-                    1 => observed.attempt = AttemptId::new(key.attempt.get() + 1).unwrap(),
-                    2 => observed.pass = FilterPass::LiveCandidate,
-                    4 => received.settings.filters = crate::domain::filters::FilterChain::default(),
-                    _ => unreachable!(),
+                4 => {
+                    received.settings.filters = crate::domain::filters::FilterChain::default();
                 }
-                received.filters = FilterOpenReceipt::Confirmed(
-                    FilterConfirmation::checked(observed, 0.0, 2.0, 32).unwrap(),
-                );
+                _ => {
+                    let mut observed = open_key;
+                    match mismatch {
+                        0 => observed.apply = ApplyId::new(key.apply.get() + 1).unwrap(),
+                        1 => observed.attempt = AttemptId::new(key.attempt.get() + 1).unwrap(),
+                        2 => observed.pass = TreatmentPass::Candidate,
+                        _ => unreachable!(),
+                    }
+                    let renderer =
+                        RendererConfirmation::checked(observed, received.settings.renderer.clone());
+                    let proof = TreatmentConfirmation::checked(
+                        observed,
+                        InitialPlayback::Live,
+                        true,
+                        FilterTreatmentProof::Reconfigured(
+                            FilterConfirmation::checked(observed, 0.0, 2.0, 32).unwrap(),
+                        ),
+                        renderer,
+                    )
+                    .unwrap();
+                    received.treatments = proof;
+                }
             }
             engine.runner.events.push_back(SessionEvent::OpenVerified {
                 key,
@@ -4440,7 +5144,7 @@ mod tests {
         );
         let mut received = receipt(prior.clone(), key);
         received.readiness = OpenReadiness::PausedPrepared;
-        received.filters = crate::app::ports::FilterOpenReceipt::PreparedPaused;
+        received.treatments = paused_treatments(key, &prior);
         received.settings.filters = crate::domain::filters::FilterChain::default();
         engine.runner.events.push_back(SessionEvent::OpenVerified {
             key,
@@ -4502,7 +5206,7 @@ mod tests {
             assert_eq!(engine.runner.opens.last().unwrap().1, prior);
             let mut received = receipt(prior.clone(), restore);
             received.readiness = OpenReadiness::PausedPrepared;
-            received.filters = crate::app::ports::FilterOpenReceipt::PreparedPaused;
+            received.treatments = paused_treatments(restore, &prior);
             if wrong_chain {
                 received.settings.filters = crate::domain::filters::FilterChain::default();
             }
@@ -4552,17 +5256,17 @@ mod tests {
             );
             assert!(engine.model().active().is_none());
             let proof = receipt(prior.clone(), resumed);
-            let crate::app::ports::FilterOpenReceipt::Confirmed(confirmation) = &proof.filters
+            let FilterTreatmentProof::Reconfigured(confirmation) = proof.treatments.filters()
             else {
                 panic!("LIVE resume requires confirmation")
             };
             assert_eq!(confirmation.advances(), 32);
             assert_eq!(
                 confirmation.key(),
-                FilterAttemptKey {
+                TreatmentAttemptKey {
                     apply: resumed.apply,
                     attempt: resumed.attempt,
-                    pass: FilterPass::Open
+                    pass: TreatmentPass::Open
                 }
             );
             engine.runner.events.push_back(SessionEvent::OpenVerified {
@@ -5416,14 +6120,14 @@ mod tests {
                     .unwrap();
                 let admission = if explicit {
                     engine
-                        .apply_filters(engine.model().state_identity(), revision)
+                        .apply_treatments(engine.model().state_identity(), revision)
                         .unwrap()
                 } else {
                     engine
                         .apply(engine.model().state_identity(), revision)
                         .unwrap()
                 };
-                let ApplyAdmission::Filters { key, .. } = admission else {
+                let ApplyAdmission::Treatments { key, .. } = admission else {
                     panic!("LIVE filter admission")
                 };
                 filter_success(&mut engine, key);
@@ -5692,6 +6396,7 @@ mod tests {
             ValidationLayer::Audio,
             ValidationLayer::Discovery,
             ValidationLayer::Filters,
+            ValidationLayer::Renderer,
         ] {
             let mut engine = engine();
             let old = initial(&mut engine);

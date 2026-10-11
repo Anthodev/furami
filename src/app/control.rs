@@ -6,12 +6,15 @@ use crate::domain::{
         ObservationEpoch, SelectionToken, UsbTopology, WatchId, WatchStamp,
     },
     filters::FilterChain,
-    state::{AttemptId, DraftRevision, FilterPass, ProductPhase},
+    render::RendererSettings,
+    state::{AttemptId, DraftRevision, ProductPhase, TreatmentPass},
 };
 use std::num::NonZeroU8;
 
 pub(crate) const LEGACY_COMMAND_MAX_BYTES: usize = 256;
-pub(crate) const FILTER_COMMAND_MAX_BYTES: usize = 65_536;
+/// Shared cap for the structured-JSON draft commands (`draft-filters`,
+/// `draft-renderer`). Both decode the untouched remainder as strict JSON.
+pub(crate) const STRUCTURED_COMMAND_MAX_BYTES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExpectedCleanup {
@@ -22,7 +25,7 @@ pub(crate) enum ExpectedCleanup {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExpectedState {
     pub phase: ProductPhase,
-    pub filter_pass: Option<FilterPass>,
+    pub treatment_pass: Option<TreatmentPass>,
     pub apply: u64,
     pub attempt: u64,
     pub cleanup: ExpectedCleanup,
@@ -35,6 +38,7 @@ pub(crate) enum Command {
     Audio(DraftRevision, bool),
     Source(DraftRevision, String),
     Filters(DraftRevision, FilterChain),
+    Renderer(DraftRevision, RendererSettings),
     Apply(ExpectedState, DraftRevision),
     Restart(ExpectedState),
     Reconnect(ExpectedState),
@@ -74,8 +78,8 @@ fn expected(
     let phase = match fields.next() {
         Some("Stopped") => ProductPhase::Stopped,
         Some("Active") => ProductPhase::Active,
-        Some("ApplyingFilters") => ProductPhase::ApplyingFilters,
-        Some("RestoringFilters") => ProductPhase::RestoringFilters,
+        Some("ApplyingTreatments") => ProductPhase::ApplyingTreatments,
+        Some("RestoringTreatments") => ProductPhase::RestoringTreatments,
         Some("PausePending") => ProductPhase::PausePending,
         Some("Paused") => ProductPhase::Paused,
         Some("Validating") => ProductPhase::Validating,
@@ -108,9 +112,9 @@ fn expected(
     };
     Ok(ExpectedState {
         phase,
-        filter_pass: match phase {
-            ProductPhase::ApplyingFilters => Some(FilterPass::LiveCandidate),
-            ProductPhase::RestoringFilters => Some(FilterPass::LiveRestore),
+        treatment_pass: match phase {
+            ProductPhase::ApplyingTreatments => Some(TreatmentPass::Candidate),
+            ProductPhase::RestoringTreatments => Some(TreatmentPass::Restore),
             _ => None,
         },
         apply,
@@ -126,12 +130,25 @@ fn hex(value: Option<&str>) -> Result<u16, &'static str> {
 }
 
 /// Inspect only the ASCII verb token; JSON labels are not legacy grammar.
-pub(crate) fn is_filter_command(line: &str) -> bool {
-    line.split_ascii_whitespace().next() == Some("draft-filters")
+/// The structured-JSON draft commands carry an untouched JSON remainder and
+/// are decoded before the legacy 256-byte lexical gate.
+pub(crate) fn is_structured_json_command(line: &str) -> bool {
+    matches!(
+        line.split_ascii_whitespace().next(),
+        Some("draft-filters" | "draft-renderer")
+    )
+}
+
+fn parse_structured_json(line: &str) -> Result<Command, &'static str> {
+    match line.split_ascii_whitespace().next() {
+        Some("draft-filters") => parse_filters(line),
+        Some("draft-renderer") => parse_renderer(line),
+        _ => Err("unknown qualification command"),
+    }
 }
 
 fn parse_filters(line: &str) -> Result<Command, &'static str> {
-    if line.len() > FILTER_COMMAND_MAX_BYTES {
+    if line.len() > STRUCTURED_COMMAND_MAX_BYTES {
         return Err("qualification filter command exceeds 65536 bytes");
     }
     let syntax = "draft-filters requires revision and strict FilterChain JSON";
@@ -151,9 +168,30 @@ fn parse_filters(line: &str) -> Result<Command, &'static str> {
     Ok(Command::Filters(revision, chain))
 }
 
+fn parse_renderer(line: &str) -> Result<Command, &'static str> {
+    if line.len() > STRUCTURED_COMMAND_MAX_BYTES {
+        return Err("qualification renderer command exceeds 65536 bytes");
+    }
+    let syntax = "draft-renderer requires revision and strict RendererSettings JSON";
+    let (_, remainder) = line
+        .trim_start_matches(|value: char| value.is_ascii_whitespace())
+        .split_once(|value: char| value.is_ascii_whitespace())
+        .ok_or(syntax)?;
+    let (revision, json) = remainder
+        .trim_start_matches(|value: char| value.is_ascii_whitespace())
+        .split_once(|value: char| value.is_ascii_whitespace())
+        .ok_or(syntax)?;
+    let revision = DraftRevision::new(unsigned(Some(revision))?);
+    // Deserialize the untouched remainder directly: no tokenization, lossy
+    // normalization or Value buffering that could collapse duplicate keys.
+    let renderer = serde_json::from_str::<RendererSettings>(json)
+        .map_err(|_| "draft-renderer requires strict RendererSettings JSON")?;
+    Ok(Command::Renderer(revision, renderer))
+}
+
 pub(crate) fn parse(line: &str) -> Result<Command, &'static str> {
-    if is_filter_command(line) {
-        return parse_filters(line);
+    if is_structured_json_command(line) {
+        return parse_structured_json(line);
     }
     if line.len() > LEGACY_COMMAND_MAX_BYTES {
         return Err("qualification command exceeds 256 bytes");
@@ -395,9 +433,9 @@ mod tests {
         }
         assert!(parse("draft-filters").is_err());
         assert!(parse("draft-filters 0").is_err());
-        assert!(!is_filter_command("draft-filtersx 0 {}"));
-        assert!(!is_filter_command("draft-filters\u{a0}0 {}"));
-        assert!(is_filter_command("\t draft-filters\t0 {}"));
+        assert!(!is_structured_json_command("draft-filtersx 0 {}"));
+        assert!(!is_structured_json_command("draft-filters\u{a0}0 {}"));
+        assert!(is_structured_json_command("\t draft-filters\t0 {}"));
     }
 
     #[test]
@@ -464,16 +502,16 @@ mod tests {
     #[test]
     fn filters_accept_exact_byte_cap_and_reject_one_more_byte() {
         let fixed_bytes = filter_line(4, &filter_chain("")).len();
-        let label = "x".repeat(FILTER_COMMAND_MAX_BYTES - fixed_bytes);
+        let label = "x".repeat(STRUCTURED_COMMAND_MAX_BYTES - fixed_bytes);
         let chain = filter_chain(&label);
         let exact = filter_line(4, &chain);
-        assert_eq!(exact.len(), FILTER_COMMAND_MAX_BYTES);
+        assert_eq!(exact.len(), STRUCTURED_COMMAND_MAX_BYTES);
         assert_eq!(
             parse(&exact),
             Ok(Command::Filters(DraftRevision::new(4), chain))
         );
         let oversize = filter_line(4, &filter_chain(&(label + "x")));
-        assert_eq!(oversize.len(), FILTER_COMMAND_MAX_BYTES + 1);
+        assert_eq!(oversize.len(), STRUCTURED_COMMAND_MAX_BYTES + 1);
         assert_eq!(
             parse(&oversize),
             Err("qualification filter command exceeds 65536 bytes")
@@ -485,13 +523,13 @@ mod tests {
         let fixed_bytes = filter_line(4, &filter_chain("")).len();
         let label = format!(
             "\u{a0}{}",
-            "x".repeat(FILTER_COMMAND_MAX_BYTES - fixed_bytes - 2)
+            "x".repeat(STRUCTURED_COMMAND_MAX_BYTES - fixed_bytes - 2)
         );
         let exact = filter_line(4, &filter_chain(&label));
-        assert_eq!(exact.len(), FILTER_COMMAND_MAX_BYTES);
+        assert_eq!(exact.len(), STRUCTURED_COMMAND_MAX_BYTES);
         assert!(parse(&exact).is_ok());
         let oversize = filter_line(4, &filter_chain(&(label + "x")));
-        assert_eq!(oversize.len(), FILTER_COMMAND_MAX_BYTES + 1);
+        assert_eq!(oversize.len(), STRUCTURED_COMMAND_MAX_BYTES + 1);
         assert!(parse(&oversize).is_err());
     }
 
@@ -513,17 +551,20 @@ mod tests {
     }
 
     #[test]
-    fn filter_phase_implies_pass_without_an_extra_wire_token() {
+    fn treatment_phase_implies_pass_without_an_extra_wire_token() {
         for (phase, pass) in [
-            ("ApplyingFilters", FilterPass::LiveCandidate),
-            ("RestoringFilters", FilterPass::LiveRestore),
+            ("ApplyingTreatments", TreatmentPass::Candidate),
+            ("RestoringTreatments", TreatmentPass::Restore),
         ] {
             let Command::Close(expected) = parse(&format!("close {phase} 7 3 Complete")).unwrap()
             else {
                 panic!("close identity")
             };
-            assert_eq!(expected.filter_pass, Some(pass));
+            assert_eq!(expected.treatment_pass, Some(pass));
             assert!(parse(&format!("close {phase} 7 3 Complete {pass:?}")).is_err());
+        }
+        for retired_phase in ["ApplyingFilters", "RestoringFilters"] {
+            assert!(parse(&format!("close {retired_phase} 7 3 Complete")).is_err());
         }
     }
     #[test]
@@ -578,7 +619,7 @@ mod tests {
             Ok(Command::Choose(
                 ExpectedState {
                     phase: ProductPhase::SelectionRequired,
-                    filter_pass: None,
+                    treatment_pass: None,
                     apply: 4,
                     attempt: 5,
                     cleanup: ExpectedCleanup::Complete,
@@ -708,6 +749,141 @@ mod tests {
         for line in ["snapshot extra", "snapshot\0", "snapshot\u{2003}", ""] {
             assert!(parse(line).is_err());
         }
+        assert!(parse(&format!("snapshot{}", " ".repeat(256))).is_err());
+    }
+
+    fn reference_renderer_json() -> &'static str {
+        include_str!("../../tests/fixtures/FUR-016/reference-renderer.json").trim()
+    }
+    fn reference_renderer() -> RendererSettings {
+        serde_json::from_str(reference_renderer_json()).unwrap()
+    }
+    fn renderer_line(revision: u64, json: &str) -> String {
+        format!("draft-renderer {revision} {json}")
+    }
+
+    #[test]
+    fn renderer_decodes_strict_json_with_exact_verb_revision_and_separator() {
+        let renderer = reference_renderer();
+        assert_eq!(
+            parse(&format!(
+                "\t draft-renderer\t18446744073709551615\t{json} ",
+                json = reference_renderer_json()
+            )),
+            Ok(Command::Renderer(
+                DraftRevision::new(u64::MAX),
+                renderer.clone()
+            ))
+        );
+        for prefix in [
+            "draft-renderer",
+            "draft-rendererx 0 ",
+            "draft-renderers 0 ",
+            "draft-renderer\u{a0}0 ",
+            "draft-renderer 0\u{a0}",
+            "draft-renderer -1 ",
+            "draft-renderer +1 ",
+            "draft-renderer 18446744073709551616 ",
+            "draft-renderer 0",
+        ] {
+            assert!(
+                parse(&format!("{prefix}{}", reference_renderer_json())).is_err(),
+                "{prefix:?}"
+            );
+        }
+        assert!(parse("draft-renderer").is_err());
+        assert!(parse("draft-renderer 0").is_err());
+        for prefix in ["", " ", "\t", "  "] {
+            assert!(
+                parse(&format!(
+                    "{prefix}draft-renderer 0 {renderer_json}",
+                    renderer_json = reference_renderer_json()
+                ))
+                .is_ok(),
+                "{prefix:?}"
+            );
+        }
+        // The structured predicate recognizes both JSON verbs and only exact verbs.
+        assert!(is_structured_json_command("\t draft-filters\t0 {}"));
+        assert!(is_structured_json_command("\t draft-renderer\t0 {}"));
+        assert!(!is_structured_json_command("draft-filtersx 0 {}"));
+        assert!(!is_structured_json_command("draft-renderers 0 {}"));
+        assert!(!is_structured_json_command("snapshot draft-renderer 0 {}"));
+        // A recognized verb with trailing junk still fails decoding, not the gate.
+        assert!(is_structured_json_command("draft-renderer 0 {} extra"));
+        assert!(parse("draft-renderer 0 {} extra").is_err());
+    }
+
+    #[test]
+    fn renderer_rejects_malformed_null_duplicates_and_unknown_fields() {
+        for json in [
+            "null",
+            "[]",
+            "{}",
+            r#"{"scale":"lanczos"}"#,
+            r#"{"scale":"lanczos","cscale":"auto","dscale":"auto","scale_antiring":0.0,"dither":"fruit","deband":{"enabled":false,"iterations":1,"grain":32},"interpolation":false,"extra":0}"#,
+            r#"{"scale":"lanczos","cscale":"auto","dscale":"auto","scale_antiring":0.0,"dither":"fruit","deband":[false,1,32],"interpolation":false}"#,
+            r#"{"scale":"not-a-kernel","cscale":"auto","dscale":"auto","scale_antiring":0.0,"dither":"fruit","deband":{"enabled":false,"iterations":1,"grain":32},"interpolation":false}"#,
+            r#"{"scale":"lanczos","cscale":"auto"}"#,
+        ] {
+            assert!(parse(&renderer_line(2, json)).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn renderer_rejects_raw_duplicate_fields_without_collapsing_them() {
+        let json = reference_renderer_json();
+        let duplicates = [
+            json.replace(
+                r#""scale":"ewa_lanczossharp""#,
+                r#""scale":"ewa_lanczossharp","scale":"bilinear""#,
+            ),
+            json.replace(
+                r#""interpolation":false"#,
+                r#""interpolation":false,"interpolation":true"#,
+            ),
+            json.replace(
+                r#"{"enabled":true,"iterations":2,"grain":16}"#,
+                r#"{"enabled":true,"enabled":true,"iterations":2,"grain":16}"#,
+            ),
+            // Invalid value first, valid last: a Value-buffer collapse would hide it.
+            json.replace(
+                r#""scale_antiring":0.7"#,
+                r#""scale_antiring":2.0,"scale_antiring":0.7"#,
+            ),
+            // Valid value first, invalid last.
+            json.replace(
+                r#""scale_antiring":0.7"#,
+                r#""scale_antiring":0.7,"scale_antiring":2.0"#,
+            ),
+        ];
+        for duplicate in duplicates {
+            assert!(parse(&renderer_line(2, &duplicate)).is_err(), "{duplicate}");
+        }
+    }
+
+    #[test]
+    fn renderer_shares_the_65536_cap_and_skips_the_legacy_gate() {
+        let json = reference_renderer_json();
+        let prefix = "draft-renderer 4 ";
+        let pad = STRUCTURED_COMMAND_MAX_BYTES - prefix.len() - json.len();
+        let exact = format!("{prefix}{}{json}", " ".repeat(pad));
+        assert_eq!(exact.len(), STRUCTURED_COMMAND_MAX_BYTES);
+        assert!(exact.len() > LEGACY_COMMAND_MAX_BYTES);
+        assert_eq!(
+            parse(&exact),
+            Ok(Command::Renderer(
+                DraftRevision::new(4),
+                reference_renderer()
+            ))
+        );
+        let oversize = format!("{exact} ");
+        assert_eq!(oversize.len(), STRUCTURED_COMMAND_MAX_BYTES + 1);
+        assert_eq!(
+            parse(&oversize),
+            Err("qualification renderer command exceeds 65536 bytes")
+        );
+        // The legacy lexical gate is unchanged for non-structured verbs.
         assert!(parse(&format!("snapshot{}", " ".repeat(256))).is_err());
     }
 }

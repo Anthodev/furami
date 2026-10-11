@@ -1,8 +1,8 @@
 //! Minimal mpv 0.41.0/client 2.5 ABI. Every handle stays on its creating thread.
 
 use super::controller::{
-    BackendCommand, BackendEvent, MediaError, OwnerBackend, PauseObservation, RequestId, StopFlag,
-    SurfaceToken,
+    BackendCommand, BackendEvent, MediaError, OwnerBackend, PauseObservation, PreparedTreatments,
+    RequestId, StopFlag, SurfaceToken,
 };
 use super::filter_catalog::CompiledFilterChain;
 use super::loopback::{
@@ -14,8 +14,6 @@ use crate::domain::capture::{
     AudioAvailability, AudioEpoch, AudioError, AudioSelection, AudioSilence, AudioSourceIdentity,
     FrameSize, PlaybackGain, WatchStamp,
 };
-#[cfg(test)]
-use crate::domain::state::FilterPass;
 use crate::domain::{
     failure::{
         FILTER_DIAGNOSTIC_RECORDS, FILTER_DIAGNOSTIC_TEXT_CHARS, FilterAttemptDiagnostics,
@@ -23,7 +21,7 @@ use crate::domain::{
         FilterFailure,
     },
     output::OutputPlan,
-    state::{AttemptId, FilterAttemptKey, FilterConfirmation, InitialPlayback, PauseRequestId},
+    state::{AttemptId, FilterConfirmation, InitialPlayback, PauseRequestId, TreatmentAttemptKey},
 };
 use libloading::Library;
 use std::time::Instant;
@@ -36,7 +34,12 @@ use std::{
     thread::{self, Thread},
 };
 
+#[path = "treatment.rs"]
+mod treatment;
 use std::collections::VecDeque;
+#[cfg(test)]
+pub(crate) use treatment::RendererFixtureFault;
+use treatment::{TreatmentObservation, TreatmentRestore};
 
 const MPV_FORMAT_DOUBLE: c_int = 5;
 
@@ -125,7 +128,11 @@ unsafe fn copy_node(node: &MpvNode, depth: usize) -> Result<NodeValue, MediaErro
                 }
                 NodeValue::String(CStr::from_ptr(node.value.string).to_owned())
             }
-            3 => NodeValue::Flag(node.value.flag != 0),
+            3 => match node.value.flag {
+                0 => NodeValue::Flag(false),
+                1 => NodeValue::Flag(true),
+                _ => return Err(malformed()),
+            },
             4 => NodeValue::Int(node.value.int64),
             5 => NodeValue::Double(node.value.double),
             7 | 8 => {
@@ -594,7 +601,19 @@ enum Pending {
     },
     Metadata(usize),
     FilterProgress {
-        key: FilterAttemptKey,
+        key: TreatmentAttemptKey,
+    },
+    RendererRead {
+        key: TreatmentAttemptKey,
+        property: crate::domain::render::RendererProperty,
+        operation: crate::domain::failure::RendererOperation,
+    },
+    RendererSet {
+        key: TreatmentAttemptKey,
+        property: crate::domain::render::RendererProperty,
+    },
+    RendererPause {
+        key: TreatmentAttemptKey,
     },
     #[cfg(test)]
     FixtureProperty(&'static CStr),
@@ -602,11 +621,12 @@ enum Pending {
 impl Pending {
     fn property(self) -> Option<&'static CStr> {
         Some(match self {
-            Self::PauseSet { .. } => return None,
-            Self::Pause | Self::PauseRead { .. } => c"pause",
+            Self::PauseSet { .. } | Self::RendererSet { .. } => return None,
+            Self::Pause | Self::PauseRead { .. } | Self::RendererPause { .. } => c"pause",
             Self::Metadata(0) => c"video-params",
             Self::Metadata(_) => c"container-fps",
             Self::FilterProgress { .. } => c"time-pos",
+            Self::RendererRead { property, .. } => super::render_catalog::native_name(property),
             #[cfg(test)]
             Self::FixtureProperty(name) => name,
         })
@@ -623,7 +643,7 @@ struct MetadataBatch {
 /// context ring, and no successful command reply alone completes this window.
 struct FilterObservation {
     id: u64,
-    key: FilterAttemptKey,
+    key: TreatmentAttemptKey,
     entries: Vec<FilterEntryMetadata>,
     command: Option<CString>,
     admitted: Instant,
@@ -650,7 +670,7 @@ struct FilterObservation {
 impl FilterObservation {
     fn new(
         id: u64,
-        key: FilterAttemptKey,
+        key: TreatmentAttemptKey,
         compiled: CompiledFilterChain,
         now: Instant,
         marker: u64,
@@ -735,7 +755,8 @@ impl FilterObservation {
 }
 
 struct FilterHealth {
-    key: FilterAttemptKey,
+    key: TreatmentAttemptKey,
+    treatment_key: TreatmentAttemptKey,
     entries: Vec<FilterEntryMetadata>,
     marker: u64,
     dropped_at_begin: u64,
@@ -819,7 +840,14 @@ pub(crate) struct MpvBackend {
     pause_pending: bool,
     pause_dirty: bool,
     emitted: VecDeque<BackendEvent>,
-    initial_filters: Option<(FilterAttemptKey, CompiledFilterChain)>,
+    initial_treatments: Option<(TreatmentAttemptKey, PreparedTreatments)>,
+    treatment_observation: Option<TreatmentObservation>,
+    treatment_restore: Option<TreatmentRestore>,
+    landed_treatments: Option<(
+        PreparedTreatments,
+        crate::domain::state::TreatmentConfirmation,
+    )>,
+    filter_result: Option<Result<FilterConfirmation, Box<FilterFailure>>>,
     filter_observation: Option<FilterObservation>,
     filter_health: Option<FilterHealth>,
     filters_poisoned: bool,
@@ -831,7 +859,9 @@ pub(crate) struct MpvBackend {
     #[cfg(test)]
     filter_fault: Option<FixtureFault>,
     #[cfg(test)]
-    filter_fault_pass: Option<FilterPass>,
+    filter_fault_pass: Option<crate::domain::state::TreatmentPass>,
+    #[cfg(test)]
+    renderer_fixture_fault: Option<RendererFixtureFault>,
     #[cfg(test)]
     fixture_recorder: Option<FixtureRecorder>,
     #[cfg(test)]
@@ -894,7 +924,11 @@ impl MpvBackend {
             pause_pending: false,
             pause_dirty: false,
             emitted: VecDeque::new(),
-            initial_filters: None,
+            initial_treatments: None,
+            treatment_observation: None,
+            treatment_restore: None,
+            landed_treatments: None,
+            filter_result: None,
             filter_observation: None,
             filter_health: None,
             filters_poisoned: false,
@@ -908,6 +942,8 @@ impl MpvBackend {
             #[cfg(test)]
             filter_fault_pass: None,
             #[cfg(test)]
+            renderer_fixture_fault: None,
+            #[cfg(test)]
             fixture_recorder: None,
             #[cfg(test)]
             property_requests: None,
@@ -915,12 +951,12 @@ impl MpvBackend {
             fixture_properties: None,
         }
     }
-    pub(crate) fn with_filters(
+    pub(crate) fn with_treatments(
         mut self,
-        key: FilterAttemptKey,
-        compiled: CompiledFilterChain,
+        key: TreatmentAttemptKey,
+        treatments: PreparedTreatments,
     ) -> Self {
-        self.initial_filters = Some((key, compiled));
+        self.initial_treatments = Some((key, treatments));
         self
     }
     #[cfg(test)]
@@ -942,7 +978,7 @@ impl MpvBackend {
 
     fn filter_diagnostics(
         &self,
-        key: FilterAttemptKey,
+        key: TreatmentAttemptKey,
         entries: &[FilterEntryMetadata],
         marker: u64,
         dropped: u64,
@@ -967,6 +1003,7 @@ impl MpvBackend {
         self.filters_poisoned = true;
         if let Some(health) = self.filter_health.as_ref().filter(|health| !health.faulted) {
             let key = health.key;
+            let treatment_key = health.treatment_key;
             let failure = FilterFailure {
                 kind,
                 attributed_ordinal: ordinal,
@@ -978,17 +1015,32 @@ impl MpvBackend {
                     health.dropped_at_begin,
                 ),
             };
+            self.treatment_filter_revoked(&failure);
             self.filter_health.as_mut().expect("known health").faulted = true;
             crate::diagnostics::filter_end(key, Err(&failure), &failure.diagnostics);
-            self.emitted.push_back(BackendEvent::FilterFault {
-                key,
-                failure: Box::new(failure),
+            self.emitted.push_back(BackendEvent::TreatmentFault {
+                key: treatment_key,
+                failure: Box::new(crate::domain::failure::TreatmentFailure {
+                    key: Some(treatment_key),
+                    kind: crate::domain::failure::TreatmentErrorKind::Filter(failure),
+                    disposition:
+                        crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner,
+                }),
             });
+        } else {
+            self.treatment_lost(
+                crate::domain::failure::TreatmentConfirmationFailure::BackendUnavailable,
+            );
         }
     }
 
     fn filter_lost(&mut self, reason: FilterConfirmationFailure) {
         self.filters_poisoned = true;
+        self.treatment_lost(if reason == FilterConfirmationFailure::EvidenceLost {
+            crate::domain::failure::TreatmentConfirmationFailure::EvidenceLost
+        } else {
+            crate::domain::failure::TreatmentConfirmationFailure::BackendUnavailable
+        });
         if reason == FilterConfirmationFailure::EvidenceLost {
             self.native_evidence_lost = true;
         }
@@ -1012,6 +1064,7 @@ impl MpvBackend {
     fn malformed_filter_log(&mut self, now: Instant) -> Result<BackendEvent, MediaError> {
         self.filter_lost(FilterConfirmationFailure::EvidenceLost);
         self.filter_tick(now, false)?;
+        self.treatment_tick(now, false)?;
         Ok(self.emitted.pop_front().unwrap_or(BackendEvent::Other))
     }
 
@@ -1032,6 +1085,9 @@ impl MpvBackend {
             && text.starts_with("log message buffer overflow:");
         let (graph, disable) = graph_log(&prefix, &text);
         let is_error = matches!(level.as_str(), "fatal" | "error");
+        if is_error && !graph && !disable && self.filter_observation.is_none() {
+            self.renderer_log_error();
+        }
         // Full copied text is classified before any retention truncation.
         let key = self
             .filter_observation
@@ -1122,6 +1178,7 @@ impl MpvBackend {
             && !self.native_evidence_lost
             && is_error
             && self.filter_health.is_some()
+            && self.treatment_observation.is_none()
         {
             self.filter_fault(
                 FilterErrorKind::Unconfirmed {
@@ -1175,6 +1232,10 @@ impl MpvBackend {
             crate::diagnostics::filter_end(observation.key, Ok(&confirmation), &diagnostics);
             self.filter_health = Some(FilterHealth {
                 key: observation.key,
+                treatment_key: self
+                    .landed_treatments
+                    .as_ref()
+                    .map_or(observation.key, |(_, confirmation)| confirmation.key()),
                 entries: observation.entries,
                 marker: observation.marker,
                 dropped_at_begin: observation.dropped_at_begin,
@@ -1184,11 +1245,7 @@ impl MpvBackend {
         };
         #[cfg(test)]
         self.native_record(serde_json::json!({"event":"result","key":observation.key,"request":observation.id,"result":result}));
-        self.emitted.push_back(BackendEvent::FilterResult {
-            id: observation.id,
-            key: observation.key,
-            result,
-        });
+        self.filter_result = Some(result);
     }
 
     fn filter_tick(&mut self, now: Instant, clean: bool) -> Result<(), MediaError> {
@@ -1416,7 +1473,13 @@ impl MpvBackend {
         true
     }
     fn get(&mut self, name: &'static CStr, pending: Pending) -> Result<(), MediaError> {
-        let id = self.next_internal()?;
+        let id = if let Pending::FilterProgress { key } = pending
+            && let Some(observation) = &mut self.treatment_observation
+        {
+            observation.progress_request(key)?
+        } else {
+            self.next_internal()?
+        };
         #[cfg(test)]
         if let Some(requests) = &mut self.property_requests {
             requests.push((id, name, None));
@@ -1720,6 +1783,10 @@ impl MpvBackend {
             self.native_record(serde_json::json!({"event":"reconfig","key":key}));
         }
     }
+    fn reconfiguration_event(&mut self) -> BackendEvent {
+        self.filter_reconfigured();
+        BackendEvent::VideoReconfig
+    }
 
     fn reply_at(
         &mut self,
@@ -1779,6 +1846,24 @@ impl MpvBackend {
             }
             return Ok(BackendEvent::Other);
         };
+        if matches!(
+            pending,
+            Pending::RendererRead { .. }
+                | Pending::RendererSet { .. }
+                | Pending::RendererPause { .. }
+        ) {
+            let correct_kind = if matches!(pending, Pending::RendererSet { .. }) {
+                kind == ReplyKind::SetProperty
+            } else {
+                kind == ReplyKind::Property
+            };
+            if !correct_kind {
+                return Ok(BackendEvent::Other);
+            }
+            self.pending.swap_remove(index);
+            self.renderer_reply(id, pending, kind, error, name.as_deref(), value.as_ref());
+            return Ok(BackendEvent::Other);
+        }
         let expected = match pending {
             Pending::PauseSet { .. } => {
                 if kind != ReplyKind::SetProperty {
@@ -1817,6 +1902,11 @@ impl MpvBackend {
         self.pending.swap_remove(index);
         tracing::info!(request = id, kind = ?kind, error, property = ?name, value = ?value, "mpv_owned_reply");
         match pending {
+            Pending::RendererRead { .. }
+            | Pending::RendererSet { .. }
+            | Pending::RendererPause { .. } => {
+                unreachable!("renderer reply handled before generic dispatch")
+            }
             Pending::FilterProgress { key } => {
                 if let Some(observation) = self
                     .filter_observation
@@ -1941,6 +2031,117 @@ impl MpvBackend {
             diagnostic,
         )
     }
+
+    /// # Safety
+    /// `data` is a live GET_PROPERTY_REPLY payload and every native pointer it
+    /// contains remains valid until this call finishes copying the NODE/name.
+    unsafe fn property_reply_payload(
+        &self,
+        id: u64,
+        data: *mut c_void,
+    ) -> Result<(CString, Option<NodeValue>), MediaError> {
+        if data.is_null() {
+            return Err(self.property_error(id, "null property reply payload"));
+        }
+        // SAFETY: Caller supplies the pinned property-event layout/lifetime.
+        let property = unsafe { &*data.cast::<MpvPropertyEvent>() };
+        if property.name.is_null() {
+            return Err(self.property_error(id, "null property name"));
+        }
+        let value = if property.format == 0 {
+            None
+        } else {
+            if property.format != 6 || property.data.is_null() {
+                return Err(self.property_error(id, "unexpected property node payload"));
+            }
+            // SAFETY: NODE payload pointers share the event lifetime. copy_node
+            // rejects invalid raw FLAG scalars before boolean normalization.
+            let node = unsafe { &*property.data.cast::<MpvNode>() };
+            Some(
+                unsafe { copy_node(node, 0) }
+                    .map_err(|error| self.property_error(id, error.diagnostic))?,
+            )
+        };
+        // SAFETY: Nonnull property name belongs to the same live native event.
+        let name = unsafe { CStr::from_ptr(property.name) }.to_owned();
+        Ok((name, value))
+    }
+
+    /// # Safety
+    /// Same native payload lifetime/layout requirements as property_reply_payload.
+    unsafe fn property_reply_event(
+        &mut self,
+        id: u64,
+        error: i32,
+        data: *mut c_void,
+    ) -> Result<BackendEvent, MediaError> {
+        // SAFETY: Caller forwards the active native GET_PROPERTY_REPLY payload.
+        match unsafe { self.property_reply_payload(id, data) } {
+            Ok((name, value)) => self.reply(id, ReplyKind::Property, error, Some(name), value),
+            Err(error) if self.invalidate_filter_progress(id) => {
+                tracing::info!(request = id, diagnostic = ?error.diagnostic, "filter_progress_invalid");
+                Ok(BackendEvent::Other)
+            }
+            Err(error) if self.invalidate_treatment_read(id) => {
+                tracing::info!(request = id, diagnostic = ?error.diagnostic, "treatment_read_invalid");
+                Ok(BackendEvent::Other)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// # Safety
+    /// Native event/data pointers refer to the pinned client ABI and stay live
+    /// until this call copies their complete scalar payload.
+    unsafe fn terminal_or_set_event(
+        &mut self,
+        event: &MpvEvent,
+    ) -> Result<BackendEvent, MediaError> {
+        let (terminal, reason) = match event.event_id {
+            1 => (
+                BackendEvent::Shutdown,
+                FilterConfirmationFailure::BackendUnavailable,
+            ),
+            4 => {
+                return self.reply(
+                    event.reply_userdata,
+                    ReplyKind::SetProperty,
+                    event.error,
+                    None,
+                    None,
+                );
+            }
+            7 => {
+                if event.data.is_null() {
+                    return Err(MediaError::new("mpv_event", "null END_FILE payload"));
+                }
+                // SAFETY: Caller supplies the genuine active END_FILE layout.
+                let end = unsafe { &*event.data.cast::<MpvEndFile>() };
+                self.video_ended = true;
+                (
+                    BackendEvent::EndFile {
+                        reason: end.reason,
+                        error: end.error,
+                    },
+                    FilterConfirmationFailure::BackendUnavailable,
+                )
+            }
+            24 => (
+                BackendEvent::QueueOverflow,
+                FilterConfirmationFailure::EvidenceLost,
+            ),
+            _ => unreachable!("terminal/set decoder only receives its pinned event IDs"),
+        };
+        self.filter_lost(reason);
+        if self.filter_observation.is_some() {
+            self.finish_filter();
+        }
+        // The native terminal invalidates the aggregate before any observer tick
+        // can mint a positive. Preserve the existing negative-then-terminal order.
+        self.treatment_tick(Instant::now(), false)?;
+        self.emitted.push_back(terminal);
+        Ok(self.emitted.pop_front().expect("terminal event"))
+    }
 }
 
 fn observed_from_nodes(
@@ -2011,13 +2212,15 @@ impl OwnerBackend for MpvBackend {
         self.handle = Some(Handle::create(&path, stop)?);
         check_stop(stop)?;
         let paused_vf = if self.playback == InitialPlayback::Paused {
-            self.initial_filters.take().map(|(_, compiled)| {
-                CString::new(compiled.vf).expect("compiler emits NUL-free syntax")
+            self.initial_treatments.as_ref().map(|(_, treatments)| {
+                CString::new(treatments.filters.vf.as_str())
+                    .expect("compiler emits NUL-free syntax")
             })
         } else {
             None
         };
         let handle = self.handle()?;
+        self.install_renderer(handle)?;
         // mpv 0.41.0 registers `osc` only with HAVE_LUA. The frozen no-Lua
         // build has neither that option nor an OSC, so no `osc=no` is submitted.
         const OPTIONS: &[(&CStr, &CStr)] = &[
@@ -2096,29 +2299,29 @@ impl OwnerBackend for MpvBackend {
     }
     fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
         match command {
-            BackendCommand::ApplyFilters { key, compiled } => {
-                if self.filter_observation.is_some() {
-                    return Err(MediaError::new(
-                        "filter_admission",
-                        "filter observation already pending",
-                    ));
+            BackendCommand::ApplyTreatments { key, treatments } => {
+                if let Err(error) = self.begin_treatment(id.get(), key, *treatments) {
+                    if error.code == "request_exhausted" {
+                        self.emitted.push_back(BackendEvent::TreatmentResult {
+                            id: id.get(),
+                            key,
+                            result: Err(Box::new(crate::domain::failure::TreatmentFailure {
+                                key: Some(key),
+                                kind: crate::domain::failure::TreatmentErrorKind::Unconfirmed {
+                                    reason: crate::domain::failure::TreatmentConfirmationFailure::BackendUnavailable,
+                                },
+                                disposition: crate::domain::failure::TreatmentFailureDisposition::Untouched,
+                            })),
+                        });
+                        return Ok(());
+                    }
+                    return Err(error);
                 }
-                crate::diagnostics::filter_begin(key, &compiled.entries);
-                #[cfg(test)]
-                self.native_record(serde_json::json!({"event":"admission","key":key,"request":id.get(),"entries":compiled.entries}));
-                let mut observation = FilterObservation::new(
-                    id.get(),
-                    key,
-                    compiled,
-                    Instant::now(),
-                    self.log_sequence,
-                    self.dropped_context,
-                );
                 if self.filters_poisoned {
-                    observation.failure = Some(FilterConfirmationFailure::BackendUnavailable);
-                    observation.fresh = true;
+                    self.treatment_lost(
+                        crate::domain::failure::TreatmentConfirmationFailure::BackendUnavailable,
+                    );
                 }
-                self.filter_observation = Some(observation);
                 Ok(())
             }
             BackendCommand::SetPaused { request, paused } => {
@@ -2238,6 +2441,7 @@ impl OwnerBackend for MpvBackend {
                 Ok(())
             }
             BackendCommand::LoadInput => {
+                tracing::info!(request = id.get(), "mpv_loadfile_submit");
                 self.load_id = Some(id.get());
                 let handle = self.handle()?;
                 let argv = [c"loadfile".as_ptr(), self.input.url().as_ptr(), ptr::null()];
@@ -2262,15 +2466,13 @@ impl OwnerBackend for MpvBackend {
         let result = match raw_id {
             0 => {
                 self.filter_tick(Instant::now(), true)?;
+                self.treatment_tick(Instant::now(), true)?;
                 Ok(self.emitted.pop_front().unwrap_or(BackendEvent::None))
             }
-            1 => {
-                self.filter_lost(FilterConfirmationFailure::BackendUnavailable);
-                if self.filter_observation.is_some() {
-                    self.finish_filter();
-                }
-                self.emitted.push_back(BackendEvent::Shutdown);
-                Ok(self.emitted.pop_front().expect("terminal event"))
+            1 | 4 | 7 | 24 => {
+                // SAFETY: The shared decoder copies this active pinned native
+                // terminal/SET reply before the next wait_event.
+                unsafe { self.terminal_or_set_event(event) }
             }
             2 => {
                 if event.data.is_null() {
@@ -2300,68 +2502,10 @@ impl OwnerBackend for MpvBackend {
                 Ok(BackendEvent::Other)
             }
             3 => {
-                let payload = (|| -> Result<_, MediaError> {
-                    if event.data.is_null() {
-                        return Err(self
-                            .property_error(event.reply_userdata, "null property reply payload"));
-                    }
-                    // SAFETY: GET_PROPERTY_REPLY and its NODE/name are copied in
-                    // this native event lifetime, before the next wait_event.
-                    unsafe {
-                        let property = &*event.data.cast::<MpvPropertyEvent>();
-                        if property.name.is_null() {
-                            return Err(
-                                self.property_error(event.reply_userdata, "null property name")
-                            );
-                        }
-                        let value = if property.format == 0 {
-                            None
-                        } else {
-                            if property.format != 6 || property.data.is_null() {
-                                return Err(self.property_error(
-                                    event.reply_userdata,
-                                    "unexpected property node payload",
-                                ));
-                            }
-                            let node = &*property.data.cast::<MpvNode>();
-                            if self.pending.iter().any(|(id, pending)| {
-                                *id == event.reply_userdata
-                                    && matches!(pending, Pending::Pause | Pending::PauseRead { .. })
-                            }) && node.format == 3
-                                && !matches!(node.value.flag, 0 | 1)
-                            {
-                                return Err(self
-                                    .property_error(event.reply_userdata, "malformed pause flag"));
-                            }
-                            Some(copy_node(node, 0).map_err(|error| {
-                                self.property_error(event.reply_userdata, error.diagnostic)
-                            })?)
-                        };
-                        Ok((CStr::from_ptr(property.name).to_owned(), value))
-                    }
-                })();
-                match payload {
-                    Ok((name, value)) => self.reply(
-                        event.reply_userdata,
-                        ReplyKind::Property,
-                        event.error,
-                        Some(name),
-                        value,
-                    ),
-                    Err(error) if self.invalidate_filter_progress(event.reply_userdata) => {
-                        tracing::info!(request = event.reply_userdata, diagnostic = ?error.diagnostic, "filter_progress_invalid");
-                        Ok(BackendEvent::Other)
-                    }
-                    Err(error) => Err(error),
-                }
+                // SAFETY: Copy/validate the genuine GET_PROPERTY_REPLY while
+                // its complete native payload is live, before the next wait.
+                unsafe { self.property_reply_event(event.reply_userdata, event.error, event.data) }
             }
-            4 => self.reply(
-                event.reply_userdata,
-                ReplyKind::SetProperty,
-                event.error,
-                None,
-                None,
-            ),
             5 => {
                 // Command result is owned before leaving native event lifetime,
                 // even commands whose scalar outcome alone is sufficient.
@@ -2402,48 +2546,19 @@ impl OwnerBackend for MpvBackend {
                     Err(error) => Err(error),
                 }
             }
-            7 => {
-                if event.data.is_null() {
-                    return Err(MediaError::new("mpv_event", "null END_FILE payload"));
-                }
-                // SAFETY: END_FILE data matches the complete pinned repr(C)
-                // payload. Copy only scalar reason/error; never retain its pointer.
-                let end = unsafe { &*event.data.cast::<MpvEndFile>() };
-                self.video_ended = true;
-                let terminal = BackendEvent::EndFile {
-                    reason: end.reason,
-                    error: end.error,
-                };
-                self.filter_lost(FilterConfirmationFailure::BackendUnavailable);
-                if self.filter_observation.is_some() {
-                    self.finish_filter();
-                }
-                self.emitted.push_back(terminal);
-                Ok(self.emitted.pop_front().expect("terminal event"))
-            }
             8 => Ok(BackendEvent::FileLoaded),
-            17 => {
-                self.filter_reconfigured();
-                Ok(BackendEvent::VideoReconfig)
-            }
+            17 => Ok(self.reconfiguration_event()),
             18 => Ok(BackendEvent::Other),
             21 => {
                 self.video_started = true;
                 self.begin_audio_if_ready()?;
                 Ok(BackendEvent::PlaybackRestart)
             }
-            24 => {
-                self.filter_lost(FilterConfirmationFailure::EvidenceLost);
-                if self.filter_observation.is_some() {
-                    self.finish_filter();
-                }
-                self.emitted.push_back(BackendEvent::QueueOverflow);
-                Ok(self.emitted.pop_front().expect("overflow event"))
-            }
             _ => Ok(BackendEvent::Other),
         };
         if raw_id != 0 {
             self.filter_tick(Instant::now(), false)?;
+            self.treatment_tick(Instant::now(), false)?;
         }
         result
     }
@@ -2490,12 +2605,8 @@ impl OwnerBackend for MpvBackend {
     fn audio_epoch(&self) -> Option<AudioEpoch> {
         self.epoch
     }
-    fn initial_filters(&mut self) -> Option<(FilterAttemptKey, CompiledFilterChain)> {
-        if self.playback == InitialPlayback::Live {
-            self.initial_filters.take()
-        } else {
-            None
-        }
+    fn initial_treatments(&mut self) -> Option<(TreatmentAttemptKey, PreparedTreatments)> {
+        self.initial_treatments.take()
     }
     fn shutdown(&mut self) -> Result<(), MediaError> {
         // Retain the video handle/native lease until actual child reap AND
@@ -2670,7 +2781,7 @@ impl FixtureBackend {
         })
     }
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_filters(
+    pub(crate) fn new_with_treatments(
         prefix: String,
         fixture: PathBuf,
         input: InputSpec,
@@ -2678,15 +2789,15 @@ impl FixtureBackend {
         playback: InitialPlayback,
         watch: WatchStamp,
         filters: crate::domain::filters::FilterChain,
-        compiled: CompiledFilterChain,
-        key: FilterAttemptKey,
+        treatments: PreparedTreatments,
+        key: TreatmentAttemptKey,
         recorder: Option<FixtureRecorder>,
     ) -> Result<Self, MediaError> {
-        if filters.entries().len() != compiled.entries.len()
+        if filters.entries().len() != treatments.filters.entries.len()
             || filters
                 .entries()
                 .iter()
-                .zip(&compiled.entries)
+                .zip(&treatments.filters.entries)
                 .enumerate()
                 .any(|(ordinal, (entry, metadata))| {
                     metadata.ordinal != ordinal
@@ -2700,7 +2811,7 @@ impl FixtureBackend {
             ));
         }
         let mut backend = Self::new(prefix, fixture, input, gain, playback, watch, recorder)?;
-        backend.inner.initial_filters = Some((key, compiled));
+        backend.inner.initial_treatments = Some((key, treatments));
         backend.inner.fixture_recorder = backend.recorder.clone();
         Ok(backend)
     }
@@ -2715,10 +2826,18 @@ impl FixtureBackend {
         self.inner.filter_fault = Some(fault);
         self
     }
-    pub(crate) fn with_fault_for_pass(self, fault: FixtureFault, pass: FilterPass) -> Self {
+    pub(crate) fn with_fault_for_pass(
+        self,
+        fault: FixtureFault,
+        pass: crate::domain::state::TreatmentPass,
+    ) -> Self {
         let mut backend = self.with_fault(fault);
         backend.inner.filter_fault_pass = Some(pass);
         backend
+    }
+    pub(crate) fn with_renderer_fault(mut self, fault: RendererFixtureFault) -> Self {
+        self.inner.renderer_fixture_fault = Some(fault);
+        self
     }
 
     fn record(&self, milestone: FixtureMilestone) -> Result<(), MediaError> {
@@ -2745,13 +2864,20 @@ impl OwnerBackend for FixtureBackend {
             generation: token.generation,
         })?;
         let paused_vf = if self.inner.playback == InitialPlayback::Paused {
-            self.inner.initial_filters.take().map(|(_, compiled)| {
-                CString::new(compiled.vf).expect("compiler emits NUL-free syntax")
-            })
+            self.inner
+                .initial_treatments
+                .as_ref()
+                .map(|(_, treatments)| {
+                    CString::new(treatments.filters.vf.as_str())
+                        .expect("compiler emits NUL-free syntax")
+                })
         } else {
             None
         };
         let handle = self.inner.handle()?;
+        if self.inner.initial_treatments.is_some() {
+            self.inner.install_renderer(handle)?;
+        }
         const OPTIONS: &[(&CStr, &CStr)] = &[
             (c"config", c"no"),
             (c"load-scripts", c"no"),
@@ -2809,6 +2935,9 @@ impl OwnerBackend for FixtureBackend {
 
     fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
         if let BackendCommand::SetPaused { request, paused } = &command {
+            self.inner.native_record(
+                serde_json::json!({"event":"pause_submit","request":id.get(),"paused":paused}),
+            );
             // Only this finite-video fixture permits unpause for time-pos checks.
             return self.inner.set(
                 c"pause",
@@ -2824,6 +2953,7 @@ impl OwnerBackend for FixtureBackend {
             return self.inner.submit(id, command);
         }
         self.inner.load_id = Some(id.get());
+        self.inner.native_record(serde_json::json!({"event":"loadfile","request":id.get(),"fixture":self.fixture.to_string_lossy()}));
         let handle = self.inner.handle()?;
         let arguments = [c"loadfile".as_ptr(), self.fixture.as_ptr(), ptr::null()];
         // SAFETY: Owner-only live handle, checked request ID and owned,
@@ -2856,8 +2986,8 @@ impl OwnerBackend for FixtureBackend {
     fn initial_playback(&self) -> InitialPlayback {
         self.inner.playback
     }
-    fn initial_filters(&mut self) -> Option<(FilterAttemptKey, CompiledFilterChain)> {
-        self.inner.initial_filters()
+    fn initial_treatments(&mut self) -> Option<(TreatmentAttemptKey, PreparedTreatments)> {
+        self.inner.initial_treatments()
     }
 
     fn shutdown(&mut self) -> Result<(), MediaError> {
@@ -3336,6 +3466,7 @@ mod tests {
 #[cfg(test)]
 mod reply_tests {
     use super::*;
+    use crate::domain::state::TreatmentPass;
     use crate::{
         capture::{input::CaptureSelection, linux},
         domain::capture::{CaptureMode, CapturedFourCc, FrameRate},
@@ -3364,8 +3495,8 @@ mod reply_tests {
         )
     }
 
-    fn filter_key(apply: u64, pass: FilterPass) -> FilterAttemptKey {
-        FilterAttemptKey {
+    fn filter_key(apply: u64, pass: TreatmentPass) -> TreatmentAttemptKey {
+        TreatmentAttemptKey {
             apply: crate::domain::state::ApplyId::new(apply).unwrap(),
             attempt: AttemptId::new(1).unwrap(),
             pass,
@@ -3399,18 +3530,36 @@ mod reply_tests {
         )
         .unwrap()
     }
+    fn admit_vf(
+        backend: &mut MpvBackend,
+        id: RequestId,
+        key: TreatmentAttemptKey,
+        chain: &crate::domain::filters::FilterChain,
+    ) -> Instant {
+        let compiled = compiled_filters(chain);
+        crate::diagnostics::filter_begin(key, &compiled.entries);
+        let observation = FilterObservation::new(
+            id.get(),
+            key,
+            compiled,
+            Instant::now(),
+            backend.log_sequence,
+            backend.dropped_context,
+        );
+        let admitted = observation.admitted;
+        backend.filter_observation = Some(observation);
+        admitted
+    }
+
     fn admitted_filter(chain: &crate::domain::filters::FilterChain) -> (MpvBackend, Instant) {
         let mut backend = backend();
         backend.property_requests = Some(Vec::new());
-        backend
-            .submit(
-                RequestId::for_test(17),
-                BackendCommand::ApplyFilters {
-                    key: filter_key(1, FilterPass::LiveCandidate),
-                    compiled: compiled_filters(chain),
-                },
-            )
-            .unwrap();
+        admit_vf(
+            &mut backend,
+            RequestId::for_test(17),
+            filter_key(1, TreatmentPass::Candidate),
+            chain,
+        );
         let now = backend.filter_observation.as_ref().unwrap().admitted;
         (backend, now)
     }
@@ -3463,16 +3612,11 @@ mod reply_tests {
         clock
     }
     fn result_failure(backend: &mut MpvBackend) -> Box<FilterFailure> {
-        loop {
-            match backend.emitted.pop_front().expect("settled result") {
-                BackendEvent::FilterResult {
-                    result: Err(failure),
-                    ..
-                } => return failure,
-                BackendEvent::FilterFault { .. } => {}
-                other => panic!("expected failure, got {other:?}"),
-            }
-        }
+        backend
+            .filter_result
+            .take()
+            .expect("settled vf result")
+            .unwrap_err()
     }
     fn confirmed_filter() -> MpvBackend {
         let (mut backend, now) = submitted_filter();
@@ -3480,11 +3624,42 @@ mod reply_tests {
         backend.filter_reconfigured();
         let final_time = complete_progress(&mut backend, now);
         backend.filter_tick(final_time, true).unwrap();
-        assert!(matches!(
-            backend.emitted.pop_front(),
-            Some(BackendEvent::FilterResult { result: Ok(_), .. })
-        ));
+        assert!(matches!(backend.filter_result.take(), Some(Ok(_))));
         backend
+    }
+
+    #[test]
+    fn late_vf_fault_revokes_latest_treatment_without_losing_graph_origin() {
+        let mut backend = confirmed_filter();
+        let origin = filter_key(1, TreatmentPass::Candidate);
+        let current = filter_key(2, TreatmentPass::Candidate);
+        // Renderer-only settlement preserves the graph and changes its consumer key.
+        backend.filter_health.as_mut().unwrap().treatment_key = current;
+        backend
+            .filter_log(
+                "vf".into(),
+                "error".into(),
+                "Disabling filter furami_2 because it has failed.".into(),
+            )
+            .unwrap();
+        let Some(BackendEvent::TreatmentFault { key, failure }) = backend.emitted.pop_front()
+        else {
+            panic!("late vf fault did not revoke the current treatment")
+        };
+        assert_eq!(key, current);
+        assert_eq!(failure.key, Some(current));
+        assert_eq!(
+            failure.disposition,
+            crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner
+        );
+        let crate::domain::failure::TreatmentErrorKind::Filter(filter) = failure.kind else {
+            panic!("late vf fault lost graph provenance")
+        };
+        assert_eq!(filter.diagnostics.key, Some(origin));
+        assert_eq!(filter.kind, FilterErrorKind::RuntimeGraph);
+        assert_eq!(filter.attributed_ordinal, Some(2));
+        assert!(filter.requires_fresh_owner);
+        assert!(backend.filters_poisoned);
     }
 
     #[test]
@@ -3544,7 +3719,10 @@ mod reply_tests {
                 sample(&mut backend, NodeValue::Double(f64::from(position)), clock);
             }
             backend.filter_tick(clock, true).unwrap();
-            assert!(backend.emitted.is_empty(), "31 advances do not confirm");
+            assert!(
+                backend.filter_result.is_none(),
+                "31 advances do not confirm"
+            );
             clock += FilterConfirmation::SAMPLE_INTERVAL;
             sample(&mut backend, NodeValue::Double(31.0), clock);
             assert_eq!(
@@ -3556,20 +3734,14 @@ mod reply_tests {
             sample(&mut backend, NodeValue::Double(32.0), clock);
             backend.filter_tick(clock, false).unwrap();
             assert!(
-                backend.emitted.is_empty(),
+                backend.filter_result.is_none(),
                 "progress must be followed by native NONE"
             );
             backend.filter_tick(clock, true).unwrap();
-            let Some(BackendEvent::FilterResult {
-                id,
-                key,
-                result: Ok(receipt),
-            }) = backend.emitted.pop_front()
-            else {
-                panic!("no confirmed result")
+            let Some(Ok(receipt)) = backend.filter_result.take() else {
+                panic!("no confirmed vf result")
             };
-            assert_eq!(id, 17);
-            assert_eq!(receipt.key(), key);
+            assert_eq!(receipt.key(), filter_key(1, TreatmentPass::Candidate));
             assert_eq!(receipt.baseline(), 0.0);
             assert_eq!(receipt.last_position(), 32.0);
             assert_eq!(receipt.advances(), 32);
@@ -3783,7 +3955,7 @@ mod reply_tests {
                 .unwrap();
             backend.filter_tick(now, false).unwrap();
             assert!(
-                backend.emitted.is_empty(),
+                backend.filter_result.is_none() && backend.emitted.is_empty(),
                 "no early rejection settlement or false incumbent fault"
             );
             if logs_first {
@@ -3811,7 +3983,7 @@ mod reply_tests {
             .filter_log("vf".into(), "error".into(), "creation context".into())
             .unwrap();
         backend.filter_tick(now, false).unwrap();
-        assert!(backend.emitted.is_empty());
+        assert!(backend.filter_result.is_none() && backend.emitted.is_empty());
         backend.filter_tick(now, true).unwrap();
         let failure = result_failure(&mut backend);
         assert_eq!(
@@ -3843,16 +4015,12 @@ mod reply_tests {
                     .collect(),
             )
             .unwrap();
-            backend
-                .submit(
-                    RequestId::for_test(18),
-                    BackendCommand::ApplyFilters {
-                        key: filter_key(2, FilterPass::LiveCandidate),
-                        compiled: compiled_filters(&candidate),
-                    },
-                )
-                .unwrap();
-            let now = Instant::now();
+            let now = admit_vf(
+                &mut backend,
+                RequestId::for_test(18),
+                filter_key(2, TreatmentPass::Candidate),
+                &candidate,
+            );
             let observation = backend.filter_observation.as_mut().unwrap();
             observation.submitted = true;
             observation.command.take();
@@ -3874,11 +4042,14 @@ mod reply_tests {
                     .unwrap();
             }
             backend.filter_tick(now, true).unwrap();
-            let Some(BackendEvent::FilterFault { key, failure }) = backend.emitted.pop_front()
+            let Some(BackendEvent::TreatmentFault { key, failure }) = backend.emitted.pop_front()
             else {
                 panic!("missing independent incumbent fault")
             };
-            assert_eq!(key, filter_key(1, FilterPass::LiveCandidate));
+            assert_eq!(key, filter_key(1, TreatmentPass::Candidate));
+            let crate::domain::failure::TreatmentErrorKind::Filter(failure) = failure.kind else {
+                panic!("incumbent fault lost vf provenance")
+            };
             assert_eq!(failure.kind, FilterErrorKind::RuntimeGraph);
             assert_eq!(failure.attributed_ordinal, Some(2));
             assert_eq!(failure.diagnostics.entries[2].label, "inert\nlabel 2");
@@ -4055,17 +4226,13 @@ mod reply_tests {
                 } else {
                     backend()
                 };
-                let key = filter_key(2, FilterPass::LiveCandidate);
-                backend
-                    .submit(
-                        RequestId::for_test(18),
-                        BackendCommand::ApplyFilters {
-                            key,
-                            compiled: compiled_filters(&ordered_filters()),
-                        },
-                    )
-                    .unwrap();
-                let now = backend.filter_observation.as_ref().unwrap().admitted;
+                let key = filter_key(2, TreatmentPass::Candidate);
+                let now = admit_vf(
+                    &mut backend,
+                    RequestId::for_test(18),
+                    key,
+                    &ordered_filters(),
+                );
                 backend
                     .filter_log(
                         "overflow".into(),
@@ -4074,14 +4241,22 @@ mod reply_tests {
                     )
                     .unwrap();
                 if incumbent {
-                    let Some(BackendEvent::FilterFault {
+                    let Some(BackendEvent::TreatmentFault {
                         key: prior,
                         failure,
                     }) = backend.emitted.pop_front()
                     else {
                         panic!("native loss did not revoke the confirmed incumbent")
                     };
-                    assert_eq!(prior, filter_key(1, FilterPass::LiveCandidate));
+                    assert_eq!(prior, filter_key(1, TreatmentPass::Candidate));
+                    assert_eq!(
+                        failure.disposition,
+                        crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner,
+                    );
+                    let crate::domain::failure::TreatmentErrorKind::Filter(failure) = failure.kind
+                    else {
+                        panic!("native loss fault lost vf provenance")
+                    };
                     assert_eq!(
                         failure.kind,
                         FilterErrorKind::Unconfirmed {
@@ -4123,16 +4298,13 @@ mod reply_tests {
     fn filter_native_loss_survives_malformed_outstanding_progress_reply_and_later_labels() {
         for post_baseline in [false, true] {
             let mut backend = confirmed_filter();
-            let key = filter_key(2, FilterPass::LiveCandidate);
-            backend
-                .submit(
-                    RequestId::for_test(18),
-                    BackendCommand::ApplyFilters {
-                        key,
-                        compiled: compiled_filters(&ordered_filters()),
-                    },
-                )
-                .unwrap();
+            let key = filter_key(2, TreatmentPass::Candidate);
+            admit_vf(
+                &mut backend,
+                RequestId::for_test(18),
+                key,
+                &ordered_filters(),
+            );
             let observation = backend.filter_observation.as_mut().unwrap();
             let now = observation.admitted;
             observation.submitted = true;
@@ -4165,14 +4337,17 @@ mod reply_tests {
                     "log message buffer overflow: native discarded messages".into(),
                 )
                 .unwrap();
-            let Some(BackendEvent::FilterFault {
+            let Some(BackendEvent::TreatmentFault {
                 key: prior,
                 failure,
             }) = backend.emitted.pop_front()
             else {
                 panic!("incumbent native loss fault missing")
             };
-            assert_eq!(prior, filter_key(1, FilterPass::LiveCandidate));
+            assert_eq!(prior, filter_key(1, TreatmentPass::Candidate));
+            let crate::domain::failure::TreatmentErrorKind::Filter(failure) = failure.kind else {
+                panic!("native loss fault lost vf provenance")
+            };
             assert_eq!(
                 failure.kind,
                 FilterErrorKind::Unconfirmed {
@@ -4223,16 +4398,13 @@ mod reply_tests {
             let mut backend = confirmed_filter();
             let recorder = FixtureRecorder::default();
             backend.fixture_recorder = Some(recorder.clone());
-            let key = filter_key(2, FilterPass::LiveCandidate);
-            backend
-                .submit(
-                    RequestId::for_test(18),
-                    BackendCommand::ApplyFilters {
-                        key,
-                        compiled: compiled_filters(&ordered_filters()),
-                    },
-                )
-                .unwrap();
+            let key = filter_key(2, TreatmentPass::Candidate);
+            admit_vf(
+                &mut backend,
+                RequestId::for_test(18),
+                key,
+                &ordered_filters(),
+            );
             let observation = backend.filter_observation.as_mut().unwrap();
             let now = observation.admitted;
             if submitted {
@@ -4244,8 +4416,12 @@ mod reply_tests {
                     .malformed_filter_log(now + std::time::Duration::from_millis(index))
                     .unwrap();
                 if index == 0 {
-                    let BackendEvent::FilterFault { failure, .. } = event else {
+                    let BackendEvent::TreatmentFault { failure, .. } = event else {
                         panic!("incumbent loss fault missing")
+                    };
+                    let crate::domain::failure::TreatmentErrorKind::Filter(failure) = failure.kind
+                    else {
+                        panic!("native loss fault lost vf provenance")
                     };
                     assert_eq!(
                         failure.kind,
@@ -4262,16 +4438,13 @@ mod reply_tests {
             let event = backend
                 .malformed_filter_log(now + FilterConfirmation::DEADLINE)
                 .unwrap();
-            let BackendEvent::FilterResult {
-                id,
-                key: actual,
-                result: Err(failure),
-            } = event
-            else {
-                panic!("malformed raw-event flood did not settle at the admission deadline")
-            };
-            assert_eq!(id, 18);
-            assert_eq!(actual, key);
+            assert_eq!(
+                event,
+                BackendEvent::Other,
+                "vf settlement is private to the aggregate owner"
+            );
+            let failure = result_failure(&mut backend);
+            assert_eq!(failure.diagnostics.key, Some(key));
             assert_eq!(
                 failure.kind,
                 FilterErrorKind::Unconfirmed {
@@ -4340,7 +4513,7 @@ mod reply_tests {
             } else {
                 submitted_filter().0
             };
-            let key = filter_key(1, FilterPass::LiveCandidate);
+            let key = filter_key(1, TreatmentPass::Candidate);
             if !late {
                 command_reply(&mut backend, 0, Instant::now());
             }
@@ -4355,7 +4528,7 @@ mod reply_tests {
                 backend.filter_tick(Instant::now(), true).unwrap();
             }
             let failure = if late {
-                let Some(BackendEvent::FilterFault {
+                let Some(BackendEvent::TreatmentFault {
                     key: observed,
                     failure,
                 }) = backend.emitted.pop_front()
@@ -4363,7 +4536,11 @@ mod reply_tests {
                     panic!("late native loss did not revoke confirmation")
                 };
                 assert_eq!(observed, key);
-                failure
+                let crate::domain::failure::TreatmentErrorKind::Filter(failure) = failure.kind
+                else {
+                    panic!("late native loss fault lost vf provenance")
+                };
+                Box::new(failure)
             } else {
                 result_failure(&mut backend)
             };
@@ -4412,17 +4589,14 @@ mod reply_tests {
                 .unwrap();
             assert!(matches!(
                 backend.emitted.pop_front(),
-                Some(BackendEvent::FilterFault { .. })
+                Some(BackendEvent::TreatmentFault { .. })
             ));
-            backend
-                .submit(
-                    RequestId::for_test(18),
-                    BackendCommand::ApplyFilters {
-                        key: filter_key(2, FilterPass::LiveCandidate),
-                        compiled: compiled_filters(&chain),
-                    },
-                )
-                .unwrap();
+            admit_vf(
+                &mut backend,
+                RequestId::for_test(18),
+                filter_key(2, TreatmentPass::Candidate),
+                &chain,
+            );
             backend.filter_tick(Instant::now(), true).unwrap();
             let failure = result_failure(&mut backend);
             assert_eq!(
@@ -5174,18 +5348,22 @@ mod reply_tests {
             audio: AudioSelection::Enabled {
                 source: source.clone(),
             },
+            renderer: crate::domain::render::RendererSettings::default(),
         };
         let prepared = crate::capture::apply::fixture_prepared(settings).unwrap();
         audio.watch = prepared.stamp();
         let stamp = audio.watch;
         let (drivers_tx, drivers) = std::sync::mpsc::channel();
         let mut gate = GateRunner::with_spawner(
-            Ok(crate::media::filter_catalog::fixture_capabilities()),
+            crate::media::render_catalog::QualifiedTreatmentCapabilities {
+                filters: Ok(crate::media::filter_catalog::fixture_capabilities()),
+                renderer: Ok(crate::media::render_catalog::fixture_capabilities()),
+            },
             move |generation, session| {
                 let requested = session.video.requested();
                 let (driver, backend) = Driver::pair(Config::default());
                 let backend =
-                    backend.with_open_filters(session.filter_key, session.compiled_filters);
+                    backend.with_open_treatments(session.treatment_key, session.treatments);
                 driver.set_observed(ObservedFacts {
                     decoded_size: Some(Observation {
                         value: requested.mode.size,
@@ -5211,11 +5389,10 @@ mod reply_tests {
         gate.begin_open(
             key,
             prepared,
-            crate::media::filter_catalog::compile_chain(
+            crate::media::controller::test_support::prepared_treatments(
                 &crate::domain::filters::FilterChain::default(),
-                &crate::media::filter_catalog::fixture_capabilities(),
-            )
-            .unwrap(),
+                &crate::domain::render::RendererSettings::default(),
+            ),
             PlaybackGain::default(),
             InitialPlayback::Live,
             initial,
@@ -5245,7 +5422,7 @@ mod reply_tests {
         });
         driver.send(BackendEvent::PlaybackRestart);
         driver.fence();
-        driver.confirm_open_filters();
+        driver.confirm_open_treatments();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if matches!(gate.poll(), Some(SessionEvent::OpenVerified { .. })) {

@@ -261,6 +261,7 @@ fn run() -> Result<(), StartupError> {
                     mode: requested.mode,
                 },
                 audio,
+                renderer: furami::domain::render::RendererSettings::default(),
             })
         })
         .transpose()?;
@@ -297,7 +298,8 @@ fn run() -> Result<(), StartupError> {
     }
     // Query once, before Qt starts. Apply uses only this immutable typed result;
     // a query refusal remains visible without pretending capabilities exist.
-    let filter_capabilities = furami::media::filter_catalog::query_qualified_capabilities(prefix);
+    let treatment_capabilities =
+        furami::media::render_catalog::QualifiedTreatmentCapabilities::query(prefix);
     tracing::info!(
         x11_display = x11_display.as_str(),
         media_prefix = media_prefix.as_str(),
@@ -305,7 +307,7 @@ fn run() -> Result<(), StartupError> {
     );
     furami::native_host::run_application(
         &media_prefix,
-        filter_capabilities,
+        treatment_capabilities,
         &x11_display,
         startup,
         persistence,

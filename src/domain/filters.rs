@@ -928,8 +928,8 @@ impl FilterChain {
 // ---------------------------------------------------------------------------
 
 /// Require a JSON object before delegating named-field checks to Serde (a derived struct
-/// deserializer would also accept positional sequences).
-fn deserialize_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+/// deserializer would also accept positional sequences). Shared with [`super::render`].
+pub(crate) fn deserialize_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,

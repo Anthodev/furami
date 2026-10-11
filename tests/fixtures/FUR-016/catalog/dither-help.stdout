@@ -1,0 +1,5 @@
+Valid values for option dither are:
+    fruit
+    ordered
+    error-diffusion
+    no

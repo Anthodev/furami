@@ -24,12 +24,20 @@ use crate::domain::capture::{
     SelectedRouteAuthorization, WatchStamp,
 };
 use crate::domain::{
-    failure::FilterFailure,
+    failure::TreatmentFailure,
     filters::FilterChain,
     output::OutputPlan,
-    state::{FilterAttemptKey, FilterConfirmation, FilterPass, InitialPlayback, PauseRequestId},
+    state::{
+        InitialPlayback, PauseRequestId, TreatmentAttemptKey, TreatmentConfirmation, TreatmentPass,
+    },
 };
 
+/// Both preparations are frozen before any native owner work is admitted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedTreatments {
+    pub(super) filters: CompiledFilterChain,
+    pub(super) renderer: super::render_catalog::CompiledRendererSettings,
+}
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     pub video: CaptureSelection,
@@ -40,8 +48,8 @@ pub struct SessionConfig {
     pub watch: WatchStamp,
     pub selected_route: Option<SelectedRouteAuthorization>,
     pub filters: FilterChain,
-    pub compiled_filters: CompiledFilterChain,
-    pub filter_key: FilterAttemptKey,
+    pub treatments: PreparedTreatments,
+    pub treatment_key: TreatmentAttemptKey,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -76,9 +84,9 @@ pub struct SurfaceToken {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlaybackIntent {
-    ApplyFilters {
-        key: FilterAttemptKey,
-        compiled: CompiledFilterChain,
+    ApplyTreatments {
+        key: TreatmentAttemptKey,
+        treatments: Box<PreparedTreatments>,
     },
     SetPaused {
         request: PauseRequestId,
@@ -151,20 +159,23 @@ pub(crate) struct Snapshot {
     pub playback: InitialPlayback,
     pub audio_detached: Option<(AudioEpoch, Result<(), AudioError>)>,
     pub audio_epoch: Option<AudioEpoch>,
-    pub filters: Option<FilterSnapshot>,
+    pub treatments: Option<TreatmentSnapshot>,
+    /// Independently retained revocation of the applied treatment. A newer
+    /// unsuccessful operation must not hide this bounded health event.
+    pub treatment_fault: Option<TreatmentSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct FilterSnapshot {
-    pub key: FilterAttemptKey,
+pub(crate) struct TreatmentSnapshot {
+    pub key: TreatmentAttemptKey,
     pub sequence: u64,
-    pub status: FilterStatus,
+    pub status: TreatmentStatus,
 }
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum FilterStatus {
+pub(crate) enum TreatmentStatus {
     Pending,
-    Confirmed(FilterConfirmation),
-    Failed(Box<FilterFailure>),
+    Confirmed(TreatmentConfirmation),
+    Failed(Box<TreatmentFailure>),
 }
 #[derive(Debug)]
 pub(crate) struct OwnerStopped {
@@ -249,9 +260,9 @@ impl RequestId {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BackendCommand {
-    ApplyFilters {
-        key: FilterAttemptKey,
-        compiled: CompiledFilterChain,
+    ApplyTreatments {
+        key: TreatmentAttemptKey,
+        treatments: Box<PreparedTreatments>,
     },
     LoadInput,
     SetPaused {
@@ -277,21 +288,21 @@ enum InFlight {
         paused: bool,
     },
     Control,
-    Filters {
-        key: FilterAttemptKey,
+    Treatments {
+        key: TreatmentAttemptKey,
     },
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BackendEvent {
     None,
-    FilterResult {
+    TreatmentResult {
         id: u64,
-        key: FilterAttemptKey,
-        result: Result<FilterConfirmation, Box<FilterFailure>>,
+        key: TreatmentAttemptKey,
+        result: Result<TreatmentConfirmation, Box<TreatmentFailure>>,
     },
-    FilterFault {
-        key: FilterAttemptKey,
-        failure: Box<FilterFailure>,
+    TreatmentFault {
+        key: TreatmentAttemptKey,
+        failure: Box<TreatmentFailure>,
     },
     FileLoaded,
     PlaybackRestart,
@@ -337,7 +348,7 @@ pub(crate) trait OwnerBackend {
     fn audio_epoch(&self) -> Option<AudioEpoch> {
         None
     }
-    fn initial_filters(&mut self) -> Option<(FilterAttemptKey, CompiledFilterChain)> {
+    fn initial_treatments(&mut self) -> Option<(TreatmentAttemptKey, PreparedTreatments)> {
         None
     }
     fn shutdown(&mut self) -> Result<(), MediaError>;
@@ -373,6 +384,7 @@ impl OwnerEndpoint {
                 mode: requested.mode,
             },
             audio: config.audio.clone(),
+            renderer: config.treatments.renderer.requested().clone(),
         };
         Self::spawn_task(
             generation,
@@ -418,7 +430,7 @@ impl OwnerEndpoint {
                         config.watch,
                         config.output,
                     )
-                    .with_filters(config.filter_key, config.compiled_filters),
+                    .with_treatments(config.treatment_key, config.treatments),
                     surface,
                     commands,
                     gain,
@@ -584,7 +596,8 @@ impl OwnerEndpoint {
                     playback: InitialPlayback::Live,
                     audio_detached: None,
                     audio_epoch: None,
-                    filters: None,
+                    treatments: None,
+                    treatment_fault: None,
                 };
                 let outcome = task(
                     &surface_rx,
@@ -908,6 +921,9 @@ fn run_owner<B: OwnerBackend>(
     mut last_request: u64,
     requested: Option<&RequestedFacts>,
 ) -> Result<(), MediaError> {
+    let mut reserved_restore = None;
+    let mut applied_treatment = None;
+    let mut applied_health_revoked = false;
     let token = loop {
         if stop.is_set() {
             return stop.outcome();
@@ -941,7 +957,6 @@ fn run_owner<B: OwnerBackend>(
     let id = RequestId::next(&mut last_request)?;
     backend.submit(id, BackendCommand::LoadInput)?;
     let mut pending = Some((id, InFlight::LoadInput));
-    let mut reserved_restore = None;
     loop {
         if stop.is_set() {
             return stop.outcome();
@@ -958,10 +973,13 @@ fn run_owner<B: OwnerBackend>(
             )?;
         }
         if pending.is_none() && snapshot.stream_ended.is_none() {
-            let initial = if snapshot.load_complete && snapshot.playback_started {
-                backend
-                    .initial_filters()
-                    .map(|(key, compiled)| PlaybackIntent::ApplyFilters { key, compiled })
+            let initial = if snapshot.readiness.is_some() {
+                backend.initial_treatments().map(|(key, treatments)| {
+                    PlaybackIntent::ApplyTreatments {
+                        key,
+                        treatments: Box::new(treatments),
+                    }
+                })
             } else {
                 None
             };
@@ -971,14 +989,14 @@ fn run_owner<B: OwnerBackend>(
                         return stop.outcome();
                     }
                     let id = match &intent {
-                        PlaybackIntent::ApplyFilters { key, .. } => {
-                            filter_request(&mut last_request, &mut reserved_restore, *key)?
+                        PlaybackIntent::ApplyTreatments { key, .. } => {
+                            treatment_request(&mut last_request, &mut reserved_restore, *key)?
                         }
                         _ => RequestId::next(&mut last_request)?,
                     };
                     let command = match intent {
-                        PlaybackIntent::ApplyFilters { key, compiled } => {
-                            BackendCommand::ApplyFilters { key, compiled }
+                        PlaybackIntent::ApplyTreatments { key, treatments } => {
+                            BackendCommand::ApplyTreatments { key, treatments }
                         }
                         PlaybackIntent::SetPaused { request, paused } => {
                             BackendCommand::SetPaused { request, paused }
@@ -1003,9 +1021,9 @@ fn run_owner<B: OwnerBackend>(
                         snapshot.pause = None;
                     }
                     let in_flight = match &command {
-                        BackendCommand::ApplyFilters { key, .. } => {
-                            record_filter(snapshot, *key, FilterStatus::Pending)?;
-                            InFlight::Filters { key: *key }
+                        BackendCommand::ApplyTreatments { key, .. } => {
+                            record_treatment(snapshot, *key, TreatmentStatus::Pending)?;
+                            InFlight::Treatments { key: *key }
                         }
                         BackendCommand::SetPaused { request, paused } => InFlight::SetPaused {
                             request: *request,
@@ -1048,28 +1066,40 @@ fn run_owner<B: OwnerBackend>(
                     drained = true;
                     break;
                 }
-                BackendEvent::FilterResult { id, key, result } => {
-                    if matches!(pending, Some((expected, InFlight::Filters { key: expected_key })) if expected.get() == id && expected_key == key)
+                BackendEvent::TreatmentResult { id, key, result } => {
+                    if matches!(pending, Some((expected, InFlight::Treatments { key: expected_key })) if expected.get() == id && expected_key == key)
                     {
                         let status = match result {
-                            Ok(confirmation) if confirmation.key() == key => {
-                                FilterStatus::Confirmed(confirmation)
+                            Ok(confirmation)
+                                if confirmation.key() == key && !applied_health_revoked =>
+                            {
+                                applied_treatment = Some(key);
+                                snapshot.treatment_fault = None;
+                                TreatmentStatus::Confirmed(confirmation)
                             }
                             Ok(_) => continue,
-                            Err(failure) => FilterStatus::Failed(failure),
+                            Err(failure) => TreatmentStatus::Failed(failure),
                         };
-                        record_filter(snapshot, key, status)?;
+                        record_treatment(snapshot, key, status)?;
                         pending = None;
                         publish(latest, snapshot);
                     }
                 }
-                BackendEvent::FilterFault { key, failure } => {
-                    if snapshot
-                        .filters
-                        .as_ref()
-                        .is_some_and(|filters| filters.key == key)
+                BackendEvent::TreatmentFault { key, failure } => {
+                    if !applied_health_revoked
+                        && applied_treatment == Some(key)
+                        && failure.key == Some(key)
                     {
-                        record_filter(snapshot, key, FilterStatus::Failed(failure))?;
+                        applied_health_revoked = true;
+                        if snapshot
+                            .treatments
+                            .as_ref()
+                            .is_some_and(|operation| operation.key == key)
+                        {
+                            record_treatment(snapshot, key, TreatmentStatus::Failed(failure))?;
+                        } else {
+                            record_treatment_fault(snapshot, key, failure)?;
+                        }
                         publish(latest, snapshot);
                     }
                 }
@@ -1131,8 +1161,8 @@ fn run_owner<B: OwnerBackend>(
                     if let Some((expected, kind)) = pending.as_ref()
                         && expected.get() == id
                     {
-                        if matches!(kind, InFlight::Filters { .. }) {
-                            continue; // Only the settled, keyed FilterResult ends this operation.
+                        if matches!(kind, InFlight::Treatments { .. }) {
+                            continue; // Only the complete keyed treatment result ends this operation.
                         }
                         if error < 0 {
                             return Err(MediaError::new(
@@ -1165,18 +1195,13 @@ fn run_owner<B: OwnerBackend>(
                     }
                 }
                 BackendEvent::EndFile { reason, error } => {
+                    snapshot.stream_ended = Some((reason, error));
                     tracing::info!(
                         generation = snapshot.generation.get(),
                         reason,
                         error,
                         "mpv_end_file"
                     );
-                    if stop.is_set() {
-                        return stop.outcome();
-                    }
-                    snapshot.stream_ended = Some((reason, error));
-                    snapshot.readiness = None;
-                    publish(latest, snapshot);
                     if error < 0 || reason == 4 {
                         return Err(MediaError::new(
                             "playback",
@@ -1186,6 +1211,7 @@ fn run_owner<B: OwnerBackend>(
                             ),
                         ));
                     }
+                    publish(latest, snapshot);
                 }
                 BackendEvent::Shutdown => {
                     return Err(MediaError::new(
@@ -1211,20 +1237,20 @@ fn run_owner<B: OwnerBackend>(
         if snapshot.readiness != previous_readiness {
             publish(latest, snapshot);
         }
-        if drained {
-            thread::park_timeout(Duration::from_millis(10));
-        }
+        // Yield even when the bounded native batch had no NONE. A hostile event
+        // stream must not turn deadline observation into an owner busy loop.
+        thread::park_timeout(Duration::from_millis(10));
     }
 }
 
 /// Reserve both cookies atomically. Output work advances the counter beyond the
 /// reserved pair and can never consume the restoration cookie.
-fn filter_request(
+fn treatment_request(
     last: &mut u64,
-    reserved: &mut Option<(FilterAttemptKey, RequestId)>,
-    key: FilterAttemptKey,
+    reserved: &mut Option<(TreatmentAttemptKey, RequestId)>,
+    key: TreatmentAttemptKey,
 ) -> Result<RequestId, MediaError> {
-    if key.pass == FilterPass::LiveRestore
+    if key.pass == TreatmentPass::Restore
         && reserved.as_ref().is_some_and(|(candidate, _)| {
             candidate.apply == key.apply && candidate.attempt == key.attempt
         })
@@ -1239,23 +1265,80 @@ fn filter_request(
     Ok(candidate)
 }
 
-fn record_filter(
-    snapshot: &mut Snapshot,
-    key: FilterAttemptKey,
-    status: FilterStatus,
-) -> Result<(), MediaError> {
-    let sequence = snapshot
-        .filters
+fn superseded_failure(previous: &TreatmentFailure, incoming: &TreatmentFailure) -> bool {
+    previous == incoming
+        || (matches!(
+            incoming.kind,
+            crate::domain::failure::TreatmentErrorKind::Unconfirmed { .. }
+        ) && !matches!(
+            previous.kind,
+            crate::domain::failure::TreatmentErrorKind::Unconfirmed { .. }
+        ))
+}
+
+fn next_treatment_sequence(
+    snapshot: &Snapshot,
+    exhausted: &'static str,
+) -> Result<u64, MediaError> {
+    snapshot
+        .treatments
         .as_ref()
-        .map_or(0, |filters| filters.sequence)
+        .map_or(0, |operation| operation.sequence)
+        .max(
+            snapshot
+                .treatment_fault
+                .as_ref()
+                .map_or(0, |fault| fault.sequence),
+        )
         .checked_add(1)
-        .ok_or_else(|| {
-            MediaError::new("filter_sequence", "filter observation sequence exhausted")
-        })?;
-    snapshot.filters = Some(FilterSnapshot {
+        .ok_or_else(|| MediaError::new("treatment_sequence", exhausted))
+}
+
+fn record_treatment(
+    snapshot: &mut Snapshot,
+    key: TreatmentAttemptKey,
+    status: TreatmentStatus,
+) -> Result<(), MediaError> {
+    if let TreatmentStatus::Failed(incoming) = &status
+        && let Some(TreatmentSnapshot {
+            key: current,
+            status: TreatmentStatus::Failed(previous),
+            ..
+        }) = &snapshot.treatments
+        && *current == key
+        && superseded_failure(previous, incoming)
+    {
+        return Ok(());
+    }
+    let sequence = next_treatment_sequence(snapshot, "treatment observation sequence exhausted")?;
+    snapshot.treatments = Some(TreatmentSnapshot {
         key,
         sequence,
         status,
+    });
+    Ok(())
+}
+
+fn record_treatment_fault(
+    snapshot: &mut Snapshot,
+    key: TreatmentAttemptKey,
+    failure: Box<TreatmentFailure>,
+) -> Result<(), MediaError> {
+    if let Some(TreatmentSnapshot {
+        key: current,
+        status: TreatmentStatus::Failed(previous),
+        ..
+    }) = &snapshot.treatment_fault
+        && *current == key
+        && superseded_failure(previous, &failure)
+    {
+        return Ok(());
+    }
+    let sequence = next_treatment_sequence(snapshot, "treatment fault sequence exhausted")?;
+    snapshot.treatment_fault = Some(TreatmentSnapshot {
+        key,
+        sequence,
+        status: TreatmentStatus::Failed(failure),
     });
     Ok(())
 }
@@ -1397,7 +1480,7 @@ pub(crate) mod test_support {
         paused: bool,
         audio_epoch: Option<AudioEpoch>,
         observed: ObservedFacts,
-        open_filters: Option<(FilterAttemptKey, CompiledFilterChain)>,
+        open_treatments: Option<(TreatmentAttemptKey, PreparedTreatments)>,
     }
 
     impl Driver {
@@ -1438,7 +1521,7 @@ pub(crate) mod test_support {
                     paused: false,
                     audio_epoch: None,
                     observed: ObservedFacts::default(),
-                    open_filters: None,
+                    open_treatments: None,
                 },
             )
         }
@@ -1458,36 +1541,94 @@ pub(crate) mod test_support {
         }
         /// Script a successful backend boundary only for the real submitted Open
         /// cookie/key. Production and observer tests never use this test driver.
-        pub(crate) fn confirm_open_filters(&self) -> FilterConfirmation {
+        pub(crate) fn confirm_open_treatments(&self) -> TreatmentConfirmation {
             loop {
                 let (id, command) = self
                     .submitted
                     .recv_timeout(Duration::from_secs(5))
-                    .expect("owner did not submit configured initial filters");
+                    .expect("owner did not submit configured initial treatments");
                 match command {
                     BackendCommand::LoadInput => continue,
-                    BackendCommand::ApplyFilters { key, .. } if key.pass == FilterPass::Open => {
-                        let confirmation = FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap();
-                        self.send(BackendEvent::FilterResult {
+                    BackendCommand::ApplyTreatments { key, treatments }
+                        if key.pass == TreatmentPass::Open =>
+                    {
+                        let confirmation = treatment_confirmation(
+                            key,
+                            InitialPlayback::Live,
+                            treatments.renderer.requested().clone(),
+                        );
+                        self.send(BackendEvent::TreatmentResult {
                             id: id.get(),
                             key,
-                            result: Ok(confirmation),
+                            result: Ok(confirmation.clone()),
                         });
                         return confirmation;
                     }
-                    other => panic!("expected initial filter command, received {other:?}"),
+                    other => panic!("expected initial treatment command, received {other:?}"),
                 }
             }
         }
     }
 
+    pub(crate) fn prepared_treatments(
+        chain: &FilterChain,
+        renderer: &crate::domain::render::RendererSettings,
+    ) -> PreparedTreatments {
+        PreparedTreatments {
+            filters: super::super::filter_catalog::compile_chain(
+                chain,
+                &super::super::filter_catalog::fixture_capabilities(),
+            )
+            .unwrap(),
+            renderer: super::super::render_catalog::compile_renderer(
+                renderer,
+                &super::super::render_catalog::fixture_capabilities(),
+            )
+            .unwrap(),
+        }
+    }
+
+    pub(crate) fn treatment_confirmation(
+        key: TreatmentAttemptKey,
+        playback: InitialPlayback,
+        renderer: crate::domain::render::RendererSettings,
+    ) -> TreatmentConfirmation {
+        use crate::domain::state::{
+            FilterConfirmation, FilterEvidence, FilterTreatmentProof, RendererConfirmation,
+        };
+        let filters = match playback {
+            InitialPlayback::Live => FilterTreatmentProof::Reconfigured(
+                FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap(),
+            ),
+            InitialPlayback::Paused if key.pass == TreatmentPass::Open => {
+                FilterTreatmentProof::PreparedPaused { key }
+            }
+            InitialPlayback::Paused => FilterTreatmentProof::Preserved {
+                origin: FilterEvidence::PreparedPaused {
+                    key: TreatmentAttemptKey {
+                        pass: TreatmentPass::Open,
+                        ..key
+                    },
+                },
+            },
+        };
+        TreatmentConfirmation::checked(
+            key,
+            playback,
+            playback == InitialPlayback::Live,
+            filters,
+            RendererConfirmation::checked(key, renderer),
+        )
+        .unwrap()
+    }
+
     impl FakeBackend {
-        pub(crate) fn with_open_filters(
+        pub(crate) fn with_open_treatments(
             mut self,
-            key: FilterAttemptKey,
-            compiled: CompiledFilterChain,
+            key: TreatmentAttemptKey,
+            treatments: PreparedTreatments,
         ) -> Self {
-            self.open_filters = Some((key, compiled));
+            self.open_treatments = Some((key, treatments));
             self
         }
     }
@@ -1501,8 +1642,8 @@ pub(crate) mod test_support {
             }
             self.config.initialization_error.take().map_or(Ok(()), Err)
         }
-        fn initial_filters(&mut self) -> Option<(FilterAttemptKey, CompiledFilterChain)> {
-            self.open_filters.take()
+        fn initial_treatments(&mut self) -> Option<(TreatmentAttemptKey, PreparedTreatments)> {
+            self.open_treatments.take()
         }
 
         fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
@@ -1628,28 +1769,27 @@ mod tests {
         owner.take_stopped().unwrap().unwrap()
     }
 
-    fn filter_key(apply: u64, pass: FilterPass) -> FilterAttemptKey {
-        FilterAttemptKey {
+    fn treatment_key(apply: u64, pass: TreatmentPass) -> TreatmentAttemptKey {
+        TreatmentAttemptKey {
             apply: crate::domain::state::ApplyId::new(apply).unwrap(),
             attempt: crate::domain::state::AttemptId::new(1).unwrap(),
             pass,
         }
     }
-    fn filters_intent(key: FilterAttemptKey) -> PlaybackIntent {
-        PlaybackIntent::ApplyFilters {
+    fn treatments_intent(key: TreatmentAttemptKey) -> PlaybackIntent {
+        PlaybackIntent::ApplyTreatments {
             key,
-            compiled: crate::media::filter_catalog::compile_chain(
+            treatments: Box::new(test_support::prepared_treatments(
                 &FilterChain::default(),
-                &crate::media::filter_catalog::fixture_capabilities(),
-            )
-            .unwrap(),
+                &crate::domain::render::RendererSettings::default(),
+            )),
         }
     }
-    fn filter_failure(
-        key: FilterAttemptKey,
+    fn treatment_failure(
+        key: TreatmentAttemptKey,
         kind: crate::domain::failure::FilterErrorKind,
-    ) -> Box<FilterFailure> {
-        Box::new(FilterFailure {
+    ) -> Box<TreatmentFailure> {
+        let filter = crate::domain::failure::FilterFailure {
             kind,
             attributed_ordinal: None,
             requires_fresh_owner: false,
@@ -1661,13 +1801,18 @@ mod tests {
                 truncated: false,
                 dropped_context: 0,
             },
+        };
+        Box::new(TreatmentFailure {
+            key: Some(key),
+            kind: crate::domain::failure::TreatmentErrorKind::Filter(filter),
+            disposition: crate::domain::failure::TreatmentFailureDisposition::RestoreSameOwner,
         })
     }
-    fn start_filter() -> (OwnerEndpoint, Driver, RequestId, FilterAttemptKey) {
+    fn start_treatment() -> (OwnerEndpoint, Driver, RequestId, TreatmentAttemptKey) {
         let (owner, driver) = start(Config::default());
         let load = load(&driver);
-        let key = filter_key(1, FilterPass::LiveCandidate);
-        owner.submit(generation(), filters_intent(key));
+        let key = treatment_key(1, TreatmentPass::Candidate);
+        owner.submit(generation(), treatments_intent(key));
         driver.send(BackendEvent::CommandReply {
             id: load.get(),
             error: 0,
@@ -1677,14 +1822,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
         assert!(
-            matches!(command, BackendCommand::ApplyFilters { key: actual, .. } if actual == key)
+            matches!(command, BackendCommand::ApplyTreatments { key: actual, .. } if actual == key)
         );
         (owner, driver, id, key)
     }
 
     #[test]
-    fn filter_pending_keeps_discrete_slot_until_exact_settled_result_not_command_reply() {
-        let (mut owner, driver, id, key) = start_filter();
+    fn treatment_pending_keeps_discrete_slot_until_exact_settled_result_not_command_reply() {
+        let (mut owner, driver, id, key) = start_treatment();
         owner.submit(generation(), pause_intent());
         driver.send(BackendEvent::CommandReply {
             id: id.get(),
@@ -1693,19 +1838,23 @@ mod tests {
         driver.fence();
         assert!(driver.submitted.try_recv().is_err());
         assert!(matches!(
-            owner.take_snapshot().unwrap().filters.unwrap().status,
-            FilterStatus::Pending
+            owner.take_snapshot().unwrap().treatments.unwrap().status,
+            TreatmentStatus::Pending
         ));
-        let wrong_key = filter_key(2, FilterPass::LiveCandidate);
+        let wrong_key = treatment_key(2, TreatmentPass::Candidate);
         for (cookie, actual) in [
             (id.get() + 1, key),
             (id.get(), wrong_key),
-            (id.get(), filter_key(1, FilterPass::LiveRestore)),
+            (id.get(), treatment_key(1, TreatmentPass::Restore)),
         ] {
-            driver.send(BackendEvent::FilterResult {
+            driver.send(BackendEvent::TreatmentResult {
                 id: cookie,
                 key: actual,
-                result: Ok(FilterConfirmation::checked(actual, 0.0, 2.0, 32).unwrap()),
+                result: Ok(test_support::treatment_confirmation(
+                    actual,
+                    InitialPlayback::Live,
+                    Default::default(),
+                )),
             });
         }
         driver.fence();
@@ -1713,10 +1862,10 @@ mod tests {
             driver.submitted.try_recv().is_err(),
             "wrong cookies/keys/passes cannot retire pending work"
         );
-        driver.send(BackendEvent::FilterResult {
+        driver.send(BackendEvent::TreatmentResult {
             id: id.get(),
             key,
-            result: Err(filter_failure(
+            result: Err(treatment_failure(
                 key,
                 crate::domain::failure::FilterErrorKind::CommandRejected { mpv_error: -12 },
             )),
@@ -1728,31 +1877,39 @@ mod tests {
         assert_eq!(command, pause_command());
         assert!(
             stop(&mut owner, &driver).outcome.is_ok(),
-            "a clean filter rejection is not a fatal owner error"
+            "a clean treatment rejection is not a fatal owner error"
         );
     }
 
     #[test]
-    fn filter_sticky_confirmed_is_overwritten_by_same_key_fault_before_consumption() {
-        let (mut owner, driver, id, key) = start_filter();
-        driver.send(BackendEvent::FilterResult {
+    fn treatment_sticky_confirmed_is_overwritten_by_same_key_fault_before_consumption() {
+        let (mut owner, driver, id, key) = start_treatment();
+        driver.send(BackendEvent::TreatmentResult {
             id: id.get(),
             key,
-            result: Ok(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()),
+            result: Ok(test_support::treatment_confirmation(
+                key,
+                InitialPlayback::Live,
+                Default::default(),
+            )),
         });
-        driver.send(BackendEvent::FilterFault {
+        driver.send(BackendEvent::TreatmentFault {
             key,
-            failure: filter_failure(key, crate::domain::failure::FilterErrorKind::RuntimeGraph),
+            failure: treatment_failure(key, crate::domain::failure::FilterErrorKind::RuntimeGraph),
         });
         driver.fence();
-        let filters = owner.take_snapshot().unwrap().filters.unwrap();
-        assert_eq!(filters.key, key);
-        assert_eq!(filters.sequence, 3);
-        assert!(matches!(filters.status, FilterStatus::Failed(_)));
-        driver.send(BackendEvent::FilterResult {
+        let treatments = owner.take_snapshot().unwrap().treatments.unwrap();
+        assert_eq!(treatments.key, key);
+        assert_eq!(treatments.sequence, 3);
+        assert!(matches!(treatments.status, TreatmentStatus::Failed(_)));
+        driver.send(BackendEvent::TreatmentResult {
             id: id.get(),
             key,
-            result: Ok(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()),
+            result: Ok(test_support::treatment_confirmation(
+                key,
+                InitialPlayback::Live,
+                Default::default(),
+            )),
         });
         driver.fence();
         assert!(
@@ -1762,8 +1919,122 @@ mod tests {
         assert!(stop(&mut owner, &driver).outcome.is_ok());
     }
 
+    /// The applied-health lane must retain a late fault on the confirmed
+    /// incumbent even while a newer candidate owns the latest-operation slot.
     #[test]
-    fn filter_terminal_and_native_overflow_share_snapshot_and_outrank_success() {
+    fn applied_fault_lane_survives_newer_candidate_failure_in_same_drain_and_after_receipt() {
+        for same_drain in [true, false] {
+            let (mut owner, driver, id, confirmed) = start_treatment();
+            driver.send(BackendEvent::TreatmentResult {
+                id: id.get(),
+                key: confirmed,
+                result: Ok(test_support::treatment_confirmation(
+                    confirmed,
+                    InitialPlayback::Live,
+                    Default::default(),
+                )),
+            });
+            driver.fence();
+            let applied = owner.take_snapshot().unwrap();
+            assert_eq!(applied.treatments.as_ref().unwrap().key, confirmed);
+            assert!(
+                applied.treatment_fault.is_none(),
+                "a positive result clears the applied-fault lane"
+            );
+
+            let candidate = treatment_key(2, TreatmentPass::Candidate);
+            owner.submit(generation(), treatments_intent(candidate));
+            let (candidate_id, command) = driver
+                .submitted
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert!(
+                matches!(command, BackendCommand::ApplyTreatments { key: actual, .. } if actual == candidate)
+            );
+            let mut rejected = treatment_failure(
+                candidate,
+                crate::domain::failure::FilterErrorKind::CommandRejected { mpv_error: -5 },
+            );
+            rejected.disposition = crate::domain::failure::TreatmentFailureDisposition::Untouched;
+            driver.send(BackendEvent::TreatmentResult {
+                id: candidate_id.get(),
+                key: candidate,
+                result: Err(rejected),
+            });
+            let fault = treatment_failure(
+                confirmed,
+                crate::domain::failure::FilterErrorKind::RuntimeGraph,
+            );
+            if same_drain {
+                driver.send(BackendEvent::TreatmentFault {
+                    key: confirmed,
+                    failure: fault,
+                });
+                driver.fence();
+            } else {
+                driver.fence();
+                let interim = owner.take_snapshot().unwrap();
+                assert_eq!(interim.treatments.as_ref().unwrap().key, candidate);
+                assert!(matches!(
+                    interim.treatments.as_ref().unwrap().status,
+                    TreatmentStatus::Failed(_)
+                ));
+                assert!(
+                    interim.treatment_fault.is_none(),
+                    "a newer candidate failure is not an applied fault"
+                );
+                driver.send(BackendEvent::TreatmentFault {
+                    key: confirmed,
+                    failure: fault,
+                });
+                driver.fence();
+            }
+            let snapshot = owner.take_snapshot().unwrap();
+            let latest = snapshot.treatments.as_ref().expect("latest operation");
+            assert_eq!(
+                latest.key, candidate,
+                "newer candidate B keeps the latest-operation slot"
+            );
+            assert!(matches!(latest.status, TreatmentStatus::Failed(_)));
+            let applied_fault = snapshot
+                .treatment_fault
+                .as_ref()
+                .expect("applied fault lane retains the incumbent fault");
+            assert_eq!(applied_fault.key, confirmed);
+            let TreatmentStatus::Failed(failure) = &applied_fault.status else {
+                panic!("applied fault lane must carry the typed failure");
+            };
+            assert_eq!(failure.key, Some(confirmed));
+            assert!(
+                applied_fault.sequence > latest.sequence,
+                "fault sequence advances beyond the newer operation"
+            );
+            // A duplicate fault on the already-revoked applied key must not
+            // advance the lane or replace the retained evidence.
+            driver.send(BackendEvent::TreatmentFault {
+                key: confirmed,
+                failure: treatment_failure(
+                    confirmed,
+                    crate::domain::failure::FilterErrorKind::RuntimeGraph,
+                ),
+            });
+            driver.fence();
+            if let Some(duplicate) = owner.take_snapshot() {
+                assert_eq!(
+                    duplicate
+                        .treatment_fault
+                        .as_ref()
+                        .map(|fault| fault.sequence),
+                    Some(applied_fault.sequence),
+                    "duplicate fault must not advance the applied lane"
+                );
+            }
+            assert!(stop(&mut owner, &driver).outcome.is_ok());
+        }
+    }
+
+    #[test]
+    fn treatment_terminal_and_native_overflow_share_snapshot_and_outrank_success() {
         for terminal in [
             BackendEvent::Shutdown,
             BackendEvent::QueueOverflow,
@@ -1772,11 +2043,15 @@ mod tests {
                 error: -12,
             },
         ] {
-            let (mut owner, driver, id, key) = start_filter();
-            driver.send(BackendEvent::FilterResult {
+            let (mut owner, driver, id, key) = start_treatment();
+            driver.send(BackendEvent::TreatmentResult {
                 id: id.get(),
                 key,
-                result: Ok(FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap()),
+                result: Ok(test_support::treatment_confirmation(
+                    key,
+                    InitialPlayback::Live,
+                    Default::default(),
+                )),
             });
             driver.send(terminal);
             assert!(owner.wait_for_ack().is_ok());
@@ -1789,19 +2064,19 @@ mod tests {
     }
 
     #[test]
-    fn filter_cookie_pair_reservation_is_checked_atomic_and_output_cannot_steal_restore() {
+    fn treatment_cookie_pair_reservation_is_checked_atomic_and_output_cannot_steal_restore() {
         let mut last = 0;
         let mut reserved = None;
-        let key = filter_key(1, FilterPass::LiveCandidate);
-        let candidate = filter_request(&mut last, &mut reserved, key).unwrap();
+        let key = treatment_key(1, TreatmentPass::Candidate);
+        let candidate = treatment_request(&mut last, &mut reserved, key).unwrap();
         assert_eq!(candidate.get(), 1);
         assert_eq!(last, 2);
         assert_eq!(RequestId::next(&mut last).unwrap().get(), 3);
         assert_eq!(
-            filter_request(
+            treatment_request(
                 &mut last,
                 &mut reserved,
-                filter_key(1, FilterPass::LiveRestore)
+                treatment_key(1, TreatmentPass::Restore)
             )
             .unwrap()
             .get(),
@@ -1810,7 +2085,7 @@ mod tests {
         assert!(reserved.is_none());
         assert_eq!(last, 3);
         let mut exhausted = (1 << 63) - 2;
-        assert!(filter_request(&mut exhausted, &mut reserved, key).is_err());
+        assert!(treatment_request(&mut exhausted, &mut reserved, key).is_err());
         assert_eq!(
             exhausted,
             (1 << 63) - 2,
@@ -2725,7 +3000,8 @@ mod recovery_readiness_tests {
             playback: InitialPlayback::Paused,
             audio_detached: None,
             audio_epoch: None,
-            filters: None,
+            treatments: None,
+            treatment_fault: None,
         }
     }
 

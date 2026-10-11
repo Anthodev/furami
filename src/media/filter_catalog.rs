@@ -178,6 +178,23 @@ impl fmt::Debug for CompiledFilterChain {
 pub fn query_qualified_capabilities(
     prefix: &Path,
 ) -> Result<FilterCapabilities, FilterCatalogError> {
+    let (prefix, executable) = qualified_executable(prefix)?;
+    let version = run_query(&prefix, &executable, CatalogQuery::Version)?;
+    let (mpv_version, ffmpeg_version) = parse_versions(&version)?;
+    let registry = run_query(&prefix, &executable, CatalogQuery::VideoFilters)?;
+    let registered = parse_registry(&registry)?;
+    Ok(FilterCapabilities {
+        prefix,
+        executable,
+        mpv_version,
+        ffmpeg_version,
+        registered,
+    })
+}
+
+pub(super) fn qualified_executable(
+    prefix: &Path,
+) -> Result<(PathBuf, PathBuf), FilterCatalogError> {
     if !prefix.is_absolute() || !prefix.is_dir() {
         return Err(FilterCatalogError::InvalidPrefix {
             detail: "prefix must be an absolute existing directory".to_owned(),
@@ -198,27 +215,29 @@ pub fn query_qualified_capabilities(
             detail: "bin/mpv must resolve to a file within the qualified prefix".to_owned(),
         });
     }
-    let version = run_query(&prefix, &executable, CatalogQuery::Version)?;
-    let (mpv_version, ffmpeg_version) = parse_versions(&version)?;
-    let registry = run_query(&prefix, &executable, CatalogQuery::VideoFilters)?;
-    let registered = parse_registry(&registry)?;
-    Ok(FilterCapabilities {
-        prefix,
-        executable,
-        mpv_version,
-        ffmpeg_version,
-        registered,
-    })
+    Ok((prefix, executable))
 }
 
 fn qualified_command(prefix: &Path, executable: &Path, query: CatalogQuery) -> Command {
+    qualified_argument_command(
+        prefix,
+        executable,
+        match query {
+            CatalogQuery::Version => "--version",
+            CatalogQuery::VideoFilters => "--vf=help",
+        },
+    )
+}
+
+pub(super) fn qualified_argument_command(
+    prefix: &Path,
+    executable: &Path,
+    argument: &str,
+) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("--no-config")
-        .arg(match query {
-            CatalogQuery::Version => "--version",
-            CatalogQuery::VideoFilters => "--vf=help",
-        })
+        .arg(argument)
         .env_clear()
         .env("LD_LIBRARY_PATH", prefix.join("lib"))
         .env("LC_ALL", "C");
@@ -251,7 +270,7 @@ fn malformed(query: CatalogQuery, reason: &'static str) -> FilterCatalogError {
     FilterCatalogError::MalformedQuery { query, reason }
 }
 
-fn parse_versions(text: &str) -> Result<(String, String), FilterCatalogError> {
+pub(super) fn parse_versions(text: &str) -> Result<(String, String), FilterCatalogError> {
     let mut mpv = None;
     let mut ffmpeg = None;
     for line in text.lines() {

@@ -251,6 +251,7 @@ mod tests {
                     },
                 },
                 audio: AudioSelection::default(),
+                renderer: crate::domain::render::RendererSettings::default(),
             },
             operation,
             operation,
