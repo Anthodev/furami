@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::domain::capture::{
-    AudioSelection, AudioSourceIdentity, CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate,
-    FrameSize, ModeRequest, PlaybackGain, UsbTopology,
+    AudioSelection, AudioSourceIdentity, CaptureModeRequest, CapturedFourCc, DeviceIdentity,
+    FrameRate, FrameSize, InputFormatPolicy, PlaybackGain, UsbTopology, VideoRequest,
 };
 use crate::domain::filters::{
     ColorLevels, EqParams, EqValues, Filter, FilterChain, FilterEntry, FormatParams, Hqdn3dParams,
@@ -23,7 +23,7 @@ use crate::domain::render::{
 use crate::domain::state::{AppliedSettings, DraftSettings, ModelEffect, ProductModel};
 use crate::settings::{
     Durability, LoadOutcome, LocalPreferences, SettingsLoadError, SettingsStore,
-    SettingsWriteError, WriteFaultPoint, WriteOutcome,
+    SettingsValidationError, SettingsWriteError, StoredDocument, WriteFaultPoint, WriteOutcome,
 };
 
 // ---------------------------------------------------------------------------
@@ -73,11 +73,25 @@ fn identity() -> DeviceIdentity {
     DeviceIdentity::new(0x1234, 0x5678, topology(), Some("SER42".to_owned())).unwrap()
 }
 
-fn mode(fourcc: u32, width: u32, height: u32, numerator: u32, denominator: u32) -> CaptureMode {
-    CaptureMode {
-        captured_fourcc: CapturedFourCc::from_kernel(fourcc),
-        size: FrameSize::new(width, height).unwrap(),
-        rate: FrameRate::new(numerator, denominator).unwrap(),
+/// A manual-policy video request: the pin and the proven concrete format agree,
+/// which is the shape both legacy v1 documents and prepared applies produce.
+fn video_request(
+    fourcc: u32,
+    width: u32,
+    height: u32,
+    numerator: u32,
+    denominator: u32,
+) -> VideoRequest {
+    let concrete = CapturedFourCc::from_kernel(fourcc);
+    VideoRequest {
+        identity: identity(),
+        mode: CaptureModeRequest {
+            format_policy: InputFormatPolicy::Manual { fourcc: concrete },
+            size: FrameSize::new(width, height).unwrap(),
+            rate: FrameRate::new(numerator, denominator).unwrap(),
+        },
+        resolved_fourcc: Some(concrete),
+        selected_node: None,
     }
 }
 
@@ -95,10 +109,7 @@ fn source_identity() -> AudioSourceIdentity {
 fn draft_settings() -> DraftSettings {
     DraftSettings {
         filters: crate::domain::filters::FilterChain::default(),
-        video: ModeRequest {
-            identity: identity(),
-            mode: mode(0x3231_564E, 1920, 1080, 60000, 1001),
-        },
+        video: video_request(0x3231_564E, 1920, 1080, 60000, 1001),
         audio: AudioSelection::Enabled {
             source: source_identity(),
         },
@@ -117,13 +128,20 @@ fn preferences() -> LocalPreferences {
 /// Mints an `AppliedSettings` through the only legitimate producer: a full
 /// verified open on the product model. The aggregate is keyed to the model's
 /// actual opening request and built with the pub(crate) checked fixture proof.
+///
+/// The model freezes a resolution-less candidate; the prepared settings are
+/// supplied through `accept_prepared` so the persisted aggregate carries the
+/// proven concrete format, exactly as the production adapter does.
 fn applied_settings(settings: DraftSettings) -> AppliedSettings {
-    let mut model = ProductModel::new(settings);
+    let mut model = ProductModel::new(settings.clone());
     model
         .apply(model.state_identity(), model.draft().revision)
         .unwrap();
     let request = model.validation_request().unwrap().clone();
-    let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+    let prepared = model
+        .accept_prepared(&request, settings, request.watch, None)
+        .expect("model accepts the resolved prepared settings");
+    let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&prepared) else {
         panic!("initial open effect missing");
     };
     open_verified(&mut model, key);
@@ -207,7 +225,7 @@ fn valid_document_loads_completely() {
     assert!(!store.is_refused());
     assert_eq!(document.applied.as_ref(), Some(&draft_settings()));
     assert_eq!(document.preferences, preferences());
-    assert_eq!(store.snapshot(), Some(&document));
+    assert_eq!(store.snapshot(), Some(&*document));
     fs::remove_dir_all(&directory).unwrap();
 }
 
@@ -695,7 +713,7 @@ fn applied_and_preferences_round_trip_exactly() {
     };
     assert_eq!(reloaded_document.applied.as_ref(), Some(&draft_settings()));
     assert_eq!(reloaded_document.preferences, preferences());
-    assert_eq!(reloaded.snapshot(), Some(&reloaded_document));
+    assert_eq!(reloaded.snapshot(), Some(&*reloaded_document));
     // Draft state (revisions, counters) never reaches the stored bytes.
     let bytes = fs::read_to_string(settings_path(&directory)).unwrap();
     assert!(!bytes.contains("revision"), "draft state leaked: {bytes}");
@@ -711,7 +729,7 @@ fn stored_fps_is_exact_integer_rational() {
     // float, and 60000/1001 must survive untouched.
     let draft = DraftSettings {
         filters: crate::domain::filters::FilterChain::default(),
-        video: ModeRequest {
+        video: VideoRequest {
             identity: DeviceIdentity::new(
                 0x1234,
                 0x5678,
@@ -719,7 +737,15 @@ fn stored_fps_is_exact_integer_rational() {
                 None,
             )
             .unwrap(),
-            mode: mode(0x3231_564E, 1280, 720, 120, 2),
+            mode: CaptureModeRequest {
+                format_policy: InputFormatPolicy::Manual {
+                    fourcc: CapturedFourCc::from_kernel(0x3231_564E),
+                },
+                size: FrameSize::new(1280, 720).unwrap(),
+                rate: FrameRate::new(120, 2).unwrap(),
+            },
+            resolved_fourcc: Some(CapturedFourCc::from_kernel(0x3231_564E)),
+            selected_node: None,
         },
         audio: AudioSelection::Disabled { retained: None },
         renderer: crate::domain::render::RendererSettings::default(),
@@ -754,7 +780,7 @@ fn stored_fps_is_exact_integer_rational() {
     assert_eq!(stored.video.mode.rate, FrameRate::new(60000, 1001).unwrap());
     assert_eq!(stored.video.mode.rate.numerator(), 60000);
     assert_eq!(stored.video.mode.rate.denominator(), 1001);
-    assert_eq!(store.snapshot(), Some(&document));
+    assert_eq!(store.snapshot(), Some(&*document));
     fs::remove_dir_all(&directory).unwrap();
 }
 
@@ -786,6 +812,256 @@ fn preferences_only_save_preserves_published_applied() {
     };
     assert_eq!(document.applied, applied_before);
     assert_eq!(document.preferences, new_preferences);
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Input format policy (FUR-030)
+// ---------------------------------------------------------------------------
+
+/// An automatic-policy request that already carries the concrete opening the
+/// owner proved. This is the shape a prepared/verified apply persists.
+fn auto_video_request() -> VideoRequest {
+    let concrete = CapturedFourCc::from_kernel(0x3231_564E);
+    VideoRequest {
+        identity: identity(),
+        mode: CaptureModeRequest {
+            format_policy: InputFormatPolicy::Auto,
+            size: FrameSize::new(1920, 1080).unwrap(),
+            rate: FrameRate::new(60000, 1001).unwrap(),
+        },
+        resolved_fourcc: Some(concrete),
+        selected_node: None,
+    }
+}
+
+/// Inject a sibling field inside the `video` object, right after `mode`.
+fn applied_with_video_suffix(suffix: &str) -> String {
+    let injected = String::from(r#""denominator":1001},"#) + suffix + "}}";
+    APPLIED.replace(r#""denominator":1001}}}"#, &injected)
+}
+
+#[test]
+fn legacy_video_document_decodes_as_manual_pin_and_reencodes_byte_for_byte() {
+    let directory = temp_dir("video-legacy-manual");
+    let path = settings_path(&directory);
+    let original = canonical_document();
+    fs::write(&path, &original).unwrap();
+
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("expected loaded document");
+    };
+    let applied = document.applied.as_ref().unwrap();
+    let concrete = CapturedFourCc::from_kernel(0x3231_564E);
+    assert_eq!(
+        applied.video.mode.format_policy,
+        InputFormatPolicy::Manual { fourcc: concrete }
+    );
+    assert_eq!(applied.video.resolved_fourcc, Some(concrete));
+    assert_eq!(applied.video.selected_node, None);
+
+    // Re-encoding a legacy manual document keeps the exact pre-policy bytes:
+    // the manual marker is represented by absence, never written.
+    store
+        .save_applied(&applied_settings(draft_settings()), preferences())
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        format!("{original}\n"),
+        "a manual pin must not add a format_policy key"
+    );
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn auto_video_policy_round_trips_with_marker_and_historical_concrete() {
+    let directory = temp_dir("video-auto-roundtrip");
+    let path = settings_path(&directory);
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    assert!(matches!(outcome, LoadOutcome::Missing));
+
+    let mut draft = draft_settings();
+    draft.video = auto_video_request();
+    let applied = applied_settings(draft);
+    let expected = applied.settings().video.clone();
+    assert_eq!(expected.mode.format_policy, InputFormatPolicy::Auto);
+
+    store.save_applied(&applied, preferences()).unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().applied.as_ref().unwrap().video,
+        expected
+    );
+
+    // Parsed shape: the marker is a `format_policy` sibling of `mode`, and the
+    // concrete opening is still stored in `mode.captured_fourcc`. The
+    // session-only node locator never reaches disk.
+    let bytes = fs::read_to_string(&path).unwrap();
+    let document: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+    let video = &document["applied"]["video"];
+    assert_eq!(video["format_policy"], "auto");
+    assert_eq!(
+        video["mode"]["captured_fourcc"],
+        serde_json::json!(842094158)
+    );
+    assert!(
+        !bytes.contains("selected_node"),
+        "node locator leaked: {bytes}"
+    );
+
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("auto document must reload");
+    };
+    let stored = document.applied.unwrap();
+    assert_eq!(stored.video.mode.format_policy, InputFormatPolicy::Auto);
+    assert_eq!(
+        stored.video.resolved_fourcc,
+        Some(CapturedFourCc::from_kernel(0x3231_564E))
+    );
+    assert_eq!(stored.video, expected);
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn strict_format_policy_schema_violations_are_refused_individually() {
+    let directory = temp_dir("video-policy-refusals");
+    let cases: &[(&str, &str)] = &[
+        ("null marker", r#""format_policy":null"#),
+        ("manual literal", r#""format_policy":"manual""#),
+        ("wrong case marker", r#""format_policy":"Auto""#),
+        ("numeric marker", r#""format_policy":1"#),
+        ("boolean marker", r#""format_policy":true"#),
+        ("array marker", r#""format_policy":["auto"]"#),
+        ("object marker", r#""format_policy":{}"#),
+        ("unknown video field", r#""future":true"#),
+        (
+            "duplicate marker",
+            r#""format_policy":"auto","format_policy":"auto""#,
+        ),
+    ];
+    for (label, suffix) in cases {
+        let json = document_with_applied(&applied_with_video_suffix(suffix));
+        refused_schema(&directory, label, &json);
+    }
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+/// Encode a constructed document directly, bypassing the model, and return the
+/// typed refusal. This is the serialization boundary the invariant protects.
+fn encode_video_error(video: VideoRequest) -> crate::settings::schema::EncodeError {
+    let document = StoredDocument {
+        applied: Some(DraftSettings {
+            video,
+            ..draft_settings()
+        }),
+        preferences: preferences(),
+    };
+    crate::settings::schema::encode(&document).unwrap_err()
+}
+
+#[test]
+fn unresolved_or_inconsistent_video_never_serializes() {
+    use crate::settings::schema::EncodeError;
+
+    // An unprepared policy keeps no concrete format: it must refuse atomically
+    // rather than invent a FourCC or panic.
+    let unresolved = VideoRequest {
+        resolved_fourcc: None,
+        selected_node: Some(PathBuf::from("/dev/video0")),
+        ..auto_video_request()
+    };
+    assert!(
+        matches!(
+            encode_video_error(unresolved),
+            EncodeError::InvalidValue(SettingsValidationError::UnresolvedVideo)
+        ),
+        "unresolved video must refuse"
+    );
+
+    // A manual pin that disagrees with the proven concrete is not a verified
+    // opening either.
+    let mut mismatched = auto_video_request();
+    mismatched.mode.format_policy = InputFormatPolicy::Manual {
+        fourcc: CapturedFourCc::from_bytes(*b"YUYV"),
+    };
+    assert!(
+        matches!(
+            encode_video_error(mismatched),
+            EncodeError::InvalidValue(SettingsValidationError::VideoFormatPolicyMismatch)
+        ),
+        "mismatched manual pin must refuse"
+    );
+
+    // The automatic policy only ever resolves to YUYV/NV12/MJPG: a manual-only
+    // FourCC or an unrecognized kernel value must refuse, matching the domain
+    // resolution invariant instead of persisting a fake automatic proof.
+    let mut bgr3_auto = auto_video_request();
+    bgr3_auto.resolved_fourcc = Some(CapturedFourCc::from_bytes(*b"BGR3"));
+    assert!(
+        matches!(
+            encode_video_error(bgr3_auto),
+            EncodeError::InvalidValue(SettingsValidationError::VideoFormatPolicyMismatch)
+        ),
+        "auto with a manual-only FourCC must refuse"
+    );
+
+    let mut unknown_auto = auto_video_request();
+    unknown_auto.resolved_fourcc = Some(CapturedFourCc::from_kernel(0x1234_5678));
+    assert!(
+        matches!(
+            encode_video_error(unknown_auto),
+            EncodeError::InvalidValue(SettingsValidationError::VideoFormatPolicyMismatch)
+        ),
+        "auto with an unrecognized FourCC must refuse"
+    );
+}
+
+#[test]
+fn manual_bgr3_video_encoding_is_preserved() {
+    let directory = temp_dir("video-manual-bgr3");
+    let path = settings_path(&directory);
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    assert!(matches!(outcome, LoadOutcome::Missing));
+
+    let bgr3 = CapturedFourCc::from_bytes(*b"BGR3");
+    let draft = DraftSettings {
+        video: VideoRequest {
+            mode: CaptureModeRequest {
+                format_policy: InputFormatPolicy::Manual { fourcc: bgr3 },
+                size: FrameSize::new(1920, 1080).unwrap(),
+                rate: FrameRate::new(60000, 1001).unwrap(),
+            },
+            resolved_fourcc: Some(bgr3),
+            ..draft_settings().video
+        },
+        ..draft_settings()
+    };
+    let applied = applied_settings(draft);
+    store.save_applied(&applied, preferences()).unwrap();
+
+    // A manual pin keeps writing its concrete FourCC and never adds a marker.
+    let bytes = fs::read_to_string(&path).unwrap();
+    assert!(
+        !bytes.contains("format_policy"),
+        "manual pin must not write a marker: {bytes}"
+    );
+    let document: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+    assert_eq!(
+        document["applied"]["video"]["mode"]["captured_fourcc"],
+        serde_json::json!(bgr3.kernel_value())
+    );
+
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("manual BGR3 document must reload");
+    };
+    let stored = document.applied.unwrap();
+    assert_eq!(
+        stored.video.mode.format_policy,
+        InputFormatPolicy::Manual { fourcc: bgr3 }
+    );
+    assert_eq!(stored.video.resolved_fourcc, Some(bgr3));
     fs::remove_dir_all(&directory).unwrap();
 }
 
@@ -1074,7 +1350,7 @@ fn invalid_in_memory_preferences_preserve_file_and_published_snapshot() {
             matches!(result, Err(SettingsWriteError::InvalidValue { .. })),
             "{operation}"
         );
-        assert_eq!(store.snapshot(), Some(&previous), "{operation}");
+        assert_eq!(store.snapshot(), Some(&*previous), "{operation}");
         assert_eq!(fs::read(&path).unwrap(), original.as_bytes(), "{operation}");
         assert_no_temp_files(&directory);
     }
@@ -1156,7 +1432,7 @@ fn precommit_faults_leave_original_file_intact_and_loadable() {
         let mut store = SettingsStore::with_injected_fault(path.clone(), point);
         let previous = store.snapshot().unwrap().clone();
         let mut attempted = draft_settings();
-        attempted.video.mode = mode(0x3231_564E, 1280, 720, 60, 1);
+        attempted.video = video_request(0x3231_564E, 1280, 720, 60, 1);
         attempted.audio = AudioSelection::Disabled { retained: None };
         let applied = applied_settings(attempted);
         let attempted_preferences = LocalPreferences {
@@ -1189,7 +1465,7 @@ fn precommit_faults_leave_original_file_intact_and_loadable() {
         let LoadOutcome::Loaded(reloaded) = reloaded else {
             panic!("{point:?}: original must stay loadable immediately after failure");
         };
-        assert_eq!(reloaded, previous, "{point:?}");
+        assert_eq!(*reloaded, previous, "{point:?}");
 
         // The fault fires once: the next write is a normal committed write.
         let outcome = store
@@ -1234,7 +1510,7 @@ fn partial_write_never_leaves_half_content_in_place() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("partial write must leave the original immediately loadable");
     };
-    assert_eq!(document, previous);
+    assert_eq!(*document, previous);
     assert_no_temp_files(&directory);
     fs::remove_dir_all(&directory).unwrap();
 }
@@ -1330,9 +1606,9 @@ fn parent_sync_uncertainty_is_committed_but_unconfirmed() {
             panic!("{point:?}: committed file must load");
         };
         assert_eq!(document.applied.as_ref(), Some(&draft_settings()));
-        assert_eq!(store.snapshot(), Some(&document));
+        assert_eq!(store.snapshot(), Some(&*document));
         assert_eq!(document.preferences, preferences());
-        assert_eq!(reloaded.snapshot(), Some(&document));
+        assert_eq!(reloaded.snapshot(), Some(&*document));
         assert!(reloaded.snapshot().unwrap().applied.is_some());
         fs::remove_dir_all(&directory).unwrap();
     }
@@ -1835,7 +2111,7 @@ fn full_chain_rename_fault_preserves_the_original_and_reports_persistence_separa
     let LoadOutcome::Loaded(reloaded) = outcome else {
         panic!("original must stay loadable immediately after the fault");
     };
-    assert_eq!(reloaded, previous);
+    assert_eq!(*reloaded, previous);
     assert!(
         reloaded
             .applied

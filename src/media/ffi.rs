@@ -5341,10 +5341,12 @@ mod reply_tests {
         let requested = audio.input.requested();
         let settings = crate::domain::state::DraftSettings {
             filters: crate::domain::filters::FilterChain::default(),
-            video: crate::domain::capture::ModeRequest {
-                identity: requested.identity.clone(),
-                mode: requested.mode,
-            },
+            video: crate::domain::capture::VideoRequest::manual(
+                crate::domain::capture::ModeRequest {
+                    identity: requested.identity.clone(),
+                    mode: requested.mode,
+                },
+            ),
             audio: AudioSelection::Enabled {
                 source: source.clone(),
             },

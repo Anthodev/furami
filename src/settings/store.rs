@@ -61,7 +61,7 @@ pub struct StoredDocument {
 #[derive(Debug)]
 pub enum LoadOutcome {
     Missing,
-    Loaded(StoredDocument),
+    Loaded(Box<StoredDocument>),
     Refused(SettingsLoadError),
 }
 
@@ -291,7 +291,7 @@ impl SettingsStore {
                         snapshot: Some(document.clone()),
                         injected_fault: None,
                     },
-                    LoadOutcome::Loaded(document),
+                    LoadOutcome::Loaded(Box::new(document)),
                 ),
                 Err(schema_error) => {
                     let error = load_error(path.clone(), schema_error);

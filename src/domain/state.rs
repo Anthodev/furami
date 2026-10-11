@@ -6,9 +6,8 @@ use serde::Serialize;
 
 use super::{
     capture::{
-        AudioSelection, LossEvidence, ModeRequest, ObservationEpoch, RecoveryCandidate,
-        RecoveryObservation, RecoveryWatchTarget, SelectionToken, VideoPresence, WatchId,
-        WatchStamp,
+        AudioSelection, LossEvidence, ObservationEpoch, RecoveryCandidate, RecoveryObservation,
+        RecoveryWatchTarget, SelectionToken, VideoPresence, VideoRequest, WatchId, WatchStamp,
     },
     failure::ApplyFailure,
     filters::FilterChain,
@@ -17,10 +16,18 @@ use super::{
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DraftSettings {
-    pub video: ModeRequest,
+    pub video: VideoRequest,
     pub audio: AudioSelection,
     pub filters: FilterChain,
     pub renderer: RendererSettings,
+}
+impl DraftSettings {
+    pub fn same_request(&self, other: &Self) -> bool {
+        self.video.same_request(&other.video)
+            && self.audio == other.audio
+            && self.filters == other.filters
+            && self.renderer == other.renderer
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DraftRevision(u64);
@@ -300,6 +307,8 @@ pub struct ValidationRequest {
     pub playback: InitialPlayback,
     pub watch: WatchStamp,
     pub choice: Option<SelectionToken>,
+    /// Session-only node/USB syspath proof from the first preparation.
+    pub pinned_node: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Draft {
@@ -941,11 +950,22 @@ impl ProductModel {
         request: &ValidationRequest,
         settings: DraftSettings,
         stamp: WatchStamp,
+        pinned_node: Option<(std::path::PathBuf, std::path::PathBuf)>,
     ) -> Option<ValidationRequest> {
         if self.validation_request() != Some(request)
             || stamp.watch != request.watch.watch
             || stamp.epoch.get() < request.watch.epoch.get()
             || settings.video.mode != request.settings.video.mode
+            || settings.video.resolved_mode().is_none()
+            || request
+                .settings
+                .video
+                .resolved_fourcc
+                .is_some_and(|fourcc| settings.video.resolved_fourcc != Some(fourcc))
+            || request
+                .pinned_node
+                .as_ref()
+                .is_some_and(|node| pinned_node.as_ref() != Some(node))
             || settings.audio != request.settings.audio
             || settings.filters != request.settings.filters
             || settings.renderer != request.settings.renderer
@@ -956,8 +976,10 @@ impl ProductModel {
             ProductState::Applying(transition) | ProductState::Recovering(transition) => transition,
             _ => return None,
         };
+        transition.requested_target.video.resolved_fourcc = settings.video.resolved_fourcc;
         transition.request.settings = settings;
         transition.request.watch = stamp;
+        transition.request.pinned_node = pinned_node;
         if matches!(
             transition.request.key.purpose,
             AttemptPurpose::Recovery | AttemptPurpose::Reconnect
@@ -985,7 +1007,7 @@ impl ProductModel {
             _ => return None,
         };
         let target = self.watch_target.as_ref()?;
-        if target.video == settings.video && target.audio == settings.audio {
+        if target.video.same_request(&settings.video) && target.audio == settings.audio {
             return None;
         }
         let settings = settings.clone();
@@ -1441,13 +1463,19 @@ impl ProductModel {
     pub fn edit_draft(
         &mut self,
         expected: DraftRevision,
-        settings: DraftSettings,
+        mut settings: DraftSettings,
     ) -> Result<DraftRevision, CommandRejection> {
         if self.quitting {
             return Err(CommandRejection::ShuttingDown);
         }
         if expected != self.draft.revision {
             return Err(CommandRejection::StaleRevision);
+        }
+        if !settings.video.same_request(&self.draft.settings.video) {
+            settings.video.resolved_fourcc = None;
+        }
+        if settings.video.identity != self.draft.settings.video.identity {
+            settings.video.selected_node = None;
         }
         let revision = self
             .draft
@@ -1509,7 +1537,11 @@ impl ProductModel {
         if self.prepared_pause.is_some() {
             return Err(CommandRejection::PlaybackBusy);
         }
-        if active.applied.settings.video != self.draft.settings.video
+        if !active
+            .applied
+            .settings
+            .video
+            .same_request(&self.draft.settings.video)
             || active.applied.settings.audio != self.draft.settings.audio
         {
             return Err(CommandRejection::CaptureDraftChanged);
@@ -1529,12 +1561,14 @@ impl ProductModel {
             attempt: incumbent.attempt(),
             pass: TreatmentPass::Candidate,
         };
+        let mut candidate = self.draft.settings.clone();
+        candidate.video = incumbent.applied.settings.video.clone();
         self.state = ProductState::Treating(TreatmentTransition {
             key,
             revision,
             prior: incumbent.applied.clone(),
             incumbent,
-            candidate: self.draft.settings.clone(),
+            candidate,
             failures: FailureReport::default(),
             route: None,
         });
@@ -1862,7 +1896,9 @@ impl ProductModel {
         if revision != self.draft.revision {
             return Err(CommandRejection::StaleRevision);
         }
-        self.begin(self.draft.settings.clone(), AttemptPurpose::Candidate)
+        let mut candidate = self.draft.settings.clone();
+        candidate.video.resolved_fourcc = None;
+        self.begin(candidate, AttemptPurpose::Candidate)
     }
     pub fn reconnect(
         &mut self,
@@ -2108,6 +2144,7 @@ impl ProductModel {
             _ => Origin::Stopped,
         };
         let request = ValidationRequest {
+            pinned_node: None,
             key: ValidationKey { apply, purpose },
             revision: self.draft.revision,
             settings,
@@ -2165,7 +2202,9 @@ impl ProductModel {
         };
     }
     pub fn validation_succeeded(&mut self, request: &ValidationRequest) -> Option<ModelEffect> {
-        if self.validation_request() != Some(request) {
+        if self.validation_request() != Some(request)
+            || request.settings.video.resolved_mode().is_none()
+        {
             return None;
         }
         let (mut transition, recovering) = self.take_transition()?;
@@ -2189,6 +2228,31 @@ impl ProductModel {
             });
         }
         self.open_transition(transition, recovering)
+    }
+
+    /// Deterministic pure-model fixture admission: manual mode intent is supplied
+    /// as the simulated adapter's concrete evidence, never a production fallback.
+    #[cfg(test)]
+    pub(crate) fn fixture_validation_succeeded(
+        &mut self,
+        request: &ValidationRequest,
+    ) -> Option<ModelEffect> {
+        let mut prepared = request.settings.clone();
+        if prepared.video.resolved_fourcc.is_none() {
+            let super::capture::InputFormatPolicy::Manual { fourcc } =
+                prepared.video.mode.format_policy
+            else {
+                panic!("auto test must provide an explicit prepared capability proof");
+            };
+            prepared.video.resolved_fourcc = Some(fourcc);
+        }
+        let normalized = self.accept_prepared(
+            request,
+            prepared,
+            request.watch,
+            request.pinned_node.clone(),
+        )?;
+        self.validation_succeeded(&normalized)
     }
     pub fn validation_failed(&mut self, request: ValidationRequest, failure: ApplyFailure) {
         if self.validation_request() != Some(&request) {
@@ -2551,6 +2615,7 @@ impl ProductModel {
                 }
             };
             let request = ValidationRequest {
+                pinned_node: None,
                 key: ValidationKey {
                     apply: transition.key.apply,
                     purpose: AttemptPurpose::Restore,
@@ -2614,6 +2679,7 @@ impl ProductModel {
                     }
                 };
                 transition.request = ValidationRequest {
+                    pinned_node: None,
                     key: ValidationKey {
                         apply: transition.request.key.apply,
                         purpose: AttemptPurpose::Restore,
@@ -2736,7 +2802,7 @@ pub struct ValidationRejection {
 mod tests {
     use super::*;
     use crate::domain::capture::{
-        CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize, UsbTopology,
+        CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize, ModeRequest, UsbTopology,
     };
 
     fn treatments() -> FilterChain {
@@ -2797,7 +2863,7 @@ mod tests {
         let proof = candidate_treatments(&model, key);
         assert!(model.treatment_confirmed(proof.clone()));
         assert_eq!(model.last_valid().unwrap().settings(), &candidate);
-        assert_eq!(model.draft().settings, settings(30));
+        assert!(model.draft().settings.same_request(&settings(30)));
         assert_eq!(model.active().unwrap().attempt(), owner.attempt);
         assert_eq!(model.state_identity().treatment_pass(), None);
         assert!(!model.treatment_confirmed(proof));
@@ -2910,7 +2976,8 @@ mod tests {
             .apply(model.state_identity(), model.draft().revision)
             .unwrap();
         let request = model.validation_request().unwrap().clone();
-        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+        let Some(ModelEffect::Open { key, .. }) = model.fixture_validation_succeeded(&request)
+        else {
             panic!("open effect missing");
         };
         let open_key = key;
@@ -3082,14 +3149,14 @@ mod tests {
         dropped.filters = FilterChain::default();
         assert!(
             model
-                .accept_prepared(&request, dropped, request.watch)
+                .accept_prepared(&request, dropped, request.watch, None)
                 .is_none()
         );
         let mut changed = submitted.clone();
         changed.filters.set_enabled(0, true).unwrap();
         assert!(
             model
-                .accept_prepared(&request, changed, request.watch)
+                .accept_prepared(&request, changed, request.watch, None)
                 .is_none()
         );
         let mut rerendered = submitted.clone();
@@ -3099,13 +3166,13 @@ mod tests {
         assert_ne!(rerendered.renderer, submitted.renderer);
         assert!(
             model
-                .accept_prepared(&request, rerendered, request.watch)
+                .accept_prepared(&request, rerendered, request.watch, None)
                 .is_none(),
             "renderer is indivisible from the frozen candidate"
         );
         assert_eq!(model.validation_request(), Some(&request));
         let accepted = model
-            .accept_prepared(&request, submitted, request.watch)
+            .accept_prepared(&request, submitted, request.watch, None)
             .unwrap();
         assert_eq!(accepted.settings.filters, treatments());
     }
@@ -3228,7 +3295,7 @@ mod tests {
     pub(super) fn settings(rate: u32) -> DraftSettings {
         DraftSettings {
             filters: crate::domain::filters::FilterChain::default(),
-            video: ModeRequest {
+            video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                 identity: DeviceIdentity::new(
                     0x32ed,
                     0x3701,
@@ -3245,7 +3312,7 @@ mod tests {
                     size: FrameSize::new(1280, 720).unwrap(),
                     rate: FrameRate::new(rate, 1).unwrap(),
                 },
-            },
+            }),
             audio: AudioSelection::default(),
             renderer: RendererSettings::default(),
         }
@@ -3264,7 +3331,7 @@ mod tests {
         let expected = model.state_identity();
         let (apply, effect) = model.apply(expected, DraftRevision::new(0)).unwrap();
         assert!(
-            matches!(&effect, ModelEffect::Validate(request) if request.settings == settings(60))
+            matches!(&effect, ModelEffect::Validate(request) if request.settings.same_request(&settings(60)) && request.settings.video.resolved_fourcc.is_none())
         );
         assert_eq!(
             model.apply(model.state_identity(), DraftRevision::new(0)),
@@ -3278,8 +3345,14 @@ mod tests {
             .edit_draft(DraftRevision::new(0), settings(30))
             .unwrap();
         assert_eq!(model.validation_request().unwrap().key.apply, apply);
-        assert_eq!(model.validation_request().unwrap().settings, settings(60));
-        assert_eq!(model.draft().settings, settings(30));
+        assert!(
+            model
+                .validation_request()
+                .unwrap()
+                .settings
+                .same_request(&settings(60))
+        );
+        assert!(model.draft().settings.same_request(&settings(30)));
     }
 
     #[test]
@@ -3308,10 +3381,12 @@ mod tests {
             .apply(model.state_identity(), model.draft().revision)
             .unwrap();
         let request = model.validation_request().unwrap().clone();
-        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+        let Some(ModelEffect::Open { key, .. }) = model.fixture_validation_succeeded(&request)
+        else {
             panic!("initial open effect missing");
         };
         verify_open(model, key);
+        model.committed_watch().unwrap();
         key
     }
 
@@ -3326,12 +3401,13 @@ mod tests {
             .edit_draft(model.draft().revision, settings(30))
             .unwrap();
         assert!(model.last_valid().is_none());
-        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+        let Some(ModelEffect::Open { key, .. }) = model.fixture_validation_succeeded(&request)
+        else {
             panic!("open missing");
         };
         verify_open(&mut model, key);
         assert_eq!(model.last_valid().unwrap().settings(), &settings(60));
-        assert_eq!(model.draft().settings, settings(30));
+        assert!(model.draft().settings.same_request(&settings(30)));
         assert_eq!(model.active().unwrap().attempt(), key.attempt);
     }
 
@@ -3400,7 +3476,7 @@ mod tests {
             panic!("resume validation missing");
         };
         assert_eq!(
-            model.validation_succeeded(&request),
+            model.fixture_validation_succeeded(&request),
             Some(ModelEffect::Stop {
                 attempt: old,
                 reason: StopIntent::Replace,
@@ -3418,7 +3494,7 @@ mod tests {
             .apply(model.state_identity(), model.draft().revision)
             .unwrap();
         let request = model.validation_request().unwrap().clone();
-        let _ = model.validation_succeeded(&request);
+        let _ = model.fixture_validation_succeeded(&request);
         let Some(ModelEffect::Open { key, .. }) = model.barrier_complete(old.attempt) else {
             panic!("candidate open missing");
         };
@@ -3429,7 +3505,8 @@ mod tests {
         let Some(ModelEffect::Validate(request)) = model.barrier_complete(key.attempt) else {
             panic!("restore validation missing");
         };
-        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+        let Some(ModelEffect::Open { key, .. }) = model.fixture_validation_succeeded(&request)
+        else {
             panic!("restore open missing");
         };
         verify_open(model, key);
@@ -3507,7 +3584,7 @@ mod tests {
             .edit_draft(model.draft().revision, settings(30))
             .unwrap();
         assert_eq!(model.state_identity(), pending);
-        assert_eq!(model.draft().settings, settings(30));
+        assert!(model.draft().settings.same_request(&settings(30)));
     }
 
     #[test]
@@ -3573,7 +3650,7 @@ mod tests {
         assert_eq!(model.phase(), ProductPhase::ValidatingResume);
         assert_eq!(model.active().unwrap().playback(), PlaybackState::Paused);
         assert_eq!(
-            model.validation_succeeded(&request),
+            model.fixture_validation_succeeded(&request),
             Some(ModelEffect::Stop {
                 attempt: old.attempt,
                 reason: StopIntent::Replace,
@@ -3601,7 +3678,7 @@ mod tests {
         assert_eq!(model.active().unwrap().applied().settings(), &settings(60));
         assert_eq!(model.last_valid().unwrap().settings(), &settings(60));
         assert_eq!(model.draft().revision, revision);
-        assert_eq!(model.draft().settings, settings(30));
+        assert!(model.draft().settings.same_request(&settings(30)));
     }
 
     #[test]
@@ -3671,7 +3748,7 @@ mod tests {
                     assert_eq!(model.barrier_complete(old.attempt), None);
                 }
                 let effect = if valid {
-                    model.validation_succeeded(&request)
+                    model.fixture_validation_succeeded(&request)
                 } else {
                     model.validation_failed(
                         request,
@@ -3730,7 +3807,8 @@ mod tests {
                 panic!("paused reconnect validation missing");
             };
             assert_eq!(validation.playback, InitialPlayback::Paused);
-            let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&validation)
+            let Some(ModelEffect::Open { key, .. }) =
+                model.fixture_validation_succeeded(&validation)
             else {
                 panic!("paused reconnect open missing");
             };
@@ -3774,7 +3852,7 @@ mod tests {
                     assert_eq!(model.active().unwrap().playback(), PlaybackState::Paused);
                     continue;
                 }
-                let _ = model.validation_succeeded(&request);
+                let _ = model.fixture_validation_succeeded(&request);
                 let Some(ModelEffect::Open { key, .. }) = model.barrier_complete(old.attempt)
                 else {
                     panic!("replacement open missing");
@@ -3829,7 +3907,8 @@ mod tests {
         };
         assert_eq!(request.key.purpose, AttemptPurpose::Reconnect);
         assert_eq!(request.playback, InitialPlayback::Live);
-        let Some(ModelEffect::Open { key: reconnect, .. }) = model.validation_succeeded(&request)
+        let Some(ModelEffect::Open { key: reconnect, .. }) =
+            model.fixture_validation_succeeded(&request)
         else {
             panic!("explicit reconnect open missing");
         };
@@ -3882,7 +3961,8 @@ mod tests {
         };
         assert_eq!(request.settings, settings(60));
         assert_eq!(request.playback, InitialPlayback::Paused);
-        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+        let Some(ModelEffect::Open { key, .. }) = model.fixture_validation_succeeded(&request)
+        else {
             panic!("loss reconnect open missing");
         };
         verify_open(&mut model, key);
@@ -3941,7 +4021,7 @@ mod tests {
                 .unwrap();
             match step {
                 0 => {
-                    let _ = model.validation_succeeded(&request);
+                    let _ = model.fixture_validation_succeeded(&request);
                 }
                 1 => {
                     let _ = model.barrier_complete(old.attempt);
@@ -3967,7 +4047,7 @@ mod tests {
                 model.resume(model.state_identity(), old.attempt).unwrap();
                 let request = model.validation_request().unwrap().clone();
                 if step > 0 {
-                    let _ = model.validation_succeeded(&request);
+                    let _ = model.fixture_validation_succeeded(&request);
                 }
                 if step > 1 {
                     let _ = model.barrier_complete(old.attempt);
@@ -4108,9 +4188,10 @@ mod tests {
         )
         .unwrap();
         let request = model
-            .accept_prepared(&request, relocated.clone(), request.watch)
+            .accept_prepared(&request, relocated.clone(), request.watch, None)
             .unwrap();
-        let Some(ModelEffect::Open { key: old, .. }) = model.validation_succeeded(&request) else {
+        let Some(ModelEffect::Open { key: old, .. }) = model.fixture_validation_succeeded(&request)
+        else {
             panic!("relocated initial open missing");
         };
         verify_open(&mut model, old);
@@ -4138,7 +4219,8 @@ mod tests {
         assert_eq!(request.playback, InitialPlayback::Live);
         assert_eq!(model.barrier_complete(reserved.attempt), None);
         assert!(model.opening().is_none());
-        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+        let Some(ModelEffect::Open { key, .. }) = model.fixture_validation_succeeded(&request)
+        else {
             panic!("physical resume open missing after cutover");
         };
         assert_eq!(key.attempt.get(), u64::MAX);
@@ -4180,7 +4262,7 @@ mod tests {
         let old = paused_active(&mut model);
         model.resume(model.state_identity(), old.attempt).unwrap();
         let request = model.validation_request().unwrap().clone();
-        let _ = model.validation_succeeded(&request);
+        let _ = model.fixture_validation_succeeded(&request);
         let failure = playback_failure(crate::domain::failure::FailureCategory::Lifecycle(
             crate::domain::failure::LifecycleFailure::SurfaceLoss,
         ));
@@ -4243,5 +4325,172 @@ mod tests {
                 assert!(model.active().is_none());
             }
         }
+    }
+
+    #[test]
+    fn auto_full_apply_reselects_but_restart_and_failed_open_keep_the_admitted_pin() {
+        use crate::domain::capture::InputFormatPolicy;
+        let mut draft = settings(60);
+        draft.video.mode.format_policy = InputFormatPolicy::Auto;
+        let mut model = ProductModel::new(draft.clone());
+        model
+            .apply(model.state_identity(), model.draft().revision)
+            .unwrap();
+        let request = model.validation_request().unwrap().clone();
+        assert!(request.settings.video.resolved_fourcc.is_none());
+        assert!(
+            model.validation_succeeded(&request).is_none(),
+            "unprepared intent cannot open"
+        );
+        let mut prepared = request.settings.clone();
+        prepared.video.resolved_fourcc = Some(CapturedFourCc::from_bytes(*b"YUYV"));
+        let request = model
+            .accept_prepared(&request, prepared, request.watch, None)
+            .unwrap();
+        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+            panic!("admitted auto open")
+        };
+        verify_open(&mut model, key);
+        assert_eq!(
+            model.last_valid().unwrap().settings().video.resolved_fourcc,
+            Some(CapturedFourCc::from_bytes(*b"YUYV"))
+        );
+        let (_, restart) = model.restart(model.state_identity()).unwrap();
+        let ModelEffect::Validate(restart) = restart else {
+            panic!("restart validation")
+        };
+        assert_eq!(
+            restart.settings.video.resolved_fourcc,
+            Some(CapturedFourCc::from_bytes(*b"YUYV"))
+        );
+        let mut wrong = restart.settings.clone();
+        wrong.video.resolved_fourcc = Some(CapturedFourCc::from_bytes(*b"NV12"));
+        assert!(
+            model
+                .accept_prepared(&restart, wrong, restart.watch, None)
+                .is_none()
+        );
+
+        let mut failed = ProductModel::new(draft);
+        failed
+            .apply(failed.state_identity(), failed.draft().revision)
+            .unwrap();
+        let request = failed.validation_request().unwrap().clone();
+        let mut prepared = request.settings.clone();
+        prepared.video.resolved_fourcc = Some(CapturedFourCc::from_bytes(*b"YUYV"));
+        let request = failed
+            .accept_prepared(&request, prepared, request.watch, None)
+            .unwrap();
+        let Some(ModelEffect::Open { key, .. }) = failed.validation_succeeded(&request) else {
+            panic!("admitted auto open")
+        };
+        assert!(matches!(
+            failed.open_failed(
+                key,
+                playback_failure(crate::domain::failure::FailureCategory::Session)
+            ),
+            Some(ModelEffect::Stop { .. })
+        ));
+        assert!(
+            failed.barrier_complete(key.attempt).is_none(),
+            "first failed auto open does not attempt another format"
+        );
+        assert!(failed.validation_request().is_none());
+        assert_eq!(failed.phase(), ProductPhase::ErrorWithoutActive);
+    }
+
+    #[test]
+    fn auto_treatment_apply_ignores_resolution_but_not_real_policy_edits() {
+        use crate::domain::capture::InputFormatPolicy;
+        let mut draft = settings(60);
+        draft.video.mode.format_policy = InputFormatPolicy::Auto;
+        draft.video.resolved_fourcc = None;
+        let mut model = ProductModel::new(draft.clone());
+        model
+            .apply(model.state_identity(), model.draft().revision)
+            .unwrap();
+        let request = model.validation_request().unwrap().clone();
+        let mut prepared = request.settings.clone();
+        prepared.video.resolved_fourcc = Some(CapturedFourCc::from_bytes(*b"YUYV"));
+        let request = model
+            .accept_prepared(&request, prepared, request.watch, None)
+            .unwrap();
+        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+            panic!("admitted auto open")
+        };
+        verify_open(&mut model, key);
+        model
+            .apply_treatments(model.state_identity(), model.draft().revision)
+            .unwrap();
+        assert_eq!(
+            model.treating().unwrap().candidate().video.resolved_fourcc,
+            Some(CapturedFourCc::from_bytes(*b"YUYV"))
+        );
+        let mut manual = draft;
+        manual.video.mode.format_policy = InputFormatPolicy::Manual {
+            fourcc: CapturedFourCc::from_bytes(*b"YUYV"),
+        };
+        assert!(
+            !manual
+                .video
+                .same_request(&model.treating().unwrap().candidate().video)
+        );
+    }
+
+    #[test]
+    fn candidate_cutover_retains_admitted_format_and_physical_node_binding() {
+        let mut model = ProductModel::new(settings(60));
+        let old = initial_active(&mut model);
+        model.committed_watch().unwrap();
+        model
+            .edit_draft(model.draft().revision, settings(30))
+            .unwrap();
+        model
+            .apply(model.state_identity(), model.draft().revision)
+            .unwrap();
+        let request = model.validation_request().unwrap().clone();
+        assert!(request.pinned_node.is_none());
+        let binding = (
+            std::path::PathBuf::from("/sys/selected/video"),
+            std::path::PathBuf::from("/sys/selected"),
+        );
+        let prepared = settings(30);
+        let accepted = model
+            .accept_prepared(&request, prepared, request.watch, Some(binding.clone()))
+            .unwrap();
+        assert!(
+            matches!(model.validation_succeeded(&accepted), Some(ModelEffect::Stop { attempt, .. }) if attempt == old.attempt)
+        );
+        let Some(ModelEffect::Open { key, .. }) = model.barrier_complete(old.attempt) else {
+            panic!("candidate reserved opening")
+        };
+        let Some(ModelEffect::Validate(cutover)) = model.cutover_validation(key) else {
+            panic!("new watch cutover")
+        };
+        assert_eq!(cutover.pinned_node, Some(binding.clone()));
+        assert_eq!(
+            cutover.settings.video.resolved_fourcc,
+            Some(CapturedFourCc::from_bytes(*b"NV12"))
+        );
+        assert!(
+            model
+                .accept_prepared(
+                    &cutover,
+                    cutover.settings.clone(),
+                    cutover.watch,
+                    Some(("/sys/other/video".into(), "/sys/other".into()))
+                )
+                .is_none()
+        );
+        assert!(
+            model
+                .accept_prepared(
+                    &cutover,
+                    cutover.settings.clone(),
+                    cutover.watch,
+                    Some(binding)
+                )
+                .is_some()
+        );
     }
 }

@@ -246,7 +246,7 @@ where
         self.check_drain()?;
         let draft = &self.model.draft().settings;
         if self.model.active().is_some_and(|active| {
-            active.applied().settings().video == draft.video
+            active.applied().settings().video.same_request(&draft.video)
                 && active.applied().settings().audio == draft.audio
                 && (active.playback() == PlaybackState::Live
                     || (active.playback() == PlaybackState::Paused
@@ -1914,9 +1914,13 @@ where
                                     self.validator.retire_selection(token);
                                 }
                                 self.model.validation_failed(request, failure);
-                            } else if let Some(accepted) =
-                                self.model.accept_prepared(&request, settings, stamp)
-                            {
+                            } else if let Some(accepted) = self.model.accept_prepared(
+                                &request,
+                                settings,
+                                stamp,
+                                V::prepared_node(&prepared)
+                                    .map(|(node, usb)| (node.to_owned(), usb.to_owned())),
+                            ) {
                                 match self.runner.prepare_treatments(&accepted.settings) {
                                     Ok(filters) => {
                                         self.prepared = Some((accepted.clone(), prepared, filters));
@@ -2083,24 +2087,26 @@ mod tests {
     fn settings(rate: u32) -> DraftSettings {
         DraftSettings {
             filters: crate::domain::filters::FilterChain::default(),
-            video: crate::domain::capture::ModeRequest {
-                identity: DeviceIdentity::new(
-                    0x32ed,
-                    0x3701,
-                    UsbTopology::new(
-                        "controller".into(),
-                        vec![std::num::NonZeroU8::new(1).unwrap()],
+            video: crate::domain::capture::VideoRequest::manual(
+                crate::domain::capture::ModeRequest {
+                    identity: DeviceIdentity::new(
+                        0x32ed,
+                        0x3701,
+                        UsbTopology::new(
+                            "controller".into(),
+                            vec![std::num::NonZeroU8::new(1).unwrap()],
+                        )
+                        .unwrap(),
+                        Some("serial".into()),
                     )
                     .unwrap(),
-                    Some("serial".into()),
-                )
-                .unwrap(),
-                mode: CaptureMode {
-                    captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
-                    size: FrameSize::new(1280, 720).unwrap(),
-                    rate: FrameRate::new(rate, 1).unwrap(),
+                    mode: CaptureMode {
+                        captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
+                        size: FrameSize::new(1280, 720).unwrap(),
+                        rate: FrameRate::new(rate, 1).unwrap(),
+                    },
                 },
-            },
+            ),
             audio: AudioSelection::default(),
             renderer: crate::domain::render::RendererSettings::default(),
         }
@@ -2200,11 +2206,20 @@ mod tests {
         fn finish(&mut self, result: Result<(), ApplyFailure>) {
             let request = self.request.take().unwrap();
             let stamp = self.observed.unwrap_or(request.watch);
+            let mut prepared_settings = request.settings.clone();
+            if prepared_settings.video.resolved_fourcc.is_none() {
+                let crate::domain::capture::InputFormatPolicy::Manual { fourcc } =
+                    prepared_settings.video.mode.format_policy
+                else {
+                    panic!("auto test requires declared native capability evidence");
+                };
+                prepared_settings.video.resolved_fourcc = Some(fourcc);
+            }
             self.result = Some(ValidationResult {
                 stamp,
                 result: match result {
                     Ok(()) => ValidationOutcome::Prepared(TestPrepared {
-                        settings: request.settings.clone(),
+                        settings: prepared_settings,
                         stamp,
                     }),
                     Err(failure) => ValidationOutcome::Failed(failure),
@@ -2220,6 +2235,9 @@ mod tests {
         }
         fn prepared_stamp(prepared: &Self::Prepared) -> WatchStamp {
             prepared.stamp
+        }
+        fn prepared_node(_: &Self::Prepared) -> Option<(&std::path::Path, &std::path::Path)> {
+            None
         }
         fn begin_validate(&mut self, request: ValidationRequest) -> Result<(), SubmitFailure> {
             if let Some(rejection) = self.reject.take() {
@@ -2520,7 +2538,15 @@ mod tests {
                     }
                     _ => unreachable!(),
                 }
-                assert_eq!(engine.validator.requests.last().unwrap().settings, target);
+                assert!(
+                    engine
+                        .validator
+                        .requests
+                        .last()
+                        .unwrap()
+                        .settings
+                        .same_request(&target)
+                );
                 validate(&mut engine);
                 if route < 3 {
                     assert_eq!(
@@ -2564,7 +2590,7 @@ mod tests {
                         PlaybackState::Live
                     }
                 );
-                assert_eq!(engine.model().draft().settings, newer);
+                assert!(engine.model().draft().settings.same_request(&newer));
                 assert_eq!(engine.runner.opens.len(), 2);
                 if route == 2 {
                     assert!(engine.has_user_apply_result_or_pending(key.apply));
@@ -2612,7 +2638,7 @@ mod tests {
                 engine.validator.finish(Err(refusal.clone()));
                 engine.poll();
             }
-            assert_eq!(engine.model().draft().settings, submitted);
+            assert!(engine.model().draft().settings.same_request(&submitted));
             assert_eq!(
                 engine.model().validation_rejection().unwrap().failure,
                 refusal
@@ -3016,7 +3042,7 @@ mod tests {
                             PlaybackState::Live
                         }
                     );
-                    assert_eq!(engine.model().draft().settings, newer);
+                    assert!(engine.model().draft().settings.same_request(&newer));
                     assert_eq!(
                         engine.model().failures().unwrap().candidate.as_ref(),
                         Some(&candidate_cause)
@@ -3177,7 +3203,7 @@ mod tests {
                                 &prior
                             );
                         }
-                        assert_eq!(engine.model().draft().settings, newer);
+                        assert!(engine.model().draft().settings.same_request(&newer));
                         assert_eq!(
                             engine.model().failures().unwrap().candidate.as_ref(),
                             Some(&cause)
@@ -3475,7 +3501,7 @@ mod tests {
                                 actual.model().active().unwrap().applied().settings(),
                                 &prior
                             );
-                            assert_eq!(actual.model().draft().settings, newer);
+                            assert!(actual.model().draft().settings.same_request(&newer));
                             assert_eq!(
                                 actual.runner.opens.len(),
                                 2,
@@ -3532,7 +3558,13 @@ mod tests {
         filter_success(&mut engine, key);
         engine.poll();
         assert_eq!(engine.model().last_valid().unwrap().settings(), &candidate);
-        assert_eq!(engine.model().draft().settings, filter_settings("newer"));
+        assert!(
+            engine
+                .model()
+                .draft()
+                .settings
+                .same_request(&filter_settings("newer"))
+        );
         assert_eq!(engine.model().active().unwrap().attempt(), old);
         assert_eq!(engine.runner.opens.len(), 1);
         assert!(engine.runner.stops.is_empty());
@@ -4184,7 +4216,7 @@ mod tests {
             FailureCategory::Validation(ValidationLayer::Filters)
         );
         assert_eq!(engine.model().active().unwrap().attempt(), old);
-        assert_eq!(engine.model().draft().settings, candidate);
+        assert!(engine.model().draft().settings.same_request(&candidate));
         assert_eq!(engine.runner.opens.len(), 1);
         assert!(engine.runner.stops.is_empty());
         assert!(engine.runner.treatment_intents.is_empty());
@@ -4211,7 +4243,7 @@ mod tests {
                 engine.model().last_valid().unwrap().settings(),
                 &settings(60)
             );
-            assert_eq!(engine.model().draft().settings, candidate);
+            assert!(engine.model().draft().settings.same_request(&candidate));
             assert_eq!(engine.runner.treatment_intents.len(), 1);
             assert!(engine.runner.stops.is_empty());
             assert_eq!(engine.runner.opens.len(), 1);
@@ -4275,7 +4307,13 @@ mod tests {
             engine.model().last_valid().unwrap().settings(),
             &settings(60)
         );
-        assert_eq!(engine.model().draft().settings, filter_settings("newer"));
+        assert!(
+            engine
+                .model()
+                .draft()
+                .settings
+                .same_request(&filter_settings("newer"))
+        );
         assert!(engine.take_verified_applied().is_none());
         assert!(!engine.has_user_apply_result_or_pending(key.apply));
         assert_eq!(engine.runner.opens.len(), 1);
@@ -4574,7 +4612,7 @@ mod tests {
                                 }
                             );
                             assert_eq!(engine.model().last_valid().unwrap().settings(), &prior);
-                            assert_eq!(engine.model().draft().settings, newer);
+                            assert!(engine.model().draft().settings.same_request(&newer));
                             assert_eq!(engine.runner.opens.len(), 1);
                             if acknowledged && release_in_drain {
                                 assert_eq!(
@@ -4649,7 +4687,7 @@ mod tests {
                                 2,
                                 "no alternate restoration route or retry"
                             );
-                            assert_eq!(engine.model().draft().settings, newer);
+                            assert!(engine.model().draft().settings.same_request(&newer));
                             assert!(engine.take_verified_applied().is_none());
                         }
                     }
@@ -4769,7 +4807,13 @@ mod tests {
             ProductPhase::ErrorWithActiveRestored
         );
         assert_eq!(engine.model().last_valid().unwrap().settings(), &applied);
-        assert_eq!(engine.model().draft().settings, filter_settings("newer"));
+        assert!(
+            engine
+                .model()
+                .draft()
+                .settings
+                .same_request(&filter_settings("newer"))
+        );
         assert_eq!(engine.runner.opens.len(), 2);
         assert_eq!(engine.runner.treatment_intents.len(), 1);
     }
@@ -5030,7 +5074,7 @@ mod tests {
         validate(&mut engine);
         assert_eq!(engine.model().active().unwrap().attempt(), old);
         assert_eq!(engine.model().last_valid(), Some(&prior));
-        assert_eq!(engine.model().draft().settings, candidate);
+        assert!(engine.model().draft().settings.same_request(&candidate));
         assert!(engine.runner.stops.is_empty());
         assert_eq!(engine.runner.opens.len(), 1);
         assert_eq!(
@@ -5218,7 +5262,7 @@ mod tests {
             assert!(engine.take_verified_applied().is_none());
             assert!(!engine.has_user_apply_result_or_pending(admission.id()));
             assert_eq!(engine.model().last_valid().unwrap().settings(), &prior);
-            assert_eq!(engine.model().draft().settings, candidate);
+            assert!(engine.model().draft().settings.same_request(&candidate));
             if wrong_chain {
                 assert!(engine.model().active().is_none());
                 assert_eq!(
@@ -5369,6 +5413,59 @@ mod tests {
     }
 
     #[test]
+    fn resolved_auto_open_commits_concrete_watch_and_requires_fresh_observation() {
+        use crate::domain::capture::InputFormatPolicy;
+        let mut draft = settings(60);
+        draft.video.mode.format_policy = InputFormatPolicy::Auto;
+        draft.video.resolved_fourcc = None;
+        draft.video.selected_node = Some("/dev/video0".into());
+        let mut engine = ApplyCoordinator::new(
+            draft,
+            PlaybackGain::default(),
+            Validator::default(),
+            Runner::default(),
+        );
+        apply(&mut engine);
+        let target = engine.model().watch_target().unwrap().clone();
+        assert_eq!(engine.installed_watch.as_ref(), Some(&target));
+        let request = engine.validator.request.take().unwrap();
+        let stamp = engine.validator.observed.unwrap_or(request.watch);
+        let mut prepared = request.settings.clone();
+        prepared.video.resolved_fourcc = Some(CapturedFourCc::from_bytes(*b"YUYV"));
+        engine.validator.result = Some(ValidationResult {
+            stamp,
+            result: ValidationOutcome::Prepared(TestPrepared {
+                settings: prepared.clone(),
+                stamp,
+            }),
+            request,
+        });
+        engine.poll();
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::Active);
+        assert_eq!(engine.model().last_valid().unwrap().settings(), &prepared);
+        let committed = engine.model().watch_target().unwrap().clone();
+        assert_ne!(committed.watch, target.watch);
+        assert_eq!(committed.video, prepared.video);
+        assert_eq!(engine.installed_watch.as_ref(), Some(&committed));
+        assert_eq!(engine.lease.as_ref().unwrap().watch, stamp);
+        assert!(engine.model().observation().is_none());
+        let fresh = engine.validator.observation.take().unwrap();
+        let mut stale = fresh.clone();
+        stale.stamp = stamp;
+        engine.validator.observation = Some(stale);
+        engine.poll();
+        assert!(engine.model().observation().is_none());
+        engine.validator.observation = Some(fresh.clone());
+        engine.poll();
+        assert_eq!(engine.model().observation(), Some(&fresh));
+        assert_eq!(fresh.stamp.watch, committed.watch);
+        assert_eq!(engine.model().last_valid().unwrap().settings(), &prepared);
+        assert_eq!(engine.runner.opens.len(), 1);
+    }
+
+    #[test]
     fn verified_applied_uses_exact_committed_settings_and_is_consumed_once() {
         let mut engine = engine();
         let apply = apply(&mut engine);
@@ -5394,7 +5491,7 @@ mod tests {
         assert_eq!(received, key);
         assert_eq!(received.apply, apply);
         assert_eq!(applied.settings(), &settings(60));
-        assert_eq!(engine.model.draft().settings, settings(30));
+        assert!(engine.model.draft().settings.same_request(&settings(30)));
         assert!(engine.take_verified_applied().is_none());
         engine.runner.verified();
         engine.poll();
@@ -5577,7 +5674,7 @@ mod tests {
                 engine.poll();
                 assert_eq!(engine.model.phase(), ProductPhase::ErrorWithoutActive);
                 assert_eq!(engine.runner.opens.len(), 1);
-                assert_eq!(engine.model.draft().settings, desired);
+                assert!(engine.model.draft().settings.same_request(&desired));
             }
         }
     }
@@ -5767,7 +5864,7 @@ mod tests {
             PlaybackState::Live
         );
         assert_eq!(engine.model().draft().revision, revision);
-        assert_eq!(engine.model().draft().settings, settings(30));
+        assert!(engine.model().draft().settings.same_request(&settings(30)));
         assert_eq!(engine.gain(), opening_gain);
         assert_eq!(engine.runner_mut().opens.len(), 2);
     }
@@ -6313,7 +6410,15 @@ mod tests {
                 } else {
                     apply(&mut engine);
                 }
-                assert_eq!(engine.validator.requests.last().unwrap().settings, target);
+                assert!(
+                    engine
+                        .validator
+                        .requests
+                        .last()
+                        .unwrap()
+                        .settings
+                        .same_request(&target)
+                );
                 if rejected {
                     engine.validator_mut().finish(Err(failure(
                         target.clone(),
@@ -6383,7 +6488,7 @@ mod tests {
             engine.model().last_valid().unwrap().settings(),
             &settings(30)
         );
-        assert_eq!(engine.model().draft().settings, settings(30));
+        assert!(engine.model().draft().settings.same_request(&settings(30)));
     }
 
     #[test]
@@ -6415,7 +6520,7 @@ mod tests {
                 engine.model().last_valid().unwrap().settings(),
                 &settings(60)
             );
-            assert_eq!(engine.model().draft().settings, settings(30));
+            assert!(engine.model().draft().settings.same_request(&settings(30)));
             assert!(engine.runner_mut().stops.is_empty());
             assert_eq!(engine.runner_mut().opens.len(), 1);
             assert_eq!(
@@ -6458,7 +6563,7 @@ mod tests {
             engine.model().active().unwrap().applied().settings(),
             &settings(60)
         );
-        assert_eq!(engine.model().draft().settings, settings(30));
+        assert!(engine.model().draft().settings.same_request(&settings(30)));
         assert_eq!(
             engine
                 .model()
@@ -6504,7 +6609,7 @@ mod tests {
         engine.runner_mut().verified();
         engine.poll();
         assert_eq!(engine.model().phase(), ProductPhase::Active);
-        assert_eq!(engine.model().draft().settings, settings(30));
+        assert!(engine.model().draft().settings.same_request(&settings(30)));
     }
 
     #[test]
@@ -6631,7 +6736,7 @@ mod tests {
         validate(&mut engine);
         engine.runner_mut().verified();
         engine.poll();
-        assert_eq!(engine.model().draft().settings, settings(25));
+        assert!(engine.model().draft().settings.same_request(&settings(25)));
     }
 
     #[test]
@@ -6783,7 +6888,7 @@ mod tests {
                     engine.model().last_valid().unwrap().settings(),
                     &settings(60)
                 );
-                assert_eq!(engine.model().draft().settings, settings(30));
+                assert!(engine.model().draft().settings.same_request(&settings(30)));
             }
         }
     }
@@ -7836,7 +7941,7 @@ mod tests {
             engine.model().last_valid().unwrap().settings(),
             &settings(60)
         );
-        assert_eq!(engine.model().draft().settings, settings(30));
+        assert!(engine.model().draft().settings.same_request(&settings(30)));
         assert_eq!(
             engine.reconnect(engine.model().state_identity()),
             Ok(ReconnectAdmission::HealthyNoop)
@@ -8235,7 +8340,7 @@ mod tests {
         engine.runner.verified();
         engine.poll();
         assert_eq!(engine.model().phase(), ProductPhase::Active);
-        assert_eq!(engine.model().draft().settings, settings(30));
+        assert!(engine.model().draft().settings.same_request(&settings(30)));
     }
     #[test]
     fn explicit_successful_apply_supersedes_loss_target_but_failed_apply_does_not() {
@@ -8691,7 +8796,7 @@ mod tests {
         assert_ne!(engine.model().watch_target().unwrap().watch, original_watch);
         assert_eq!(engine.runner.opens.len(), 1);
         let request = engine.validator.request.as_ref().unwrap().clone();
-        assert_eq!(request.settings, settings(30));
+        assert!(request.settings.same_request(&settings(30)));
         assert_eq!(
             request.watch.watch,
             engine.model().watch_target().unwrap().watch
@@ -9130,6 +9235,8 @@ mod tests {
             receipt: Box::new(opened),
         });
         engine.poll();
+        // Settle the authoritative observation for the post-open committed watch.
+        engine.poll();
         assert_eq!(engine.model().active().unwrap().attempt(), key.attempt);
         assert!(engine.lease.as_ref().unwrap().audio_retired);
         assert!(engine.lease.as_ref().unwrap().audio_epoch.is_none());
@@ -9161,15 +9268,24 @@ mod tests {
             (attempt, ImmediateIntent::SetOutput(target))
         );
         let epoch = AudioEpoch::new(1).unwrap();
+        // The mock route carries the exact current observation admitted with the
+        // AttachAudio authorization (lease.audio_stamp), not the open attempt's
+        // original capture watch.
+        let admitted = engine
+            .lease
+            .as_ref()
+            .unwrap()
+            .audio_stamp
+            .expect("admitted attach audio observation stamp");
         assert!(
-            matches!(&engine.runner.intents[1], (active, ImmediateIntent::AttachAudio { epoch: admitted, source: selected, stamp })
-            if *active == attempt && *admitted == epoch && selected == &source && *stamp == engine.lease.as_ref().unwrap().watch)
+            matches!(&engine.runner.intents[1], (active, ImmediateIntent::AttachAudio { epoch: epoch_value, source: selected, stamp })
+            if *active == attempt && *epoch_value == epoch && selected == &source && *stamp == admitted)
         );
         let route = crate::media::loopback::LoopbackReceipt::for_test(
             crate::media::controller::Generation::new(attempt.get()).unwrap(),
             attempt,
             epoch,
-            engine.lease.as_ref().unwrap().watch,
+            admitted,
             source.clone(),
             output_fixture(),
             revision,
@@ -9188,7 +9304,7 @@ mod tests {
         ));
         assert_eq!(engine.model().active().unwrap().attempt(), attempt);
         assert_eq!(engine.model().last_valid().unwrap().settings(), &applied);
-        assert_eq!(engine.model().draft().settings, dirty);
+        assert!(engine.model().draft().settings.same_request(&dirty));
         assert_eq!(engine.runner.opens.len(), 1);
         assert!(engine.runner.stops.is_empty());
     }
@@ -9298,7 +9414,7 @@ mod tests {
         assert_eq!(engine.runner.opens.last().unwrap().1, applied);
         assert_eq!(engine.runner.outputs.last(), Some(&waiting));
         assert_eq!(engine.output_plan(), &waiting);
-        assert_eq!(engine.model().draft().settings, dirty);
+        assert!(engine.model().draft().settings.same_request(&dirty));
     }
 
     #[test]
@@ -9345,11 +9461,20 @@ mod tests {
             })
             .unwrap();
         let epoch = AudioEpoch::new(1).unwrap();
+        // The mock route must carry the exact current observation admitted with
+        // the AttachAudio authorization (lease.audio_stamp), not the open
+        // attempt's original capture watch.
+        let admitted = engine
+            .lease
+            .as_ref()
+            .unwrap()
+            .audio_stamp
+            .expect("admitted attach audio observation stamp");
         let route = crate::media::loopback::LoopbackReceipt::for_test(
             crate::media::controller::Generation::new(attempt.get()).unwrap(),
             attempt,
             epoch,
-            engine.lease.as_ref().unwrap().watch,
+            admitted,
             source.clone(),
             output_fixture(),
             first,
@@ -9364,6 +9489,12 @@ mod tests {
                 },
             });
         engine.poll();
+        // Consumer-visible proof that the fresh admitted route is accepted while
+        // the live epoch is still kept before any silence transition.
+        assert!(matches!(
+            engine.audio_availability(),
+            Some(AudioAvailability::Active { .. })
+        ));
         let silent = first.next();
         engine
             .set_output_plan(OutputPlan::Silent {
@@ -9407,7 +9538,7 @@ mod tests {
             crate::media::controller::Generation::new(attempt.get()).unwrap(),
             attempt,
             epoch,
-            engine.lease.as_ref().unwrap().watch,
+            admitted,
             source,
             output_fixture(),
             silent.next(),

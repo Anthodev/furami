@@ -2,8 +2,8 @@
 
 use super::linux::{self, CaptureSnapshot, ValidatedCapture};
 use crate::domain::capture::{
-    CaptureBufferType, CaptureDataError, CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate,
-    FrameSize, ModeRequest,
+    CaptureBufferType, CaptureDataError, CaptureMode, CaptureModeRequest, CapturedFourCc,
+    DeviceIdentity, FrameRate, FrameSize, InputFormatPolicy, ModeRequest, VideoRequest,
 };
 use serde::Serialize;
 use std::{
@@ -15,7 +15,7 @@ use std::{
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureArgumentError {
     #[error(
-        "capture selection requires --capture-node, --capture-fourcc, --capture-size and --capture-rate together"
+        "capture selection requires --capture-node, --capture-size and --capture-rate together; --capture-fourcc defaults to auto"
     )]
     IncompleteSelection,
     #[error("invalid capture argument: {0}")]
@@ -27,16 +27,21 @@ pub enum CaptureArgumentError {
 #[derive(Debug)]
 pub struct CaptureArguments {
     pub node: PathBuf,
-    pub mode: CaptureMode,
+    pub mode: CaptureModeRequest,
 }
 impl fmt::Display for CaptureArguments {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let bytes = self.mode.captured_fourcc.bytes();
+        write!(f, "{} ", self.node.display())?;
+        match self.mode.format_policy {
+            InputFormatPolicy::Auto => f.write_str("auto")?,
+            InputFormatPolicy::Manual { fourcc } => {
+                let bytes = fourcc.bytes();
+                write!(f, "{}", String::from_utf8_lossy(&bytes))?;
+            }
+        }
         write!(
             f,
-            "{} {} {}x{} {}/{}",
-            self.node.display(),
-            String::from_utf8_lossy(&bytes),
+            " {}x{} {}/{}",
             self.mode.size.width(),
             self.mode.size.height(),
             self.mode.rate.numerator(),
@@ -77,7 +82,7 @@ impl CaptureArguments {
         if node.is_none() && fourcc.is_none() && size.is_none() && rate.is_none() {
             return Ok(None);
         }
-        let (Some(node), Some(fourcc), Some(size), Some(rate)) = (node, fourcc, size, rate) else {
+        let (Some(node), Some(size), Some(rate)) = (node, size, rate) else {
             return Err(CaptureArgumentError::IncompleteSelection);
         };
         let text = |value: OsString, name: &str| {
@@ -85,12 +90,20 @@ impl CaptureArguments {
                 .into_string()
                 .map_err(|_| CaptureArgumentError::InvalidArgument(format!("{name} must be UTF-8")))
         };
-        let fourcc = text(fourcc, "FourCC")?;
-        let bytes: [u8; 4] = fourcc.as_bytes().try_into().map_err(|_| {
-            CaptureArgumentError::InvalidArgument(
-                "FourCC must contain exactly four bytes, e.g. NV12".into(),
-            )
-        })?;
+        let fourcc = fourcc.map(|value| text(value, "FourCC")).transpose()?;
+        let format_policy = match fourcc.as_deref() {
+            None | Some("auto") => InputFormatPolicy::Auto,
+            Some(value) => {
+                let bytes: [u8; 4] = value.as_bytes().try_into().map_err(|_| {
+                    CaptureArgumentError::InvalidArgument(
+                        "FourCC must be auto or exactly four bytes, e.g. NV12".into(),
+                    )
+                })?;
+                InputFormatPolicy::Manual {
+                    fourcc: CapturedFourCc::from_bytes(bytes),
+                }
+            }
+        };
         let size = text(size, "size")?;
         let (width, height) = size.split_once('x').ok_or_else(|| {
             CaptureArgumentError::InvalidArgument("size must be WIDTHxHEIGHT".into())
@@ -107,8 +120,8 @@ impl CaptureArguments {
         };
         Ok(Some(Self {
             node: node.into(),
-            mode: CaptureMode {
-                captured_fourcc: CapturedFourCc::from_bytes(bytes),
+            mode: CaptureModeRequest {
+                format_policy,
                 size: FrameSize::new(dimension(width)?, dimension(height)?)?,
                 rate: FrameRate::parse_exact(&text(rate, "rate")?)?,
             },
@@ -169,8 +182,10 @@ impl fmt::Display for RequestedFacts {
 /// identity anew, and must still prove the explicitly selected node.
 #[derive(Clone, Debug)]
 pub struct CaptureSelection {
-    request: ModeRequest,
+    request: VideoRequest,
     node: PathBuf,
+    node_syspath: PathBuf,
+    usb_syspath: PathBuf,
 }
 impl CaptureSelection {
     pub fn from_snapshot(
@@ -178,6 +193,27 @@ impl CaptureSelection {
         node: &Path,
         mode: CaptureMode,
     ) -> Result<Self, SelectionError> {
+        Self::from_prepared(
+            snapshot,
+            node,
+            VideoRequest::manual(ModeRequest {
+                identity: Self::request_from_snapshot(
+                    snapshot,
+                    node,
+                    CaptureModeRequest::manual(mode),
+                )?
+                .identity,
+                mode,
+            }),
+        )
+    }
+
+    /// Resolve a CLI node's identity without inventing a concrete auto tuple.
+    pub fn request_from_snapshot(
+        snapshot: &CaptureSnapshot,
+        node: &Path,
+        mode: CaptureModeRequest,
+    ) -> Result<VideoRequest, SelectionError> {
         node_text(node)?;
         let mut candidates = snapshot.devices().iter().flat_map(|device| {
             device
@@ -192,13 +228,46 @@ impl CaptureSelection {
         if candidates.next().is_some() {
             return Err(SelectionError::NodeAmbiguous(node.to_owned()));
         }
-        Ok(Self {
-            request: ModeRequest {
-                identity: identity.clone(),
-                mode,
-            },
-            node: node.to_owned(),
+        Ok(VideoRequest {
+            identity: identity.clone(),
+            mode,
+            resolved_fourcc: None,
+            selected_node: Some(node.to_owned()),
         })
+    }
+
+    pub(crate) fn from_prepared(
+        snapshot: &CaptureSnapshot,
+        node: &Path,
+        request: VideoRequest,
+    ) -> Result<Self, SelectionError> {
+        if request.resolved_mode().is_none() {
+            return Err(InputError::MalformedSpec("prepared format is unresolved").into());
+        }
+        let device = snapshot
+            .devices()
+            .iter()
+            .find(|device| device.identity() == &request.identity)
+            .ok_or_else(|| SelectionError::NodeNotFound(node.to_owned()))?;
+        let route = device
+            .nodes()
+            .iter()
+            .find(|route| route.devnode() == node)
+            .ok_or_else(|| SelectionError::NodeNotFound(node.to_owned()))?;
+        Ok(Self {
+            request,
+            node: node.to_owned(),
+            node_syspath: route.syspath().to_owned(),
+            usb_syspath: route.usb_syspath().to_owned(),
+        })
+    }
+
+    pub(crate) fn video_request(&self) -> &VideoRequest {
+        &self.request
+    }
+
+    pub(crate) fn physical_node(&self) -> (&Path, &Path) {
+        (&self.node_syspath, &self.usb_syspath)
     }
 
     pub fn requested(&self) -> RequestedFacts {
@@ -206,7 +275,10 @@ impl CaptureSelection {
             identity: self.request.identity.clone(),
             node: self.node.clone(),
             buffer_type: CaptureBufferType::SinglePlanar,
-            mode: self.request.mode,
+            mode: self
+                .request
+                .resolved_mode()
+                .expect("prepared capture selection"),
         }
     }
 
@@ -215,7 +287,13 @@ impl CaptureSelection {
         &self,
         snapshot: &CaptureSnapshot,
     ) -> Result<InputSpec, SelectionError> {
-        let validated = linux::validate(snapshot, &self.request)?;
+        let validated = linux::resolve_video_with_query(
+            snapshot,
+            &self.request,
+            None,
+            Some(self.physical_node()),
+            linux::query_intervals,
+        )?;
         Ok(InputSpec::from_validated(&validated, Some(&self.node))?)
     }
 }
@@ -432,13 +510,8 @@ mod tests {
             Some("other".into()),
         )
         .unwrap();
-        let request = CaptureSelection {
-            request: ModeRequest {
-                identity: changed,
-                mode,
-            },
-            node: selection.node.clone(),
-        };
+        let mut request = selection.clone();
+        request.request.identity = changed;
         assert!(matches!(
             request.validate_snapshot(&original),
             Err(SelectionError::Capture(linux::CaptureError::Identity(_)))
@@ -446,7 +519,9 @@ mod tests {
         let moved = linux::session_fixture(&["/dev/video2"], mode);
         assert!(matches!(
             selection.validate_snapshot(&moved),
-            Err(SelectionError::Input(InputError::RouteNotProven(_)))
+            Err(SelectionError::Capture(
+                linux::CaptureError::StaleSnapshot { .. }
+            ))
         ));
     }
 

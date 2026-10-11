@@ -47,7 +47,7 @@ pub fn decide_startup(
     if let Some(draft) = explicit {
         return StartupSelection { draft: Some(draft), auto_open: false, reason: "Explicit command-line selection; saved capture auto-open suspended until a user Apply.".into() };
     }
-    let Some(draft) = saved else {
+    let Some(mut draft) = saved else {
         return StartupSelection {
             draft: None,
             auto_open: false,
@@ -56,6 +56,9 @@ pub fn decide_startup(
                     .into(),
         };
     };
+    if draft.video.mode.format_policy == crate::domain::capture::InputFormatPolicy::Auto {
+        draft.video.resolved_fourcc = None;
+    }
     let result = check_video(&draft).and_then(|()| {
         if !draft.audio.enabled() { return Ok(()); }
         let sources = audio?;
@@ -200,7 +203,11 @@ impl PersistenceSession {
         &self.startup_reason
     }
     pub fn draft_dirty(&self, draft: Option<&DraftSettings>) -> bool {
-        draft != self.baseline.as_ref()
+        match (draft, self.baseline.as_ref()) {
+            (Some(draft), Some(baseline)) => !draft.same_request(baseline),
+            (None, None) => false,
+            _ => true,
+        }
     }
     pub fn admit_user_apply(&mut self, admission: ApplyAdmission, submitted: Draft) {
         self.user_apply = Some((admission, submitted));
@@ -237,6 +244,7 @@ impl PersistenceSession {
                     && key.purpose == AttemptPurpose::Candidate
                     && self.user_open == Some(key)
                     && applied.settings().video.mode == submitted.settings.video.mode
+                    && applied.settings().video.resolved_mode().is_some()
                     && applied.settings().audio == submitted.settings.audio
                     && applied.settings().filters == submitted.settings.filters
                     && applied.settings().renderer == submitted.settings.renderer =>
@@ -257,7 +265,8 @@ impl PersistenceSession {
                 && key.pass == crate::domain::state::TreatmentPass::Candidate
                 && *admitted_revision == revision
                 && submitted.revision == revision
-                && applied.settings() == &submitted.settings =>
+                && applied.settings().same_request(&submitted.settings)
+                && applied.settings().video.resolved_mode().is_some() =>
             {
                 applied
             }
@@ -510,7 +519,7 @@ mod tests {
     fn selection(rate: u32) -> DraftSettings {
         DraftSettings {
             filters: crate::domain::filters::FilterChain::default(),
-            video: ModeRequest {
+            video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                 identity: DeviceIdentity::new(
                     0x1234,
                     0xabcd,
@@ -523,7 +532,7 @@ mod tests {
                     size: FrameSize::new(1280, 720).unwrap(),
                     rate: FrameRate::new(rate, 1001).unwrap(),
                 },
-            },
+            }),
             audio: AudioSelection::default(),
             renderer: crate::domain::render::RendererSettings::default(),
         }
@@ -576,7 +585,8 @@ mod tests {
             .apply(model.state_identity(), model.draft().revision)
             .unwrap();
         let request = model.validation_request().unwrap().clone();
-        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+        let Some(ModelEffect::Open { key, .. }) = model.fixture_validation_succeeded(&request)
+        else {
             panic!("opening")
         };
         verify_open(&mut model, key);
@@ -602,7 +612,7 @@ mod tests {
         let (_, LoadOutcome::Loaded(document)) = SettingsStore::load(path) else {
             panic!("document not loadable")
         };
-        document
+        *document
     }
     fn preferences(percent: u8) -> LocalPreferences {
         LocalPreferences {
@@ -628,6 +638,39 @@ mod tests {
         );
         assert!(resolve_settings_path(None, Some(OsStr::new("relative"))).is_err());
         assert!(resolve_settings_path(None, None).is_err());
+    }
+
+    #[test]
+    fn saved_auto_rechecks_current_capabilities_without_historical_pin_or_dirty_change() {
+        use crate::domain::capture::InputFormatPolicy;
+        let mut saved = selection(60000);
+        saved.video.mode.format_policy = InputFormatPolicy::Auto;
+        let startup = decide_startup(
+            Some(saved.clone()),
+            None,
+            |draft| {
+                assert_eq!(draft.video.mode.format_policy, InputFormatPolicy::Auto);
+                assert!(draft.video.resolved_fourcc.is_none());
+                Ok(())
+            },
+            Ok(&[]),
+        );
+        assert!(startup.auto_open);
+        let temp = Temp::new();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        session.prepare_startup(&startup);
+        assert!(
+            !session.draft_dirty(Some(&saved)),
+            "resolution is not a user selection edit"
+        );
+        let mut changed = saved;
+        changed.video.mode.format_policy = InputFormatPolicy::Manual {
+            fourcc: changed.video.resolved_fourcc.unwrap(),
+        };
+        assert!(
+            session.draft_dirty(Some(&changed)),
+            "auto to same concrete manual pin is a real edit"
+        );
     }
     #[test]
     fn startup_present_exact_tuple_opens_but_absent_unknown_or_unsupported_prefills() {
@@ -1330,9 +1373,11 @@ mod tests {
                 &original_request,
                 normalized.clone(),
                 original_request.watch,
+                None,
             )
             .unwrap();
-        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&request) else {
+        let Some(ModelEffect::Open { key, .. }) = model.fixture_validation_succeeded(&request)
+        else {
             panic!("opening")
         };
         session.observe_opening(key);

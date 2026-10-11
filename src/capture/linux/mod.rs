@@ -20,8 +20,9 @@ use serde::Serialize;
 
 use crate::domain::capture::{
     CaptureBufferType, CaptureDataError, CaptureMode, CapturedFourCc, Descriptor, DeviceIdentity,
-    FrameIntervals, FrameSize, IdentityError, ModeRequest, NodeCapabilities, SupportVerdict,
-    UnknownReason, UnsupportedReason, resolve_identity,
+    FrameIntervals, FrameSize, IdentityError, InputFormatPolicy, ModeRequest, NodeCapabilities,
+    SelectedRouteAuthorization, SupportVerdict, UnknownReason, UnsupportedReason, VideoRequest,
+    resolve_identity,
 };
 
 mod ffi;
@@ -406,21 +407,6 @@ pub fn validate<'a>(
     validate_with_query(snapshot, request, query_intervals)
 }
 
-/// Internal seam: identical validation with an injected exact-size interval
-/// query, so range-descriptor fixtures never touch real `/dev` nodes.
-pub(crate) fn validate_with_injected_query<'a>(
-    snapshot: &'a CaptureSnapshot,
-    request: &ModeRequest,
-    query: impl FnMut(
-        &CaptureDevice,
-        &CaptureNode,
-        CapturedFourCc,
-        FrameSize,
-    ) -> Result<ExactSizeIntervals, CaptureError>,
-) -> Result<ValidatedCapture<'a>, CaptureError> {
-    validate_with_query(snapshot, request, query)
-}
-
 fn validate_with_query<'a>(
     snapshot: &'a CaptureSnapshot,
     request: &ModeRequest,
@@ -438,44 +424,124 @@ fn validate_with_query<'a>(
     validate_device_with_query(&snapshot.devices[index], request.mode, query)
 }
 
-/// Explicit one-open authorization, not a relaxation of resolve_identity.
-/// Both physical locators and the complete observed technical identity must
-/// still match; the ordinary tuple proof is shared with automatic resolution.
-pub(crate) fn validate_authorized_with_query<'a>(
+/// Resolve intent once, using only the selected physical device/node and exact
+/// native tuple proof. A prepared request's concrete format is never reranked.
+pub(crate) fn resolve_video_with_query<'a>(
     snapshot: &'a CaptureSnapshot,
-    request: &ModeRequest,
-    authorization: &crate::domain::capture::SelectedRouteAuthorization,
-    query: impl FnMut(
+    request: &VideoRequest,
+    selected: Option<&SelectedRouteAuthorization>,
+    pinned_node: Option<(&Path, &Path)>,
+    mut query: impl FnMut(
         &CaptureDevice,
         &CaptureNode,
         CapturedFourCc,
         FrameSize,
     ) -> Result<ExactSizeIntervals, CaptureError>,
 ) -> Result<ValidatedCapture<'a>, CaptureError> {
-    let requested = &request.identity;
-    let selected = &authorization.identity;
-    if requested.vendor_id() != selected.vendor_id()
-        || requested.product_id() != selected.product_id()
-        || requested.serial() != selected.serial()
-    {
-        return Err(CaptureError::Identity(IdentityError::NotFound));
-    }
-    let mut matches = snapshot.devices.iter().filter(|device| {
-        device.identity == *selected
-            && device.nodes.iter().any(|node| {
-                node.usb_syspath == authorization.usb_syspath
-                    && node.syspath == authorization.node_syspath
-            })
+    let device = if let Some(selected) = selected {
+        if request.identity.vendor_id() != selected.identity.vendor_id()
+            || request.identity.product_id() != selected.identity.product_id()
+            || request.identity.serial() != selected.identity.serial()
+        {
+            return Err(CaptureError::Identity(IdentityError::NotFound));
+        }
+        let mut devices = snapshot.devices.iter().filter(|device| {
+            device.identity == selected.identity
+                && device.nodes.iter().any(|node| {
+                    node.syspath == selected.node_syspath
+                        && node.usb_syspath == selected.usb_syspath
+                })
+        });
+        let device = devices.next().ok_or_else(|| CaptureError::StaleSnapshot {
+            path: selected.node_syspath.clone(),
+        })?;
+        if devices.next().is_some() {
+            return Err(CaptureError::StaleSnapshot {
+                path: selected.node_syspath.clone(),
+            });
+        }
+        device
+    } else {
+        let index = resolve_identity(
+            &request.identity,
+            snapshot.devices.iter().map(|device| &device.identity),
+        )?;
+        &snapshot.devices[index]
+    };
+    let physical = pinned_node.or_else(|| {
+        selected.map(|route| (route.node_syspath.as_path(), route.usb_syspath.as_path()))
     });
-    let device = matches.next().ok_or_else(|| CaptureError::StaleSnapshot {
-        path: authorization.node_syspath.clone(),
-    })?;
-    if matches.next().is_some() {
+    let node_hint = if physical.is_none() && request.resolved_fourcc.is_none() {
+        request.selected_node.as_deref()
+    } else {
+        None
+    };
+    if let Some((syspath, usb_syspath)) = physical
+        && !device
+            .nodes
+            .iter()
+            .any(|node| node.syspath == syspath && node.usb_syspath == usb_syspath)
+    {
         return Err(CaptureError::StaleSnapshot {
-            path: authorization.node_syspath.clone(),
+            path: syspath.to_owned(),
         });
     }
-    validate_device_with_query(device, request.mode, query)
+    if let Some(path) = node_hint
+        && !device.nodes.iter().any(|node| node.devnode == path)
+    {
+        return Err(CaptureError::InvalidNode {
+            path: path.to_owned(),
+        });
+    }
+    if request.resolved_fourcc.is_none()
+        && let (Some(path), Some((syspath, usb))) = (request.selected_node.as_deref(), physical)
+        && !device
+            .nodes
+            .iter()
+            .any(|node| node.devnode == path && node.syspath == syspath && node.usb_syspath == usb)
+    {
+        return Err(CaptureError::InvalidNode {
+            path: path.to_owned(),
+        });
+    }
+    let validate = |mode, query: &mut _| {
+        validate_device_filtered_with_query(device, mode, node_hint, physical, true, query)
+    };
+    if request.resolved_fourcc.is_some() {
+        let mode = request
+            .resolved_mode()
+            .ok_or(CaptureError::Unsupported(UnsupportedReason::FourCc))?;
+        return validate(mode, &mut query);
+    }
+    if let InputFormatPolicy::Manual { fourcc } = request.mode.format_policy {
+        return validate(request.mode.with_fourcc(fourcc), &mut query);
+    }
+    // Quality/fidelity heuristic, not a measured latency or load ranking.
+    let mut unavailable = None;
+    let mut unsupported = UnsupportedReason::FourCc;
+    for bytes in [*b"YUYV", *b"NV12", *b"MJPG"] {
+        match validate(
+            request.mode.with_fourcc(CapturedFourCc::from_bytes(bytes)),
+            &mut query,
+        ) {
+            Ok(validated) => return Ok(validated),
+            Err(CaptureError::Unsupported(reason)) => {
+                if unsupported_rank(reason) > unsupported_rank(unsupported) {
+                    unsupported = reason;
+                }
+            }
+            Err(CaptureError::DescriptorUnavailable(reason)) => {
+                if unavailable.is_none() || reason == UnknownReason::FrameIntervalsNotReported {
+                    unavailable = Some(reason);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    match unavailable {
+        Some(reason) => Err(CaptureError::DescriptorUnavailable(reason)),
+        None => Err(CaptureError::Unsupported(unsupported)),
+    }
 }
 
 pub(crate) fn validate_device_with_query(
@@ -488,16 +554,36 @@ pub(crate) fn validate_device_with_query(
         FrameSize,
     ) -> Result<ExactSizeIntervals, CaptureError>,
 ) -> Result<ValidatedCapture<'_>, CaptureError> {
+    validate_device_filtered_with_query(device, mode, None, None, false, &mut query)
+}
+
+fn validate_device_filtered_with_query<'a>(
+    device: &'a CaptureDevice,
+    mode: CaptureMode,
+    selected_node: Option<&Path>,
+    physical: Option<(&Path, &Path)>,
+    single_planar: bool,
+    mut query: impl FnMut(
+        &CaptureDevice,
+        &CaptureNode,
+        CapturedFourCc,
+        FrameSize,
+    ) -> Result<ExactSizeIntervals, CaptureError>,
+) -> Result<ValidatedCapture<'a>, CaptureError> {
     let mut routes = Vec::new();
     let mut unsupported = UnsupportedReason::FourCc;
     let mut unavailable = None;
     for node in &device.nodes {
-        let Some(first) = node
-            .capabilities
-            .formats()
-            .iter()
-            .find(|format| format.captured_fourcc == mode.captured_fourcc)
-        else {
+        if selected_node.is_some_and(|path| node.devnode != path)
+            || physical
+                .is_some_and(|(syspath, usb)| node.syspath != syspath || node.usb_syspath != usb)
+        {
+            continue;
+        }
+        let Some(first) = node.capabilities.formats().iter().find(|format| {
+            format.captured_fourcc == mode.captured_fourcc
+                && (!single_planar || format.buffer_type == CaptureBufferType::SinglePlanar)
+        }) else {
             continue;
         };
         let supported = match node.capabilities.assess(first.buffer_type, mode) {
@@ -520,6 +606,11 @@ pub(crate) fn validate_device_with_query(
                 // Descriptors are shared between queues of this node only.
                 // Query this exact size once, never a range endpoint.
                 let exact = query(device, node, mode.captured_fourcc, mode.size)?;
+                if exact.captured_fourcc != mode.captured_fourcc || exact.size != mode.size {
+                    return Err(CaptureError::StaleSnapshot {
+                        path: node.devnode.clone(),
+                    });
+                }
                 match exact.intervals {
                     Descriptor::NotReported => {
                         unavailable = Some(UnknownReason::FrameIntervalsNotReported);
@@ -537,12 +628,10 @@ pub(crate) fn validate_device_with_query(
             }
         };
         if supported {
-            for format in node
-                .capabilities
-                .formats()
-                .iter()
-                .filter(|format| format.captured_fourcc == mode.captured_fourcc)
-            {
+            for format in node.capabilities.formats().iter().filter(|format| {
+                format.captured_fourcc == mode.captured_fourcc
+                    && (!single_planar || format.buffer_type == CaptureBufferType::SinglePlanar)
+            }) {
                 routes.push(ValidatedRoute {
                     node,
                     buffer_type: format.buffer_type,
@@ -651,7 +740,7 @@ pub(crate) fn session_fixture(paths: &[&str], mode: CaptureMode) -> CaptureSnaps
 
 /// Range-descriptor fixture: same identity, but sizes are announced as a
 /// Stepwise range containing the requested size, so proving the tuple needs an
-/// exact interval query (injected via validate_with_injected_query in tests).
+/// exact interval query through the shared native query seam in tests.
 #[cfg(test)]
 pub(crate) fn session_range_fixture(paths: &[&str], mode: CaptureMode) -> CaptureSnapshot {
     use crate::domain::capture::{
@@ -904,6 +993,349 @@ mod tests {
                 rate: FrameRate::new(rate, 1).unwrap(),
             },
         }
+    }
+
+    fn auto_request() -> VideoRequest {
+        let mut request = VideoRequest::manual(request(NV12, 60));
+        request.mode.format_policy = InputFormatPolicy::Auto;
+        request.resolved_fourcc = None;
+        request
+    }
+
+    fn policy_proof<'a>(
+        snapshot: &'a CaptureSnapshot,
+        requested: &VideoRequest,
+    ) -> Result<ValidatedCapture<'a>, CaptureError> {
+        resolve_video_with_query(snapshot, requested, None, None, |_, _, _, _| {
+            panic!("discrete capability must not query")
+        })
+    }
+
+    #[test]
+    fn auto_quality_preference_is_independent_of_driver_order_and_excludes_bgr3() {
+        let mjpg = CapturedFourCc::from_bytes(*b"MJPG");
+        let bgr3 = CapturedFourCc::from_bytes(*b"BGR3");
+        for driver_order in [vec![mjpg, NV12, YUYV, bgr3], vec![bgr3, YUYV, mjpg, NV12]] {
+            let snapshot = snapshot(vec![node(
+                "/dev/video0",
+                driver_order
+                    .iter()
+                    .map(|fourcc| (CaptureBufferType::SinglePlanar, *fourcc))
+                    .collect(),
+                driver_order
+                    .iter()
+                    .map(|fourcc| (*fourcc, discrete(2560, 1440, intervals(60))))
+                    .collect(),
+            )]);
+            let prepared = policy_proof(&snapshot, &auto_request()).unwrap();
+            assert_eq!(prepared.mode().captured_fourcc, YUYV);
+            assert_eq!(prepared.mode().size, size(2560, 1440));
+            assert_eq!(prepared.mode().rate, FrameRate::new(60, 1).unwrap());
+            for fourcc in [NV12, bgr3] {
+                let mut manual = VideoRequest::manual(request(fourcc, 60));
+                manual.resolved_fourcc = None;
+                assert_eq!(
+                    policy_proof(&snapshot, &manual)
+                        .unwrap()
+                        .mode()
+                        .captured_fourcc,
+                    fourcc
+                );
+            }
+        }
+        let only_bgr3 = snapshot(vec![node(
+            "/dev/video0",
+            vec![(CaptureBufferType::SinglePlanar, bgr3)],
+            vec![(bgr3, discrete(2560, 1440, intervals(60)))],
+        )]);
+        assert!(matches!(
+            policy_proof(&only_bgr3, &auto_request()),
+            Err(CaptureError::Unsupported(UnsupportedReason::FourCc))
+        ));
+    }
+
+    #[test]
+    fn auto_unknown_and_absent_are_distinct_and_lower_confirmed_format_can_win() {
+        let absent = snapshot(vec![node(
+            "/dev/video0",
+            vec![(CaptureBufferType::SinglePlanar, NV12)],
+            vec![(NV12, discrete(2560, 1440, intervals(30)))],
+        )]);
+        assert!(matches!(
+            policy_proof(&absent, &auto_request()),
+            Err(CaptureError::Unsupported(UnsupportedReason::FrameRate))
+        ));
+        let unknown = snapshot(vec![node(
+            "/dev/video0",
+            vec![
+                (CaptureBufferType::SinglePlanar, YUYV),
+                (CaptureBufferType::SinglePlanar, NV12),
+            ],
+            vec![
+                (YUYV, discrete(2560, 1440, Descriptor::NotReported)),
+                (NV12, discrete(2560, 1440, intervals(30))),
+            ],
+        )]);
+        assert!(matches!(
+            policy_proof(&unknown, &auto_request()),
+            Err(CaptureError::DescriptorUnavailable(
+                UnknownReason::FrameIntervalsNotReported
+            ))
+        ));
+        let lower = snapshot(vec![node(
+            "/dev/video0",
+            vec![
+                (CaptureBufferType::SinglePlanar, YUYV),
+                (CaptureBufferType::SinglePlanar, NV12),
+            ],
+            vec![
+                (YUYV, Descriptor::NotReported),
+                (NV12, discrete(2560, 1440, intervals(60))),
+            ],
+        )]);
+        assert_eq!(
+            policy_proof(&lower, &auto_request())
+                .unwrap()
+                .mode()
+                .captured_fourcc,
+            NV12
+        );
+        let mut manual = auto_request();
+        manual.mode.format_policy = InputFormatPolicy::Manual { fourcc: NV12 };
+        assert_eq!(
+            policy_proof(&lower, &manual)
+                .unwrap()
+                .mode()
+                .captured_fourcc,
+            NV12
+        );
+    }
+
+    #[test]
+    fn auto_ranges_query_exact_size_and_rational_rate_once_without_downgrade() {
+        let snapshot = snapshot(vec![node(
+            "/dev/video0",
+            vec![
+                (CaptureBufferType::SinglePlanar, YUYV),
+                (CaptureBufferType::SinglePlanar, NV12),
+            ],
+            vec![(YUYV, range()), (NV12, range())],
+        )]);
+        let mut requested = auto_request();
+        requested.mode.size = size(1920, 1080);
+        requested.mode.rate = FrameRate::new(60000, 1001).unwrap();
+        let mut queries = Vec::new();
+        let validated =
+            resolve_video_with_query(&snapshot, &requested, None, None, |_, _, fourcc, size| {
+                queries.push((fourcc, size));
+                Ok(fixture_exact_intervals(
+                    fourcc,
+                    size,
+                    if fourcc == YUYV {
+                        FrameRate::new(60, 1).unwrap()
+                    } else {
+                        requested.mode.rate
+                    },
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            queries,
+            vec![(YUYV, requested.mode.size), (NV12, requested.mode.size)]
+        );
+        assert_eq!(validated.mode(), requested.mode.with_fourcc(NV12));
+        let error =
+            resolve_video_with_query(&snapshot, &requested, None, None, |_, _, fourcc, size| {
+                Ok(fixture_exact_intervals(
+                    fourcc,
+                    size,
+                    FrameRate::new(60, 1).unwrap(),
+                ))
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureError::Unsupported(UnsupportedReason::FrameRate)
+        ));
+    }
+
+    #[test]
+    fn auto_selected_node_never_borrows_sibling_format_and_prepared_pin_never_reranks() {
+        let snapshot = snapshot(vec![
+            node(
+                "/dev/preferred",
+                vec![(CaptureBufferType::SinglePlanar, YUYV)],
+                vec![(YUYV, discrete(2560, 1440, intervals(60)))],
+            ),
+            node(
+                "/dev/selected",
+                vec![(CaptureBufferType::SinglePlanar, NV12)],
+                vec![(NV12, discrete(2560, 1440, intervals(60)))],
+            ),
+        ]);
+        let mut requested = auto_request();
+        requested.selected_node = Some("/dev/selected".into());
+        assert_eq!(
+            policy_proof(&snapshot, &requested)
+                .unwrap()
+                .mode()
+                .captured_fourcc,
+            NV12
+        );
+        requested.resolved_fourcc = Some(NV12);
+        let mut new_request = requested.clone();
+        new_request.resolved_fourcc = None;
+        new_request.selected_node = None;
+        assert_eq!(
+            policy_proof(&snapshot, &new_request)
+                .unwrap()
+                .mode()
+                .captured_fourcc,
+            YUYV
+        );
+        assert_eq!(
+            policy_proof(&snapshot, &requested)
+                .unwrap()
+                .mode()
+                .captured_fourcc,
+            NV12
+        );
+        let changed = self::snapshot(vec![node(
+            "/dev/selected",
+            vec![(CaptureBufferType::SinglePlanar, YUYV)],
+            vec![(YUYV, discrete(2560, 1440, intervals(60)))],
+        )]);
+        assert!(matches!(
+            policy_proof(&changed, &requested),
+            Err(CaptureError::Unsupported(UnsupportedReason::FourCc))
+        ));
+    }
+
+    #[test]
+    fn auto_exact_query_io_failure_is_not_an_alternate_format_retry() {
+        let snapshot = snapshot(vec![node(
+            "/dev/video0",
+            vec![
+                (CaptureBufferType::SinglePlanar, YUYV),
+                (CaptureBufferType::SinglePlanar, NV12),
+            ],
+            vec![(YUYV, range()), (NV12, discrete(2560, 1440, intervals(60)))],
+        )]);
+        let mut queries = 0;
+        let error =
+            resolve_video_with_query(&snapshot, &auto_request(), None, None, |_, node, _, _| {
+                queries += 1;
+                Err(CaptureError::Io {
+                    path: node.devnode().to_owned(),
+                    operation: "exact intervals",
+                    source: io::Error::from_raw_os_error(5),
+                })
+            })
+            .unwrap_err();
+        assert!(matches!(error, CaptureError::Io { .. }));
+        assert_eq!(queries, 1);
+    }
+
+    #[test]
+    fn prepared_physical_node_allows_renumbering_but_never_unique_other_node_handoff() {
+        let initial = snapshot(vec![node(
+            "/dev/selected",
+            vec![(CaptureBufferType::SinglePlanar, NV12)],
+            vec![(NV12, discrete(2560, 1440, intervals(60)))],
+        )]);
+        let mut requested = auto_request();
+        requested.selected_node = Some("/dev/selected".into());
+        requested.resolved_fourcc = Some(NV12);
+        let node_syspath = initial.devices()[0].nodes()[0].syspath();
+        let usb_syspath = initial.devices()[0].nodes()[0].usb_syspath();
+        let other = snapshot(vec![node(
+            "/dev/other",
+            vec![(CaptureBufferType::SinglePlanar, NV12)],
+            vec![(NV12, discrete(2560, 1440, intervals(60)))],
+        )]);
+        assert!(matches!(
+            resolve_video_with_query(
+                &other,
+                &requested,
+                None,
+                Some((node_syspath, usb_syspath)),
+                |_, _, _, _| panic!("missing physical node cannot query")
+            ),
+            Err(CaptureError::StaleSnapshot { .. })
+        ));
+        let mut renamed = other;
+        renamed.devices[0].nodes[0].syspath = node_syspath.to_owned();
+        let validated = resolve_video_with_query(
+            &renamed,
+            &requested,
+            None,
+            Some((node_syspath, usb_syspath)),
+            |_, _, _, _| panic!("discrete route does not query"),
+        )
+        .unwrap();
+        assert_eq!(
+            validated.routes()[0].node().devnode(),
+            Path::new("/dev/other")
+        );
+        assert_eq!(validated.mode().captured_fourcc, NV12);
+    }
+
+    #[test]
+    fn unknown_ranked_sizes_never_prove_support_or_bypass_manual_validation() {
+        let snapshot = snapshot(vec![node(
+            "/dev/video0",
+            vec![(CaptureBufferType::SinglePlanar, YUYV)],
+            vec![(YUYV, Descriptor::NotReported)],
+        )]);
+        assert!(matches!(
+            policy_proof(&snapshot, &auto_request()),
+            Err(CaptureError::DescriptorUnavailable(
+                UnknownReason::FrameSizesNotReported
+            ))
+        ));
+        let mut manual = auto_request();
+        manual.mode.format_policy = InputFormatPolicy::Manual { fourcc: YUYV };
+        assert!(matches!(
+            policy_proof(&snapshot, &manual),
+            Err(CaptureError::DescriptorUnavailable(
+                UnknownReason::FrameSizesNotReported
+            ))
+        ));
+    }
+
+    #[test]
+    fn auto_route_ambiguity_is_not_resolved_by_trying_a_lower_ranked_format() {
+        let snapshot = snapshot(vec![
+            node(
+                "/dev/video0",
+                vec![
+                    (CaptureBufferType::SinglePlanar, YUYV),
+                    (CaptureBufferType::SinglePlanar, NV12),
+                ],
+                vec![
+                    (YUYV, discrete(2560, 1440, intervals(60))),
+                    (NV12, discrete(2560, 1440, intervals(60))),
+                ],
+            ),
+            node(
+                "/dev/video1",
+                vec![(CaptureBufferType::SinglePlanar, YUYV)],
+                vec![(YUYV, discrete(2560, 1440, intervals(60)))],
+            ),
+        ]);
+        let requested = crate::domain::state::DraftSettings {
+            video: auto_request(),
+            audio: crate::domain::capture::AudioSelection::default(),
+            filters: crate::domain::filters::FilterChain::default(),
+            renderer: crate::domain::render::RendererSettings::default(),
+        };
+        let stamp = crate::domain::capture::WatchStamp {
+            watch: crate::domain::capture::WatchId::new(1).unwrap(),
+            epoch: crate::domain::capture::ObservationEpoch::new(1).unwrap(),
+        };
+        let failure =
+            crate::capture::apply::validate_prepared(requested, &snapshot, &[], stamp).unwrap_err();
+        assert!(failure.diagnostic.contains("multiple capture routes"));
     }
 
     fn exact_from_pod(

@@ -242,14 +242,14 @@ mod tests {
             Cause::Generic,
             DraftSettings {
                 filters: crate::domain::filters::FilterChain::default(),
-                video: ModeRequest {
+                video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                     identity,
                     mode: CaptureMode {
                         captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
                         size: FrameSize::new(1280, 720).unwrap(),
                         rate: FrameRate::new(60, 1).unwrap(),
                     },
-                },
+                }),
                 audio: AudioSelection::default(),
                 renderer: crate::domain::render::RendererSettings::default(),
             },

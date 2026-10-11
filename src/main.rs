@@ -248,18 +248,14 @@ fn run() -> Result<(), StartupError> {
                 request: args.to_string(),
                 source,
             })?;
-            let selection = CaptureSelection::from_snapshot(&snapshot, &args.node, args.mode)
+            let video = CaptureSelection::request_from_snapshot(&snapshot, &args.node, args.mode)
                 .map_err(|source| StartupError::CaptureSelection {
-                    request: args.to_string(),
-                    source,
-                })?;
-            let requested = selection.requested();
+                request: args.to_string(),
+                source,
+            })?;
             Ok::<_, StartupError>(DraftSettings {
                 filters: furami::domain::filters::FilterChain::default(),
-                video: furami::domain::capture::ModeRequest {
-                    identity: requested.identity,
-                    mode: requested.mode,
-                },
+                video,
                 audio,
                 renderer: furami::domain::render::RendererSettings::default(),
             })
@@ -380,6 +376,58 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn capture_cli_defaults_to_auto_without_fourcc_and_accepts_explicit_auto() {
+        for suffix in [vec![], vec!["--capture-fourcc", "auto"]] {
+            let mut values = vec![
+                "--capture-node",
+                "/dev/video0",
+                "--capture-size",
+                "1920x1080",
+                "--capture-rate",
+                "60/1",
+                "--capture-audio-off",
+            ];
+            values.extend(suffix);
+            let parsed = StartupArguments::parse(args(&values))
+                .unwrap()
+                .video
+                .unwrap();
+            assert_eq!(
+                parsed.mode.format_policy,
+                furami::domain::capture::InputFormatPolicy::Auto
+            );
+            assert_eq!(parsed.mode.size.width(), 1920);
+            assert_eq!(
+                parsed.mode.rate,
+                furami::domain::capture::FrameRate::new(60, 1).unwrap()
+            );
+        }
+        for fourcc in ["NV12", "BGR3", "AUTO"] {
+            let parsed = StartupArguments::parse(args(&[
+                "--capture-node",
+                "/dev/video0",
+                "--capture-size",
+                "1920x1080",
+                "--capture-rate",
+                "60000/1001",
+                "--capture-fourcc",
+                fourcc,
+            ]))
+            .unwrap()
+            .video
+            .unwrap();
+            assert_eq!(
+                parsed.mode.format_policy,
+                furami::domain::capture::InputFormatPolicy::Manual {
+                    fourcc: furami::domain::capture::CapturedFourCc::from_bytes(
+                        fourcc.as_bytes().try_into().unwrap()
+                    ),
+                }
+            );
+        }
     }
 
     #[test]

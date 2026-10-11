@@ -314,9 +314,9 @@ mod tests {
         .unwrap()
         .unwrap();
         CaptureSelection::from_snapshot(
-            &linux::session_fixture(&["/dev/video0"], args.mode),
+            &linux::session_fixture(&["/dev/video0"], mode()),
             &args.node,
-            args.mode,
+            mode(),
         )
         .unwrap()
     }
