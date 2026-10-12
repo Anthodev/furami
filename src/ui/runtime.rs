@@ -987,6 +987,7 @@ impl RuntimeCoordinator {
                 Command::Video(revision, mode) => {
                     let mut settings = engine.model().draft().settings.clone();
                     settings.video.mode = mode;
+                    settings.video.resolved_fourcc = None;
                     engine
                         .edit_draft(revision, settings)
                         .map_err(|error| error.to_string())?;
@@ -994,6 +995,8 @@ impl RuntimeCoordinator {
                 Command::Identity(revision, identity) => {
                     let mut settings = engine.model().draft().settings.clone();
                     settings.video.identity = identity;
+                    settings.video.resolved_fourcc = None;
+                    settings.video.selected_node = None;
                     engine
                         .edit_draft(revision, settings)
                         .map_err(|error| error.to_string())?;
@@ -1349,6 +1352,12 @@ impl RuntimeCoordinator {
         let quit = model.shutdown_ready();
         let mut diagnostic = String::new();
         if changed {
+            if model.active().is_some() {
+                diagnostic.push_str(&format!(
+                    "Active selection:\n{}\n",
+                    selection_text(desired_settings)
+                ));
+            }
             if let Some(rejection) = model.validation_rejection() {
                 diagnostic.push_str(&rejection.failure.to_string());
                 if let Some(treatment) = &rejection.failure.treatment {
@@ -1631,19 +1640,36 @@ fn selection_text(settings: &DraftSettings) -> String {
         .source()
         .map(|source| format!("{source:?}"))
         .unwrap_or_else(|| "none".into());
+    let policy = match mode.format_policy {
+        crate::domain::capture::InputFormatPolicy::Auto => "Auto".to_owned(),
+        crate::domain::capture::InputFormatPolicy::Manual { fourcc } => {
+            format!("Manual {}", String::from_utf8_lossy(&fourcc.bytes()))
+        }
+    };
+    let resolved = settings
+        .video
+        .resolved_fourcc
+        .map(|fourcc| {
+            format!(
+                "{} ({:#010x})",
+                String::from_utf8_lossy(&fourcc.bytes()),
+                fourcc.kernel_value()
+            )
+        })
+        .unwrap_or_else(|| "not prepared".into());
     format!(
-        "USB {:04x}:{:04x}\nController {} / ports {} / serial {}\n{} ({:#010x}) · {}×{} · {}/{} FPS\nAudio {}: {}",
+        "USB {:04x}:{:04x}\nController {} / ports {} / serial {}\nInput policy: {} · {}×{} · {}/{} FPS\nResolved input: {} (advertised selection, not negotiated proof)\nAudio {}: {}",
         identity.vendor_id(),
         identity.product_id(),
         identity.topology().controller(),
         ports,
         identity.serial().unwrap_or("none"),
-        String::from_utf8_lossy(&mode.captured_fourcc.bytes()),
-        mode.captured_fourcc.kernel_value(),
+        policy,
         mode.size.width(),
         mode.size.height(),
         mode.rate.numerator(),
         mode.rate.denominator(),
+        resolved,
         if settings.audio.enabled() {
             "enabled"
         } else {
@@ -1845,12 +1871,14 @@ mod tests {
         };
         DraftSettings {
             filters: crate::domain::filters::FilterChain::default(),
-            video: crate::domain::capture::ModeRequest {
-                identity: session_fixture(&["/dev/video0"], mode).devices()[0]
-                    .identity()
-                    .clone(),
-                mode,
-            },
+            video: crate::domain::capture::VideoRequest::manual(
+                crate::domain::capture::ModeRequest {
+                    identity: session_fixture(&["/dev/video0"], mode).devices()[0]
+                        .identity()
+                        .clone(),
+                    mode,
+                },
+            ),
             audio: AudioSelection::default(),
             renderer: crate::domain::render::RendererSettings::default(),
         }
@@ -1982,6 +2010,29 @@ mod tests {
                 update.can_set_gain,
                 update.changed,
                 update.audio_status
+            );
+            std::thread::yield_now();
+        }
+    }
+    /// The post-open committed watch is subscribed during the opening poll while
+    /// its authoritative observation is published by the fixture observation
+    /// worker and drained by a later poll. Settle that observation before
+    /// comparing exact `StateIdentity` values, which carry the stamp; later
+    /// polls are stable until a new subscription or validation refresh.
+    #[track_caller]
+    fn settle_committed_watch(runtime: &mut RuntimeCoordinator) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            runtime.poll();
+            let model = runtime.engine.as_ref().unwrap().model();
+            if model.observation().is_some_and(|observation| {
+                model.watch_target().unwrap().watch == observation.stamp.watch
+            }) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "committed watch observation was not delivered"
             );
             std::thread::yield_now();
         }
@@ -2764,6 +2815,35 @@ mod tests {
         cleanup(&mut runtime);
     }
     #[test]
+    fn qualification_auto_draft_remains_unprepared_and_manual_edit_stays_available() {
+        use crate::domain::capture::InputFormatPolicy;
+        let (mut runtime, drivers) = runtime();
+        runtime.poll();
+        let auto = runtime.qualification_command("draft-video 0 auto 1920x1080 60000/1001");
+        assert!(auto.saved_selection.contains("Input policy: Auto"));
+        assert!(
+            auto.saved_selection
+                .contains("Resolved input: not prepared")
+        );
+        let draft = &runtime.engine.as_ref().unwrap().model().draft().settings;
+        assert_eq!(draft.video.mode.format_policy, InputFormatPolicy::Auto);
+        assert!(draft.video.resolved_fourcc.is_none());
+        runtime.qualification_command("draft-video 1 BGR3 1920x1080 60000/1001");
+        let draft = &runtime.engine.as_ref().unwrap().model().draft().settings;
+        assert_eq!(
+            draft.video.mode.format_policy,
+            InputFormatPolicy::Manual {
+                fourcc: CapturedFourCc::from_bytes(*b"BGR3")
+            }
+        );
+        assert!(draft.video.resolved_fourcc.is_none());
+        assert!(
+            drivers.try_recv().is_err(),
+            "draft edits never create a stream or bypass tuple validation"
+        );
+        cleanup(&mut runtime);
+    }
+    #[test]
     fn stale_full_state_or_revision_rejected_without_worker_or_owner_effect() {
         let (mut runtime, drivers) = runtime();
         for line in [
@@ -2796,7 +2876,8 @@ mod tests {
             .apply(model.state_identity(), model.draft().revision)
             .unwrap();
         let initial_request = model.validation_request().unwrap().clone();
-        let Some(ModelEffect::Open { key: old, .. }) = model.validation_succeeded(&initial_request)
+        let Some(ModelEffect::Open { key: old, .. }) =
+            model.fixture_validation_succeeded(&initial_request)
         else {
             panic!("initial physical opening missing");
         };
@@ -2830,7 +2911,8 @@ mod tests {
             panic!("paused recovery validation missing");
         };
         assert_eq!(request.playback, InitialPlayback::Paused);
-        let Some(ModelEffect::Open { key: recovered, .. }) = model.validation_succeeded(&request)
+        let Some(ModelEffect::Open { key: recovered, .. }) =
+            model.fixture_validation_succeeded(&request)
         else {
             panic!("paused recovery physical opening missing");
         };
@@ -3137,6 +3219,7 @@ mod tests {
             assert!(drivers.try_recv().is_err());
         }
         let driver = start_live(&mut runtime, &drivers);
+        settle_committed_watch(&mut runtime);
         assert_eq!(
             runtime.engine.as_ref().unwrap().audio_availability(),
             Some(&AudioAvailability::Disabled)
@@ -3212,6 +3295,7 @@ mod tests {
     fn explicit_pause_rejected_by_unavailable_port_keeps_live_state_and_reports_status() {
         let (mut runtime, drivers) = runtime();
         let driver = start_live(&mut runtime, &drivers);
+        settle_committed_watch(&mut runtime);
         let before = runtime.engine.as_ref().unwrap().model().state_identity();
         // Replace only the admission port. Keep the real owner alive, then
         // restore its port before cleanup; this is not a physical owner failure.
@@ -3489,7 +3573,7 @@ mod tests {
     fn validate_enabled_audio(
         request: ValidationRequest,
     ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>) {
-        let snapshot = session_fixture(&["/dev/video0"], request.settings.video.mode);
+        let snapshot = session_fixture(&["/dev/video0"], request.settings.video.fixture_mode());
         let catalog = request
             .settings
             .audio

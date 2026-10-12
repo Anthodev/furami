@@ -379,10 +379,7 @@ impl OwnerEndpoint {
         let requested = config.video.requested();
         let settings = crate::domain::state::DraftSettings {
             filters: config.filters.clone(),
-            video: crate::domain::capture::ModeRequest {
-                identity: requested.identity.clone(),
-                mode: requested.mode,
-            },
+            video: config.video.video_request().clone(),
             audio: config.audio.clone(),
             renderer: config.treatments.renderer.requested().clone(),
         };
@@ -403,6 +400,7 @@ impl OwnerEndpoint {
                 let input = crate::capture::revalidate_authorized_input(
                     &settings,
                     config.selected_route.as_ref(),
+                    &config.video,
                     &fresh,
                 )
                 .map_err(|failure| {

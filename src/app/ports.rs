@@ -39,6 +39,8 @@ pub trait DraftValidator {
     /// Successful adapter evidence, including a freshly selected complete identity.
     fn prepared_settings(prepared: &Self::Prepared) -> &DraftSettings;
     fn prepared_stamp(prepared: &Self::Prepared) -> WatchStamp;
+    /// Actual node and USB syspaths, retained across a pre-owner watch cutover.
+    fn prepared_node(prepared: &Self::Prepared) -> Option<(&std::path::Path, &std::path::Path)>;
     fn begin_validate(&mut self, request: ValidationRequest) -> Result<(), SubmitFailure>;
     fn poll_validation(&mut self) -> Option<ValidationResult<Self::Prepared>>;
     /// Cancellation never discards the terminal result: consuming it drains work.
@@ -274,7 +276,7 @@ mod tests {
     fn settings() -> DraftSettings {
         DraftSettings {
             filters: crate::domain::filters::FilterChain::default(),
-            video: ModeRequest {
+            video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                 identity: DeviceIdentity::new(
                     0x32ed,
                     0x3701,
@@ -291,7 +293,7 @@ mod tests {
                     size: FrameSize::new(1280, 720).unwrap(),
                     rate: FrameRate::new(60, 1).unwrap(),
                 },
-            },
+            }),
             audio: AudioSelection::default(),
             renderer: RendererSettings::default(),
         }

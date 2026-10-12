@@ -27,11 +27,21 @@ View a console connected through a USB capture card, with playback controls besi
 
 ## First use
 
-Choose your capture device and one of its supported video modes. All four options are required:
+Choose your capture device and one of its supported video modes. The node, size and rate are required together; the input format defaults to **Auto**:
+
+```sh
+./furami --capture-node /dev/video0 --capture-size 2560x1440 --capture-rate 60/1
+```
+
+Omitting `--capture-fourcc`, or setting it to lowercase `auto`, selects among the chosen node's advertised formats for that exact size and rational rate, preferring `YUYV`, then `NV12`, then `MJPG`. This is an image-fidelity heuristic, not a latency or CPU/GPU ranking. Furami uses native V4L2 discovery; `v4l2-ctl` is not required.
+
+Pass an explicit FourCC to pin the input format; manual `BGR3` remains supported but is excluded from Auto:
 
 ```sh
 ./furami --capture-node /dev/video0 --capture-fourcc NV12 --capture-size 2560x1440 --capture-rate 60/1
 ```
+
+Unknown capabilities remain distinct from unsupported modes. Neither Auto nor manual selection silently lowers the size or rate, and an opening failure never triggers an alternate-format retry. Advertised support and the resolved input request are not proof of actual negotiation, held cadence or image quality.
 
 The values above are examples — use what your card actually supports. With no saved capture and no explicit selection, the window opens idle. Explicit capture arguments take precedence over automatic restoration until you apply them.
 
@@ -69,6 +79,10 @@ Focused controls keep their keys: `Space` types a space or activates the focused
 Furami stores a successfully applied capture selection plus the chosen **Auto/Manual output preference** and local volume, mute and fullscreen settings — saved at safe close even when idle or paused, and never a draft or live route. Closing with an edited, unapplied selection offers **Cancel close** or **Quit without applying**.
 
 The settings format is strict schema version 1. The output preference is an optional `output` entry inside `preferences`; documents written before that entry existed (meaning Auto) still load. A **Manual** entry is refused by older strict builds, so return the output to **Auto** and safely close before downgrading — no destructive reset is involved, and the applied capture selection is retained either way.
+
+The **input-format policy** is separate from the audio-output preference. An applied Auto input writes `"format_policy": "auto"` inside `applied.video`, alongside the last successfully applied concrete request. Documents without this marker retain their previous manual FourCC pin. Auto is resolved afresh at startup or a new full capture Apply; restart, resume and recovery retain the admitted concrete format. Older strict builds refuse the Auto marker, so successfully apply a manual input format and safely close before downgrading.
+
+Within the same process, those reopen operations also retain the admitted physical node/USB binding: a missing node is refused rather than replaced by a compatible sibling. This binding is not saved to JSON; a new process validates the saved selection afresh. Auto documents whose recorded concrete FourCC is outside `YUYV`, `NV12` or `MJPG` are refused at load, with the original preserved and automatic saves blocked. Manual `BGR3` documents remain valid.
 
 The file is `$XDG_CONFIG_HOME/furami/settings.json` when `XDG_CONFIG_HOME` is an absolute path. If that variable is unset or empty, Furami uses `$HOME/.config/furami/settings.json`. An invalid location is reported rather than replaced with a guessed path.
 

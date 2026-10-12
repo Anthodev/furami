@@ -2,8 +2,8 @@
 
 use crate::domain::{
     capture::{
-        CandidateId, CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize,
-        ObservationEpoch, SelectionToken, UsbTopology, WatchId, WatchStamp,
+        CandidateId, CaptureModeRequest, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize,
+        InputFormatPolicy, ObservationEpoch, SelectionToken, UsbTopology, WatchId, WatchStamp,
     },
     filters::FilterChain,
     render::RendererSettings,
@@ -33,7 +33,7 @@ pub(crate) struct ExpectedState {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Command {
     Snapshot,
-    Video(DraftRevision, CaptureMode),
+    Video(DraftRevision, CaptureModeRequest),
     Identity(DraftRevision, DeviceIdentity),
     Audio(DraftRevision, bool),
     Source(DraftRevision, String),
@@ -208,19 +208,24 @@ pub(crate) fn parse(line: &str) -> Result<Command, &'static str> {
         "snapshot" => Command::Snapshot,
         "draft-video" => {
             let revision = DraftRevision::new(unsigned(fields.next())?);
-            let fourcc = fields
-                .next()
-                .filter(|value| {
-                    value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_graphic())
-                })
-                .ok_or("FourCC requires four printable ASCII bytes")?;
-            let bytes: [u8; 4] = fourcc.as_bytes().try_into().map_err(|_| "invalid FourCC")?;
+            let value = fields.next().ok_or("auto or FourCC required")?;
+            let format_policy = if value == "auto" {
+                InputFormatPolicy::Auto
+            } else {
+                if value.len() != 4 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+                    return Err("FourCC requires four printable ASCII bytes");
+                }
+                let bytes: [u8; 4] = value.as_bytes().try_into().map_err(|_| "invalid FourCC")?;
+                InputFormatPolicy::Manual {
+                    fourcc: CapturedFourCc::from_bytes(bytes),
+                }
+            };
             let (width, height) = pair(fields.next(), 'x')?;
             let (numerator, denominator) = pair(fields.next(), '/')?;
             Command::Video(
                 revision,
-                CaptureMode {
-                    captured_fourcc: CapturedFourCc::from_bytes(bytes),
+                CaptureModeRequest {
+                    format_policy,
                     size: FrameSize::new(width, height).map_err(|_| "invalid size")?,
                     rate: FrameRate::new(numerator, denominator).map_err(|_| "invalid rate")?,
                 },
@@ -693,6 +698,24 @@ mod tests {
         ] {
             assert!(parse(line).is_err(), "{line}");
         }
+    }
+    #[test]
+    fn draft_video_auto_is_intent_only_and_manual_bgr3_is_preserved() {
+        let Command::Video(_, auto) = parse("draft-video 0 auto 1920x1080 60000/1001").unwrap()
+        else {
+            panic!("video command")
+        };
+        assert_eq!(auto.format_policy, InputFormatPolicy::Auto);
+        assert_eq!(auto.rate, FrameRate::new(60000, 1001).unwrap());
+        let Command::Video(_, manual) = parse("draft-video 1 BGR3 1920x1080 60/1").unwrap() else {
+            panic!("video command")
+        };
+        assert_eq!(
+            manual.format_policy,
+            InputFormatPolicy::Manual {
+                fourcc: CapturedFourCc::from_bytes(*b"BGR3")
+            }
+        );
     }
     #[test]
     fn technical_identity_rejects_node_aliases_and_invalid_ports() {

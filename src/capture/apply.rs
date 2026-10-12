@@ -101,6 +101,7 @@ pub fn validate_prepared(
         audio_catalog,
         stamp,
         None,
+        None,
         linux::query_intervals,
     )
 }
@@ -125,6 +126,7 @@ fn validate_prepared_fixture(
         audio_catalog,
         fixture_stamp(),
         None,
+        None,
         query,
     )
 }
@@ -135,12 +137,25 @@ fn validate_prepared_fixture(
 pub(crate) fn revalidate_authorized_input(
     settings: &DraftSettings,
     selected_route: Option<&SelectedRouteAuthorization>,
+    selection: &CaptureSelection,
     snapshot: &CaptureSnapshot,
 ) -> Result<InputSpec, ApplyFailure> {
+    let frozen = selection.video_request();
+    if settings.video.resolved_mode().is_none()
+        || settings.video.resolved_mode() != frozen.resolved_mode()
+        || settings.video.identity != frozen.identity
+    {
+        return Err(input_failure(
+            settings,
+            "match frozen owner input",
+            &InputError::MalformedSpec("prepared input differs from frozen selection"),
+        ));
+    }
     revalidate_authorized_with(
         settings,
         selected_route,
         snapshot,
+        Some(selection.physical_node()),
         linux::query_intervals,
         linux::revalidate_route,
     )
@@ -150,6 +165,7 @@ fn revalidate_authorized_with(
     settings: &DraftSettings,
     selected_route: Option<&SelectedRouteAuthorization>,
     snapshot: &CaptureSnapshot,
+    pinned_node: Option<(&std::path::Path, &std::path::Path)>,
     query: impl FnMut(
         &linux::CaptureDevice,
         &linux::CaptureNode,
@@ -170,7 +186,7 @@ fn revalidate_authorized_with(
             &CaptureError::Identity(crate::domain::capture::IdentityError::NotFound),
         ));
     }
-    let validated = validate_video_with(settings, snapshot, selected_route, query)?;
+    let validated = validate_video_with(settings, snapshot, selected_route, pinned_node, query)?;
     let node = unique_single_planar_node(settings, &validated)?;
     if let Some(selected) = selected_route {
         ensure_selected_node(settings, &validated, &node, selected)?;
@@ -193,6 +209,7 @@ fn validate_video_with<'a>(
     settings: &DraftSettings,
     snapshot: &'a CaptureSnapshot,
     selected_route: Option<&SelectedRouteAuthorization>,
+    pinned_node: Option<(&std::path::Path, &std::path::Path)>,
     query: impl FnMut(
         &linux::CaptureDevice,
         &linux::CaptureNode,
@@ -200,13 +217,26 @@ fn validate_video_with<'a>(
         crate::domain::capture::FrameSize,
     ) -> Result<linux::ExactSizeIntervals, CaptureError>,
 ) -> Result<ValidatedCapture<'a>, ApplyFailure> {
-    let validated = match selected_route {
-        None => linux::validate_with_injected_query(snapshot, &settings.video, query),
-        Some(selected) => {
-            linux::validate_authorized_with_query(snapshot, &settings.video, selected, query)
-        }
-    };
-    validated.map_err(|error| capture_failure(settings, "validate requested tuple", &error))
+    let validated = linux::resolve_video_with_query(
+        snapshot,
+        &settings.video,
+        selected_route,
+        pinned_node,
+        query,
+    );
+    validated.map_err(|error| {
+        capture_failure(
+            settings,
+            if settings.video.mode.format_policy == crate::domain::capture::InputFormatPolicy::Auto
+                && settings.video.resolved_fourcc.is_none()
+            {
+                "resolve automatic input format for the exact requested size/rate"
+            } else {
+                "validate requested tuple"
+            },
+            &error,
+        )
+    })
 }
 
 fn ensure_selected_node(
@@ -238,6 +268,7 @@ fn validate_prepared_with(
     _audio_catalog: &[AudioSource],
     stamp: WatchStamp,
     selected_route: Option<SelectedRouteAuthorization>,
+    pinned_node: Option<(&std::path::Path, &std::path::Path)>,
     query: impl FnMut(
         &crate::capture::linux::CaptureDevice,
         &crate::capture::linux::CaptureNode,
@@ -245,14 +276,22 @@ fn validate_prepared_with(
         crate::domain::capture::FrameSize,
     ) -> Result<crate::capture::linux::ExactSizeIntervals, CaptureError>,
 ) -> Result<PreparedCapture, ApplyFailure> {
-    let validated = validate_video_with(&settings, snapshot, selected_route.as_ref(), query)?;
+    let validated = validate_video_with(
+        &settings,
+        snapshot,
+        selected_route.as_ref(),
+        pinned_node,
+        query,
+    )?;
     let node = unique_single_planar_node(&settings, &validated)?;
     if let Some(selected) = &selected_route {
         ensure_selected_node(&settings, &validated, &node, selected)?;
     }
     settings.video.identity = validated.identity().clone();
-    let selection = CaptureSelection::from_snapshot(snapshot, node.as_path(), settings.video.mode)
-        .map_err(|error| selection_failure(&settings, "resolve the selected route", &error))?;
+    settings.video.resolved_fourcc = Some(validated.mode().captured_fourcc);
+    let selection =
+        CaptureSelection::from_prepared(snapshot, node.as_path(), settings.video.clone())
+            .map_err(|error| selection_failure(&settings, "resolve the selected route", &error))?;
     // Built from the same proven ValidatedCapture: one validation pass, no
     // second live interval query, identical route proof.
     let input = InputSpec::from_validated(&validated, Some(node.as_path()))
@@ -414,8 +453,30 @@ pub(crate) fn fixture_prepared_at(
     settings: DraftSettings,
     stamp: WatchStamp,
 ) -> Result<PreparedCapture, ApplyFailure> {
-    let snapshot = crate::capture::linux::session_fixture(&["/dev/video0"], settings.video.mode);
+    let snapshot =
+        crate::capture::linux::session_fixture(&["/dev/video0"], settings.video.fixture_mode());
     validate_prepared(settings, &snapshot, &[], stamp)
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_request_prepared(
+    request: &ValidationRequest,
+    snapshot: &CaptureSnapshot,
+    stamp: WatchStamp,
+) -> Result<PreparedCapture, ApplyFailure> {
+    let rate = request.settings.video.mode.rate;
+    validate_prepared_with(
+        request.settings.clone(),
+        snapshot,
+        &[],
+        stamp,
+        None,
+        request
+            .pinned_node
+            .as_ref()
+            .map(|(node, usb)| (node.as_path(), usb.as_path())),
+        |_device, _node, fourcc, size| Ok(linux::fixture_exact_intervals(fourcc, size, rate)),
+    )
 }
 
 #[cfg(test)]
@@ -432,6 +493,7 @@ pub(super) fn fixture_authorized_prepared_at(
         &[],
         stamp,
         Some(selected),
+        None,
         |_device, _node, fourcc, size| Ok(linux::fixture_exact_intervals(fourcc, size, rate)),
     )
 }
@@ -502,7 +564,7 @@ fn run_validation(
         Err(error) => ValidationOutcome::Failed(error.clone()),
         Ok(snapshot) => {
             if request.choice.is_none()
-                && scan.target.video == request.settings.video
+                && scan.target.video.same_request(&request.settings.video)
                 && let VideoPresence::Ambiguous(candidates) = &scan.observation.video
             {
                 let mut eligible = Vec::new();
@@ -520,6 +582,10 @@ fn run_validation(
                             &request.settings,
                             snapshot,
                             Some(authorization),
+                            request
+                                .pinned_node
+                                .as_ref()
+                                .map(|(node, usb)| (node.as_path(), usb.as_path())),
                             linux::query_intervals,
                         )?;
                         let node = unique_single_planar_node(&request.settings, &validated)?;
@@ -548,6 +614,10 @@ fn run_validation(
                     &[],
                     stamp,
                     selected_route,
+                    request
+                        .pinned_node
+                        .as_ref()
+                        .map(|(node, usb)| (node.as_path(), usb.as_path())),
                     linux::query_intervals,
                 ) {
                     Ok(prepared) => ValidationOutcome::Prepared(prepared),
@@ -699,6 +769,9 @@ impl DraftValidator for CaptureValidator {
 
     fn prepared_stamp(prepared: &Self::Prepared) -> WatchStamp {
         prepared.stamp()
+    }
+    fn prepared_node(prepared: &Self::Prepared) -> Option<(&std::path::Path, &std::path::Path)> {
+        Some(prepared.selection().physical_node())
     }
 
     fn watch(&mut self, target: RecoveryWatchTarget) -> Result<(), SubmitFailure> {
@@ -870,10 +943,10 @@ mod tests {
     ) -> DraftSettings {
         DraftSettings {
             filters: crate::domain::filters::FilterChain::default(),
-            video: ModeRequest {
+            video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                 identity: video_identity,
                 mode,
-            },
+            }),
             audio,
             renderer: crate::domain::render::RendererSettings::default(),
         }
@@ -881,6 +954,7 @@ mod tests {
 
     fn request(settings: DraftSettings) -> ValidationRequest {
         ValidationRequest {
+            pinned_node: None,
             key: ValidationKey {
                 apply: ApplyId::new(1).unwrap(),
                 purpose: AttemptPurpose::Candidate,
@@ -1143,7 +1217,7 @@ mod tests {
 
     fn fixture_runner() -> fn(ValidationRequest) -> WorkerOutcome {
         fn execute(request: ValidationRequest) -> WorkerOutcome {
-            let snapshot = session_fixture(&["/dev/video0"], request.settings.video.mode);
+            let snapshot = session_fixture(&["/dev/video0"], request.settings.video.fixture_mode());
             let outcome = validate_prepared(request.settings.clone(), &snapshot, &fixture_audio());
             (request, outcome)
         }
@@ -1243,7 +1317,7 @@ mod tests {
                     Ok(()) | Err(mpsc::RecvError) => {}
                 }
             }
-            let snapshot = session_fixture(&["/dev/video0"], request.settings.video.mode);
+            let snapshot = session_fixture(&["/dev/video0"], request.settings.video.fixture_mode());
             let outcome = validate_prepared(request.settings.clone(), &snapshot, &fixture_audio());
             (request, outcome)
         }
@@ -1263,6 +1337,7 @@ mod tests {
             AudioSelection::default(),
         ));
         let original = ValidationRequest {
+            pinned_node: None,
             key: ValidationKey {
                 apply: ApplyId::new(2).unwrap(),
                 purpose: original.key.purpose,
@@ -1305,7 +1380,7 @@ mod tests {
             if request.key.apply.get() == 2 {
                 panic!("fixture runner explosion");
             }
-            let snapshot = session_fixture(&["/dev/video0"], request.settings.video.mode);
+            let snapshot = session_fixture(&["/dev/video0"], request.settings.video.fixture_mode());
             let outcome = validate_prepared(request.settings.clone(), &snapshot, &fixture_audio());
             (request, outcome)
         }
@@ -1316,6 +1391,7 @@ mod tests {
             AudioSelection::default(),
         ));
         let gated = ValidationRequest {
+            pinned_node: None,
             key: ValidationKey {
                 apply: ApplyId::new(2).unwrap(),
                 purpose: gated.key.purpose,
@@ -1529,6 +1605,7 @@ mod tests {
             requested,
             selected,
             snapshot,
+            None,
             |_device, _node, fourcc, size| {
                 Ok(linux::fixture_exact_intervals(fourcc, size, mode().rate))
             },
@@ -1568,13 +1645,14 @@ mod tests {
             &[],
             fixture_stamp(),
             Some(selected.clone()),
+            None,
             |_device, _node, fourcc, size| {
                 Ok(linux::fixture_exact_intervals(fourcc, size, mode().rate))
             },
         )
         .unwrap();
         assert_eq!(prepared.settings().video.identity, chosen);
-        assert_eq!(prepared.settings().video.mode, mode());
+        assert_eq!(prepared.settings().video.fixture_mode(), mode());
         let second =
             authorized_input(prepared.settings(), prepared.selected_route(), &snapshot).unwrap();
         assert_eq!(second.node(), Path::new("/dev/video1"));
@@ -1669,6 +1747,7 @@ mod tests {
             &requested,
             None,
             &snapshot,
+            None,
             |_device, _node, fourcc, size| {
                 Ok(linux::fixture_exact_intervals(fourcc, size, mode().rate))
             },
@@ -1681,5 +1760,54 @@ mod tests {
         .unwrap_err();
         assert_eq!(failure.stage, Stage::Prevalidation);
         assert!(failure.diagnostic.contains("no longer matches"));
+    }
+
+    #[test]
+    fn auto_preparation_preserves_policy_and_reuses_exact_query_proof() {
+        use crate::capture::linux::session_range_fixture;
+        use crate::domain::capture::InputFormatPolicy;
+        let snapshot = session_range_fixture(&["/dev/video0"], mode());
+        let mut requested = settings(fixture_identity(), mode(), AudioSelection::default());
+        requested.video.mode.format_policy = InputFormatPolicy::Auto;
+        requested.video.resolved_fourcc = None;
+        requested.video.selected_node = Some("/dev/video0".into());
+        let mut queries = 0;
+        let prepared =
+            validate_prepared_fixture(requested.clone(), &snapshot, &[], |_, _, fourcc, size| {
+                queries += 1;
+                Ok(linux::fixture_exact_intervals(fourcc, size, mode().rate))
+            })
+            .unwrap();
+        assert_eq!(
+            queries, 1,
+            "same proof constructs InputSpec without another query"
+        );
+        assert_eq!(
+            prepared.settings().video.mode.format_policy,
+            InputFormatPolicy::Auto
+        );
+        assert_eq!(
+            prepared.settings().video.resolved_fourcc,
+            Some(mode().captured_fourcc)
+        );
+        assert!(requested.video.resolved_fourcc.is_none());
+        assert_eq!(prepared.selection().requested().mode, mode());
+        let changed = session_fixture(
+            &["/dev/video0"],
+            crate::domain::capture::CaptureMode {
+                captured_fourcc: crate::domain::capture::CapturedFourCc::from_bytes(*b"YUYV"),
+                ..mode()
+            },
+        );
+        let error = revalidate_authorized_with(
+            prepared.settings(),
+            None,
+            &changed,
+            Some(prepared.selection().physical_node()),
+            |_, _, _, _| panic!("pinned discrete mode"),
+            |_, _| panic!("refused mode must not create backend input"),
+        )
+        .unwrap_err();
+        assert!(error.diagnostic.contains("unsupported"));
     }
 }

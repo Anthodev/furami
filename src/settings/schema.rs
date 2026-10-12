@@ -16,8 +16,9 @@ use thiserror::Error;
 
 use super::store::{LocalPreferences, StoredDocument};
 use crate::domain::capture::{
-    AudioError, AudioSelection, AudioSourceIdentity, CaptureDataError, CaptureMode, CapturedFourCc,
-    DeviceIdentity, FrameRate, FrameSize, ModeRequest, PlaybackGain, UsbTopology,
+    AudioError, AudioSelection, AudioSourceIdentity, CaptureDataError, CaptureModeRequest,
+    CapturedFourCc, DeviceIdentity, FrameRate, FrameSize, InputFormatPolicy, PlaybackGain,
+    UsbTopology, VideoRequest,
 };
 use crate::domain::filters::FilterChain;
 use crate::domain::output::{PersistentOutputChoice, SinkIdentity};
@@ -27,13 +28,24 @@ use crate::domain::state::DraftSettings;
 /// On-disk schema version this module reads and writes.
 pub(crate) const SCHEMA_VERSION: u64 = 1;
 
-/// Value-level rejection after a structurally valid document was decoded.
+/// Value-level rejection of a structurally valid document, on decode or on
+/// encode before any bytes are written.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SettingsValidationError {
     #[error("video identity is invalid: {0}")]
     VideoIdentity(#[from] CaptureDataError),
     #[error("audio selection is invalid: {0}")]
     Audio(#[from] AudioError),
+    /// Encode-only: an applied video request has no proven concrete format, so
+    /// it must never be written as if a mode had been opened. The decoder always
+    /// produces a concrete opening, so this can never arise on load.
+    #[error("applied video request has no resolved capture format")]
+    UnresolvedVideo,
+    /// A manual pin and the resolved concrete format disagree, or an automatic
+    /// policy resolves to a non-concrete FourCC: the document would not describe
+    /// the verified opening. Guards both the encode and decode boundaries.
+    #[error("applied video format policy does not match its resolved capture format")]
+    VideoFormatPolicyMismatch,
 }
 
 /// Internal decode failure taxonomy; `store` adds the file path.
@@ -160,12 +172,18 @@ struct AppliedV1 {
     renderer: RendererSettings,
 }
 
-object_dto! {
-    #[derive(Debug)]
-    struct VideoV1 {
-        identity: DeviceIdentityV1,
-        mode: CaptureModeV1,
-    }
+/// The applied video request. `identity` and `mode` stay mandatory; the optional
+/// `format_policy` marker is absent-by-default for backward compatibility with
+/// documents written before automatic selection existed. A present marker is
+/// decoded straight into the validated policy (never through an intermediate
+/// `Value`), so an explicit `null` is a schema violation rather than the
+/// manual default. The custom deserializer below replaces the `object_dto!`
+/// derive for exactly that reason.
+#[derive(Debug)]
+struct VideoV1 {
+    identity: DeviceIdentityV1,
+    mode: CaptureModeV1,
+    format_policy: Option<FormatPolicyV1>,
 }
 
 #[derive(Debug)]
@@ -184,6 +202,8 @@ object_dto! {
     }
 }
 
+// Wire shape of a capture mode: the concrete proven opening. The automatic
+// selection policy lives beside it as `VideoV1.format_policy`, not here.
 object_dto! {
     #[derive(Debug, Serialize)]
     struct CaptureModeV1 {
@@ -192,6 +212,14 @@ object_dto! {
         height: u32,
         fps: FrameRateV1,
     }
+}
+
+/// The only accepted `format_policy` marker. Manual is represented by omitting
+/// the key entirely so pre-policy v1 documents keep their exact shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum FormatPolicyV1 {
+    Auto,
 }
 
 object_dto! {
@@ -256,6 +284,7 @@ object_dto! {
 const DOCUMENT_FIELDS: &[&str] = &["schema_version", "applied", "preferences"];
 const APPLIED_FIELDS: &[&str] = &["video", "audio", "filters", "renderer"];
 const IDENTITY_FIELDS: &[&str] = &["vendor_id", "product_id", "topology", "serial"];
+const VIDEO_FIELDS: &[&str] = &["identity", "mode", "format_policy"];
 const AUDIO_FIELDS: &[&str] = &["kind", "source", "retained"];
 const PREFS_FIELDS: &[&str] = &["volume_percent", "muted", "fullscreen", "output"];
 const OUTPUT_FIELDS: &[&str] = &["kind", "sink"];
@@ -473,6 +502,103 @@ impl<'de> Visitor<'de> for OutputVisitor {
             }),
             other => Err(de::Error::unknown_variant(other, &["auto", "manual"])),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for FormatPolicyV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // `deserialize_str`, not a generic value: only the literal string
+        // `"auto"` is a policy marker, so `null`, numbers and arrays are
+        // rejected as invalid types rather than coerced.
+        struct FormatPolicyVisitor;
+
+        impl Visitor<'_> for FormatPolicyVisitor {
+            type Value = FormatPolicyV1;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("the string \"auto\"")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "auto" => Ok(FormatPolicyV1::Auto),
+                    other => Err(de::Error::unknown_variant(other, &["auto"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(FormatPolicyVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for VideoV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Not the `object_dto!` derive: `format_policy` is absent-by-default for
+        // backward compatibility, and a plain `Option` field would also accept
+        // an explicit `null`. The visitor refuses `null` (the marker type is
+        // string-only) while still defaulting only a missing key to manual.
+        deserializer.deserialize_struct("VideoV1", VIDEO_FIELDS, VideoVisitor)
+    }
+}
+
+struct VideoVisitor;
+
+impl<'de> Visitor<'de> for VideoVisitor {
+    type Value = VideoV1;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a video object with identity, mode and optional format_policy")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut identity: Option<DeviceIdentityV1> = None;
+        let mut mode: Option<CaptureModeV1> = None;
+        let mut format_policy: Option<FormatPolicyV1> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "identity" => {
+                    if identity.is_some() {
+                        return Err(de::Error::duplicate_field("identity"));
+                    }
+                    identity = Some(map.next_value()?);
+                }
+                "mode" => {
+                    if mode.is_some() {
+                        return Err(de::Error::duplicate_field("mode"));
+                    }
+                    mode = Some(map.next_value()?);
+                }
+                "format_policy" => {
+                    if format_policy.is_some() {
+                        return Err(de::Error::duplicate_field("format_policy"));
+                    }
+                    // Present field decodes the marker directly: an explicit
+                    // `null` is refused, only the absent key defaults to the
+                    // legacy manual pin.
+                    format_policy = Some(map.next_value::<FormatPolicyV1>()?);
+                }
+                other => return Err(de::Error::unknown_field(other, VIDEO_FIELDS)),
+            }
+        }
+
+        Ok(VideoV1 {
+            identity: identity.ok_or_else(|| de::Error::missing_field("identity"))?,
+            mode: mode.ok_or_else(|| de::Error::missing_field("mode"))?,
+            format_policy,
+        })
     }
 }
 
@@ -783,6 +909,10 @@ struct AppliedWrite<'a> {
 struct VideoWrite<'a> {
     identity: DeviceIdentityWrite<'a>,
     mode: CaptureModeV1,
+    /// Omitted for a manual pin so pre-policy v1 documents keep their exact
+    /// wire shape; only the automatic policy is recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format_policy: Option<FormatPolicyV1>,
 }
 
 #[derive(Serialize)]
@@ -855,9 +985,13 @@ fn renderer_is_baseline(renderer: &RendererSettings) -> bool {
 /// rebuilding strings/vectors or sorting already-normalized properties.
 pub(crate) fn encode(document: &StoredDocument) -> Result<Vec<u8>, EncodeError> {
     let preferences = preferences_to_dto(&document.preferences)?;
+    let applied = match document.applied.as_ref() {
+        Some(applied) => Some(applied_to_dto(applied)?),
+        None => None,
+    };
     let document = DocumentWrite {
         schema_version: SCHEMA_VERSION,
-        applied: document.applied.as_ref().map(applied_to_dto),
+        applied,
         preferences,
     };
     let mut bytes = serde_json::to_vec(&document).map_err(EncodeError::Serialize)?;
@@ -869,13 +1003,13 @@ pub(crate) fn encode(document: &StoredDocument) -> Result<Vec<u8>, EncodeError> 
 // Domain conversions
 // ---------------------------------------------------------------------------
 
-fn applied_to_dto(applied: &DraftSettings) -> AppliedWrite<'_> {
-    AppliedWrite {
-        video: video_to_dto(&applied.video),
+fn applied_to_dto(applied: &DraftSettings) -> Result<AppliedWrite<'_>, SettingsValidationError> {
+    Ok(AppliedWrite {
+        video: video_to_dto(&applied.video)?,
         audio: audio_to_dto(&applied.audio),
         filters: &applied.filters,
         renderer: &applied.renderer,
-    }
+    })
 }
 
 fn applied_from_dto(applied: AppliedV1) -> Result<DraftSettings, SettingsValidationError> {
@@ -887,11 +1021,27 @@ fn applied_from_dto(applied: AppliedV1) -> Result<DraftSettings, SettingsValidat
     })
 }
 
-fn video_to_dto(video: &ModeRequest) -> VideoWrite<'_> {
+fn video_to_dto(video: &VideoRequest) -> Result<VideoWrite<'_>, SettingsValidationError> {
+    // Only a proven concrete opening may be persisted: an unresolved request
+    // must never be written as if a mode had been verified.
+    if video.resolved_fourcc.is_none() {
+        return Err(SettingsValidationError::UnresolvedVideo);
+    }
+    // The domain resolution invariant is the single authority on what a proven
+    // opening is: a manual pin must equal the resolved concrete and an
+    // automatic resolution must be one of YUYV/NV12/MJPG. A constructed
+    // document that violates it must refuse rather than persist a fake proof.
+    let concrete = video
+        .resolved_mode()
+        .ok_or(SettingsValidationError::VideoFormatPolicyMismatch)?
+        .captured_fourcc;
+    let format_policy = match video.mode.format_policy {
+        InputFormatPolicy::Auto => Some(FormatPolicyV1::Auto),
+        InputFormatPolicy::Manual { .. } => None,
+    };
     let identity = &video.identity;
     let topology = identity.topology();
-    let mode = video.mode;
-    VideoWrite {
+    Ok(VideoWrite {
         identity: DeviceIdentityWrite {
             vendor_id: identity.vendor_id(),
             product_id: identity.product_id(),
@@ -902,36 +1052,61 @@ fn video_to_dto(video: &ModeRequest) -> VideoWrite<'_> {
             serial: identity.serial(),
         },
         mode: CaptureModeV1 {
-            captured_fourcc: mode.captured_fourcc.kernel_value(),
-            width: mode.size.width(),
-            height: mode.size.height(),
+            captured_fourcc: concrete.kernel_value(),
+            width: video.mode.size.width(),
+            height: video.mode.size.height(),
             fps: FrameRateV1 {
-                numerator: mode.rate.numerator(),
-                denominator: mode.rate.denominator(),
+                numerator: video.mode.rate.numerator(),
+                denominator: video.mode.rate.denominator(),
             },
         },
-    }
+        format_policy,
+    })
 }
 
-fn video_from_dto(video: VideoV1) -> Result<ModeRequest, SettingsValidationError> {
+fn video_from_dto(video: VideoV1) -> Result<VideoRequest, SettingsValidationError> {
+    let VideoV1 {
+        identity,
+        mode,
+        format_policy,
+    } = video;
     let DeviceIdentityV1 {
         vendor_id,
         product_id,
         topology,
         serial,
-    } = video.identity;
+    } = identity;
     let topology = UsbTopology::new(topology.controller, topology.ports)?;
     let identity = DeviceIdentity::new(vendor_id, product_id, topology, serial)?;
-    let mode = video.mode;
 
-    Ok(ModeRequest {
+    // The stored concrete format is the proven opening. An absent marker is the
+    // legacy manual pin; the `"auto"` marker keeps the historical concrete as
+    // an audit value that startup clears before a fresh selection.
+    let concrete = CapturedFourCc::from_kernel(mode.captured_fourcc);
+    let format_policy = match format_policy {
+        Some(FormatPolicyV1::Auto) => InputFormatPolicy::Auto,
+        None => InputFormatPolicy::Manual { fourcc: concrete },
+    };
+
+    let request = VideoRequest {
         identity,
-        mode: CaptureMode {
-            captured_fourcc: CapturedFourCc::from_kernel(mode.captured_fourcc),
+        mode: CaptureModeRequest {
+            format_policy,
             size: FrameSize::new(mode.width, mode.height)?,
             rate: FrameRate::new(mode.fps.numerator, mode.fps.denominator)?,
         },
-    })
+        resolved_fourcc: Some(concrete),
+        selected_node: None,
+    };
+    // A structurally valid document can still describe no verified opening: the
+    // automatic policy only ever resolves to YUYV/NV12/MJPG, so an on-disk auto
+    // marker paired with a manual-only or unrecognized FourCC must be refused at
+    // the same domain invariant that guards the encode side rather than loaded as
+    // a poison baseline (startup Auto clearing repairs a live mode, not the store).
+    if request.resolved_mode().is_none() {
+        return Err(SettingsValidationError::VideoFormatPolicyMismatch);
+    }
+    Ok(request)
 }
 
 fn audio_to_dto(selection: &AudioSelection) -> AudioWrite<'_> {

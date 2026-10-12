@@ -1276,7 +1276,10 @@ fn verified_receipt(
         return Ok(None);
     };
     if session.requested.identity != settings.video.identity
-        || session.requested.mode != settings.video.mode
+        || settings
+            .video
+            .resolved_mode()
+            .is_none_or(|mode| session.requested.mode != mode)
     {
         return Err(ApplyFailure::new(
             FailureCategory::Session,
@@ -1459,6 +1462,11 @@ mod tests {
         }
         fn prepared_stamp(prepared: &Self::Prepared) -> crate::domain::capture::WatchStamp {
             prepared.stamp()
+        }
+        fn prepared_node(
+            prepared: &Self::Prepared,
+        ) -> Option<(&std::path::Path, &std::path::Path)> {
+            Some(prepared.selection().physical_node())
         }
         fn watch(
             &mut self,
@@ -1688,7 +1696,7 @@ mod tests {
             }
             assert_eq!(opens.borrow().len(), 1, "no owner before native release");
             assert_eq!(app.gain(), gap_gain);
-            assert_eq!(app.model().draft().settings, draft);
+            assert!(app.model().draft().settings.same_request(&draft));
             app.runner_mut().native_released(first);
             fixture_wait(&mut app, "single fresh resume opening", |app| {
                 app.model().opening().is_some()
@@ -1713,14 +1721,14 @@ mod tests {
             );
             assert_eq!(app.model().active().unwrap().applied().settings(), &applied);
             assert_eq!(app.model().draft().revision, revision);
-            assert_eq!(app.model().draft().settings, draft);
+            assert!(app.model().draft().settings.same_request(&draft));
             assert_eq!(app.gain(), gap_gain);
             assert_eq!(app.validator_mut().requests.len(), 2);
             let actual_opens = opens.borrow();
             assert_eq!(actual_opens.len(), 2);
             for (_, facts, _) in actual_opens.iter() {
                 assert_eq!(facts.identity, applied.video.identity);
-                assert_eq!(facts.mode, applied.video.mode);
+                assert_eq!(facts.mode, applied.video.fixture_mode());
             }
             assert_eq!(actual_opens[1].2, gap_gain);
             drop(actual_opens);
@@ -1799,12 +1807,14 @@ mod tests {
         };
         DraftSettings {
             filters: crate::domain::filters::FilterChain::default(),
-            video: crate::domain::capture::ModeRequest {
-                identity: session_fixture(&["/dev/video0"], mode).devices()[0]
-                    .identity()
-                    .clone(),
-                mode,
-            },
+            video: crate::domain::capture::VideoRequest::manual(
+                crate::domain::capture::ModeRequest {
+                    identity: session_fixture(&["/dev/video0"], mode).devices()[0]
+                        .identity()
+                        .clone(),
+                    mode,
+                },
+            ),
             audio: AudioSelection::default(),
             renderer: crate::domain::render::RendererSettings::default(),
         }
@@ -3077,7 +3087,7 @@ mod tests {
                     fixture_app_ready(&mut app, &restored_driver, restored.attempt);
                     assert_eq!(app.model().phase(), ProductPhase::ErrorWithActiveRestored);
                     assert_eq!(app.model().active().unwrap().applied().settings(), &prior);
-                    assert_eq!(app.model().draft().settings, candidate);
+                    assert!(app.model().draft().settings.same_request(&candidate));
                     assert_eq!(
                         app.model().failures().unwrap().candidate.as_ref(),
                         Some(&cause)
@@ -3310,7 +3320,7 @@ mod tests {
         let loss = app.model().recovery().unwrap();
         assert_eq!(loss.applied.settings(), &prior);
         assert_eq!(loss.evidence, LossEvidence::Removed { stamp });
-        assert_eq!(app.model().draft().settings, candidate);
+        assert!(app.model().draft().settings.same_request(&candidate));
         assert!(!app.has_user_apply_result_or_pending(key.apply));
         driver
             .shutdown_started
@@ -3342,7 +3352,7 @@ mod tests {
             .unwrap();
         fixture_app_ready(&mut app, &recovered_driver, recovery.attempt);
         assert_eq!(app.model().active().unwrap().applied().settings(), &prior);
-        assert_eq!(app.model().draft().settings, candidate);
+        assert!(app.model().draft().settings.same_request(&candidate));
         assert!(drivers.try_recv().is_err());
         fixture_app_quit(&mut app);
     }
@@ -3399,7 +3409,7 @@ mod tests {
         assert_eq!(app.model().phase(), ProductPhase::RestoringTreatments);
         assert_eq!(app.model().treating().unwrap().prior().settings(), &prior);
         assert!(!app.has_user_apply_result_or_pending(source_admission.id()));
-        assert_eq!(app.model().draft().settings, newer);
+        assert!(app.model().draft().settings.same_request(&newer));
         assert_eq!(
             app.model()
                 .failures()
@@ -3440,7 +3450,7 @@ mod tests {
         fixture_app_ready(&mut app, &restored_driver, restore.attempt);
         assert_eq!(app.model().phase(), ProductPhase::ErrorWithActiveRestored);
         assert_eq!(app.model().active().unwrap().applied().settings(), &prior);
-        assert_eq!(app.model().draft().settings, newer);
+        assert!(app.model().draft().settings.same_request(&newer));
         assert_eq!(app.validator_mut().requests.len(), 3);
         assert!(app.take_verified_applied().is_none());
         assert!(
@@ -4652,7 +4662,7 @@ mod tests {
                     .is_some_and(|active| active.attempt() != resumed)
             });
             assert_eq!(app.model().active().unwrap().applied().settings(), &prior);
-            assert_eq!(app.model().draft().settings, newer);
+            assert!(app.model().draft().settings.same_request(&newer));
             assert!(
                 app.take_verified_applied().is_none(),
                 "Restart has no user-save event"
@@ -5394,7 +5404,7 @@ mod tests {
                     if renderer.property == RendererProperty::Cscale
                         && matches!(renderer.kind, RendererErrorKind::Rejected { .. }))
                 );
-                assert_eq!(app.model().draft().settings, draft);
+                assert!(app.model().draft().settings.same_request(&draft));
                 assert_eq!(app.model().last_valid(), Some(&prior));
                 assert!(
                     app.take_verified_applied().is_none(),
@@ -5506,7 +5516,7 @@ mod tests {
             );
             assert_ne!(app.model().active().unwrap().attempt(), original);
             assert_eq!(app.model().last_valid(), Some(&prior));
-            assert_eq!(app.model().draft().settings, candidate);
+            assert!(app.model().draft().settings.same_request(&candidate));
             assert_eq!(
                 app.model()
                     .confirmed_treatments()

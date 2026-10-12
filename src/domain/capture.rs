@@ -39,7 +39,7 @@ pub struct WatchStamp {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecoveryWatchTarget {
     pub watch: WatchId,
-    pub video: ModeRequest,
+    pub video: VideoRequest,
     pub audio: AudioSelection,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -579,6 +579,111 @@ pub struct CaptureMode {
 pub struct ModeRequest {
     pub identity: DeviceIdentity,
     pub mode: CaptureMode,
+}
+
+/// User intent remains distinct from the format proven for one opening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum InputFormatPolicy {
+    Auto,
+    Manual { fourcc: CapturedFourCc },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CaptureModeRequest {
+    pub format_policy: InputFormatPolicy,
+    pub size: FrameSize,
+    pub rate: FrameRate,
+}
+impl CaptureModeRequest {
+    pub fn manual(mode: CaptureMode) -> Self {
+        Self {
+            format_policy: InputFormatPolicy::Manual {
+                fourcc: mode.captured_fourcc,
+            },
+            size: mode.size,
+            rate: mode.rate,
+        }
+    }
+
+    pub fn with_fourcc(self, captured_fourcc: CapturedFourCc) -> CaptureMode {
+        CaptureMode {
+            captured_fourcc,
+            size: self.size,
+            rate: self.rate,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VideoRequest {
+    pub identity: DeviceIdentity,
+    pub mode: CaptureModeRequest,
+    pub resolved_fourcc: Option<CapturedFourCc>,
+    /// Command-line route hint; never part of persisted device identity.
+    pub selected_node: Option<std::path::PathBuf>,
+}
+impl VideoRequest {
+    pub fn manual(request: ModeRequest) -> Self {
+        Self {
+            identity: request.identity,
+            mode: CaptureModeRequest::manual(request.mode),
+            resolved_fourcc: Some(request.mode.captured_fourcc),
+            selected_node: None,
+        }
+    }
+
+    pub fn resolved_mode(&self) -> Option<CaptureMode> {
+        let fourcc = self.resolved_fourcc?;
+        match self.mode.format_policy {
+            InputFormatPolicy::Manual { fourcc: pin } if pin != fourcc => return None,
+            InputFormatPolicy::Auto
+                if ![*b"YUYV", *b"NV12", *b"MJPG"].contains(&fourcc.bytes()) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        Some(self.mode.with_fourcc(fourcc))
+    }
+
+    pub fn same_request(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.mode == other.mode
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_mode(&self) -> CaptureMode {
+        let fourcc = self
+            .resolved_fourcc
+            .or(match self.mode.format_policy {
+                InputFormatPolicy::Manual { fourcc } => Some(fourcc),
+                InputFormatPolicy::Auto => None,
+            })
+            .expect("auto fixtures must provide actual capabilities explicitly");
+        self.mode.with_fourcc(fourcc)
+    }
+
+    /// Watchers only shortlist routes; exact ranged intervals remain a validator's job.
+    pub fn may_use(&self, capabilities: &NodeCapabilities) -> bool {
+        let supports = |fourcc| {
+            matches!(
+                capabilities.assess(
+                    CaptureBufferType::SinglePlanar,
+                    self.mode.with_fourcc(fourcc)
+                ),
+                SupportVerdict::Supported | SupportVerdict::NeedsExactIntervals
+            )
+        };
+        if let Some(fourcc) = self.resolved_fourcc {
+            return self.resolved_mode().is_some() && supports(fourcc);
+        }
+        match self.mode.format_policy {
+            InputFormatPolicy::Manual { fourcc } => supports(fourcc),
+            InputFormatPolicy::Auto => [*b"YUYV", *b"NV12", *b"MJPG"]
+                .into_iter()
+                .any(|bytes| supports(CapturedFourCc::from_bytes(bytes))),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

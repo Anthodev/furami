@@ -27,10 +27,10 @@ use crate::{
     app::ports::SubmitFailure,
     domain::{
         capture::{
-            AudioError, AudioSelection, CandidateId, CaptureBufferType, DeviceIdentity,
-            IdentityError, ObservationEpoch, RecoveryCandidate, RecoveryObservation,
-            RecoveryWatchTarget, SelectedRouteAuthorization, SelectionToken, SourcePresence,
-            SupportVerdict, VideoPresence, WatchStamp, resolve_identity,
+            AudioError, AudioSelection, CandidateId, DeviceIdentity, IdentityError,
+            ObservationEpoch, RecoveryCandidate, RecoveryObservation, RecoveryWatchTarget,
+            SelectedRouteAuthorization, SelectionToken, SourcePresence, VideoPresence, WatchStamp,
+            resolve_identity,
         },
         failure::{ApplyFailure, Cause, FailureCategory, Stage, ValidationLayer},
         state::{DraftSettings, ValidationRequest},
@@ -219,7 +219,8 @@ impl Observer {
         }
         let authorization = if let Some(token) = request.choice {
             if slots.target.as_ref().is_none_or(|target| {
-                target.video != request.settings.video || target.audio != request.settings.audio
+                !target.video.same_request(&request.settings.video)
+                    || target.audio != request.settings.audio
             }) {
                 return Err(fail(
                     "selection token belongs to a different requested tuple",
@@ -649,11 +650,13 @@ impl Inventory {
                 .filter(|device| choice_identity_matches(&target.video.identity, device.identity()))
             {
                 let mut routes = device.nodes().iter().filter(|node| {
-                    matches!(
-                        node.capabilities()
-                            .assess(CaptureBufferType::SinglePlanar, target.video.mode),
-                        SupportVerdict::Supported | SupportVerdict::NeedsExactIntervals
-                    )
+                    target.video.may_use(node.capabilities())
+                        && (target.video.resolved_fourcc.is_some()
+                            || target
+                                .video
+                                .selected_node
+                                .as_ref()
+                                .is_none_or(|path| node.devnode() == path))
                 });
                 let Some(node) = routes.next() else {
                     continue;
@@ -733,11 +736,9 @@ fn authorized_route_present(
         return false;
     }
     let mut routes = device.nodes().iter().filter(|node| {
-        matches!(
-            node.capabilities()
-                .assess(CaptureBufferType::SinglePlanar, target.video.mode),
-            SupportVerdict::Supported | SupportVerdict::NeedsExactIntervals
-        )
+        target.video.may_use(node.capabilities())
+            && node.syspath() == selected.node_syspath
+            && node.usb_syspath() == selected.usb_syspath
     });
     let Some(node) = routes.next() else {
         return false;
@@ -947,7 +948,7 @@ fn run(
                     if fixture {
                         Ok(linux::session_fixture(
                             &["/dev/video0"],
-                            requested.video.mode,
+                            requested.video.fixture_mode(),
                         ))
                     } else {
                         discover_snapshot(&requested)
@@ -1160,10 +1161,10 @@ mod tests {
     fn target(identity: DeviceIdentity, id: u64) -> RecoveryWatchTarget {
         RecoveryWatchTarget {
             watch: WatchId::new(id).unwrap(),
-            video: ModeRequest {
+            video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                 identity,
                 mode: mode(),
-            },
+            }),
             audio: AudioSelection::default(),
         }
     }
@@ -1205,6 +1206,7 @@ mod tests {
     }
     fn request(target: &RecoveryWatchTarget, stamp: WatchStamp) -> ValidationRequest {
         ValidationRequest {
+            pinned_node: None,
             key: ValidationKey {
                 apply: ApplyId::new(1).unwrap(),
                 purpose: AttemptPurpose::Recovery,
@@ -1734,10 +1736,9 @@ mod tests {
             .unwrap();
         let snapshot = scan.snapshot.as_ref().unwrap();
         let prepared = match selected {
-            None => super::super::apply::validate_prepared(
-                request.settings.clone(),
+            None => super::super::apply::fixture_request_prepared(
+                &request,
                 snapshot,
-                &[],
                 scan.observation.stamp,
             )
             .unwrap(),
@@ -1749,8 +1750,14 @@ mod tests {
             )
             .unwrap(),
         };
+        let (node, usb) = prepared.selection().physical_node();
         let request = model
-            .accept_prepared(&request, prepared.settings().clone(), prepared.stamp())
+            .accept_prepared(
+                &request,
+                prepared.settings().clone(),
+                prepared.stamp(),
+                Some((node.to_owned(), usb.to_owned())),
+            )
             .unwrap();
         let Some(crate::domain::state::ModelEffect::Open { key, .. }) =
             model.validation_succeeded(&request)
@@ -1791,10 +1798,10 @@ mod tests {
         use crate::domain::state::{ModelEffect, ProductModel};
         let settings = DraftSettings {
             filters: crate::domain::filters::FilterChain::default(),
-            video: ModeRequest {
+            video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                 identity,
                 mode: mode(),
-            },
+            }),
             audio: AudioSelection::default(),
             renderer: crate::domain::render::RendererSettings::default(),
         };
@@ -1808,6 +1815,10 @@ mod tests {
         model.recovery_observed(&first.observation);
         let key = open_model_from_scan(&mut model, &first, None);
         verify_open(&mut model, key);
+        model.committed_watch().unwrap();
+        inventory.set_target(Some(Arc::new(model.watch_target().unwrap().clone())));
+        let committed = scan(&mut inventory, snapshot(devices));
+        model.recovery_observed(&committed.observation);
         assert!(model.active().is_some());
         (model, inventory, key)
     }
@@ -1963,9 +1974,15 @@ mod tests {
         let request = model.validation_request().unwrap().clone();
         let validation = observer.clone();
         let handle = std::thread::spawn(move || validation.fresh(&request));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut slots = observer.0.slots.lock();
         while slots.refresh_requested == 0 {
-            observer.0.changed.wait(&mut slots);
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "selected validation did not request a fresh scan"
+            );
+            observer.0.changed.wait_for(&mut slots, remaining);
         }
         drop(slots);
         let fresh = scan_for_observer(&mut inventory, snapshot(&devices), &observer);
@@ -2038,6 +2055,82 @@ mod tests {
         };
         assert_eq!(attempt, opening.attempt);
         assert!(model.opening().is_none());
+    }
+
+    #[test]
+    fn genuine_recovery_choice_replaces_session_binding_and_reopens_selected_route() {
+        use crate::domain::{capture::LossEvidence, state::ModelEffect};
+        let initial = [(
+            identity(1, None),
+            "/dev/video0",
+            "/sys/usb/1",
+            "/sys/usb/1/video0",
+        )];
+        let (mut model, mut inventory, old) = active_model(identity(1, None), &initial);
+        let applied = model.active().unwrap().applied().settings().clone();
+        model.video_lost(
+            old.attempt,
+            LossEvidence::StreamEnded {
+                reason: 0,
+                error: 0,
+            },
+            session_failure(&applied, Stage::StreamStart),
+        );
+        let devices = [
+            (
+                identity(1, None),
+                "/dev/video0",
+                "/sys/usb/1",
+                "/sys/usb/1/video0",
+            ),
+            (
+                identity(2, None),
+                "/dev/video1",
+                "/sys/usb/2",
+                "/sys/usb/2/video1",
+            ),
+        ];
+        let ambiguous = scan(&mut inventory, snapshot(&devices));
+        let selected = ambiguous
+            .candidates
+            .iter()
+            .find(|candidate| candidate.identity == identity(2, None))
+            .expect("inventory authorizes the actual second physical device")
+            .clone();
+        model.recovery_observed(&ambiguous.observation);
+        model.barrier_complete(old.attempt);
+        model.continue_recovery();
+        model
+            .choose_recovery(model.state_identity(), selected.token)
+            .unwrap();
+        assert!(model.validation_request().unwrap().pinned_node.is_none());
+        let opened = open_model_from_scan(&mut model, &ambiguous, Some(selected));
+        verify_open(&mut model, opened);
+        model.committed_watch().unwrap();
+        inventory.set_target(Some(Arc::new(model.watch_target().unwrap().clone())));
+        let committed = scan(&mut inventory, snapshot(&devices[1..]));
+        model.recovery_observed(&committed.observation);
+        let (_, restart) = model.restart(model.state_identity()).unwrap();
+        let ModelEffect::Validate(request) = restart else {
+            panic!("restart requires native validation");
+        };
+        assert_eq!(
+            request.pinned_node,
+            Some(("/sys/usb/2/video1".into(), "/sys/usb/2".into()))
+        );
+        let prepared = super::super::apply::fixture_request_prepared(
+            &request,
+            committed.snapshot.as_ref().unwrap(),
+            committed.observation.stamp,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.selection().physical_node(),
+            (
+                std::path::Path::new("/sys/usb/2/video1"),
+                std::path::Path::new("/sys/usb/2")
+            )
+        );
     }
 
     #[test]
