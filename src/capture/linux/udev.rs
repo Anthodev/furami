@@ -497,6 +497,39 @@ pub(super) fn scan() -> Result<Observations, CaptureError> {
     Ok(observations)
 }
 
+/// Resolve a catalog observation's decimal ALSA card to its nearest raw USB
+/// ancestor. This runs only on the existing catalog worker, never in callbacks.
+pub(crate) fn sound_usb(
+    card: &str,
+) -> Result<Option<crate::capture::audio::UsbAssociation>, String> {
+    if card.is_empty() || !card.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Le locator alsa.card n'est pas un entier décimal.".into());
+    }
+    let index: u32 = card
+        .parse()
+        .map_err(|_| "Le locator alsa.card dépasse u32.")?;
+    let path = PathBuf::from(format!("/sys/class/sound/card{index}"));
+    let canonical = fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "Association audio USB indisponible ({}): {error}",
+            path.display()
+        )
+    })?;
+    let cpath = CString::new(canonical.as_os_str().as_bytes())
+        .map_err(|_| "Le chemin ALSA contient NUL.")?;
+    let context = Context::new().map_err(|error| error.to_string())?;
+    let device = Device::new(&context, &cpath).map_err(|error| error.to_string())?;
+    let Some(usb) = device.borrow().usb_parent(c"usb_device") else {
+        return Ok(None);
+    };
+    let syspath = usb.syspath().map_err(|error| error.to_string())?;
+    let identity = read_identity(usb, &syspath).map_err(|error| error.to_string())?;
+    Ok(Some(crate::capture::audio::UsbAssociation {
+        syspath,
+        identity,
+    }))
+}
+
 fn observe(
     node: DeviceRef<'_>,
 ) -> Result<Option<(DeviceIdentity, PathBuf, NodeObservation)>, CaptureError> {
@@ -758,6 +791,22 @@ pub(super) fn revalidate_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_card_locator_rejects_nondecimal_or_overflow_before_sysfs_access() {
+        for card in [
+            "",
+            "-1",
+            "+1",
+            "1/card2",
+            "../video0",
+            " 1",
+            "١",
+            "4294967296",
+        ] {
+            assert!(sound_usb(card).is_err(), "invalid ALSA locator {card:?}");
+        }
+    }
 
     fn identity(serial: Option<&str>, port: u8) -> DeviceIdentity {
         DeviceIdentity::new(

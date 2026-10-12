@@ -184,11 +184,43 @@ impl StartupArguments {
         }
         Ok(Self {
             video: CaptureArguments::parse(video_args)?,
-            audio_off: audio_off || audio_source.is_none(),
+            audio_off,
             audio_source,
             list_audio_sources,
             qualification_stdin,
         })
+    }
+    fn capture_audio(
+        &self,
+        saved: Option<&DraftSettings>,
+        sources: &[audio::AudioSource],
+    ) -> Result<(AudioSelection, furami::app::settings::StartupAudioPolicy), AudioError> {
+        let selection = match self.audio_source.as_deref() {
+            Some(name) => {
+                let source = audio::select(sources, name)?;
+                if self.audio_off {
+                    AudioSelection::Disabled {
+                        retained: Some(source),
+                    }
+                } else {
+                    AudioSelection::Enabled { source }
+                }
+            }
+            None if !self.audio_off => saved
+                .map(|settings| settings.audio.clone())
+                .unwrap_or_default(),
+            None => AudioSelection::Disabled {
+                retained: saved.and_then(|settings| settings.audio.source().cloned()),
+            },
+        };
+        let policy = if self.audio_off || self.audio_source.is_some() {
+            furami::app::settings::StartupAudioPolicy::Cli
+        } else if saved.is_some() {
+            furami::app::settings::StartupAudioPolicy::Explicit
+        } else {
+            furami::app::settings::StartupAudioPolicy::AutoCard
+        };
+        Ok((selection, policy))
     }
 }
 
@@ -204,8 +236,10 @@ fn run() -> Result<(), StartupError> {
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     ));
-    let saved = persistence.saved_selection();
-    let restore_audio = arguments.video.is_none()
+    let mut saved = persistence.saved_selection();
+    let restore_audio = !arguments.audio_off
+        && arguments.audio_source.is_none()
+        && arguments.video.is_none()
         && saved
             .as_ref()
             .is_some_and(|settings| settings.audio.enabled());
@@ -228,19 +262,14 @@ fn run() -> Result<(), StartupError> {
     } else {
         Vec::new()
     };
-    let audio = match arguments.audio_source.as_deref() {
-        Some(name) => {
-            let source = audio::select(&audio_sources, name)?;
-            if arguments.audio_off {
-                AudioSelection::Disabled {
-                    retained: Some(source),
-                }
-            } else {
-                AudioSelection::Enabled { source }
-            }
-        }
-        None => AudioSelection::default(),
-    };
+    let (audio, audio_policy) = arguments.capture_audio(saved.as_ref(), &audio_sources)?;
+    if (arguments.audio_off || arguments.audio_source.is_some())
+        && let Some(saved) = &mut saved
+    {
+        saved.audio = audio.clone();
+    }
+    let mut startup_binding = None;
+    let mut topology_pin = None;
     let capture = arguments
         .video
         .map(|args| {
@@ -253,10 +282,27 @@ fn run() -> Result<(), StartupError> {
                 request: args.to_string(),
                 source,
             })?;
+            persistence.observe_profile_identities(
+                snapshot.devices().iter().map(|device| device.identity()),
+            );
+            let identity = &video.identity;
+            let serial_unique = identity.serial().is_some()
+                && snapshot
+                    .devices()
+                    .iter()
+                    .filter(|device| {
+                        let observed = device.identity();
+                        observed.vendor_id() == identity.vendor_id()
+                            && observed.product_id() == identity.product_id()
+                            && observed.serial() == identity.serial()
+                    })
+                    .count()
+                    == 1;
+            startup_binding = Some(persistence.profile_binding(identity, serial_unique));
             Ok::<_, StartupError>(DraftSettings {
                 filters: furami::domain::filters::FilterChain::default(),
                 video,
-                audio,
+                audio: audio.clone(),
                 renderer: furami::domain::render::RendererSettings::default(),
             })
         })
@@ -265,21 +311,58 @@ fn run() -> Result<(), StartupError> {
         .into_iter()
         .map(|source| source.identity)
         .collect();
-    let startup = decide_startup(
+    let mut startup = decide_startup(
         saved,
         capture,
         |settings| {
-            let snapshot = linux::discover().map_err(|error| error.to_string())?;
+            use furami::app::settings::StartupVideoError;
+            let snapshot = linux::discover()
+                .map_err(|error| StartupVideoError::Unavailable(error.to_string()))?;
+            persistence.observe_profile_identities(
+                snapshot.devices().iter().map(|device| device.identity()),
+            );
+            let index = furami::domain::capture::resolve_identity(
+                &settings.video.identity,
+                snapshot.devices().iter().map(|device| device.identity()),
+            )
+            .map_err(|error| StartupVideoError::Unavailable(error.to_string()))?;
+            startup_binding = persistence.saved_binding();
+            if persistence.saved_binding() == Some(furami::settings::ProfileBinding::Topology)
+                && snapshot.devices()[index].identity() != &settings.video.identity
+            {
+                return Err(StartupVideoError::Unavailable(
+                    "The exact topology-bound last source is absent.".into(),
+                ));
+            }
             let stamp = WatchStamp {
-                watch: WatchId::new(1).ok_or("invalid initial preflight watch")?,
-                epoch: ObservationEpoch::new(1).ok_or("invalid initial preflight epoch")?,
+                watch: WatchId::new(1).expect("nonzero initial preflight watch"),
+                epoch: ObservationEpoch::new(1).expect("nonzero initial preflight epoch"),
             };
-            furami::capture::validate_prepared(settings.clone(), &snapshot, &[], stamp)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
+            let prepared =
+                furami::capture::validate_prepared(settings.clone(), &snapshot, &[], stamp)
+                    .map_err(StartupVideoError::from_failure)?;
+            if startup_binding == Some(furami::settings::ProfileBinding::Topology) {
+                let node = snapshot.devices()[index]
+                    .nodes()
+                    .iter()
+                    .find(|node| node.devnode() == prepared.input().node())
+                    .expect("preflight proved this unique input route");
+                topology_pin = Some((node.syspath().to_owned(), node.usb_syspath().to_owned()));
+            }
+            Ok(())
         },
         restore_audio_error.map_or_else(|| Ok(sources.as_slice()), Err),
     );
+    startup.audio_policy = audio_policy;
+    startup.source_binding = startup_binding;
+    startup.topology_pin = if startup.auto_open {
+        topology_pin
+    } else {
+        None
+    };
+    if startup.draft.is_none() {
+        startup.bootstrap_audio = audio;
+    }
     persistence.prepare_startup(&startup);
     let x11_display = match std::env::var("DISPLAY") {
         Ok(value) if !value.is_empty() => value,
@@ -317,6 +400,78 @@ fn run() -> Result<(), StartupError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saved_with_audio(audio: AudioSelection) -> DraftSettings {
+        use furami::domain::capture::{
+            CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize, ModeRequest,
+            UsbTopology, VideoRequest,
+        };
+        DraftSettings {
+            video: VideoRequest::manual(ModeRequest {
+                identity: DeviceIdentity::new(
+                    0x32ed,
+                    0x3701,
+                    UsbTopology::new(
+                        "pci-test".into(),
+                        vec![std::num::NonZeroU8::new(1).unwrap()],
+                    )
+                    .unwrap(),
+                    Some("raw-usb-serial".into()),
+                )
+                .unwrap(),
+                mode: CaptureMode {
+                    captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
+                    size: FrameSize::new(1920, 1080).unwrap(),
+                    rate: FrameRate::new(60000, 1001).unwrap(),
+                },
+            }),
+            audio,
+            filters: Default::default(),
+            renderer: Default::default(),
+        }
+    }
+
+    #[test]
+    fn startup_audio_provenance_distinguishes_factory_saved_and_explicit_cli_off() {
+        use furami::app::settings::StartupAudioPolicy;
+        let source = AudioSourceIdentity::new(
+            "card.input".into(),
+            vec![("device.serial".into(), "decorated-raw-usb-serial".into())],
+        )
+        .unwrap();
+        let rows = vec![audio::AudioSource {
+            identity: source.clone(),
+            description: "Card".into(),
+        }];
+        let defaults = StartupArguments::parse(args(&[])).unwrap();
+        assert_eq!(
+            defaults.capture_audio(None, &rows).unwrap(),
+            (AudioSelection::default(), StartupAudioPolicy::AutoCard)
+        );
+        let enabled = saved_with_audio(AudioSelection::Enabled {
+            source: source.clone(),
+        });
+        assert_eq!(
+            defaults.capture_audio(Some(&enabled), &[]).unwrap(),
+            (enabled.audio.clone(), StartupAudioPolicy::Explicit)
+        );
+        let off = StartupArguments::parse(args(&["--capture-audio-off"])).unwrap();
+        let (disabled, policy) = off.capture_audio(Some(&enabled), &[]).unwrap();
+        assert!(!disabled.enabled());
+        assert_eq!(disabled.source(), Some(&source));
+        assert_eq!(policy, StartupAudioPolicy::Cli);
+        let saved_off = saved_with_audio(AudioSelection::Disabled { retained: None });
+        assert_eq!(
+            defaults.capture_audio(Some(&saved_off), &rows).unwrap(),
+            (saved_off.audio.clone(), StartupAudioPolicy::Explicit)
+        );
+        let explicit =
+            StartupArguments::parse(args(&["--capture-audio-source", "card.input"])).unwrap();
+        assert_eq!(
+            explicit.capture_audio(None, &rows).unwrap(),
+            (AudioSelection::Enabled { source }, StartupAudioPolicy::Cli)
+        );
+    }
     use std::ffi::OsString;
 
     fn args(values: &[&str]) -> Vec<OsString> {
@@ -449,8 +604,10 @@ mod tests {
     #[test]
     fn audio_cli_is_explicit_and_can_start_disabled_with_retained_source() {
         let defaults = StartupArguments::parse(args(&[])).unwrap();
-        assert!(defaults.audio_source.is_none() && defaults.audio_off);
+        assert!(defaults.audio_source.is_none() && !defaults.audio_off);
         assert!(!defaults.list_audio_sources && !defaults.qualification_stdin);
+        let explicit_off = StartupArguments::parse(args(&["--capture-audio-off"])).unwrap();
+        assert!(explicit_off.audio_off && explicit_off.audio_source.is_none());
         let enabled =
             StartupArguments::parse(args(&["--capture-audio-source", "exact.usb.source"])).unwrap();
         assert_eq!(enabled.audio_source.as_deref(), Some("exact.usb.source"));

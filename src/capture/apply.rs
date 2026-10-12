@@ -649,21 +649,43 @@ impl CaptureValidator {
         execute: fn(ValidationRequest) -> WorkerOutcome,
         catalog: Vec<AudioSource>,
     ) -> Self {
-        Self::with_executor(
+        Self::with_fixture_runner(
+            execute,
             super::watch::ObservationWorker::fixture_with_audio_catalog(catalog),
-            move |request| {
-                let (request, result) = execute(request);
-                let stamp = request.watch;
-                let result = match result {
-                    Ok(mut prepared) => {
-                        prepared.stamp = stamp;
-                        ValidationOutcome::Prepared(prepared)
-                    }
-                    Err(error) => ValidationOutcome::Failed(error),
-                };
-                (request, stamp, result)
-            },
         )
+    }
+
+    /// The observation worker uses actual advertised test capabilities, never a
+    /// concrete format invented from an unresolved Auto request.
+    #[cfg(test)]
+    pub fn with_runner_and_snapshot(
+        execute: fn(ValidationRequest) -> WorkerOutcome,
+        snapshot: CaptureSnapshot,
+        catalog: Vec<AudioSource>,
+    ) -> Self {
+        Self::with_fixture_runner(
+            execute,
+            super::watch::ObservationWorker::fixture_with_snapshot(snapshot, catalog),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_fixture_runner(
+        execute: fn(ValidationRequest) -> WorkerOutcome,
+        observation: super::watch::ObservationWorker,
+    ) -> Self {
+        Self::with_executor(observation, move |request| {
+            let (request, result) = execute(request);
+            let stamp = request.watch;
+            let result = match result {
+                Ok(mut prepared) => {
+                    prepared.stamp = stamp;
+                    ValidationOutcome::Prepared(prepared)
+                }
+                Err(error) => ValidationOutcome::Failed(error),
+            };
+            (request, stamp, result)
+        })
     }
 
     fn with_executor(

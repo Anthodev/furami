@@ -326,6 +326,12 @@ impl AppliedSettings {
     pub fn settings(&self) -> &DraftSettings {
         &self.settings
     }
+    /// Borrows the session-only physical route, node syspath before USB syspath.
+    pub fn physical_node(&self) -> Option<(&std::path::Path, &std::path::Path)> {
+        self.pinned_node
+            .as_ref()
+            .map(|(node, usb)| (node.as_path(), usb.as_path()))
+    }
 }
 /// Frozen last-successful state and real loss facts; never derived from the draft.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1898,13 +1904,35 @@ impl ProductModel {
         expected: StateIdentity,
         revision: DraftRevision,
     ) -> Result<(ApplyId, ModelEffect), CommandRejection> {
+        self.apply_capture_candidate(expected, revision, None)
+    }
+    pub(crate) fn apply_selected_capture(
+        &mut self,
+        expected: StateIdentity,
+        revision: DraftRevision,
+        physical_node: (&std::path::Path, &std::path::Path),
+    ) -> Result<(ApplyId, ModelEffect), CommandRejection> {
+        self.apply_capture_candidate(expected, revision, Some(physical_node))
+    }
+    fn apply_capture_candidate(
+        &mut self,
+        expected: StateIdentity,
+        revision: DraftRevision,
+        physical_node: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> Result<(ApplyId, ModelEffect), CommandRejection> {
         self.check_command(expected)?;
         if revision != self.draft.revision {
             return Err(CommandRejection::StaleRevision);
         }
         let mut candidate = self.draft.settings.clone();
         candidate.video.resolved_fourcc = None;
-        self.begin(candidate, AttemptPurpose::Candidate, None)
+        let pinned_node = physical_node.map(|(node, usb)| (node.to_path_buf(), usb.to_path_buf()));
+        if pinned_node.is_some() {
+            // The exact session-only physical pair, not an earlier /dev/videoN
+            // locator, determines the route during fresh candidate validation.
+            candidate.video.selected_node = None;
+        }
+        self.begin(candidate, AttemptPurpose::Candidate, pinned_node)
     }
     pub fn reconnect(
         &mut self,
@@ -3362,6 +3390,121 @@ mod tests {
                 .same_request(&settings(60))
         );
         assert!(model.draft().settings.same_request(&settings(30)));
+    }
+
+    #[test]
+    fn selected_capture_first_effect_and_frozen_candidate_share_complete_physical_binding() {
+        let mut candidate = settings(60);
+        candidate.filters = treatments();
+        candidate.renderer = altered_renderer(&candidate.renderer);
+        let mut model = ProductModel::new(candidate.clone());
+        let binding = (
+            std::path::Path::new("/sys/selected/video"),
+            std::path::Path::new("/sys/selected"),
+        );
+        let (_, effect) = model
+            .apply_selected_capture(model.state_identity(), model.draft().revision, binding)
+            .unwrap();
+        let ModelEffect::Validate(request) = effect else {
+            panic!("first selected capture effect must validate");
+        };
+        assert_eq!(model.validation_request(), Some(&request));
+        assert_eq!(
+            request
+                .pinned_node
+                .as_ref()
+                .map(|(node, usb)| (node.as_path(), usb.as_path())),
+            Some(binding)
+        );
+        assert!(request.settings.video.resolved_fourcc.is_none());
+        let mut expected = candidate.clone();
+        expected.video.resolved_fourcc = None;
+        assert_eq!(request.settings, expected);
+        assert_eq!(model.draft().settings, candidate);
+        assert!(
+            model
+                .accept_prepared(&request, candidate.clone(), request.watch, None)
+                .is_none()
+        );
+        assert!(
+            model
+                .accept_prepared(
+                    &request,
+                    candidate.clone(),
+                    request.watch,
+                    Some(("/sys/other/video".into(), "/sys/selected".into())),
+                )
+                .is_none()
+        );
+        let prepared = model
+            .accept_prepared(
+                &request,
+                candidate,
+                request.watch,
+                request.pinned_node.clone(),
+            )
+            .unwrap();
+        let Some(ModelEffect::Open { key, .. }) = model.validation_succeeded(&prepared) else {
+            panic!("selected physical preparation must open");
+        };
+        verify_open(&mut model, key);
+        let applied = model.last_valid().unwrap();
+        let (node, usb) = applied.physical_node().unwrap();
+        let stored = applied.pinned_node.as_ref().unwrap();
+        assert_eq!((node, usb), binding);
+        assert!(std::ptr::eq(node, stored.0.as_path()));
+        assert!(std::ptr::eq(usb, stored.1.as_path()));
+    }
+
+    #[test]
+    fn selected_capture_guards_leave_operation_counters_and_effects_unchanged() {
+        let mut model = ProductModel::new(settings(60));
+        let stopped = model.state_identity();
+        let old = initial_active(&mut model);
+        let stale_revision = model.draft().revision;
+        model.edit_draft(stale_revision, settings(60)).unwrap();
+        let binding = (
+            std::path::Path::new("/sys/selected/video"),
+            std::path::Path::new("/sys/selected"),
+        );
+        for stale in [true, false] {
+            let state = model.state_identity();
+            let counters = (model.next_apply, model.next_attempt, model.last_operation);
+            assert_eq!(
+                model.apply_selected_capture(
+                    if stale { stopped } else { state },
+                    if stale {
+                        model.draft().revision
+                    } else {
+                        stale_revision
+                    },
+                    binding,
+                ),
+                Err(if stale {
+                    CommandRejection::StaleState
+                } else {
+                    CommandRejection::StaleRevision
+                })
+            );
+            assert_eq!(model.state_identity(), state);
+            assert_eq!(
+                (model.next_apply, model.next_attempt, model.last_operation),
+                counters
+            );
+            assert!(model.validation_request().is_none());
+            assert_eq!(model.active().unwrap().attempt(), old.attempt);
+        }
+        model.cleanup = CleanupStatus::Draining;
+        let counters = (model.next_apply, model.next_attempt, model.last_operation);
+        assert_eq!(
+            model.apply_selected_capture(model.state_identity(), model.draft().revision, binding),
+            Err(CommandRejection::CleanupIncomplete)
+        );
+        assert_eq!(
+            (model.next_apply, model.next_attempt, model.last_operation),
+            counters
+        );
+        assert!(model.validation_request().is_none());
     }
 
     #[test]

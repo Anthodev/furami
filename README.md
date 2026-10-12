@@ -18,16 +18,22 @@ View a console connected through a USB capture card, with playback controls besi
 - **Console audio.** Routes the capture card's audio through one Furami-owned PipeWire loopback into your output. This requires a host PipeWire session providing the `pw-loopback` and `pw-metadata` helpers (see the [media recipe](packaging/media/README.md)); a standalone PulseAudio setup is not a supported transport. Audio stays optional — video-only viewing works without it.
 - **Output choice.** **Auto** sends audio to EasyEffects' output sink when it is live and routable, otherwise to the current default output. **Manual** pins a sink of your choice and goes silent if it disappears — there is no fallback; when it returns, selecting it again is up to you.
 - **Pause and resume.** `Space` freezes the picture and silences the output; resuming jumps to the console's current scene without replaying the pause.
-- **Immediate volume and mute.** The panel's slider and mute button change Furami's playback output right away — never the capture device or system mixer.
+- **Audio defaults that follow the card.** For a new configuration, Furami automatically enables the card's own audio input when one unique match ties it to the selected USB device, and keeps the output on **Auto** at 100 %, unmuted. Choices you have saved — audio off, mute or zero volume — stay respected, and `--capture-audio-off` still wins.
 - **Fullscreen.** `F11` toggles fullscreen and restores your previous window size and focus.
-- **Collapsible controls.** Hide the panel when you want more space for the picture.
+- **Immediate volume and mute.** Hover the right-side audio control to reveal the slider; volume and mute change Furami's playback output right away — never the capture device or system mixer.
+- **Quiet overlay controls.** A soft Brume ribbon uses a Catppuccin Macchiato-inspired default palette and appears on pointer movement. Controls fade away after five seconds without movement when no menu is open and no control retains keyboard focus, and the whole ribbon hides while another application takes focus so Furami never floats above your work. Prune and Craie remain future themes.
+- **Stream statistics.** Source, input format, resolution, FPS and a concise capture-audio label appear at the bottom left while the chrome is shown; **Options** stays at the bottom right. Hide only these statistics in **Options → Réglages → Préférences** — errors and recovery messages remain visible.
+- **Capture selection in the window.** Choose a real source and the window keeps the current compatible mode, or automatically takes the card's largest advertised resolution at its maximum exact frame rate. Changing any choice applies right away, and options also expose Auto/manual input format and capture audio.
+- **Filters and renderer settings.** Edit video-filter enablement and renderer settings inside the same Options frame; each complete numeric entry or toggle commits one immediate transaction. Each filter has a **Retirer** action that removes it immediately without toggling it. Options and its settings pages are 20% wider, bounded by the available window width.
 - **Capture recovery.** Reconnects the last applied selection when the same card returns; paused playback stays paused, and ambiguous matches require your choice.
 - **Audio-only recovery.** Keeps video running silently while waiting for the selected audio source, without choosing a different input.
-- **Saved settings.** Restores the last successfully applied capture and keeps the Auto/Manual output preference, local volume, mute and fullscreen settings across safe closes.
+- **Saved settings.** Restores the last successfully applied capture and keeps the Auto/Manual output preference, local volume, mute, fullscreen and statistics-visibility settings across safe closes.
 
 ## First use
 
-Choose your capture device and one of its supported video modes. The node, size and rate are required together; the input format defaults to **Auto**:
+Launch `./furami` without capture arguments to choose a source, resolution and frame rate in the window, then apply the draft. With no saved selection, Furami starts idle; the input format defaults to **Auto**.
+
+Command-line selection remains available. The node, size and rate are required together:
 
 ```sh
 ./furami --capture-node /dev/video0 --capture-size 2560x1440 --capture-rate 60/1
@@ -55,9 +61,11 @@ Audio is optional. It requires a running host PipeWire session with `pw-loopback
 
 ## Using it
 
-Click **Open capture** to apply an explicit selection. Normal launches automatically reopen the saved selection when its requested sources and exact mode are available; otherwise the panel shows the selection and the reason without starting a stream. The panel's output selector switches between **Auto** and **Manual** routing immediately, independently of the capture draft and **Apply**. Pause or resume with `Space` or the panel button, adjust volume and mute in the panel, and toggle fullscreen with `F11`. **Close session** returns to idle; **Restart capture** fully reopens the capture. **Reconnect** retries the last valid selection after a failure and leaves a healthy session unchanged.
+Move the pointer over the window to reveal the ribbon. **Source**, **Résolution** and **Framerate** select the capture immediately — **Annuler** is no longer part of the ribbon. **Audio** chooses the playback output right away, independently of capture and Apply. Open **Options** for capture actions, including capture-audio input, compatible input formats, filters and renderer controls.
 
-Resuming briefly reconnects: the panel shows `Resuming` for a moment, then the console's current scene.
+The ribbon also displays **Auto** as the output label when Auto routing is active, whichever cards or sinks resolve. Normal launches automatically reopen the saved selection when its requested sources and exact mode are available; otherwise the window shows the selection and the reason without starting a stream. Pause or resume with `Space` or the Options action. Adjust playback volume and mute on the right, toggle fullscreen with `F11` or the ribbon button, and hide Furami underneath another application — its controls disappear there without stealing focus. Closing capture returns to idle; restarting fully reopens it. Reconnect retries the last valid selection after a failure and leaves a healthy session unchanged.
+
+Resuming briefly reconnects, then shows the console's current scene.
 
 ## Controls
 
@@ -65,9 +73,9 @@ Resuming briefly reconnects: the panel shows `Resuming` for a moment, then the c
 | --- | --- |
 | `Space` | Pause or resume, when the video or window has focus |
 | `F11` | Toggle fullscreen for the Furami window only |
-| `Esc` | Leave fullscreen, otherwise hide the control panel |
+| `Esc` | Dismiss the open menu or leave fullscreen |
 | `Tab` / `Shift+Tab` | Move focus between controls |
-| **Pause / Resume** button | Same as `Space`, from the panel |
+| **Pause / Resume** action | Same as `Space`, from Options |
 | **Volume slider** | Furami's playback volume, 0–100, immediate |
 | **Mute / Unmute** button | Furami's playback output only |
 | **Reconnect** button | Retry the last valid selection; join recovery already in progress |
@@ -76,22 +84,26 @@ Focused controls keep their keys: `Space` types a space or activates the focused
 
 ## Saved settings
 
-Furami stores a successfully applied capture selection plus the chosen **Auto/Manual output preference** and local volume, mute and fullscreen settings — saved at safe close even when idle or paused, and never a draft or live route. Closing with an edited, unapplied selection offers **Cancel close** or **Quit without applying**.
+Furami silently remembers a separate **automatic profile for each capture source**: resolution, exact rational Framerate, input-format policy, complete filter chain, renderer settings and input audio. Selecting a known source restores those six fields together; a new source starts independently with Auto format, its largest eligible advertised mode and highest exact rate, empty filters, default rendering and uniquely associated card audio when available. There is no profile manager or normal save confirmation.
 
-The settings format is strict schema version 1. The output preference is an optional `output` entry inside `preferences`; documents written before that entry existed (meaning Auto) still load. A **Manual** entry is refused by older strict builds, so return the output to **Auto** and safely close before downgrading — no destructive reset is involved, and the applied capture selection is retained either way.
+**Output routing, volume, mute, fullscreen and statistics visibility stay global.** Source changes never replace them; they save at safe close even without capture. Verified successful selections update their profiles; failed selections and unverified candidates do not. The last successful source is restored at startup when identity and validation permit, without selecting another card if it is absent.
 
-The **input-format policy** is separate from the audio-output preference. An applied Auto input writes `"format_policy": "auto"` inside `applied.video`, alongside the last successfully applied concrete request. Documents without this marker retain their previous manual FourCC pin. Auto is resolved afresh at startup or a new full capture Apply; restart, resume and recovery retain the admitted concrete format. Older strict builds refuse the Auto marker, so successfully apply a manual input format and safely close before downgrading.
+If a saved video mode is no longer advertised, Furami adapts the resolution and rate before opening, retaining a manual format while any eligible mode exists under it. Only proven absence of an eligible manual mode permits Auto. Missing saved audio or rejected treatments remain visible errors, not silent substitutions. A verified startup adaptation is saved; an unchanged startup does not itself rewrite a profile.
 
-Within the same process, those reopen operations also retain the admitted physical node/USB binding: a missing node is refused rather than replaced by a compatible sibling. This binding is not saved to JSON; a new process validates the saved selection afresh. Auto documents whose recorded concrete FourCC is outside `YUYV`, `NV12` or `MJPG` are refused at load, with the original preserved and automatic saves blocked. Manual `BGR3` documents remain valid.
+Profiles follow an exact raw USB serial plus vendor/product identity when unique. Missing serials and observed duplicate serials use the exact USB topology instead; changing ports can then mean a new source. An observed collision stays topology-bound. These profile rules do not relax capture-device admission or resolve ambiguous devices.
+
+The strict **schema version 2** document contains `profiles`, `last_source` and `preferences`, with no legacy `applied` payload. Version 1 files load strictly into memory and migrate only at the next authorized save, including safe close. Older binaries refuse version 2 without changing it: preserve a copy and use a separate configuration before downgrading, or explicitly reset the file and lose its saved profiles. There is no automatic downgrade.
+
+The input-format policy is separate from audio output. Auto is resolved afresh for a full capture selection; restart, resume and recovery retain the admitted concrete format and physical node/USB binding. That binding is session-only and never saved as a `/dev/videoN` route. A new process validates the profile afresh. Invalid Auto FourCC values are refused with the original preserved and automatic saves blocked; manual `BGR3` remains valid.
 
 The file is `$XDG_CONFIG_HOME/furami/settings.json` when `XDG_CONFIG_HOME` is an absolute path. If that variable is unset or empty, Furami uses `$HOME/.config/furami/settings.json`. An invalid location is reported rather than replaced with a guessed path.
 
-A corrupt, invalid or newer-version file is preserved. All automatic saves remain blocked; preference changes are session-only until you explicitly confirm **Reset saved file**. Reset replaces the saved file with your current preferences and no saved capture. It does not stop live capture, apply the draft or reset live preferences.
+A corrupt, invalid or newer-version file is preserved. All automatic saves remain blocked; preference changes are session-only until you explicitly confirm **Reset saved file**. Reset clears **all source profiles and the last-source pointer**, retaining current global preferences. It does not stop or modify live capture; only a new verified user selection can create a profile again.
 
 ## Limitations
 
-- **New selections are command-line only.** Saved selections restore automatically, and recovery can ask you to choose between matching cards; there is no general device, mode or audio-source picker.
-- **Profiles are not available.** Local application settings are saved, but named profiles have not been implemented.
+- **No named profile manager.** Profiles are automatic per source; there is no profile naming, import/export or cross-source copying.
+- **Active-capture profile qualification is blocked.** Automated checks and capture-free file migration/relaunch pass. Isolated ShadowCast NV12 capture crashed during close at 120 FPS and in the single authorized 60-FPS candidate attempt; the pre-profiles baseline also crashed under the identical private 60-FPS verification setup. Stacks locate the failure in RADV/libplacebo/mpv upload, but the root cause and its relation to this feature remain unresolved. Successful active-profile saving/relaunch and startup adaptation are not yet qualified.
 - **Recovery qualification is pending.** Physical unplug/replug, recovery while paused, audio-only loss and post-recovery A/V still need live hardware verification.
 - **Narrowly tested.** Fedora 44 / KDE Plasma Wayland with an AMD RX 7900 XTX is the exercised setup; Ubuntu and Arch are untested. See the [portability notes](packaging/appimage/PORTABILITY.md).
 - **Hardware Vulkan is required.** Wayland sessions also need XWayland; software rendering is not supported.

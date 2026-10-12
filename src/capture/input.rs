@@ -298,6 +298,22 @@ impl CaptureSelection {
     }
 }
 
+fn lavf_format(fourcc: CapturedFourCc) -> Option<&'static str> {
+    match fourcc.bytes() {
+        [b'N', b'V', b'1', b'2'] => Some("nv12"),
+        [b'Y', b'U', b'Y', b'V'] => Some("yuyv422"),
+        [b'M', b'J', b'P', b'G'] => Some("mjpeg"),
+        [b'B', b'G', b'R', b'3'] => Some("bgr24"),
+        _ => None,
+    }
+}
+
+/// Whether the pinned lavf input has a closed mapping for this announced format.
+/// This reports mapping availability only; it does not prove a node or mode.
+pub(crate) fn supports_fourcc(fourcc: CapturedFourCc) -> bool {
+    lavf_format(fourcc).is_some()
+}
+
 #[derive(Debug)]
 pub struct InputSpec {
     requested: RequestedFacts,
@@ -326,13 +342,8 @@ impl InputSpec {
             ));
         }
         let mode = validated.mode();
-        let format = match mode.captured_fourcc.bytes() {
-            [b'N', b'V', b'1', b'2'] => "nv12",
-            [b'Y', b'U', b'Y', b'V'] => "yuyv422",
-            [b'M', b'J', b'P', b'G'] => "mjpeg",
-            [b'B', b'G', b'R', b'3'] => "bgr24",
-            _ => return Err(InputError::UnmappedFourCc(mode.captured_fourcc)),
-        };
+        let format = lavf_format(mode.captured_fourcc)
+            .ok_or(InputError::UnmappedFourCc(mode.captured_fourcc))?;
         let lavf_options = CString::new(format!(
             "input_format={format},video_size={}x{},framerate={}/{}",
             mode.size.width(),

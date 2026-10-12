@@ -12,6 +12,24 @@ pub struct AudioSource {
     pub description: String,
 }
 
+/// Catalog-only physical evidence from the very same Pulse source observation.
+/// Neither the ALSA index nor this observation is a saved source identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UsbAssociation {
+    pub syspath: std::path::PathBuf,
+    pub identity: crate::domain::capture::DeviceIdentity,
+}
+
+pub(crate) struct CatalogSource {
+    pub source: AudioSource,
+    /// Ok(None) is a freshly established non-USB card; Err is missing evidence.
+    pub usb: Result<Option<UsbAssociation>, String>,
+}
+
+pub(crate) fn discover_for_catalog() -> Result<Vec<CatalogSource>, AudioError> {
+    pulse::discover_for_catalog()
+}
+
 /// Ephemeral, read-only mapping for the loopback owner. Never serialized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeSourceSnapshot {

@@ -22,8 +22,9 @@ use crate::domain::render::{
 };
 use crate::domain::state::{AppliedSettings, DraftSettings, ModelEffect, ProductModel};
 use crate::settings::{
-    Durability, LoadOutcome, LocalPreferences, SettingsLoadError, SettingsStore,
-    SettingsValidationError, SettingsWriteError, StoredDocument, WriteFaultPoint, WriteOutcome,
+    Durability, LoadOutcome, LocalPreferences, ProfileBinding, ProfileValidationError,
+    SettingsLoadError, SettingsStore, SettingsValidationError, SettingsWriteError, SourceProfile,
+    SourceProfiles, StoredDocument, WriteFaultPoint, WriteOutcome,
 };
 
 // ---------------------------------------------------------------------------
@@ -122,7 +123,48 @@ fn preferences() -> LocalPreferences {
         gain: PlaybackGain::new(73, false).unwrap(),
         fullscreen: true,
         output: PersistentOutputChoice::Auto,
+        stats_hidden: false,
     }
+}
+
+/// Consumer fixtures always save a complete collection through the new API.
+fn last_settings(document: &StoredDocument) -> Option<&DraftSettings> {
+    let identity = document.last_source.as_ref()?;
+    document
+        .profiles
+        .entries()
+        .iter()
+        .find(|profile| &profile.settings().video.identity == identity)
+        .map(SourceProfile::settings)
+}
+
+fn persist_verified(
+    store: &mut SettingsStore,
+    applied: &AppliedSettings,
+    preferences: LocalPreferences,
+) -> Result<WriteOutcome, SettingsWriteError> {
+    let mut profiles = store
+        .snapshot()
+        .map(|document| document.profiles.clone())
+        .unwrap_or_default();
+    let identity = &applied.settings().video.identity;
+    let binding = profiles.binding_for(identity, true);
+    profiles.upsert_verified(applied, binding);
+    store.save_profiles(&profiles, Some(identity), preferences)
+}
+
+fn persist_globals(
+    store: &mut SettingsStore,
+    preferences: LocalPreferences,
+) -> Result<WriteOutcome, SettingsWriteError> {
+    let profiles = store
+        .snapshot()
+        .map(|document| document.profiles.clone())
+        .unwrap_or_default();
+    let last_source = store
+        .snapshot()
+        .and_then(|document| document.last_source.clone());
+    store.save_profiles(&profiles, last_source.as_ref(), preferences)
 }
 
 /// Mints an `AppliedSettings` through the only legitimate producer: a full
@@ -223,7 +265,7 @@ fn valid_document_loads_completely() {
         panic!("expected loaded document, got {outcome:?}");
     };
     assert!(!store.is_refused());
-    assert_eq!(document.applied.as_ref(), Some(&draft_settings()));
+    assert_eq!(last_settings(&document), Some(&draft_settings()));
     assert_eq!(document.preferences, preferences());
     assert_eq!(store.snapshot(), Some(&*document));
     fs::remove_dir_all(&directory).unwrap();
@@ -240,7 +282,8 @@ fn required_nullable_fields_distinguish_null_from_missing() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("applied:null must load, got {outcome:?}");
     };
-    assert_eq!(document.applied, None);
+    assert!(document.profiles.entries().is_empty());
+    assert!(document.last_source.is_none());
 
     // serial: null is valid (absent serial), missing the key entirely is a
     // schema violation.
@@ -253,7 +296,14 @@ fn required_nullable_fields_distinguish_null_from_missing() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("serial:null must load, got {outcome:?}");
     };
-    assert_eq!(document.applied.unwrap().video.identity.serial(), None);
+    assert_eq!(
+        last_settings(&document).unwrap().video.identity.serial(),
+        None
+    );
+    assert_eq!(
+        document.profiles.entries()[0].binding(),
+        ProfileBinding::Topology
+    );
 
     fs::write(
         &path,
@@ -281,7 +331,7 @@ fn required_nullable_fields_distinguish_null_from_missing() {
         panic!("retained:null must load, got {outcome:?}");
     };
     assert_eq!(
-        document.applied.unwrap().audio,
+        last_settings(&document).unwrap().audio,
         AudioSelection::Disabled { retained: None }
     );
 
@@ -537,7 +587,7 @@ fn positional_struct_arrays_are_schema_refusals_and_block_all_automatic_saves() 
         assert!(store.snapshot().is_none(), "{label}");
         assert!(
             matches!(
-                store.save_preferences(preferences()),
+                persist_globals(&mut store, preferences()),
                 Err(SettingsWriteError::RefusedOriginal { .. })
             ),
             "{label}: preference autosave must be blocked"
@@ -545,7 +595,7 @@ fn positional_struct_arrays_are_schema_refusals_and_block_all_automatic_saves() 
         assert_eq!(fs::read(&path).unwrap(), json.as_bytes(), "{label}");
         assert!(
             matches!(
-                store.save_applied(&applied, preferences()),
+                persist_verified(&mut store, &applied, preferences()),
                 Err(SettingsWriteError::RefusedOriginal { .. })
             ),
             "{label}: applied autosave must be blocked"
@@ -645,7 +695,7 @@ fn value_violations_are_refused_without_touching_the_file() {
 #[test]
 fn unsupported_schema_versions_are_refused_before_decoding() {
     let directory = temp_dir("versions");
-    for version in ["0", "2", "999", "18446744073709551615"] {
+    for version in ["0", "3", "999", "18446744073709551615"] {
         let json =
             format!(r#"{{"schema_version":{version},"applied":null,"preferences":{PREFS}}}"#);
         let (store, outcome) = refused_schema(&directory, version, &json);
@@ -679,7 +729,7 @@ fn io_error_is_refused_and_blocks_saves() {
     assert_eq!(reported, path);
     assert!(store.is_refused());
     assert!(matches!(
-        store.save_preferences(preferences()),
+        persist_globals(&mut store, preferences()),
         Err(SettingsWriteError::RefusedOriginal { .. })
     ));
     fs::remove_dir_all(&directory).unwrap();
@@ -699,11 +749,11 @@ fn applied_and_preferences_round_trip_exactly() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("expected loaded document");
     };
-    assert_eq!(document.applied.as_ref(), Some(&draft_settings()));
+    assert_eq!(last_settings(&document), Some(&draft_settings()));
     assert_eq!(document.preferences, preferences());
 
     let applied = applied_settings(draft_settings());
-    let outcome = store.save_applied(&applied, preferences()).unwrap();
+    let outcome = persist_verified(&mut store, &applied, preferences()).unwrap();
     assert!(outcome.is_confirmed());
     assert!(matches!(outcome.durability(), Durability::Confirmed));
 
@@ -711,7 +761,7 @@ fn applied_and_preferences_round_trip_exactly() {
     let LoadOutcome::Loaded(reloaded_document) = reload_outcome else {
         panic!("expected reloaded document");
     };
-    assert_eq!(reloaded_document.applied.as_ref(), Some(&draft_settings()));
+    assert_eq!(last_settings(&reloaded_document), Some(&draft_settings()));
     assert_eq!(reloaded_document.preferences, preferences());
     assert_eq!(reloaded.snapshot(), Some(&*reloaded_document));
     // Draft state (revisions, counters) never reaches the stored bytes.
@@ -753,9 +803,7 @@ fn stored_fps_is_exact_integer_rational() {
     let applied = applied_settings(draft);
     let (mut store, outcome) = SettingsStore::load(path.clone());
     assert!(matches!(outcome, LoadOutcome::Missing));
-    store
-        .save_applied(&applied, LocalPreferences::default())
-        .unwrap();
+    persist_verified(&mut store, &applied, LocalPreferences::default()).unwrap();
 
     let bytes = fs::read_to_string(&path).unwrap();
     assert!(
@@ -765,7 +813,7 @@ fn stored_fps_is_exact_integer_rational() {
 
     // 60000/1001 keeps its exact rational form on disk.
     let applied = applied_settings(draft_settings());
-    store.save_applied(&applied, preferences()).unwrap();
+    persist_verified(&mut store, &applied, preferences()).unwrap();
     let bytes = fs::read_to_string(&path).unwrap();
     assert!(
         bytes.contains(r#""fps":{"numerator":60000,"denominator":1001}"#),
@@ -776,7 +824,7 @@ fn stored_fps_is_exact_integer_rational() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("expected loaded document");
     };
-    let stored = document.applied.as_ref().unwrap();
+    let stored = last_settings(&document).unwrap();
     assert_eq!(stored.video.mode.rate, FrameRate::new(60000, 1001).unwrap());
     assert_eq!(stored.video.mode.rate.numerator(), 60000);
     assert_eq!(stored.video.mode.rate.denominator(), 1001);
@@ -794,23 +842,27 @@ fn preferences_only_save_preserves_published_applied() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("expected loaded document");
     };
-    let applied_before = document.applied.clone();
+    let applied_before = last_settings(&document).cloned();
 
     let new_preferences = LocalPreferences {
         gain: PlaybackGain::new(42, true).unwrap(),
         fullscreen: false,
         output: PersistentOutputChoice::Auto,
+        stats_hidden: false,
     };
-    store.save_preferences(new_preferences.clone()).unwrap();
+    persist_globals(&mut store, new_preferences.clone()).unwrap();
 
-    assert_eq!(store.snapshot().unwrap().applied, applied_before);
+    assert_eq!(
+        last_settings(store.snapshot().unwrap()).cloned(),
+        applied_before
+    );
     assert_eq!(store.snapshot().unwrap().preferences, new_preferences);
 
     let (_, outcome) = SettingsStore::load(path);
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("expected reloaded document");
     };
-    assert_eq!(document.applied, applied_before);
+    assert_eq!(last_settings(&document).cloned(), applied_before);
     assert_eq!(document.preferences, new_preferences);
     fs::remove_dir_all(&directory).unwrap();
 }
@@ -842,7 +894,7 @@ fn applied_with_video_suffix(suffix: &str) -> String {
 }
 
 #[test]
-fn legacy_video_document_decodes_as_manual_pin_and_reencodes_byte_for_byte() {
+fn legacy_video_document_migrates_without_changing_the_manual_pin() {
     let directory = temp_dir("video-legacy-manual");
     let path = settings_path(&directory);
     let original = canonical_document();
@@ -852,7 +904,7 @@ fn legacy_video_document_decodes_as_manual_pin_and_reencodes_byte_for_byte() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("expected loaded document");
     };
-    let applied = document.applied.as_ref().unwrap();
+    let applied = last_settings(&document).unwrap();
     let concrete = CapturedFourCc::from_kernel(0x3231_564E);
     assert_eq!(
         applied.video.mode.format_policy,
@@ -861,15 +913,26 @@ fn legacy_video_document_decodes_as_manual_pin_and_reencodes_byte_for_byte() {
     assert_eq!(applied.video.resolved_fourcc, Some(concrete));
     assert_eq!(applied.video.selected_node, None);
 
-    // Re-encoding a legacy manual document keeps the exact pre-policy bytes:
-    // the manual marker is represented by absence, never written.
-    store
-        .save_applied(&applied_settings(draft_settings()), preferences())
-        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    persist_verified(
+        &mut store,
+        &applied_settings(draft_settings()),
+        preferences(),
+    )
+    .unwrap();
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(migrated) = outcome else {
+        panic!("migrated profile must load")
+    };
+    assert_eq!(last_settings(&migrated), last_settings(&document));
     assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        format!("{original}\n"),
-        "a manual pin must not add a format_policy key"
+        migrated.profiles.entries()[0].binding(),
+        ProfileBinding::Serial
+    );
+    assert_eq!(migrated.last_source.as_ref(), Some(&identity()));
+    assert!(
+        !fs::read_to_string(&path).unwrap().contains("format_policy"),
+        "manual policy retains its existing representation"
     );
     fs::remove_dir_all(&directory).unwrap();
 }
@@ -887,9 +950,9 @@ fn auto_video_policy_round_trips_with_marker_and_historical_concrete() {
     let expected = applied.settings().video.clone();
     assert_eq!(expected.mode.format_policy, InputFormatPolicy::Auto);
 
-    store.save_applied(&applied, preferences()).unwrap();
+    persist_verified(&mut store, &applied, preferences()).unwrap();
     assert_eq!(
-        store.snapshot().unwrap().applied.as_ref().unwrap().video,
+        last_settings(store.snapshot().unwrap()).unwrap().video,
         expected
     );
 
@@ -898,7 +961,7 @@ fn auto_video_policy_round_trips_with_marker_and_historical_concrete() {
     // session-only node locator never reaches disk.
     let bytes = fs::read_to_string(&path).unwrap();
     let document: serde_json::Value = serde_json::from_str(&bytes).unwrap();
-    let video = &document["applied"]["video"];
+    let video = &document["profiles"][0]["settings"]["video"];
     assert_eq!(video["format_policy"], "auto");
     assert_eq!(
         video["mode"]["captured_fourcc"],
@@ -913,7 +976,7 @@ fn auto_video_policy_round_trips_with_marker_and_historical_concrete() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("auto document must reload");
     };
-    let stored = document.applied.unwrap();
+    let stored = last_settings(&document).unwrap();
     assert_eq!(stored.video.mode.format_policy, InputFormatPolicy::Auto);
     assert_eq!(
         stored.video.resolved_fourcc,
@@ -1003,13 +1066,16 @@ fn auto_policy_with_non_concrete_fourcc_is_refused_at_decode_and_blocks_saves() 
         // Neither a preference-only save nor a full applied save may rewrite the
         // refused baseline; the exact original bytes survive.
         assert!(
-            store.save_preferences(preferences()).is_err(),
+            persist_globals(&mut store, preferences()).is_err(),
             "{label}: preference save must be blocked"
         );
         assert!(
-            store
-                .save_applied(&applied_settings(draft_settings()), preferences())
-                .is_err(),
+            persist_verified(
+                &mut store,
+                &applied_settings(draft_settings()),
+                preferences()
+            )
+            .is_err(),
             "{label}: applied save must be blocked"
         );
         assert_eq!(fs::read(&path).unwrap(), original, "{label}");
@@ -1021,11 +1087,17 @@ fn auto_policy_with_non_concrete_fourcc_is_refused_at_decode_and_blocks_saves() 
 /// Encode a constructed document directly, bypassing the model, and return the
 /// typed refusal. This is the serialization boundary the invariant protects.
 fn encode_video_error(video: VideoRequest) -> crate::settings::schema::EncodeError {
+    let settings = DraftSettings {
+        video,
+        ..draft_settings()
+    };
+    let last_source = Some(settings.video.identity.clone());
     let document = StoredDocument {
-        applied: Some(DraftSettings {
-            video,
-            ..draft_settings()
-        }),
+        profiles: SourceProfiles::new(vec![
+            SourceProfile::new(ProfileBinding::Serial, settings).unwrap(),
+        ])
+        .unwrap(),
+        last_source,
         preferences: preferences(),
     };
     crate::settings::schema::encode(&document).unwrap_err()
@@ -1109,7 +1181,7 @@ fn manual_bgr3_video_encoding_is_preserved() {
         ..draft_settings()
     };
     let applied = applied_settings(draft);
-    store.save_applied(&applied, preferences()).unwrap();
+    persist_verified(&mut store, &applied, preferences()).unwrap();
 
     // A manual pin keeps writing its concrete FourCC and never adds a marker.
     let bytes = fs::read_to_string(&path).unwrap();
@@ -1119,7 +1191,7 @@ fn manual_bgr3_video_encoding_is_preserved() {
     );
     let document: serde_json::Value = serde_json::from_str(&bytes).unwrap();
     assert_eq!(
-        document["applied"]["video"]["mode"]["captured_fourcc"],
+        document["profiles"][0]["settings"]["video"]["mode"]["captured_fourcc"],
         serde_json::json!(bgr3.kernel_value())
     );
 
@@ -1127,7 +1199,7 @@ fn manual_bgr3_video_encoding_is_preserved() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("manual BGR3 document must reload");
     };
-    let stored = document.applied.unwrap();
+    let stored = last_settings(&document).unwrap();
     assert_eq!(
         stored.video.mode.format_policy,
         InputFormatPolicy::Manual { fourcc: bgr3 }
@@ -1143,12 +1215,73 @@ fn preferences_only_save_on_missing_file_writes_null_applied() {
     let (mut store, outcome) = SettingsStore::load(path.clone());
     assert!(matches!(outcome, LoadOutcome::Missing));
 
-    store.save_preferences(preferences()).unwrap();
+    persist_globals(&mut store, preferences()).unwrap();
     let bytes = fs::read_to_string(&path).unwrap();
-    assert!(bytes.contains(r#""applied":null"#), "bytes: {bytes}");
-    assert_eq!(store.snapshot().unwrap().applied, None);
+    assert!(
+        !bytes.contains(r#""applied""#),
+        "legacy payload leaked: {bytes}"
+    );
+    assert!(store.snapshot().unwrap().profiles.entries().is_empty());
+    assert!(store.snapshot().unwrap().last_source.is_none());
     assert_eq!(store.snapshot().unwrap().preferences, preferences());
     fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn stats_visibility_defaults_and_persists_without_changing_applied() {
+    let directory = temp_dir("stats-visibility");
+    let path = settings_path(&directory);
+    fs::write(&path, canonical_document()).unwrap();
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(original) = outcome else {
+        panic!("legacy document must load");
+    };
+    assert!(!original.preferences.stats_hidden);
+    let mut hidden = original.preferences.clone();
+    hidden.stats_hidden = true;
+    persist_globals(&mut store, hidden.clone()).unwrap();
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(reloaded) = outcome else {
+        panic!("hidden preference must reload");
+    };
+    assert_eq!(reloaded.profiles, original.profiles);
+    assert_eq!(reloaded.last_source, original.last_source);
+    assert_eq!(reloaded.preferences, hidden);
+    persist_verified(
+        &mut store,
+        &applied_settings(draft_settings()),
+        hidden.clone(),
+    )
+    .unwrap();
+    assert!(store.snapshot().unwrap().preferences.stats_hidden);
+    store.reset(hidden.clone()).unwrap();
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(reset) = outcome else {
+        panic!("reset preference must reload");
+    };
+    assert!(reset.profiles.entries().is_empty());
+    assert!(reset.last_source.is_none());
+    assert_eq!(reset.preferences, hidden);
+    hidden.stats_hidden = false;
+    persist_globals(&mut store, hidden).unwrap();
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(document["preferences"].get("stats_hidden").is_none());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn invalid_stats_visibility_preserves_original_and_refuses_automatic_saves() {
+    let directory = temp_dir("stats-visibility-refusals");
+    for value in ["null", "\"true\"", "1", "{}", "true,\"stats_hidden\":false"] {
+        let document = format!(
+            r#"{{"schema_version":1,"applied":null,"preferences":{{"volume_percent":73,"muted":false,"fullscreen":true,"stats_hidden":{value}}}}}"#
+        );
+        let (mut store, outcome) = refused_schema(&directory, value, &document);
+        assert!(matches!(outcome, LoadOutcome::Refused(_)));
+        assert!(persist_globals(&mut store, preferences()).is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), document.as_bytes());
+    }
+    fs::remove_dir_all(directory).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,6 +1301,7 @@ fn manual_output_preferences() -> LocalPreferences {
         gain: PlaybackGain::new(73, false).unwrap(),
         fullscreen: true,
         output: PersistentOutputChoice::Manual(manual_sink_identity()),
+        stats_hidden: false,
     }
 }
 
@@ -1187,7 +1321,7 @@ fn manual_output_choice_round_trips_exactly() {
     assert!(matches!(outcome, LoadOutcome::Missing));
 
     let manual = manual_output_preferences();
-    store.save_preferences(manual.clone()).unwrap();
+    persist_globals(&mut store, manual.clone()).unwrap();
 
     // Parsed shape, not serializer byte layout: the manual choice is a
     // kind-tagged sink object next to the legacy preference fields.
@@ -1215,7 +1349,7 @@ fn auto_output_choice_omits_the_output_key_and_defaults_from_missing() {
     let path = settings_path(&directory);
     let (mut store, _) = SettingsStore::load(path.clone());
 
-    store.save_preferences(preferences()).unwrap();
+    persist_globals(&mut store, preferences()).unwrap();
     // Parsed shape: Auto omits the `output` key entirely.
     let document: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -1316,7 +1450,7 @@ fn strict_output_choice_schema_violations_are_refused_individually() {
     let (mut store, outcome) = SettingsStore::load(path.clone());
     assert!(matches!(outcome, LoadOutcome::Refused(_)));
     assert!(matches!(
-        store.save_preferences(manual_output_preferences()),
+        persist_globals(&mut store, manual_output_preferences()),
         Err(SettingsWriteError::RefusedOriginal { .. })
     ));
     assert_eq!(fs::read(&path).unwrap(), original);
@@ -1333,21 +1467,24 @@ fn manual_output_preference_save_preserves_applied_and_unrelated_preferences() {
     let LoadOutcome::Loaded(previous) = outcome else {
         panic!("expected valid original");
     };
-    let applied_before = previous.applied.clone();
+    let applied_before = last_settings(&previous).cloned();
 
     // Only the output choice changes; gain/fullscreen and the published
     // applied document are preserved through a preferences-only save.
     let mut switched = previous.preferences.clone();
     switched.output = PersistentOutputChoice::Manual(manual_sink_identity());
-    store.save_preferences(switched.clone()).unwrap();
-    assert_eq!(store.snapshot().unwrap().applied, applied_before);
+    persist_globals(&mut store, switched.clone()).unwrap();
+    assert_eq!(
+        last_settings(store.snapshot().unwrap()).cloned(),
+        applied_before
+    );
     assert_eq!(store.snapshot().unwrap().preferences, switched);
 
     let (_, outcome) = SettingsStore::load(path);
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("manual output document must reload");
     };
-    assert_eq!(document.applied, applied_before);
+    assert_eq!(last_settings(&document).cloned(), applied_before);
     assert_eq!(
         document.preferences.gain, previous.preferences.gain,
         "unrelated preference value preserved"
@@ -1365,7 +1502,7 @@ fn manual_output_preference_save_preserves_applied_and_unrelated_preferences() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn refusal_blocks_save_applied_and_save_preferences_byte_for_byte() {
+fn refusal_blocks_all_collection_saves_byte_for_byte() {
     let directory = temp_dir("refusal-blocks");
     let path = settings_path(&directory);
     fs::write(&path, "{corrupt").unwrap();
@@ -1378,11 +1515,11 @@ fn refusal_blocks_save_applied_and_save_preferences_byte_for_byte() {
 
     let applied = applied_settings(draft_settings());
     assert!(matches!(
-        store.save_applied(&applied, preferences()),
+        persist_verified(&mut store, &applied, preferences()),
         Err(SettingsWriteError::RefusedOriginal { .. })
     ));
     assert!(matches!(
-        store.save_preferences(preferences()),
+        persist_globals(&mut store, preferences()),
         Err(SettingsWriteError::RefusedOriginal { .. })
     ));
 
@@ -1409,11 +1546,12 @@ fn invalid_in_memory_preferences_preserve_file_and_published_snapshot() {
         },
         fullscreen: false,
         output: PersistentOutputChoice::Auto,
+        stats_hidden: false,
     };
     for operation in ["applied", "preferences", "reset"] {
         let result = match operation {
-            "applied" => store.save_applied(&applied, invalid.clone()),
-            "preferences" => store.save_preferences(invalid.clone()),
+            "applied" => persist_verified(&mut store, &applied, invalid.clone()),
+            "preferences" => persist_globals(&mut store, invalid.clone()),
             "reset" => store.reset(invalid.clone()),
             _ => unreachable!(),
         };
@@ -1432,7 +1570,7 @@ fn invalid_in_memory_preferences_preserve_file_and_published_snapshot() {
 fn failed_reset_preserves_refusal_original_and_blocks_automatic_saves() {
     let directory = temp_dir("failed-reset");
     let path = settings_path(&directory);
-    let original = br#"{"schema_version":2,"future":"preserve this original"}"#;
+    let original = br#"{"schema_version":3,"future":"preserve this original"}"#;
     fs::write(&path, original).unwrap();
     let mut store = SettingsStore::with_injected_fault(path.clone(), WriteFaultPoint::PartialWrite);
     assert!(store.is_refused());
@@ -1444,6 +1582,7 @@ fn failed_reset_preserves_refusal_original_and_blocks_automatic_saves() {
         },
         fullscreen: false,
         output: PersistentOutputChoice::Auto,
+        stats_hidden: false,
     };
     assert!(matches!(
         store.reset(invalid),
@@ -1464,15 +1603,15 @@ fn failed_reset_preserves_refusal_original_and_blocks_automatic_saves() {
     let (_, outcome) = SettingsStore::load(path.clone());
     assert!(matches!(
         outcome,
-        LoadOutcome::Refused(SettingsLoadError::UnsupportedVersion { version: 2, .. })
+        LoadOutcome::Refused(SettingsLoadError::UnsupportedVersion { version: 3, .. })
     ));
     let applied = applied_settings(draft_settings());
     assert!(matches!(
-        store.save_applied(&applied, preferences()),
+        persist_verified(&mut store, &applied, preferences()),
         Err(SettingsWriteError::RefusedOriginal { .. })
     ));
     assert!(matches!(
-        store.save_preferences(preferences()),
+        persist_globals(&mut store, preferences()),
         Err(SettingsWriteError::RefusedOriginal { .. })
     ));
     assert_eq!(fs::read(&path).unwrap(), original);
@@ -1510,8 +1649,9 @@ fn precommit_faults_leave_original_file_intact_and_loadable() {
             gain: PlaybackGain::new(42, true).unwrap(),
             fullscreen: false,
             output: PersistentOutputChoice::Auto,
+            stats_hidden: false,
         };
-        let result = store.save_applied(&applied, attempted_preferences.clone());
+        let result = persist_verified(&mut store, &applied, attempted_preferences.clone());
         let expected_error = match point {
             WriteFaultPoint::BeforeWrite | WriteFaultPoint::PartialWrite => {
                 matches!(result, Err(SettingsWriteError::WriteTemporary { .. }))
@@ -1539,15 +1679,14 @@ fn precommit_faults_leave_original_file_intact_and_loadable() {
         assert_eq!(*reloaded, previous, "{point:?}");
 
         // The fault fires once: the next write is a normal committed write.
-        let outcome = store
-            .save_preferences(attempted_preferences.clone())
-            .unwrap();
+        let outcome = persist_globals(&mut store, attempted_preferences.clone()).unwrap();
         assert!(outcome.is_confirmed(), "{point:?}");
         let (_, outcome) = SettingsStore::load(path);
         let LoadOutcome::Loaded(document) = outcome else {
             panic!("{point:?}: next preference write must load");
         };
-        assert_eq!(document.applied, previous.applied, "{point:?}");
+        assert_eq!(document.profiles, previous.profiles, "{point:?}");
+        assert_eq!(document.last_source, previous.last_source, "{point:?}");
         assert_eq!(document.preferences, attempted_preferences, "{point:?}");
         fs::remove_dir_all(&directory).unwrap();
     }
@@ -1559,7 +1698,7 @@ fn partial_write_never_leaves_half_content_in_place() {
     let path = settings_path(&directory);
     let (mut store, outcome) = SettingsStore::load(path.clone());
     assert!(matches!(outcome, LoadOutcome::Missing));
-    store.save_preferences(preferences()).unwrap();
+    persist_globals(&mut store, preferences()).unwrap();
     let complete = fs::read(&path).unwrap();
 
     let mut store = SettingsStore::with_injected_fault(path.clone(), WriteFaultPoint::PartialWrite);
@@ -1569,9 +1708,10 @@ fn partial_write_never_leaves_half_content_in_place() {
         gain: PlaybackGain::new(42, true).unwrap(),
         fullscreen: false,
         output: PersistentOutputChoice::Auto,
+        stats_hidden: false,
     };
     assert!(matches!(
-        store.save_applied(&applied, attempted_preferences),
+        persist_verified(&mut store, &applied, attempted_preferences),
         Err(SettingsWriteError::WriteTemporary { .. })
     ));
     // The target and published snapshot retain the previous complete document.
@@ -1602,17 +1742,16 @@ fn explicit_reset_clears_refusal_and_writes_null_applied() {
     let outcome = store.reset(preferences()).unwrap();
     assert!(outcome.is_confirmed());
     assert!(!store.is_refused());
-    assert_eq!(
-        store.snapshot().map(|stored| stored.applied.clone()),
-        Some(None)
-    );
+    assert!(store.snapshot().unwrap().profiles.entries().is_empty());
+    assert!(store.snapshot().unwrap().last_source.is_none());
     assert_eq!(store.snapshot().unwrap().preferences, preferences());
 
     let (mut reloaded, outcome) = SettingsStore::load(path.clone());
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("reset must produce a loadable file");
     };
-    assert_eq!(document.applied, None);
+    assert!(document.profiles.entries().is_empty());
+    assert!(document.last_source.is_none());
     assert_eq!(document.preferences, preferences());
 
     // After reset, a preference save keeps applied explicitly null.
@@ -1620,13 +1759,15 @@ fn explicit_reset_clears_refusal_and_writes_null_applied() {
         gain: PlaybackGain::new(15, true).unwrap(),
         fullscreen: false,
         output: PersistentOutputChoice::Auto,
+        stats_hidden: false,
     };
-    reloaded.save_preferences(later.clone()).unwrap();
+    persist_globals(&mut reloaded, later.clone()).unwrap();
     let (_, outcome) = SettingsStore::load(path);
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("expected loaded document after later save");
     };
-    assert_eq!(document.applied, None);
+    assert!(document.profiles.entries().is_empty());
+    assert!(document.last_source.is_none());
     assert_eq!(document.preferences, later);
     fs::remove_dir_all(&directory).unwrap();
 }
@@ -1641,13 +1782,14 @@ fn reset_refuses_nothing_about_the_previous_content_and_is_explicit_only() {
         panic!("expected loaded document");
     };
 
-    // save_preferences must NOT clear a published applied document.
-    store.save_preferences(LocalPreferences::default()).unwrap();
-    assert!(store.snapshot().unwrap().applied.is_some());
+    // A full collection save changing only globals must not clear profiles.
+    persist_globals(&mut store, LocalPreferences::default()).unwrap();
+    assert_eq!(store.snapshot().unwrap().profiles.entries().len(), 1);
 
     // Only reset replaces the whole document.
     store.reset(LocalPreferences::default()).unwrap();
-    assert_eq!(store.snapshot().unwrap().applied, None);
+    assert!(store.snapshot().unwrap().profiles.entries().is_empty());
+    assert!(store.snapshot().unwrap().last_source.is_none());
     fs::remove_dir_all(&directory).unwrap();
 }
 
@@ -1663,7 +1805,7 @@ fn parent_sync_uncertainty_is_committed_but_unconfirmed() {
         let mut store = SettingsStore::with_injected_fault(path.clone(), point);
 
         let applied = applied_settings(draft_settings());
-        let outcome = store.save_applied(&applied, preferences()).unwrap();
+        let outcome = persist_verified(&mut store, &applied, preferences()).unwrap();
         let WriteOutcome::Committed { durability } = &outcome;
         assert!(!outcome.is_confirmed(), "{point:?}");
         assert!(
@@ -1676,11 +1818,11 @@ fn parent_sync_uncertainty_is_committed_but_unconfirmed() {
         let LoadOutcome::Loaded(document) = outcome else {
             panic!("{point:?}: committed file must load");
         };
-        assert_eq!(document.applied.as_ref(), Some(&draft_settings()));
+        assert_eq!(last_settings(&document), Some(&draft_settings()));
         assert_eq!(store.snapshot(), Some(&*document));
         assert_eq!(document.preferences, preferences());
         assert_eq!(reloaded.snapshot(), Some(&*document));
-        assert!(reloaded.snapshot().unwrap().applied.is_some());
+        assert_eq!(reloaded.snapshot().unwrap().profiles.entries().len(), 1);
         fs::remove_dir_all(&directory).unwrap();
     }
 }
@@ -1694,7 +1836,7 @@ fn written_settings_file_is_owner_only() {
     let directory = temp_dir("perms");
     let path = settings_path(&directory);
     let (mut store, _) = SettingsStore::load(path.clone());
-    store.save_preferences(preferences()).unwrap();
+    persist_globals(&mut store, preferences()).unwrap();
     let mode = fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600, "settings must be 0600, got {mode:o}");
     fs::remove_dir_all(&directory).unwrap();
@@ -1790,7 +1932,7 @@ fn draft_with_filters(filters: FilterChain) -> DraftSettings {
 }
 
 #[test]
-fn pre_filter_v1_document_loads_empty_chain_and_reencodes_byte_for_byte() {
+fn pre_filter_v1_document_migrates_preserving_empty_chain() {
     let directory = temp_dir("filters-parity");
     let path = settings_path(&directory);
     let original = canonical_document();
@@ -1800,19 +1942,23 @@ fn pre_filter_v1_document_loads_empty_chain_and_reencodes_byte_for_byte() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("pre-filter v1 document must load, got {outcome:?}");
     };
-    let loaded = document.applied.as_ref().expect("applied present");
+    let loaded = last_settings(&document).expect("applied present");
     assert!(loaded.filters.entries().is_empty());
     assert_eq!(loaded, &draft_settings());
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
-    store
-        .save_applied(&applied_settings(draft_settings()), preferences())
-        .unwrap();
+    persist_verified(
+        &mut store,
+        &applied_settings(draft_settings()),
+        preferences(),
+    )
+    .unwrap();
 
-    assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        format!("{original}\n"),
-        "an empty chain must not add a filters key"
-    );
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(migrated) = outcome else {
+        panic!("migrated profile must load")
+    };
+    assert_eq!(last_settings(&migrated), last_settings(&document));
     fs::remove_dir_all(&directory).unwrap();
 }
 
@@ -1831,18 +1977,18 @@ fn full_filter_chain_round_trips_exactly_through_the_store() {
         panic!("three-entry chain must load, got {outcome:?}");
     };
     assert_eq!(
-        document.applied.as_ref().unwrap().filters,
+        last_settings(&document).unwrap().filters,
         three_entry_chain()
     );
 
     let applied = applied_settings(draft_with_filters(three_entry_chain()));
-    store.save_applied(&applied, preferences()).unwrap();
+    persist_verified(&mut store, &applied, preferences()).unwrap();
 
     let (_, outcome) = SettingsStore::load(path.clone());
     let LoadOutcome::Loaded(reloaded) = outcome else {
         panic!("re-encoded document must load");
     };
-    let entries = reloaded.applied.as_ref().unwrap().filters.entries();
+    let entries = last_settings(&reloaded).unwrap().filters.entries();
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].label(), "Levels");
     assert!(entries[0].enabled());
@@ -1851,7 +1997,7 @@ fn full_filter_chain_round_trips_exactly_through_the_store() {
     assert_eq!(entries[2].label(), "Denoise");
     assert!(entries[2].enabled());
     assert_eq!(
-        reloaded.applied.as_ref().unwrap().filters,
+        last_settings(&reloaded).unwrap().filters,
         three_entry_chain()
     );
     assert!(
@@ -1924,15 +2070,15 @@ fn inert_labels_unicode_whitespace_controls_and_nul_survive_the_store() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("inert labels must load, got {outcome:?}");
     };
-    assert_eq!(document.applied.as_ref().unwrap().filters, expected);
+    assert_eq!(last_settings(&document).unwrap().filters, expected);
 
     let applied = applied_settings(draft_with_filters(expected.clone()));
-    store.save_applied(&applied, preferences()).unwrap();
+    persist_verified(&mut store, &applied, preferences()).unwrap();
     let (_, outcome) = SettingsStore::load(path.clone());
     let LoadOutcome::Loaded(reloaded) = outcome else {
         panic!("re-encoded inert labels must load");
     };
-    assert_eq!(reloaded.applied.as_ref().unwrap().filters, expected);
+    assert_eq!(last_settings(&reloaded).unwrap().filters, expected);
 
     // The bytes on disk prove real JSON escaping rather than a stored echo.
     let written = fs::read_to_string(&path).unwrap();
@@ -1992,10 +2138,10 @@ fn all_disabled_nonempty_chain_is_serialized_and_reloaded_exactly() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("all-disabled chain must load, got {outcome:?}");
     };
-    assert_eq!(document.applied.as_ref().unwrap().filters, expected);
+    assert_eq!(last_settings(&document).unwrap().filters, expected);
 
     let applied = applied_settings(draft_with_filters(expected.clone()));
-    store.save_applied(&applied, preferences()).unwrap();
+    persist_verified(&mut store, &applied, preferences()).unwrap();
     assert!(
         fs::read_to_string(&path)
             .unwrap()
@@ -2006,7 +2152,7 @@ fn all_disabled_nonempty_chain_is_serialized_and_reloaded_exactly() {
     let LoadOutcome::Loaded(reloaded) = outcome else {
         panic!("all-disabled chain must reload");
     };
-    assert_eq!(reloaded.applied.as_ref().unwrap().filters, expected);
+    assert_eq!(last_settings(&reloaded).unwrap().filters, expected);
     fs::remove_dir_all(&directory).unwrap();
 }
 
@@ -2124,14 +2270,14 @@ fn malformed_filter_json_refuses_the_complete_original_and_blocks_saves_until_re
         assert!(store.snapshot().is_none(), "{label}");
         assert!(
             matches!(
-                store.save_applied(&applied, preferences()),
+                persist_verified(&mut store, &applied, preferences()),
                 Err(SettingsWriteError::RefusedOriginal { .. })
             ),
             "{label}: applied write must stay blocked"
         );
         assert!(
             matches!(
-                store.save_preferences(preferences()),
+                persist_globals(&mut store, preferences()),
                 Err(SettingsWriteError::RefusedOriginal { .. })
             ),
             "{label}: preference write must stay blocked"
@@ -2166,7 +2312,7 @@ fn full_chain_rename_fault_preserves_the_original_and_reports_persistence_separa
     let previous = store.snapshot().unwrap().clone();
     let applied = applied_settings(draft_with_filters(three_entry_chain()));
 
-    let result = store.save_applied(&applied, preferences());
+    let result = persist_verified(&mut store, &applied, preferences());
     assert!(
         matches!(result, Err(SettingsWriteError::Rename { .. })),
         "persistence failure must be reported separately: {result:?}"
@@ -2184,9 +2330,7 @@ fn full_chain_rename_fault_preserves_the_original_and_reports_persistence_separa
     };
     assert_eq!(*reloaded, previous);
     assert!(
-        reloaded
-            .applied
-            .as_ref()
+        last_settings(&reloaded)
             .unwrap()
             .filters
             .entries()
@@ -2194,16 +2338,13 @@ fn full_chain_rename_fault_preserves_the_original_and_reports_persistence_separa
     );
 
     // The fault fires once: the next write commits the full chain.
-    let outcome = store.save_applied(&applied, preferences()).unwrap();
+    let outcome = persist_verified(&mut store, &applied, preferences()).unwrap();
     assert!(outcome.is_confirmed());
     let (_, outcome) = SettingsStore::load(path);
     let LoadOutcome::Loaded(stored) = outcome else {
         panic!("committed chain must load");
     };
-    assert_eq!(
-        stored.applied.as_ref().unwrap().filters,
-        three_entry_chain()
-    );
+    assert_eq!(last_settings(&stored).unwrap().filters, three_entry_chain());
     fs::remove_dir_all(&directory).unwrap();
 }
 
@@ -2253,7 +2394,7 @@ fn draft_with_renderer(renderer: RendererSettings) -> DraftSettings {
 }
 
 #[test]
-fn pre_renderer_v1_document_loads_baseline_and_reencodes_byte_for_byte() {
+fn pre_renderer_v1_document_migrates_preserving_baseline() {
     let directory = temp_dir("renderer-parity");
     let path = settings_path(&directory);
     let original = canonical_document();
@@ -2263,24 +2404,23 @@ fn pre_renderer_v1_document_loads_baseline_and_reencodes_byte_for_byte() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("pre-renderer v1 document must load, got {outcome:?}");
     };
-    let loaded = document.applied.as_ref().expect("applied present");
+    let loaded = last_settings(&document).expect("applied present");
     assert_eq!(loaded.renderer, RendererSettings::default());
     assert!(loaded.renderer.is_baseline());
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
-    store
-        .save_applied(&applied_settings(draft_settings()), preferences())
-        .unwrap();
+    persist_verified(
+        &mut store,
+        &applied_settings(draft_settings()),
+        preferences(),
+    )
+    .unwrap();
 
-    let written = fs::read_to_string(&path).unwrap();
-    assert_eq!(
-        written,
-        format!("{original}\n"),
-        "a baseline renderer must not add a renderer key"
-    );
-    assert!(
-        !written.contains("renderer"),
-        "no renderer key on a baseline document: {written}"
-    );
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(migrated) = outcome else {
+        panic!("migrated profile must load")
+    };
+    assert_eq!(last_settings(&migrated), last_settings(&document));
     fs::remove_dir_all(&directory).unwrap();
 }
 
@@ -2299,12 +2439,12 @@ fn reference_renderer_round_trips_exactly_through_the_store() {
     let LoadOutcome::Loaded(document) = outcome else {
         panic!("reference renderer document must load, got {outcome:?}");
     };
-    let loaded = document.applied.as_ref().expect("applied present");
+    let loaded = last_settings(&document).expect("applied present");
     assert_eq!(loaded.renderer, reference_renderer());
     assert!(!loaded.renderer.is_baseline());
 
     let applied = applied_settings(draft_with_renderer(reference_renderer()));
-    store.save_applied(&applied, preferences()).unwrap();
+    persist_verified(&mut store, &applied, preferences()).unwrap();
 
     let written = fs::read_to_string(&path).unwrap();
     let expected = serde_json::to_string(&reference_renderer()).unwrap();
@@ -2317,7 +2457,7 @@ fn reference_renderer_round_trips_exactly_through_the_store() {
         panic!("re-encoded reference must load");
     };
     assert_eq!(
-        reloaded.applied.as_ref().unwrap().renderer,
+        last_settings(&reloaded).unwrap().renderer,
         reference_renderer()
     );
     fs::remove_dir_all(&directory).unwrap();
@@ -2490,14 +2630,14 @@ fn malformed_renderer_json_refuses_the_complete_original_and_blocks_saves_until_
         assert!(store.snapshot().is_none(), "{label}");
         assert!(
             matches!(
-                store.save_applied(&applied, preferences()),
+                persist_verified(&mut store, &applied, preferences()),
                 Err(SettingsWriteError::RefusedOriginal { .. })
             ),
             "{label}: applied write must stay blocked"
         );
         assert!(
             matches!(
-                store.save_preferences(preferences()),
+                persist_globals(&mut store, preferences()),
                 Err(SettingsWriteError::RefusedOriginal { .. })
             ),
             "{label}: preference write must stay blocked"
@@ -2519,4 +2659,719 @@ fn malformed_renderer_json_refuses_the_complete_original_and_blocks_saves_until_
         );
     }
     fs::remove_dir_all(&directory).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Automatic source profiles: identity, strict v2 migration and complete saves
+// ---------------------------------------------------------------------------
+
+fn profile_identity(port: u8, serial: Option<&str>) -> DeviceIdentity {
+    DeviceIdentity::new(
+        0x1234,
+        0x5678,
+        UsbTopology::new(
+            "usb-0000:03:00.0".to_owned(),
+            vec![NonZeroU8::new(port).unwrap(), NonZeroU8::new(1).unwrap()],
+        )
+        .unwrap(),
+        serial.map(str::to_owned),
+    )
+    .unwrap()
+}
+
+fn two_profile_settings() -> (DraftSettings, DraftSettings) {
+    let a = DraftSettings {
+        video: auto_video_request(),
+        filters: three_entry_chain(),
+        renderer: reference_renderer(),
+        ..draft_settings()
+    };
+    let mut b = DraftSettings {
+        video: video_request(u32::from_le_bytes(*b"MJPG"), 1280, 720, 30000, 1001),
+        audio: AudioSelection::Disabled {
+            retained: Some(
+                AudioSourceIdentity::new(
+                    "alsa_input.usb-B".to_owned(),
+                    vec![
+                        ("card.id".to_owned(), "4".to_owned()),
+                        ("node.name".to_owned(), "capture.b".to_owned()),
+                    ],
+                )
+                .unwrap(),
+            ),
+        },
+        filters: FilterChain::new(
+            three_entry_chain()
+                .entries()
+                .iter()
+                .rev()
+                .cloned()
+                .collect(),
+        )
+        .unwrap(),
+        renderer: RendererSettings::default(),
+    };
+    b.video.identity = profile_identity(3, Some("B"));
+    (a, b)
+}
+
+#[test]
+fn source_profiles_round_trip_all_six_fields_and_globals_without_cross_source_inheritance() {
+    let directory = temp_dir("multi-profile");
+    let path = settings_path(&directory);
+    let (a, b) = two_profile_settings();
+    let mut profiles = SourceProfiles::default();
+    profiles.upsert_verified(&applied_settings(a.clone()), ProfileBinding::Serial);
+    profiles.upsert_verified(&applied_settings(b.clone()), ProfileBinding::Serial);
+    let globals = LocalPreferences {
+        gain: PlaybackGain::new(0, true).unwrap(),
+        fullscreen: true,
+        output: PersistentOutputChoice::Manual(manual_sink_identity()),
+        stats_hidden: true,
+    };
+    let (mut store, _) = SettingsStore::load(path.clone());
+    store
+        .save_profiles(&profiles, Some(&b.video.identity), globals.clone())
+        .unwrap();
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("all profiles must reload")
+    };
+    assert_eq!(document.profiles.entries().len(), 2);
+    assert_eq!(document.profiles.lookup(&a.video.identity, true), Some(&a));
+    assert_eq!(document.profiles.lookup(&b.video.identity, true), Some(&b));
+    assert_eq!(last_settings(&document), Some(&b));
+    assert_eq!(document.preferences, globals);
+    assert!(
+        document
+            .profiles
+            .lookup(&profile_identity(4, Some("C")), true)
+            .is_none()
+    );
+    assert!(!fs::read_to_string(path).unwrap().contains("\"applied\""));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn unique_serial_port_move_replaces_one_profile_and_last_source_only_after_verified_save() {
+    let directory = temp_dir("serial-port-move");
+    let path = settings_path(&directory);
+    let settings = draft_with_filters(three_entry_chain());
+    let old = settings.video.identity.clone();
+    let moved = profile_identity(8, Some("SER42"));
+    let mut profiles = SourceProfiles::default();
+    profiles.upsert_verified(&applied_settings(settings.clone()), ProfileBinding::Serial);
+    profiles.observe(std::iter::once(&moved));
+    assert_eq!(profiles.lookup(&moved, true), Some(&settings));
+    assert_eq!(profiles.entries()[0].settings().video.identity, old);
+    let (mut store, _) = SettingsStore::load(path.clone());
+    store
+        .save_profiles(&profiles, Some(&old), preferences())
+        .unwrap();
+    let mut moved_settings = settings.clone();
+    moved_settings.video.identity = moved.clone();
+    profiles.upsert_verified(
+        &applied_settings(moved_settings.clone()),
+        ProfileBinding::Serial,
+    );
+    assert_eq!(profiles.entries().len(), 1);
+    assert_eq!(profiles.entries()[0].settings(), &moved_settings);
+    assert_eq!(store.snapshot().unwrap().last_source.as_ref(), Some(&old));
+    store
+        .save_profiles(&profiles, Some(&moved), preferences())
+        .unwrap();
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("moved profile must reload")
+    };
+    assert_eq!(document.profiles.entries().len(), 1);
+    assert_eq!(document.last_source.as_ref(), Some(&moved));
+    assert_eq!(last_settings(&document), Some(&moved_settings));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn exact_raw_serial_and_vid_pid_are_not_normalized_or_cross_matched() {
+    let settings = draft_settings();
+    let mut profiles = SourceProfiles::default();
+    profiles.upsert_verified(&applied_settings(settings.clone()), ProfileBinding::Serial);
+    for serial in ["ser42", "SER42 ", "usb-SER42"] {
+        assert!(
+            profiles
+                .lookup(&profile_identity(2, Some(serial)), true)
+                .is_none()
+        );
+    }
+    let other_product =
+        DeviceIdentity::new(0x1234, 0x5679, topology(), Some("SER42".to_owned())).unwrap();
+    assert!(profiles.lookup(&other_product, true).is_none());
+    let other_vendor =
+        DeviceIdentity::new(0x1235, 0x5678, topology(), Some("SER42".to_owned())).unwrap();
+    assert!(profiles.lookup(&other_vendor, true).is_none());
+    profiles.observe([&settings.video.identity, &other_product, &other_vendor].into_iter());
+    assert_eq!(
+        profiles.binding_for(&settings.video.identity, true),
+        ProfileBinding::Serial
+    );
+}
+
+#[test]
+fn serialless_profiles_remain_exact_topology_bound_when_devices_disappear_or_move() {
+    let mut a = draft_settings();
+    a.video.identity = profile_identity(2, None);
+    let mut b = a.clone();
+    b.video.identity = profile_identity(3, None);
+    b.video.mode.rate = FrameRate::new(30000, 1001).unwrap();
+    let mut profiles = SourceProfiles::default();
+    profiles.upsert_verified(&applied_settings(a.clone()), ProfileBinding::Serial);
+    profiles.upsert_verified(&applied_settings(b.clone()), ProfileBinding::Topology);
+    profiles.observe([&a.video.identity, &b.video.identity].into_iter());
+    assert_eq!(profiles.entries().len(), 2);
+    assert_eq!(
+        profiles.binding_for(&a.video.identity, true),
+        ProfileBinding::Topology
+    );
+    assert_eq!(profiles.lookup(&a.video.identity, false), Some(&a));
+    assert_eq!(profiles.lookup(&b.video.identity, false), Some(&b));
+    profiles.observe(std::iter::once(&a.video.identity));
+    assert!(profiles.lookup(&profile_identity(8, None), true).is_none());
+}
+
+#[test]
+fn duplicate_serial_observation_is_sticky_without_b_success_and_survives_global_save_reload() {
+    let directory = temp_dir("sticky-collision");
+    let path = settings_path(&directory);
+    let settings = draft_with_renderer(reference_renderer());
+    let a = settings.video.identity.clone();
+    let b = profile_identity(3, Some("SER42"));
+    let mut profiles = SourceProfiles::default();
+    profiles.upsert_verified(&applied_settings(settings.clone()), ProfileBinding::Serial);
+    profiles.observe([&a, &a].into_iter());
+    assert_eq!(profiles.binding_for(&a, true), ProfileBinding::Serial);
+    profiles.observe([&a, &b].into_iter());
+    assert_eq!(
+        profiles.entries().len(),
+        1,
+        "observation creates no fake B profile"
+    );
+    assert_eq!(profiles.entries()[0].binding(), ProfileBinding::Topology);
+    assert_eq!(profiles.entries()[0].settings(), &settings);
+    profiles.observe(std::iter::once(&a));
+    assert_eq!(profiles.binding_for(&a, true), ProfileBinding::Topology);
+    assert!(profiles.lookup(&b, true).is_none());
+    let (mut store, _) = SettingsStore::load(path.clone());
+    store
+        .save_profiles(&profiles, Some(&a), manual_output_preferences())
+        .unwrap();
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(mut document) = outcome else {
+        panic!("collision profile must reload")
+    };
+    document.profiles.observe(std::iter::once(&a));
+    assert_eq!(
+        document.profiles.binding_for(&a, true),
+        ProfileBinding::Topology
+    );
+    assert_eq!(document.profiles.lookup(&a, true), Some(&settings));
+    assert!(document.profiles.lookup(&b, true).is_none());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn collision_without_profiles_restricts_first_success_and_a_pre_collision_serial_receipt() {
+    let a = profile_identity(2, Some("DUP"));
+    let b = profile_identity(3, Some("DUP"));
+    let mut profiles = SourceProfiles::default();
+    profiles.observe([&a, &b].into_iter());
+    assert!(profiles.entries().is_empty());
+    profiles.observe(std::iter::once(&a));
+    assert_eq!(profiles.binding_for(&a, true), ProfileBinding::Topology);
+    let mut a_settings = draft_settings();
+    a_settings.video.identity = a.clone();
+    profiles.upsert_verified(
+        &applied_settings(a_settings.clone()),
+        ProfileBinding::Serial,
+    );
+    let mut b_settings = a_settings.clone();
+    b_settings.video.identity = b.clone();
+    b_settings.video.mode.rate = FrameRate::new(30000, 1001).unwrap();
+    profiles.upsert_verified(
+        &applied_settings(b_settings.clone()),
+        ProfileBinding::Serial,
+    );
+    assert_eq!(profiles.entries().len(), 2);
+    assert!(
+        profiles
+            .entries()
+            .iter()
+            .all(|profile| profile.binding() == ProfileBinding::Topology)
+    );
+    assert_eq!(profiles.lookup(&a, true), Some(&a_settings));
+    assert_eq!(profiles.lookup(&b, true), Some(&b_settings));
+}
+
+#[test]
+fn v1_migration_is_lazy_and_the_first_global_save_preserves_full_profile_and_preferences() {
+    let directory = temp_dir("v1-lazy-migration");
+    let path = settings_path(&directory);
+    let payload = applied_with_filters(THREE_FILTER_ENTRIES);
+    let payload = format!(
+        "{},\"renderer\":{}}}",
+        payload.strip_suffix('}').unwrap(),
+        reference_renderer_json(),
+    );
+    let legacy = document_with_applied(&payload);
+    fs::write(&path, legacy.as_bytes()).unwrap();
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("complete v1 payload must migrate")
+    };
+    let expected = DraftSettings {
+        filters: three_entry_chain(),
+        renderer: reference_renderer(),
+        ..draft_settings()
+    };
+    assert_eq!(last_settings(&document), Some(&expected));
+    assert_eq!(
+        document.profiles.entries()[0].binding(),
+        ProfileBinding::Serial
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        legacy.as_bytes(),
+        "load must not rewrite v1"
+    );
+    let globals = manual_output_preferences();
+    store
+        .save_profiles(
+            &document.profiles,
+            document.last_source.as_ref(),
+            globals.clone(),
+        )
+        .unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(wire["schema_version"], 2);
+    assert!(wire.get("applied").is_none());
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(migrated) = outcome else {
+        panic!("lazy v2 save must reload")
+    };
+    assert_eq!(last_settings(&migrated), Some(&expected));
+    assert_eq!(migrated.last_source, document.last_source);
+    assert_eq!(migrated.preferences, globals);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn v2_document(profiles: &str, last_source: &str) -> String {
+    format!(
+        r#"{{"schema_version":2,"profiles":{profiles},"last_source":{last_source},"preferences":{PREFS}}}"#
+    )
+}
+
+fn wire_profile(binding: &str, settings: &str) -> String {
+    format!(r#"{{"binding":"{binding}","settings":{settings}}}"#)
+}
+
+#[test]
+fn strict_v2_refuses_invalid_collection_pointer_duplicates_nulls_and_settings_without_touching_bytes()
+ {
+    let directory = temp_dir("v2-refusals");
+    let serial = wire_profile("serial", APPLIED);
+    let topology = wire_profile("topology", APPLIED);
+    let moved = APPLIED.replace("\"ports\":[2,1]", "\"ports\":[3,1]");
+    let moved_serial = wire_profile("serial", &moved);
+    let moved_topology = wire_profile("topology", &moved);
+    let bad_pointer = serde_json::to_string(&profile_identity(9, Some("SER42"))).unwrap();
+    let cases = [
+        ("null profiles", v2_document("null", "null")),
+        ("null profile", v2_document("[null]", "null")),
+        (
+            "positional profile",
+            v2_document(&format!(r#"[["serial",{APPLIED}]]"#), "null"),
+        ),
+        (
+            "missing binding",
+            v2_document(&format!(r#"[{{"settings":{APPLIED}}}]"#), "null"),
+        ),
+        (
+            "missing settings",
+            v2_document(r#"[{"binding":"serial"}]"#, "null"),
+        ),
+        (
+            "null binding",
+            v2_document(
+                &format!(r#"[{{"binding":null,"settings":{APPLIED}}}]"#),
+                "null",
+            ),
+        ),
+        (
+            "invalid binding",
+            v2_document(&format!("[{}]", wire_profile("auto", APPLIED)), "null"),
+        ),
+        (
+            "null settings",
+            v2_document(r#"[{"binding":"serial","settings":null}]"#, "null"),
+        ),
+        (
+            "unknown profile field",
+            v2_document(
+                &format!(r#"[{{"binding":"serial","settings":{APPLIED},"extra":0}}]"#),
+                "null",
+            ),
+        ),
+        (
+            "duplicate binding",
+            v2_document(
+                &format!(r#"[{{"binding":"serial","binding":"topology","settings":{APPLIED}}}]"#),
+                "null",
+            ),
+        ),
+        (
+            "duplicate settings",
+            v2_document(
+                &format!(r#"[{{"binding":"serial","settings":{APPLIED},"settings":{APPLIED}}}]"#),
+                "null",
+            ),
+        ),
+        (
+            "duplicate full identity",
+            v2_document(&format!("[{serial},{serial}]"), "null"),
+        ),
+        (
+            "multiple serial group",
+            v2_document(&format!("[{serial},{moved_serial}]"), "null"),
+        ),
+        (
+            "mixed bindings",
+            v2_document(&format!("[{serial},{moved_topology}]"), "null"),
+        ),
+        (
+            "reverse mixed bindings",
+            v2_document(&format!("[{topology},{moved_serial}]"), "null"),
+        ),
+        (
+            "serial binding without serial",
+            v2_document(
+                &format!(
+                    "[{}]",
+                    wire_profile(
+                        "serial",
+                        &APPLIED.replace(r#""serial":"SER42""#, r#""serial":null"#)
+                    )
+                ),
+                "null",
+            ),
+        ),
+        (
+            "last pointer missing",
+            format!(r#"{{"schema_version":2,"profiles":[],"preferences":{PREFS}}}"#),
+        ),
+        (
+            "last pointer to absent identity",
+            v2_document(&format!("[{serial}]"), &bad_pointer),
+        ),
+        (
+            "last pointer on empty profiles",
+            v2_document("[]", &bad_pointer),
+        ),
+        (
+            "duplicate last pointer",
+            format!(
+                r#"{{"schema_version":2,"profiles":[],"last_source":null,"last_source":null,"preferences":{PREFS}}}"#
+            ),
+        ),
+        (
+            "duplicate null profiles",
+            format!(
+                r#"{{"schema_version":2,"profiles":null,"profiles":[],"last_source":null,"preferences":{PREFS}}}"#
+            ),
+        ),
+        (
+            "missing profiles",
+            format!(r#"{{"schema_version":2,"last_source":null,"preferences":{PREFS}}}"#),
+        ),
+        (
+            "legacy payload key",
+            format!(
+                r#"{{"schema_version":2,"profiles":[],"last_source":null,"applied":null,"preferences":{PREFS}}}"#
+            ),
+        ),
+        (
+            "invalid exact rate",
+            v2_document(
+                &format!(
+                    "[{}]",
+                    wire_profile(
+                        "serial",
+                        &APPLIED.replace("\"denominator\":1001", "\"denominator\":0")
+                    )
+                ),
+                "null",
+            ),
+        ),
+        (
+            "invalid identity",
+            v2_document(
+                &format!(
+                    "[{}]",
+                    wire_profile(
+                        "serial",
+                        &APPLIED.replace("\"ports\":[2,1]", "\"ports\":[]")
+                    )
+                ),
+                "null",
+            ),
+        ),
+        (
+            "null filters",
+            v2_document(
+                &format!(
+                    "[{}]",
+                    wire_profile("serial", &applied_with_filters("null"))
+                ),
+                "null",
+            ),
+        ),
+        (
+            "null renderer",
+            v2_document(
+                &format!(
+                    "[{}]",
+                    wire_profile("serial", &applied_with_renderer("null"))
+                ),
+                "null",
+            ),
+        ),
+        (
+            "duplicate nested rate",
+            v2_document(
+                &format!(
+                    "[{}]",
+                    wire_profile(
+                        "serial",
+                        &APPLIED.replace(
+                            "\"denominator\":1001",
+                            "\"denominator\":1001,\"denominator\":1001"
+                        )
+                    )
+                ),
+                "null",
+            ),
+        ),
+        (
+            "duplicate schema version",
+            format!(
+                r#"{{"schema_version":2,"schema_version":2,"profiles":[],"last_source":null,"preferences":{PREFS}}}"#
+            ),
+        ),
+    ];
+    for (label, json) in cases {
+        let (mut store, _) = refused_schema(&directory, label, &json);
+        assert!(
+            matches!(
+                store.save_profiles(&SourceProfiles::default(), None, preferences()),
+                Err(SettingsWriteError::RefusedOriginal { .. })
+            ),
+            "{label}"
+        );
+        assert_eq!(fs::read(store.path()).unwrap(), json.as_bytes(), "{label}");
+        assert_no_temp_files(&directory);
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn topology_duplicates_of_one_serial_group_are_legal_and_never_promoted_after_reload() {
+    let directory = temp_dir("v2-topology-group");
+    let path = settings_path(&directory);
+    let moved = APPLIED.replace("\"ports\":[2,1]", "\"ports\":[3,1]");
+    let original = v2_document(
+        &format!(
+            "[{},{}]",
+            wire_profile("topology", APPLIED),
+            wire_profile("topology", &moved)
+        ),
+        "null",
+    );
+    fs::write(&path, original.as_bytes()).unwrap();
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(mut document) = outcome else {
+        panic!("topology group must load")
+    };
+    assert_eq!(document.profiles.entries().len(), 2);
+    document.profiles.observe(std::iter::once(&identity()));
+    assert_eq!(
+        document.profiles.binding_for(&identity(), true),
+        ProfileBinding::Topology
+    );
+    assert_eq!(
+        document.profiles.lookup(&identity(), true),
+        Some(&draft_settings())
+    );
+    store
+        .save_profiles(&document.profiles, None, preferences())
+        .unwrap();
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(reloaded) = outcome else {
+        panic!("topology group must survive save")
+    };
+    assert_eq!(document.profiles, reloaded.profiles);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn preference_save_and_precommit_failure_preserve_all_profiles_and_the_committed_last_source() {
+    let directory = temp_dir("collection-write-fault");
+    let path = settings_path(&directory);
+    let (a, b) = two_profile_settings();
+    let mut profiles = SourceProfiles::default();
+    profiles.upsert_verified(&applied_settings(a.clone()), ProfileBinding::Serial);
+    profiles.upsert_verified(&applied_settings(b.clone()), ProfileBinding::Serial);
+    let (mut store, _) = SettingsStore::load(path.clone());
+    store
+        .save_profiles(&profiles, Some(&b.video.identity), preferences())
+        .unwrap();
+    let globals_before = manual_output_preferences();
+    store
+        .save_profiles(&profiles, Some(&b.video.identity), globals_before.clone())
+        .unwrap();
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(global_save) = outcome else {
+        panic!("global save must load")
+    };
+    assert_eq!(
+        global_save.profiles.lookup(&a.video.identity, true),
+        Some(&a)
+    );
+    assert_eq!(
+        global_save.profiles.lookup(&b.video.identity, true),
+        Some(&b)
+    );
+    assert_eq!(global_save.last_source.as_ref(), Some(&b.video.identity));
+    assert_eq!(global_save.preferences, globals_before);
+    let original = fs::read(&path).unwrap();
+    let committed = store.snapshot().unwrap().clone();
+    let mut faulted =
+        SettingsStore::with_injected_fault(path.clone(), WriteFaultPoint::BeforeRename);
+    let mut newer_a = a.clone();
+    newer_a.video.mode.rate = FrameRate::new(30000, 1001).unwrap();
+    profiles.upsert_verified(&applied_settings(newer_a.clone()), ProfileBinding::Serial);
+    assert!(matches!(
+        faulted.save_profiles(
+            &profiles,
+            Some(&a.video.identity),
+            manual_output_preferences()
+        ),
+        Err(SettingsWriteError::Rename { .. })
+    ));
+    assert_eq!(faulted.snapshot(), Some(&committed));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    let globals = manual_output_preferences();
+    faulted
+        .save_profiles(&profiles, Some(&a.video.identity), globals.clone())
+        .unwrap();
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("whole-collection retry must load")
+    };
+    assert_eq!(
+        document.profiles.lookup(&a.video.identity, true),
+        Some(&newer_a)
+    );
+    assert_eq!(document.profiles.lookup(&b.video.identity, true), Some(&b));
+    assert_eq!(document.preferences, globals);
+    assert_eq!(document.last_source.as_ref(), Some(&a.video.identity));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn invalid_last_source_is_a_typed_prewrite_refusal_and_reset_discards_collision_history() {
+    let directory = temp_dir("profile-pointer-write");
+    let path = settings_path(&directory);
+    let mut profiles = SourceProfiles::default();
+    let a = identity();
+    let b = profile_identity(3, Some("SER42"));
+    profiles.observe([&a, &b].into_iter());
+    profiles.upsert_verified(&applied_settings(draft_settings()), ProfileBinding::Serial);
+    let (mut store, _) = SettingsStore::load(path.clone());
+    store
+        .save_profiles(&profiles, Some(&a), preferences())
+        .unwrap();
+    let original = fs::read(&path).unwrap();
+    let snapshot = store.snapshot().unwrap().clone();
+    assert!(matches!(
+        store.save_profiles(&profiles, Some(&b), manual_output_preferences()),
+        Err(SettingsWriteError::InvalidValue {
+            source: SettingsValidationError::Profiles(ProfileValidationError::InvalidLastSource),
+        })
+    ));
+    assert_eq!(store.snapshot(), Some(&snapshot));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    let globals = manual_output_preferences();
+    store.reset(globals.clone()).unwrap();
+    let cleared = store.snapshot().unwrap();
+    assert!(cleared.profiles.entries().is_empty());
+    assert_eq!(
+        cleared.profiles.binding_for(&a, true),
+        ProfileBinding::Serial
+    );
+    assert!(cleared.last_source.is_none());
+    assert_eq!(cleared.preferences, globals);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn v1_preferences_only_migrates_lazily_with_empty_profiles_and_unchanged_globals() {
+    let directory = temp_dir("v1-global-only");
+    let path = settings_path(&directory);
+    let original = document_with_applied("null");
+    fs::write(&path, original.as_bytes()).unwrap();
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded(document) = outcome else {
+        panic!("v1 globals must load")
+    };
+    assert!(document.profiles.entries().is_empty());
+    assert!(document.last_source.is_none());
+    assert_eq!(document.preferences, preferences());
+    assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+    store
+        .save_profiles(&document.profiles, None, document.preferences.clone())
+        .unwrap();
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded(migrated) = outcome else {
+        panic!("migrated globals must load")
+    };
+    assert_eq!(*migrated, *document);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn encode_invalid_profile_settings_refuses_before_writing_and_keeps_the_committed_document() {
+    let directory = temp_dir("invalid-profile-write");
+    let path = settings_path(&directory);
+    let (mut store, _) = SettingsStore::load(path.clone());
+    let mut valid = SourceProfiles::default();
+    valid.upsert_verified(&applied_settings(draft_settings()), ProfileBinding::Serial);
+    store
+        .save_profiles(&valid, Some(&identity()), preferences())
+        .unwrap();
+    let original = fs::read(&path).unwrap();
+    let committed = store.snapshot().unwrap().clone();
+    let mut invalid = draft_settings();
+    invalid.video.resolved_fourcc = None;
+    let invalid = SourceProfiles::new(vec![
+        SourceProfile::new(ProfileBinding::Serial, invalid).unwrap(),
+    ])
+    .unwrap();
+    assert!(matches!(
+        store.save_profiles(&invalid, Some(&identity()), manual_output_preferences()),
+        Err(SettingsWriteError::InvalidValue {
+            source: SettingsValidationError::UnresolvedVideo
+        })
+    ));
+    assert_eq!(store.snapshot(), Some(&committed));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_no_temp_files(&directory);
+    fs::remove_dir_all(directory).unwrap();
 }
