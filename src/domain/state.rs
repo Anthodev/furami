@@ -318,6 +318,9 @@ pub struct Draft {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AppliedSettings {
     settings: DraftSettings,
+    /// Admitted physical route for this process, never an on-disk identity.
+    #[serde(skip)]
+    pinned_node: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 impl AppliedSettings {
     pub fn settings(&self) -> &DraftSettings {
@@ -1392,8 +1395,9 @@ impl ProductModel {
             }
             VideoPresence::Present => {
                 let settings = loss.applied.settings.clone();
+                let pinned_node = loss.applied.pinned_node.clone();
                 let stamp = observation.stamp;
-                match self.begin(settings, AttemptPurpose::Recovery) {
+                match self.begin(settings, AttemptPurpose::Recovery, pinned_node) {
                     Ok((_, effect)) => {
                         self.recovery_attempted = Some(stamp);
                         Some(effect)
@@ -1429,7 +1433,8 @@ impl ProductModel {
             .applied
             .settings
             .clone();
-        let (_, _) = self.begin(settings, AttemptPurpose::Recovery)?;
+        // A genuine current choice authorizes a different physical route.
+        let (_, _) = self.begin(settings, AttemptPurpose::Recovery, None)?;
         let transition = match &mut self.state {
             ProductState::Recovering(transition) => transition,
             _ => return Err(CommandRejection::SelectionUnavailable),
@@ -1620,6 +1625,7 @@ impl ProductModel {
         if key.pass == TreatmentPass::Candidate {
             let applied = AppliedSettings {
                 settings: transition.candidate,
+                pinned_node: transition.incumbent.applied.pinned_node.clone(),
             };
             transition.incumbent.applied = applied.clone();
             self.last_valid = Some(applied);
@@ -1898,7 +1904,7 @@ impl ProductModel {
         }
         let mut candidate = self.draft.settings.clone();
         candidate.video.resolved_fourcc = None;
-        self.begin(candidate, AttemptPurpose::Candidate)
+        self.begin(candidate, AttemptPurpose::Candidate, None)
     }
     pub fn reconnect(
         &mut self,
@@ -1935,15 +1941,15 @@ impl ProductModel {
             return Ok((ReconnectAdmission::HealthyNoop, None));
         }
         self.check_command(expected)?;
-        let target = self
+        let applied = self
             .last_valid
             .as_ref()
-            .ok_or(CommandRejection::ReconnectUnavailable)?
-            .settings
-            .clone();
+            .ok_or(CommandRejection::ReconnectUnavailable)?;
+        let target = applied.settings.clone();
+        let pinned_node = applied.pinned_node.clone();
         self.recovery_attempted = None;
         self.recovery_apply = None;
-        let (apply, effect) = self.begin(target, AttemptPurpose::Reconnect)?;
+        let (apply, effect) = self.begin(target, AttemptPurpose::Reconnect, pinned_node)?;
         Ok((ReconnectAdmission::Started(apply), Some(effect)))
     }
     pub fn restart(
@@ -1953,21 +1959,21 @@ impl ProductModel {
         self.check_command(expected)?;
         if self.active().is_none() {
             self.check_command(expected)?;
-            let target = self
+            let applied = self
                 .last_valid
                 .as_ref()
-                .ok_or(CommandRejection::ReconnectUnavailable)?
-                .settings
-                .clone();
-            return self.begin(target, AttemptPurpose::Reconnect);
+                .ok_or(CommandRejection::ReconnectUnavailable)?;
+            let target = applied.settings.clone();
+            let pinned_node = applied.pinned_node.clone();
+            return self.begin(target, AttemptPurpose::Reconnect, pinned_node);
         }
-        let settings = self
+        let applied = &self
             .active()
             .ok_or(CommandRejection::ReconnectUnavailable)?
-            .applied
-            .settings
-            .clone();
-        self.begin(settings, AttemptPurpose::Candidate)
+            .applied;
+        let settings = applied.settings.clone();
+        let pinned_node = applied.pinned_node.clone();
+        self.begin(settings, AttemptPurpose::Candidate, pinned_node)
     }
     fn playback_attempt(&self, attempt: AttemptId) -> Result<&Active, CommandRejection> {
         let active = match &self.state {
@@ -2068,12 +2074,14 @@ impl ProductModel {
             return Err(CommandRejection::PlaybackUnavailable);
         }
         let settings = active.applied.settings.clone();
-        self.begin(settings, AttemptPurpose::Resume)
+        let pinned_node = active.applied.pinned_node.clone();
+        self.begin(settings, AttemptPurpose::Resume, pinned_node)
     }
     fn begin(
         &mut self,
         settings: DraftSettings,
         purpose: AttemptPurpose,
+        pinned_node: Option<(std::path::PathBuf, std::path::PathBuf)>,
     ) -> Result<(ApplyId, ModelEffect), CommandRejection> {
         let value = if purpose == AttemptPurpose::Recovery {
             self.recovery_apply
@@ -2144,7 +2152,7 @@ impl ProductModel {
             _ => Origin::Stopped,
         };
         let request = ValidationRequest {
-            pinned_node: None,
+            pinned_node,
             key: ValidationKey { apply, purpose },
             revision: self.draft.revision,
             settings,
@@ -2388,6 +2396,7 @@ impl ProductModel {
         };
         let applied = AppliedSettings {
             settings: transition.request.settings,
+            pinned_node: transition.request.pinned_node,
         };
         let active = Active {
             applied: applied.clone(),
@@ -2615,7 +2624,7 @@ impl ProductModel {
                 }
             };
             let request = ValidationRequest {
-                pinned_node: None,
+                pinned_node: transition.prior.pinned_node.clone(),
                 key: ValidationKey {
                     apply: transition.key.apply,
                     purpose: AttemptPurpose::Restore,
@@ -2679,7 +2688,7 @@ impl ProductModel {
                     }
                 };
                 transition.request = ValidationRequest {
-                    pinned_node: None,
+                    pinned_node: prior.pinned_node.clone(),
                     key: ValidationKey {
                         apply: transition.request.key.apply,
                         purpose: AttemptPurpose::Restore,

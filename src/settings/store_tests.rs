@@ -947,6 +947,77 @@ fn strict_format_policy_schema_violations_are_refused_individually() {
     fs::remove_dir_all(&directory).unwrap();
 }
 
+/// The `"auto"` marker document for `kernel`: the same shape a verified apply
+/// persists (auto marker plus the concrete opening it proved). Generated from
+/// the pinned literal `APPLIED` fixture through `serde_json::Value` so the
+/// document is structurally valid by construction while the concrete opening is
+/// set as a real integer; the marker is a sibling of `mode`, matching the
+/// writer's `format_policy` placement.
+fn auto_marker_document(kernel: u32) -> String {
+    let mut applied: serde_json::Value = serde_json::from_str(APPLIED).unwrap();
+    applied["video"]["format_policy"] = serde_json::Value::String("auto".to_owned());
+    applied["video"]["mode"]["captured_fourcc"] = serde_json::Value::from(kernel);
+    document_with_applied(&applied.to_string())
+}
+
+#[test]
+fn auto_policy_with_non_concrete_fourcc_is_refused_at_decode_and_blocks_saves() {
+    // Presence guard: the automatic marker paired with an admissible concrete
+    // opening decodes, so the refusals below exercise the value boundary rather
+    // than a structurally broken fixture.
+    let directory = temp_dir("video-auto-decode-refusals");
+    let path = settings_path(&directory);
+    let valid = auto_marker_document(842094158);
+    fs::write(&path, &valid).unwrap();
+    let (_, outcome) = SettingsStore::load(path.clone());
+    assert!(
+        matches!(outcome, LoadOutcome::Loaded(_)),
+        "admissible auto document must load: {outcome:?}"
+    );
+
+    // The automatic policy only ever resolves to YUYV/NV12/MJPG. BGR3 is a
+    // manual-only opening, so an auto marker claiming it describes no verified
+    // opening at all. This is the exact state a `SettingsStore` snapshot keeps
+    // after startup clears an auto mode: the on-disk baseline must be refused
+    // rather than silently reopened on another node or leaving a poison value
+    // whose preference-only save would fail to re-encode.
+    let unknown = 0x1234_5678;
+    for (label, kernel) in [
+        ("auto with manual-only BGR3", 861030210u32),
+        ("auto with unknown FourCC", unknown),
+    ] {
+        let json = auto_marker_document(kernel);
+        fs::write(&path, &json).unwrap();
+        let original = fs::read(&path).unwrap();
+        let (mut store, outcome) = SettingsStore::load(path.clone());
+        assert!(
+            matches!(
+                outcome,
+                LoadOutcome::Refused(SettingsLoadError::InvalidValue { .. })
+            ),
+            "{label}: expected InvalidValue refusal, got {outcome:?}"
+        );
+        assert!(store.is_refused(), "{label}");
+        assert!(store.snapshot().is_none(), "{label}");
+
+        // Neither a preference-only save nor a full applied save may rewrite the
+        // refused baseline; the exact original bytes survive.
+        assert!(
+            store.save_preferences(preferences()).is_err(),
+            "{label}: preference save must be blocked"
+        );
+        assert!(
+            store
+                .save_applied(&applied_settings(draft_settings()), preferences())
+                .is_err(),
+            "{label}: applied save must be blocked"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original, "{label}");
+        assert_no_temp_files(&directory);
+    }
+    fs::remove_dir_all(&directory).unwrap();
+}
+
 /// Encode a constructed document directly, bypassing the model, and return the
 /// typed refusal. This is the serialization boundary the invariant protects.
 fn encode_video_error(video: VideoRequest) -> crate::settings::schema::EncodeError {

@@ -27,6 +27,8 @@
 
 ### Fixes
 
+- Preserve the admitted physical node/USB binding in session-only applied state across Restart, Resume, Recovery, Reconnect and restoration; refuse silent sibling-node substitution while retaining explicit authorized recovery choices. No new persisted node identity or schema field is introduced ([PR #47](https://github.com/Anthodev/furami/pull/47)).
+- Reject Auto settings with a concrete FourCC outside the ranked formats during decoding, matching the existing encoding invariant; preserve refused originals and block automatic saves, while keeping legacy manual BGR3 settings valid ([PR #47](https://github.com/Anthodev/furami/pull/47)).
 - Report missing or unreachable X11 displays with actionable XWayland/session guidance before Qt GUI construction.
 - Stage an executable AppRun and reject non-executable launch entries in the final-image audit.
 - Parse empty Deb822 checksum headers correctly and attribute built-in QML generated metadata through verified vendor backing modules.

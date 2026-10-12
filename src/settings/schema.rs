@@ -37,11 +37,13 @@ pub enum SettingsValidationError {
     #[error("audio selection is invalid: {0}")]
     Audio(#[from] AudioError),
     /// Encode-only: an applied video request has no proven concrete format, so
-    /// it must never be written as if a mode had been opened.
+    /// it must never be written as if a mode had been opened. The decoder always
+    /// produces a concrete opening, so this can never arise on load.
     #[error("applied video request has no resolved capture format")]
     UnresolvedVideo,
-    /// Encode-only: a manual pin and the resolved concrete format disagree, so
-    /// the document would not describe the verified opening.
+    /// A manual pin and the resolved concrete format disagree, or an automatic
+    /// policy resolves to a non-concrete FourCC: the document would not describe
+    /// the verified opening. Guards both the encode and decode boundaries.
     #[error("applied video format policy does not match its resolved capture format")]
     VideoFormatPolicyMismatch,
 }
@@ -1086,7 +1088,7 @@ fn video_from_dto(video: VideoV1) -> Result<VideoRequest, SettingsValidationErro
         None => InputFormatPolicy::Manual { fourcc: concrete },
     };
 
-    Ok(VideoRequest {
+    let request = VideoRequest {
         identity,
         mode: CaptureModeRequest {
             format_policy,
@@ -1095,7 +1097,16 @@ fn video_from_dto(video: VideoV1) -> Result<VideoRequest, SettingsValidationErro
         },
         resolved_fourcc: Some(concrete),
         selected_node: None,
-    })
+    };
+    // A structurally valid document can still describe no verified opening: the
+    // automatic policy only ever resolves to YUYV/NV12/MJPG, so an on-disk auto
+    // marker paired with a manual-only or unrecognized FourCC must be refused at
+    // the same domain invariant that guards the encode side rather than loaded as
+    // a poison baseline (startup Auto clearing repairs a live mode, not the store).
+    if request.resolved_mode().is_none() {
+        return Err(SettingsValidationError::VideoFormatPolicyMismatch);
+    }
+    Ok(request)
 }
 
 fn audio_to_dto(selection: &AudioSelection) -> AudioWrite<'_> {

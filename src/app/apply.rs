@@ -2180,6 +2180,7 @@ mod tests {
     struct TestPrepared {
         settings: DraftSettings,
         stamp: WatchStamp,
+        node: Option<(std::path::PathBuf, std::path::PathBuf)>,
     }
     #[derive(Default)]
     struct Validator {
@@ -2201,11 +2202,34 @@ mod tests {
         watcher_join_pending: bool,
         grant: Option<SelectionToken>,
         retired_choices: Vec<SelectionToken>,
+        native_snapshot: Option<crate::capture::linux::CaptureSnapshot>,
     }
     impl Validator {
         fn finish(&mut self, result: Result<(), ApplyFailure>) {
             let request = self.request.take().unwrap();
             let stamp = self.observed.unwrap_or(request.watch);
+            if let Some(snapshot) = &self.native_snapshot {
+                let prepared =
+                    crate::capture::apply::fixture_request_prepared(&request, snapshot, stamp);
+                self.result = Some(ValidationResult {
+                    stamp,
+                    result: match prepared {
+                        Ok(prepared) => {
+                            let (node, usb) =
+                                crate::capture::apply::CaptureValidator::prepared_node(&prepared)
+                                    .expect("native fixture has a physical route");
+                            ValidationOutcome::Prepared(TestPrepared {
+                                settings: prepared.settings().clone(),
+                                stamp,
+                                node: Some((node.to_path_buf(), usb.to_path_buf())),
+                            })
+                        }
+                        Err(failure) => ValidationOutcome::Failed(failure),
+                    },
+                    request,
+                });
+                return;
+            }
             let mut prepared_settings = request.settings.clone();
             if prepared_settings.video.resolved_fourcc.is_none() {
                 let crate::domain::capture::InputFormatPolicy::Manual { fourcc } =
@@ -2221,6 +2245,7 @@ mod tests {
                     Ok(()) => ValidationOutcome::Prepared(TestPrepared {
                         settings: prepared_settings,
                         stamp,
+                        node: None,
                     }),
                     Err(failure) => ValidationOutcome::Failed(failure),
                 },
@@ -2236,8 +2261,13 @@ mod tests {
         fn prepared_stamp(prepared: &Self::Prepared) -> WatchStamp {
             prepared.stamp
         }
-        fn prepared_node(_: &Self::Prepared) -> Option<(&std::path::Path, &std::path::Path)> {
-            None
+        fn prepared_node(
+            prepared: &Self::Prepared,
+        ) -> Option<(&std::path::Path, &std::path::Path)> {
+            prepared
+                .node
+                .as_ref()
+                .map(|(node, usb)| (node.as_path(), usb.as_path()))
         }
         fn begin_validate(&mut self, request: ValidationRequest) -> Result<(), SubmitFailure> {
             if let Some(rejection) = self.reject.take() {
@@ -3156,6 +3186,7 @@ mod tests {
                                 result: ValidationOutcome::Prepared(TestPrepared {
                                     settings: request.settings.clone(),
                                     stamp: request.watch,
+                                    node: None,
                                 }),
                                 request: request.clone(),
                             });
@@ -5412,6 +5443,342 @@ mod tests {
         );
     }
 
+    fn native_node_engine() -> Engine {
+        let mut draft = settings(60);
+        let mode = draft
+            .video
+            .mode
+            .with_fourcc(CapturedFourCc::from_bytes(*b"YUYV"));
+        draft.video.mode.format_policy = crate::domain::capture::InputFormatPolicy::Auto;
+        draft.video.resolved_fourcc = None;
+        draft.video.selected_node = Some("/dev/video0".into());
+        let snapshot =
+            crate::capture::linux::session_fixture(&["/dev/video0", "/dev/video1"], mode);
+        draft.video.identity = snapshot.devices()[0].identity().clone();
+        ApplyCoordinator::new(
+            draft,
+            PlaybackGain::default(),
+            Validator {
+                native_snapshot: Some(snapshot),
+                ..Validator::default()
+            },
+            Runner::default(),
+        )
+    }
+
+    #[test]
+    fn session_node_binding_reopens_cli_node_across_restart_resume_recovery_and_reconnect() {
+        for operation in 0..4 {
+            let mut engine = native_node_engine();
+            let old = initial(&mut engine);
+            assert_eq!(engine.model().phase(), ProductPhase::Active);
+            match operation {
+                0 => {
+                    engine.restart(engine.model().state_identity()).unwrap();
+                }
+                1 => {
+                    confirm_pause(&mut engine, old);
+                    engine.resume(engine.model().state_identity(), old).unwrap();
+                }
+                2 | 3 => {
+                    eof(&mut engine, old);
+                    engine.runner.barrier(old);
+                    engine.poll();
+                    if operation == 3 {
+                        engine.validator.native_snapshot =
+                            Some(crate::capture::linux::session_fixture(
+                                &["/dev/video1"],
+                                engine
+                                    .model()
+                                    .last_valid()
+                                    .unwrap()
+                                    .settings()
+                                    .video
+                                    .fixture_mode(),
+                            ));
+                        validate(&mut engine);
+                        assert!(engine.model().active().is_none());
+                        engine.validator.native_snapshot =
+                            Some(crate::capture::linux::session_fixture(
+                                &["/dev/video0", "/dev/video1"],
+                                engine
+                                    .model()
+                                    .last_valid()
+                                    .unwrap()
+                                    .settings()
+                                    .video
+                                    .fixture_mode(),
+                            ));
+                        engine.reconnect(engine.model().state_identity()).unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            validate(&mut engine);
+            if operation < 2 {
+                engine.runner.barrier(old);
+                engine.poll();
+            }
+            engine.runner.verified();
+            engine.poll();
+            assert_eq!(
+                engine.model().phase(),
+                ProductPhase::Active,
+                "operation {operation}"
+            );
+            assert_eq!(
+                engine
+                    .model()
+                    .active()
+                    .unwrap()
+                    .applied()
+                    .settings()
+                    .video
+                    .resolved_fourcc,
+                Some(CapturedFourCc::from_bytes(*b"YUYV"))
+            );
+        }
+    }
+
+    #[test]
+    fn session_node_binding_refuses_sibling_when_admitted_node_disappears() {
+        for operation in 0..4 {
+            let mut engine = native_node_engine();
+            let old = initial(&mut engine);
+            engine.validator.native_snapshot = Some(crate::capture::linux::session_fixture(
+                &["/dev/video1"],
+                engine
+                    .model()
+                    .last_valid()
+                    .unwrap()
+                    .settings()
+                    .video
+                    .fixture_mode(),
+            ));
+            match operation {
+                0 => {
+                    engine.restart(engine.model().state_identity()).unwrap();
+                }
+                1 => {
+                    confirm_pause(&mut engine, old);
+                    engine.resume(engine.model().state_identity(), old).unwrap();
+                }
+                2 | 3 => {
+                    eof(&mut engine, old);
+                    engine.runner.barrier(old);
+                    engine.poll();
+                    if operation == 3 {
+                        validate(&mut engine);
+                        assert!(engine.model().active().is_none());
+                        engine.reconnect(engine.model().state_identity()).unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            validate(&mut engine);
+            assert_eq!(
+                engine.runner.opens.len(),
+                1,
+                "sibling must not open for operation {operation}"
+            );
+            assert!(engine.model().opening().is_none());
+            let rejection = engine.model().validation_rejection().unwrap_or_else(|| {
+                panic!(
+                    "missing bound node must report validation refusal for operation {operation}, phase {:?}",
+                    engine.model().phase()
+                )
+            });
+            assert_eq!(rejection.failure.cause, Cause::RequestedModeRefused);
+            assert!(!rejection.failure.diagnostic.is_empty());
+            assert_eq!(
+                rejection.request.pinned_node,
+                Some(("/sys/dev/video0".into(), "/sys/usb/fixture".into()))
+            );
+            if operation < 2 {
+                let active = engine
+                    .model()
+                    .active()
+                    .expect("prevalidation keeps incumbent");
+                assert_eq!(active.attempt(), old);
+                assert_eq!(
+                    active.playback(),
+                    if operation == 1 {
+                        PlaybackState::Paused
+                    } else {
+                        PlaybackState::Live
+                    }
+                );
+                assert!(engine.runner.stops.is_empty());
+            } else {
+                assert!(engine.model().active().is_none());
+                assert!(engine.model().failures().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn session_node_binding_accepts_devnode_renumbering_with_same_physical_syspath() {
+        let mut engine = native_node_engine();
+        let old = initial(&mut engine);
+        let applied = engine.model().last_valid().unwrap().settings();
+        engine.validator.native_snapshot = Some(crate::capture::linux::physical_fixture(&[(
+            applied.video.identity.clone(),
+            "/dev/video9",
+            "/sys/usb/fixture",
+            "/sys/dev/video0",
+            applied.video.fixture_mode(),
+        )]));
+        engine.restart(engine.model().state_identity()).unwrap();
+        validate(&mut engine);
+        engine.runner.barrier(old);
+        engine.poll();
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::Active);
+    }
+
+    #[test]
+    fn session_node_binding_survives_close_but_is_absent_in_new_model_and_serialized_applied() {
+        let mut engine = native_node_engine();
+        let old = initial(&mut engine);
+        let applied = engine.model().last_valid().unwrap();
+        let serialized = serde_json::to_value(applied).unwrap();
+        assert!(serialized.get("pinned_node").is_none());
+        let mut fresh = ProductModel::new(applied.settings().clone());
+        fresh
+            .apply(fresh.state_identity(), fresh.draft().revision)
+            .unwrap();
+        assert!(fresh.validation_request().unwrap().pinned_node.is_none());
+        engine.close(engine.model().state_identity()).unwrap();
+        engine.runner.barrier(old);
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::Stopped);
+        engine.restart(engine.model().state_identity()).unwrap();
+        validate(&mut engine);
+        engine.runner.verified();
+        engine.poll();
+        assert_eq!(engine.model().phase(), ProductPhase::Active);
+    }
+
+    #[test]
+    fn session_node_binding_survives_hot_treatment_commit_and_fresh_owner_restore() {
+        for restore in [false, true] {
+            let mut engine = native_node_engine();
+            let old = initial(&mut engine);
+            let origin = engine.model().confirmed_filter_origin().unwrap();
+            engine.take_verified_applied();
+            let mut candidate = engine.model().draft().settings.clone();
+            candidate.renderer = altered_renderer(&candidate.renderer);
+            let revision = engine
+                .edit_draft(engine.model().draft().revision, candidate)
+                .unwrap();
+            let ApplyAdmission::Treatments { key, .. } = engine
+                .apply(engine.model().state_identity(), revision)
+                .unwrap()
+            else {
+                panic!("same-source renderer edit uses hot treatment");
+            };
+            filter_success(&mut engine, key);
+            engine.poll();
+            if restore {
+                engine
+                    .runner
+                    .events
+                    .push_back(SessionEvent::TreatmentFault {
+                        key,
+                        failure: applied_vf_fault(origin, key),
+                    });
+                engine.poll();
+                assert_eq!(
+                    engine.model().treating().unwrap().route(),
+                    Some(TreatmentRestoreRoute::FreshOwner)
+                );
+                engine.runner.barrier(old);
+                engine.poll();
+            } else {
+                engine.restart(engine.model().state_identity()).unwrap();
+            }
+            validate(&mut engine);
+            if !restore {
+                engine.runner.barrier(old);
+                engine.poll();
+            }
+            engine.runner.verified();
+            engine.poll();
+            assert!(engine.model().active().is_some());
+            assert_eq!(engine.runner.opens.len(), 2);
+        }
+    }
+
+    #[test]
+    fn session_node_binding_new_candidate_replaces_pin_but_failed_candidate_restores_prior_pin() {
+        for fail in [false, true] {
+            let mut engine = native_node_engine();
+            let old = initial(&mut engine);
+            let prior = engine.model().last_valid().unwrap().settings().clone();
+            let mut candidate = prior.clone();
+            candidate.video.mode.rate = FrameRate::new(30, 1).unwrap();
+            candidate.video.selected_node = Some("/dev/video1".into());
+            candidate.video.resolved_fourcc = None;
+            engine.validator.native_snapshot = Some(crate::capture::linux::session_fixture(
+                &["/dev/video0", "/dev/video1"],
+                candidate
+                    .video
+                    .mode
+                    .with_fourcc(CapturedFourCc::from_bytes(*b"YUYV")),
+            ));
+            engine
+                .edit_draft(engine.model().draft().revision, candidate)
+                .unwrap();
+            apply(&mut engine);
+            assert!(
+                engine
+                    .model()
+                    .validation_request()
+                    .unwrap()
+                    .pinned_node
+                    .is_none()
+            );
+            validate(&mut engine);
+            engine.runner.barrier(old);
+            engine.poll();
+            let next = engine.runner.opens.last().unwrap().0.attempt;
+            if fail {
+                engine.runner.fail("new candidate failed");
+                engine.poll();
+                engine.validator.native_snapshot = Some(crate::capture::linux::session_fixture(
+                    &["/dev/video0", "/dev/video1"],
+                    prior.video.fixture_mode(),
+                ));
+                engine.runner.barrier(next);
+                engine.poll();
+                validate(&mut engine);
+            }
+            engine.runner.verified();
+            engine.poll();
+            assert!(engine.model().active().is_some());
+            let incumbent = engine.model().active().unwrap().attempt();
+            engine.restart(engine.model().state_identity()).unwrap();
+            assert_eq!(
+                engine.model().validation_request().unwrap().pinned_node,
+                Some((
+                    if fail {
+                        "/sys/dev/video0".into()
+                    } else {
+                        "/sys/dev/video1".into()
+                    },
+                    "/sys/usb/fixture".into(),
+                ))
+            );
+            validate(&mut engine);
+            engine.runner.barrier(incumbent);
+            engine.poll();
+            engine.runner.verified();
+            engine.poll();
+            assert!(engine.model().active().is_some());
+        }
+    }
+
     #[test]
     fn resolved_auto_open_commits_concrete_watch_and_requires_fresh_observation() {
         use crate::domain::capture::InputFormatPolicy;
@@ -5437,6 +5804,7 @@ mod tests {
             result: ValidationOutcome::Prepared(TestPrepared {
                 settings: prepared.clone(),
                 stamp,
+                node: None,
             }),
             request,
         });
@@ -7146,6 +7514,7 @@ mod tests {
             result: ValidationOutcome::Prepared(TestPrepared {
                 settings: settings(30),
                 stamp: request.watch,
+                node: None,
             }),
             request,
         });
@@ -8176,6 +8545,7 @@ mod tests {
             result: ValidationOutcome::Prepared(TestPrepared {
                 settings: selected.clone(),
                 stamp: fresh.stamp,
+                node: None,
             }),
             request,
         });
@@ -8912,6 +9282,7 @@ mod tests {
             result: ValidationOutcome::Prepared(TestPrepared {
                 settings: stale.settings.clone(),
                 stamp: stale.watch,
+                node: None,
             }),
             request: stale,
         });
@@ -9098,6 +9469,7 @@ mod tests {
             result: ValidationOutcome::Prepared(TestPrepared {
                 settings: selected,
                 stamp: request.watch,
+                node: None,
             }),
             request,
         });

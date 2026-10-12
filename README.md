@@ -82,6 +82,8 @@ The settings format is strict schema version 1. The output preference is an opti
 
 The **input-format policy** is separate from the audio-output preference. An applied Auto input writes `"format_policy": "auto"` inside `applied.video`, alongside the last successfully applied concrete request. Documents without this marker retain their previous manual FourCC pin. Auto is resolved afresh at startup or a new full capture Apply; restart, resume and recovery retain the admitted concrete format. Older strict builds refuse the Auto marker, so successfully apply a manual input format and safely close before downgrading.
 
+Within the same process, those reopen operations also retain the admitted physical node/USB binding: a missing node is refused rather than replaced by a compatible sibling. This binding is not saved to JSON; a new process validates the saved selection afresh. Auto documents whose recorded concrete FourCC is outside `YUYV`, `NV12` or `MJPG` are refused at load, with the original preserved and automatic saves blocked. Manual `BGR3` documents remain valid.
+
 The file is `$XDG_CONFIG_HOME/furami/settings.json` when `XDG_CONFIG_HOME` is an absolute path. If that variable is unset or empty, Furami uses `$HOME/.config/furami/settings.json`. An invalid location is reported rather than replaced with a guessed path.
 
 A corrupt, invalid or newer-version file is preserved. All automatic saves remain blocked; preference changes are session-only until you explicitly confirm **Reset saved file**. Reset replaces the saved file with your current preferences and no saved capture. It does not stop live capture, apply the draft or reset live preferences.

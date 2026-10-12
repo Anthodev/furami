@@ -459,6 +459,27 @@ pub(crate) fn fixture_prepared_at(
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_request_prepared(
+    request: &ValidationRequest,
+    snapshot: &CaptureSnapshot,
+    stamp: WatchStamp,
+) -> Result<PreparedCapture, ApplyFailure> {
+    let rate = request.settings.video.mode.rate;
+    validate_prepared_with(
+        request.settings.clone(),
+        snapshot,
+        &[],
+        stamp,
+        None,
+        request
+            .pinned_node
+            .as_ref()
+            .map(|(node, usb)| (node.as_path(), usb.as_path())),
+        |_device, _node, fourcc, size| Ok(linux::fixture_exact_intervals(fourcc, size, rate)),
+    )
+}
+
+#[cfg(test)]
 pub(super) fn fixture_authorized_prepared_at(
     settings: DraftSettings,
     snapshot: &CaptureSnapshot,

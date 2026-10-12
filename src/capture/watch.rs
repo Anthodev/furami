@@ -1736,10 +1736,9 @@ mod tests {
             .unwrap();
         let snapshot = scan.snapshot.as_ref().unwrap();
         let prepared = match selected {
-            None => super::super::apply::validate_prepared(
-                request.settings.clone(),
+            None => super::super::apply::fixture_request_prepared(
+                &request,
                 snapshot,
-                &[],
                 scan.observation.stamp,
             )
             .unwrap(),
@@ -2056,6 +2055,82 @@ mod tests {
         };
         assert_eq!(attempt, opening.attempt);
         assert!(model.opening().is_none());
+    }
+
+    #[test]
+    fn genuine_recovery_choice_replaces_session_binding_and_reopens_selected_route() {
+        use crate::domain::{capture::LossEvidence, state::ModelEffect};
+        let initial = [(
+            identity(1, None),
+            "/dev/video0",
+            "/sys/usb/1",
+            "/sys/usb/1/video0",
+        )];
+        let (mut model, mut inventory, old) = active_model(identity(1, None), &initial);
+        let applied = model.active().unwrap().applied().settings().clone();
+        model.video_lost(
+            old.attempt,
+            LossEvidence::StreamEnded {
+                reason: 0,
+                error: 0,
+            },
+            session_failure(&applied, Stage::StreamStart),
+        );
+        let devices = [
+            (
+                identity(1, None),
+                "/dev/video0",
+                "/sys/usb/1",
+                "/sys/usb/1/video0",
+            ),
+            (
+                identity(2, None),
+                "/dev/video1",
+                "/sys/usb/2",
+                "/sys/usb/2/video1",
+            ),
+        ];
+        let ambiguous = scan(&mut inventory, snapshot(&devices));
+        let selected = ambiguous
+            .candidates
+            .iter()
+            .find(|candidate| candidate.identity == identity(2, None))
+            .expect("inventory authorizes the actual second physical device")
+            .clone();
+        model.recovery_observed(&ambiguous.observation);
+        model.barrier_complete(old.attempt);
+        model.continue_recovery();
+        model
+            .choose_recovery(model.state_identity(), selected.token)
+            .unwrap();
+        assert!(model.validation_request().unwrap().pinned_node.is_none());
+        let opened = open_model_from_scan(&mut model, &ambiguous, Some(selected));
+        verify_open(&mut model, opened);
+        model.committed_watch().unwrap();
+        inventory.set_target(Some(Arc::new(model.watch_target().unwrap().clone())));
+        let committed = scan(&mut inventory, snapshot(&devices[1..]));
+        model.recovery_observed(&committed.observation);
+        let (_, restart) = model.restart(model.state_identity()).unwrap();
+        let ModelEffect::Validate(request) = restart else {
+            panic!("restart requires native validation");
+        };
+        assert_eq!(
+            request.pinned_node,
+            Some(("/sys/usb/2/video1".into(), "/sys/usb/2".into()))
+        );
+        let prepared = super::super::apply::fixture_request_prepared(
+            &request,
+            committed.snapshot.as_ref().unwrap(),
+            committed.observation.stamp,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.selection().physical_node(),
+            (
+                std::path::Path::new("/sys/usb/2/video1"),
+                std::path::Path::new("/sys/usb/2")
+            )
+        );
     }
 
     #[test]
