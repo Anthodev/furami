@@ -235,6 +235,7 @@ pub(super) struct FilterKindRow {
     pub available: bool,
     pub reason: String,
     pub default_parameters: Parameters,
+    pub fields: Vec<FilterFieldRow>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(super) struct FilterEntryRow {
@@ -245,6 +246,18 @@ pub(super) struct FilterEntryRow {
     pub parameters: Parameters,
     pub available: bool,
     pub reason: String,
+}
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(super) struct FilterFieldRow {
+    pub key: &'static str,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub field_type: &'static str,
+    pub choices: Vec<Choice>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub step: Option<f64>,
+    pub notice: String,
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub(super) struct Renderer {
@@ -373,6 +386,175 @@ pub(super) fn default_filter(kind: FilterKind) -> Filter {
         )),
     }
 }
+
+fn filter_fields(kind: FilterKind) -> Vec<FilterFieldRow> {
+    use filters::*;
+    let number = |key, label: &str, bounds: (f64, f64), notice: &str| FilterFieldRow {
+        key,
+        label: label.into(),
+        field_type: "number",
+        choices: Vec::new(),
+        min: Some(bounds.0),
+        max: Some(bounds.1),
+        step: None,
+        notice: notice.into(),
+    };
+    let matrix = |key, label: &str, notice: &str| FilterFieldRow {
+        key,
+        label: label.into(),
+        field_type: "integer",
+        choices: Vec::new(),
+        min: Some(f64::from(UnsharpParams::MATRIX_MIN)),
+        max: Some(f64::from(UnsharpParams::MATRIX_MAX)),
+        step: Some(f64::from(UnsharpParams::MATRIX_STEP)),
+        notice: notice.into(),
+    };
+    fn choice(
+        key: &'static str,
+        label: &str,
+        tokens: impl Iterator<Item = &'static str>,
+    ) -> FilterFieldRow {
+        FilterFieldRow {
+            key,
+            label: label.into(),
+            field_type: "choice",
+            choices: tokens
+                .map(|token| Choice {
+                    key: token.into(),
+                    label: token.into(),
+                    eligible: true,
+                    reason: String::new(),
+                })
+                .collect(),
+            min: None,
+            max: None,
+            step: None,
+            notice: String::new(),
+        }
+    }
+    const STRENGTH: &str = "Force sans dimension.";
+    const TAPS: &str = "Nombre impair de taps, de 3 à 23.";
+    const ALPHA: &str = "Sans effet garanti si le format ne contient pas de canal alpha.";
+    const DENOISE: &str = "Force sans dimension. Zéro demande le défaut relationnel FFmpeg ; il ne désactive pas le filtre.";
+    match kind {
+        FilterKind::Format => vec![
+            choice(
+                "matrix",
+                "Matrice SDR",
+                SdrMatrix::ALL.iter().map(|v| v.as_str()),
+            ),
+            choice(
+                "levels",
+                "Plage des niveaux",
+                ColorLevels::ALL.iter().map(|v| v.as_str()),
+            ),
+            choice(
+                "gamma",
+                "Transfert gamma SDR",
+                SdrGamma::ALL.iter().map(|v| v.as_str()),
+            ),
+        ],
+        FilterKind::Eq => vec![
+            number("contrast", "Contraste", EqParams::CONTRAST_BOUNDS, STRENGTH),
+            number(
+                "brightness",
+                "Luminosité",
+                EqParams::BRIGHTNESS_BOUNDS,
+                STRENGTH,
+            ),
+            number(
+                "saturation",
+                "Saturation",
+                EqParams::SATURATION_BOUNDS,
+                STRENGTH,
+            ),
+            number("gamma", "Gamma", EqParams::GAMMA_BOUNDS, STRENGTH),
+            number("gamma_r", "Gamma rouge", EqParams::GAMMA_BOUNDS, STRENGTH),
+            number("gamma_g", "Gamma vert", EqParams::GAMMA_BOUNDS, STRENGTH),
+            number("gamma_b", "Gamma bleu", EqParams::GAMMA_BOUNDS, STRENGTH),
+            number(
+                "gamma_weight",
+                "Poids du gamma",
+                EqParams::GAMMA_WEIGHT_BOUNDS,
+                STRENGTH,
+            ),
+        ],
+        FilterKind::Unsharp => vec![
+            matrix("luma_msize_x", "Luma · largeur (taps)", TAPS),
+            matrix("luma_msize_y", "Luma · hauteur (taps)", TAPS),
+            number(
+                "luma_amount",
+                "Luma · force",
+                UnsharpParams::AMOUNT_BOUNDS,
+                STRENGTH,
+            ),
+            matrix("chroma_msize_x", "Chroma · largeur (taps)", TAPS),
+            matrix("chroma_msize_y", "Chroma · hauteur (taps)", TAPS),
+            number(
+                "chroma_amount",
+                "Chroma · force",
+                UnsharpParams::AMOUNT_BOUNDS,
+                STRENGTH,
+            ),
+            matrix(
+                "alpha_msize_x",
+                "Alpha · largeur (taps)",
+                "Nombre impair de taps, de 3 à 23. Sans effet garanti sans canal alpha.",
+            ),
+            matrix(
+                "alpha_msize_y",
+                "Alpha · hauteur (taps)",
+                "Nombre impair de taps, de 3 à 23. Sans effet garanti sans canal alpha.",
+            ),
+            number(
+                "alpha_amount",
+                "Alpha · force",
+                UnsharpParams::AMOUNT_BOUNDS,
+                ALPHA,
+            ),
+        ],
+        FilterKind::Hqdn3d => vec![
+            number(
+                "luma_spatial",
+                "Luma · spatial",
+                Hqdn3dParams::STRENGTH_BOUNDS,
+                DENOISE,
+            ),
+            number(
+                "chroma_spatial",
+                "Chroma · spatial",
+                Hqdn3dParams::STRENGTH_BOUNDS,
+                DENOISE,
+            ),
+            number(
+                "luma_tmp",
+                "Luma · temporel",
+                Hqdn3dParams::STRENGTH_BOUNDS,
+                DENOISE,
+            ),
+            number(
+                "chroma_tmp",
+                "Chroma · temporel",
+                Hqdn3dParams::STRENGTH_BOUNDS,
+                DENOISE,
+            ),
+        ],
+        FilterKind::Bwdif => vec![
+            choice("mode", "Mode", BwdifMode::ALL.iter().map(|v| v.as_str())),
+            choice(
+                "parity",
+                "Parité",
+                FieldParity::ALL.iter().map(|v| v.as_str()),
+            ),
+            choice(
+                "deint",
+                "Images à désentrelacer",
+                DeinterlaceSelection::ALL.iter().map(|v| v.as_str()),
+            ),
+        ],
+    }
+}
+
 pub(super) fn filter_kinds(capabilities: Result<&FilterCapabilities, String>) -> Filters {
     let error = capabilities.as_ref().err().cloned().unwrap_or_default();
     Filters {
@@ -402,6 +584,7 @@ pub(super) fn filter_kinds(capabilities: Result<&FilterCapabilities, String>) ->
                         error.clone()
                     },
                     default_parameters: Parameters::from(&default_filter(kind)),
+                    fields: filter_fields(kind),
                 }
             })
             .collect(),
@@ -530,6 +713,81 @@ pub(super) fn mutate_renderer(values: RendererValues) -> Result<RendererSettings
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offered_filter_fields_cover_exact_payloads_and_valid_domain_boundaries() {
+        let catalog = filter_kinds(Err("unavailable fixture".into()));
+        let mut counts = [0, 0, 0];
+        for kind in catalog.kinds {
+            let parameters = serde_json::to_value(kind.default_parameters).unwrap();
+            let mut control_keys = kind
+                .fields
+                .iter()
+                .map(|field| field.key)
+                .collect::<Vec<_>>();
+            control_keys.sort_unstable();
+            let mut payload_keys = parameters
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            payload_keys.sort_unstable();
+            assert_eq!(
+                control_keys, payload_keys,
+                "{} has exactly one control per payload field",
+                kind.kind
+            );
+            for field in kind.fields {
+                assert!(parameters.get(field.key).is_some(), "{}", field.key);
+                let decode = |value: serde_json::Value| {
+                    let mut edited = parameters.clone();
+                    edited[field.key] = value;
+                    serde_json::from_value::<Filter>(serde_json::json!({
+                        "kind": kind.kind, "parameters": edited,
+                    }))
+                };
+                match field.field_type {
+                    "choice" => {
+                        counts[2] += 1;
+                        assert!(!field.choices.is_empty());
+                        assert_eq!((field.min, field.max, field.step), (None, None, None));
+                        for choice in field.choices {
+                            assert!(choice.eligible && choice.reason.is_empty());
+                            assert!(decode(choice.key.into()).is_ok());
+                        }
+                        assert!(decode("not-a-domain-token".into()).is_err());
+                    }
+                    "number" | "integer" => {
+                        let integer = field.field_type == "integer";
+                        counts[usize::from(integer)] += 1;
+                        assert!(field.choices.is_empty());
+                        let min = field.min.unwrap();
+                        let max = field.max.unwrap();
+                        for value in [min, max] {
+                            let value = if integer {
+                                serde_json::json!(value as u32)
+                            } else {
+                                serde_json::json!(value)
+                            };
+                            assert!(decode(value).is_ok(), "{}: {}", kind.kind, field.key);
+                        }
+                        if integer {
+                            assert_eq!(field.step, Some(2.0));
+                            assert!(decode(serde_json::json!(min as u32 + 1)).is_err());
+                            assert!(decode(serde_json::json!(min + 0.5)).is_err());
+                        } else {
+                            assert_eq!(field.step, None, "continuous values are not quantized");
+                            assert!(decode(serde_json::json!(min - 0.0001)).is_err());
+                            assert!(decode(serde_json::json!(max + 0.0001)).is_err());
+                        }
+                    }
+                    other => panic!("unexpected filter field type {other}"),
+                }
+            }
+        }
+        assert_eq!(counts, [15, 6, 6]);
+    }
     #[test]
     fn renderer_invalid_values_never_replace_the_typed_value() {
         for value in [f64::NAN, f64::INFINITY, -0.1, 1.1] {

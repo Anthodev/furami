@@ -13,6 +13,7 @@ Item {
 
     // root | settings | capture | audio | filters | renderer | prefs
     property string section: "root"
+    property bool editorActive: false
 
     readonly property var profile: Projection.view
     readonly property bool settingsSection: section !== "root" && section !== "settings"
@@ -244,6 +245,7 @@ Item {
             spacing: Brume.gapSmall
 
             BrumeButton {
+                id: sectionBack
                 objectName: "menuBackSection"
                 Layout.fillWidth: true
                 icon.source: Brume.icon("chevron-down")
@@ -307,7 +309,10 @@ Item {
     }
     Component {
         id: filtersSection
-        FiltersSettingsView {}
+        FiltersSettingsView {
+            editorActive: menu.editorActive && menu.visible && menu.section === "filters"
+                && !sectionBack.pressed && Chrome.rootAvailable && Chrome.popup === "menu"
+        }
     }
     Component {
         id: rendererSection

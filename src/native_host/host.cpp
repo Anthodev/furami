@@ -817,6 +817,30 @@ void FuramiBridge::removeFilter(const QString &selectionRevision, const QString 
     applyUpdate(gate_remove_filter(*m_gate, asRust(selectionRevision.toUtf8()), asRust(entryKey.toUtf8())));
 }
 
+void FuramiBridge::setFilterNumber(const QString &revision, const QString &entry, const QString &parameter, double value)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_filter_number(*m_gate, asRust(revision.toUtf8()), asRust(entry.toUtf8()), asRust(parameter.toUtf8()), value));
+}
+
+void FuramiBridge::setFilterChoice(const QString &revision, const QString &entry, const QString &parameter, const QString &value)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_filter_choice(*m_gate, asRust(revision.toUtf8()), asRust(entry.toUtf8()), asRust(parameter.toUtf8()), asRust(value.toUtf8())));
+}
+
+void FuramiBridge::moveFilter(const QString &revision, const QString &entry, const QString &direction)
+{
+    assertGuiThread();
+    applyUpdate(gate_move_filter(*m_gate, asRust(revision.toUtf8()), asRust(entry.toUtf8()), asRust(direction.toUtf8())));
+}
+
+void FuramiBridge::clearFilters(const QString &revision)
+{
+    assertGuiThread();
+    applyUpdate(gate_clear_filters(*m_gate, asRust(revision.toUtf8())));
+}
+
 void FuramiBridge::setScale(const QString &selectionRevision, const QString &kernel)
 {
     assertGuiThread();
@@ -1767,7 +1791,7 @@ void FuramiBridge::logGeometry()
         "renderValue_scale", "renderValue_cscale", "renderValue_dscale", "renderValue_scale_antiring",
         "renderValue_dither", "renderValue_deband", "renderValue_deband_iterations", "renderValue_deband_grain", "renderValue_interpolation",
         "sizeWidthField", "sizeHeightField", "rateExactField", "sizeRateCatalogError",
-        "filtersError", "rendererNotice",
+        "filtersError", "rendererNotice", "filterClear",
         "preferencesStatus", "preferencesStartup", "preferencesPath", "preferencesImmediate",
         "preferencesReset", "preferencesRefused",
         "sourceCatalogError", "sourceCapability", "outputMissing", "outputStatus",
@@ -1786,11 +1810,15 @@ void FuramiBridge::logGeometry()
         }
         logControl(QString::fromLatin1(name), item);
     }
-    // Real product rows carry model-derived suffixes; one local children() walk over the four
-    // owned subtrees finds them without a per-name recursive search or an inspector registry.
+    // Real product rows carry model-derived suffixes; one visual-tree walk over the owned
+    // subtrees finds them without a per-name recursive search or an inspector registry.
+    // Model-driven controls are QML Repeater delegates: they exist only in the visual tree
+    // (QQuickItem::childItems()) and are absent from QObject::children(), so a QObject walk
+    // never sees them. Each item has exactly one parent item, so nothing logs twice.
     const char *dynamicPrefixes[] = {
         "sourceRow_", "outputRow_", "sizeRow_", "rateRow_",
-        "filterToggle_", "filterAdd_",
+        "filterToggle_", "filterAdd_", "filterRemove_", "filterMoveUp_", "filterMoveDown_",
+        "filterNumber_", "filterChoice_", "filterInputError_",
         "captureFormatSelector_row_", "audioInputSelector_row_", "audioOutputSelector_row_",
         "renderChoice_scale_row_", "renderChoice_cscale_row_", "renderChoice_dscale_row_",
         "renderChoice_scale_antiring_row_", "renderChoice_dither_row_", "renderChoice_deband_row_",
@@ -1800,27 +1828,23 @@ void FuramiBridge::logGeometry()
         return window == m_root.data() || window == m_topChromeWindow.data()
             || window == m_volumeChromeWindow.data() || window == m_bottomChromeWindow.data();
     };
-    const auto walk = [&](const auto &self, QObject *parent) -> void {
-        const QList<QObject *> &children = parent->children();
-        for (QObject *child : children) {
-            if (auto *item = qobject_cast<QQuickItem *>(child)) {
-                const QString &objectName = item->objectName();
-                if (!objectName.isEmpty() && ownsWindow(item->window())) {
-                    for (const auto *prefix : dynamicPrefixes) {
-                        if (objectName.startsWith(QLatin1String(prefix))) {
-                            logControl(objectName, item);
-                            break;
-                        }
+    const auto walk = [&](const auto &self, QQuickItem *node) -> void {
+        for (QQuickItem *child : node->childItems()) {
+            const QString &objectName = child->objectName();
+            if (!objectName.isEmpty() && ownsWindow(child->window())) {
+                for (const auto *prefix : dynamicPrefixes) {
+                    if (objectName.startsWith(QLatin1String(prefix))) {
+                        logControl(objectName, child);
+                        break;
                     }
                 }
             }
             self(self, child);
         }
     };
-    walk(walk, m_root.data());
-    for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
-        if (window)
-            walk(walk, window);
+    for (auto *window : {m_root.data(), m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
+        if (window && window->contentItem())
+            walk(walk, window->contentItem());
     }
 }
 

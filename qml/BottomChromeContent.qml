@@ -56,6 +56,9 @@ Item {
                            : stack.implicitHeight)
     property int surfaceEpoch: -1
     property int closingEpoch: -1
+    // Chrome.popup remains selected during the exit transition. Editing ends
+    // at aboutToHide, before deferred field completions can run.
+    property bool menuEditorActive: false
 
     signal extentChanged()
     onChromeHeightChanged: bottom.extentChanged()
@@ -194,14 +197,19 @@ Item {
         maximumWidth: bottom.width
         maximumHeight: Math.max(1, bottom.availableHeight
             - (stack.visible ? stack.implicitHeight + Brume.gap : 0))
-        onAboutToHide: bottom.closingEpoch = bottom.surfaceEpoch
+        onAboutToHide: {
+            bottom.menuEditorActive = false
+            bottom.closingEpoch = bottom.surfaceEpoch
+        }
         onOpened: {
             if (!bottom.popupActive || !Chrome.rootAvailable || bottom.surfaceEpoch !== Chrome.popupEpoch)
                 return
+            bottom.menuEditorActive = true
             bottom.Window.window.requestActivate()
             bottom.focusBoundary(false)
         }
         onClosed: {
+            bottom.menuEditorActive = false
             const restoreInvoker = Chrome.popupClosed("bottom", bottom.closingEpoch)
             if (bottom.popupActive) {
                 bottom.reconcilePopup()
@@ -250,7 +258,9 @@ Item {
 
     Component {
         id: menuSurface
-        MenuView {}
+        MenuView {
+            editorActive: bottom.menuEditorActive
+        }
     }
     Component {
         id: saveFailureSurface

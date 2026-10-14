@@ -13,12 +13,16 @@ TextField {
 
     property string projected: ""
     property bool integerOnly: true
+    property bool scientificNotation: false
     property real minimum: 0
     property real maximum: 1e9
 
     readonly property real numericValue: Number(control.text)
     readonly property bool valid: control.acceptableInput
-        && (control.integerOnly ? /^[+-]?[0-9]+$/ : /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$/).test(control.text)
+        && (control.scientificNotation
+            ? /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/
+            : control.integerOnly ? /^[+-]?[0-9]+$/
+                : /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$/).test(control.text)
         && isFinite(control.numericValue)
         && control.numericValue >= control.minimum && control.numericValue <= control.maximum
         && (!control.integerOnly || Math.floor(control.numericValue) === control.numericValue)
@@ -41,7 +45,7 @@ TextField {
     palette.highlight: Brume.accent
     palette.highlightedText: Brume.matte
     inputMethodHints: Qt.ImhFormattedNumbersOnly
-    validator: control.integerOnly
+    validator: control.integerOnly && !control.scientificNotation
         ? integerValidator
         : doubleValidator
 
@@ -54,7 +58,8 @@ TextField {
         locale: "C"
         bottom: control.minimum
         top: control.maximum
-        notation: DoubleValidator.StandardNotation
+        notation: control.scientificNotation
+            ? DoubleValidator.ScientificNotation : DoubleValidator.StandardNotation
     }
 
     onProjectedChanged: {

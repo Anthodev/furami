@@ -5,21 +5,40 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import dev.antho.furami
 
-// Filter settings.
-//
-// Existing loaded entries are shown losslessly and toggled in place: labels,
-// order, repeated kinds and parameter data are never rewritten. Adding a
-// missing kind appends the documented default chosen by the runtime; there is
-// no generic chain editor.
+// Immediate typed filter editor. Every actual loaded entry remains independent,
+// including repeated kinds and disabled entries.
 Item {
     id: view
 
     implicitWidth: Brume.settingsWidth
     implicitHeight: layout.implicitHeight
+    property bool editorActive: false
 
     readonly property var profile: Projection.view
     readonly property var filters: profile.filters
     readonly property var entries: profile.filters.entries
+
+    function fieldsFor(kind) {
+        const kinds = view.filters.kinds
+        for (let i = 0; i < kinds.length; ++i) {
+            if (kinds[i].kind === kind)
+                return kinds[i].fields
+        }
+        return []
+    }
+
+    function setNumber(revision, entry, parameter, value) {
+        if (view.editorActive && Projection.bridge)
+            Projection.bridge.setFilterNumber(revision, entry, parameter, value)
+    }
+    function setChoice(revision, entry, parameter, value) {
+        if (view.editorActive && Projection.bridge)
+            Projection.bridge.setFilterChoice(revision, entry, parameter, value)
+    }
+    function move(entryKey, direction) {
+        if (view.editorActive && Projection.bridge)
+            Projection.bridge.moveFilter(view.profile.selectionRevision, entryKey, direction)
+    }
 
     function kindPresent(kind) {
         const list = view.entries
@@ -113,18 +132,34 @@ Item {
             variant: "secondary"
         }
 
+        BrumeButton {
+            objectName: "filterClear"
+            Layout.fillWidth: true
+            label: "Vider la chaîne"
+            enabled: view.editorActive && view.entries.length > 0
+                && view.profile.canEditSelection && view.profile.selection.present
+            Accessible.name: "Vider toute la chaîne de filtres"
+            onClicked: if (view.editorActive && Projection.bridge)
+                Projection.bridge.clearFilters(view.profile.selectionRevision)
+        }
+
         ColumnLayout {
             id: entryList
             Layout.fillWidth: true
             spacing: Brume.gapSmall
-            enabled: view.profile.canEditSelection && view.profile.selection.present
+            enabled: view.editorActive && view.profile.canEditSelection && view.profile.selection.present
 
                 Repeater {
-                    model: view.entries
+                    // Keep positional controls alive when an admitted edit
+                    // updates revision-scoped keys. Identity remains guarded
+                    // by each field's captured revision/key, not by its slot.
+                    model: view.entries.length
 
                     ColumnLayout {
                         id: entryBlock
-                        required property var modelData
+                        required property int index
+                        readonly property var modelData: view.entries[entryBlock.index]
+                        readonly property var fields: view.fieldsFor(String(entryBlock.modelData.kind))
                         Layout.fillWidth: true
                         spacing: 2
 
@@ -160,6 +195,47 @@ Item {
                             text: view.summarise(entryBlock.modelData)
                                 + (String(entryBlock.modelData.reason || "").length > 0
                                     ? " — " + String(entryBlock.modelData.reason) : "")
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Brume.gapSmall
+                            BrumeButton {
+                                objectName: "filterMoveUp_" + entryBlock.modelData.key
+                                Layout.fillWidth: true
+                                label: "Monter"
+                                enabled: entryBlock.index > 0
+                                Accessible.name: "Monter " + String(entryBlock.modelData.label)
+                                onClicked: view.move(String(entryBlock.modelData.key), "up")
+                            }
+                            BrumeButton {
+                                objectName: "filterMoveDown_" + entryBlock.modelData.key
+                                Layout.fillWidth: true
+                                label: "Descendre"
+                                enabled: entryBlock.index + 1 < view.entries.length
+                                Accessible.name: "Descendre " + String(entryBlock.modelData.label)
+                                onClicked: view.move(String(entryBlock.modelData.key), "down")
+                            }
+                        }
+                        Repeater {
+                            model: entryBlock.fields.length
+                            FilterParameterField {
+                                required property int index
+                                readonly property var modelData: entryBlock.fields[index]
+                                row: modelData
+                                // A shrinking count removes tail delegates in
+                                // this turn; their descriptor may vanish first.
+                                value: modelData
+                                    ? entryBlock.modelData.parameters[modelData.key] : undefined
+                                revision: view.profile.selectionRevision
+                                entryKey: String(entryBlock.modelData.key)
+                                editorActive: view.editorActive
+                                onNumberRequested: function(revision, entry, parameter, value) {
+                                    view.setNumber(revision, entry, parameter, value)
+                                }
+                                onChoiceRequested: function(revision, entry, parameter, value) {
+                                    view.setChoice(revision, entry, parameter, value)
+                                }
+                            }
                         }
                     }
             }
@@ -198,6 +274,7 @@ Item {
                 enabled: kindButton.modelData.available === true
                     && !view.kindPresent(String(kindButton.modelData.kind))
                     && view.profile.canEditSelection
+                    && view.editorActive
                     && view.profile.selection.present
                 Accessible.name: label
                 onClicked: view.addKind(String(kindButton.modelData.kind))
