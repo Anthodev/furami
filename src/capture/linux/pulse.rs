@@ -33,6 +33,8 @@ const SOURCE_OUTPUT_EVENT: c_int = 3;
 const REMOVE_EVENT: c_int = 0x20;
 const FACILITY_MASK: c_int = 0x0f;
 const TYPE_MASK: c_int = 0x30;
+// PA_SOURCE_NETWORK from PulseAudio 17.0 pulse/def.h.
+const SOURCE_NETWORK: c_int = 0x0008;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Stable libpulse ABI prefixes. Introspection structures append fields between
@@ -680,14 +682,53 @@ unsafe fn native_object_serial(proplist: *mut c_void) -> Option<u64> {
         .filter(|value| *value != 0 && *value != u64::MAX)
 }
 
+/// Positive endpoint facts only: missing properties (including a missing
+/// hardware flag) do not establish that a source is unrelated to USB.
+/// Pulse's device.bus values: pulse/proplist.h; node.virtual: PipeWire keys.h.
+unsafe fn source_known_non_usb(proplist: *mut c_void, flags: c_int) -> bool {
+    if flags & SOURCE_NETWORK != 0 {
+        return true;
+    }
+    if proplist.is_null() {
+        return false;
+    }
+    let observed_is = |key: &CStr, values: &[&CStr]| {
+        // SAFETY: The callback retains this proplist and its borrowed values.
+        let raw = unsafe { pa_proplist_gets(proplist, key.as_ptr()) };
+        !raw.is_null() && values.contains(&unsafe { CStr::from_ptr(raw) })
+    };
+    observed_is(c"node.virtual", &[c"true", c"1"])
+        || observed_is(c"device.bus", &[c"isa", c"pci", c"firewire", c"bluetooth"])
+}
+
 #[derive(Clone)]
 struct ObservedSource {
     source: AudioSource,
+    /// Ephemeral backing-card locator, copied before the Pulse callback returns.
+    alsa_card: Option<String>,
+    /// Copied from positive properties/flags in this same callback observation.
+    known_non_usb: bool,
     index: u32,
     native_serial: Option<u64>,
     rate: u32,
     channels: u8,
     channel_positions: [i32; 32],
+}
+impl ObservedSource {
+    fn into_catalog(self) -> super::super::audio::CatalogSource {
+        let usb = if self.known_non_usb {
+            Ok(None)
+        } else {
+            self.alsa_card
+                .as_deref()
+                .ok_or_else(|| "La source Pulse ne rapporte pas alsa.card.".to_owned())
+                .and_then(super::udev::sound_usb)
+        };
+        super::super::audio::CatalogSource {
+            source: self.source,
+            usb,
+        }
+    }
 }
 
 unsafe extern "C" fn source_callback(
@@ -745,6 +786,11 @@ unsafe extern "C" fn source_callback(
                 identity: AudioSourceIdentity::new(name, properties)?,
                 description,
             },
+            alsa_card: unsafe { property(info.proplist, c"alsa.card") }
+                .ok()
+                .flatten(),
+            // SAFETY: The same callback-scoped proplist/flags as alsa.card.
+            known_non_usb: unsafe { source_known_non_usb(info.proplist, info.flags) },
             index: info.index,
             native_serial: unsafe { native_object_serial(info.proplist) },
             rate: info.sample_spec.rate,
@@ -771,6 +817,16 @@ pub(crate) fn discover() -> Result<Vec<AudioSource>, AudioError> {
         .sources(None)?
         .into_iter()
         .map(|row| row.source)
+        .collect())
+}
+
+pub(crate) fn discover_for_catalog() -> Result<Vec<super::super::audio::CatalogSource>, AudioError>
+{
+    let mut connection = Connection::connect(None)?;
+    Ok(connection
+        .sources(None)?
+        .into_iter()
+        .map(ObservedSource::into_catalog)
         .collect())
 }
 
@@ -1414,6 +1470,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_association_classifies_observed_virtual_and_non_usb_sources_without_guessing() {
+        fn observed(
+            properties: &[(&CStr, &CStr)],
+            flags: c_int,
+        ) -> crate::capture::audio::CatalogSource {
+            unsafe extern "C" {
+                fn pa_proplist_new() -> *mut c_void;
+                fn pa_proplist_sets(
+                    proplist: *mut c_void,
+                    key: *const c_char,
+                    value: *const c_char,
+                ) -> c_int;
+                fn pa_proplist_free(proplist: *mut c_void);
+            }
+            struct Properties(NonNull<c_void>);
+            impl Drop for Properties {
+                fn drop(&mut self) {
+                    // SAFETY: This test owns exactly one allocated proplist.
+                    unsafe { pa_proplist_free(self.0.as_ptr()) };
+                }
+            }
+            // SAFETY: Official zero-argument constructor; no Pulse server/I/O.
+            let proplist =
+                Properties(NonNull::new(unsafe { pa_proplist_new() }).expect("test proplist"));
+            for (key, value) in properties {
+                // SAFETY: Proplist and both C strings remain live for this copy.
+                assert_eq!(
+                    unsafe { pa_proplist_sets(proplist.0.as_ptr(), key.as_ptr(), value.as_ptr()) },
+                    0
+                );
+            }
+            let row = ObservedSource {
+                source: AudioSource {
+                    identity: AudioSourceIdentity::new("observed-source".into(), Vec::new())
+                        .unwrap(),
+                    description: String::new(),
+                },
+                // SAFETY: Same live observation as the production callback.
+                alsa_card: unsafe { property(proplist.0.as_ptr(), c"alsa.card") }.unwrap(),
+                // SAFETY: All properties belong to this single live observation.
+                known_non_usb: unsafe { source_known_non_usb(proplist.0.as_ptr(), flags) },
+                index: 1,
+                native_serial: None,
+                rate: 48000,
+                channels: 2,
+                channel_positions: [0; 32],
+            };
+            row.into_catalog()
+        }
+        assert_eq!(observed(&[(c"node.virtual", c"true")], 0).usb, Ok(None));
+        assert_eq!(observed(&[(c"node.virtual", c"1")], 0).usb, Ok(None));
+        for bus in [c"pci", c"isa", c"firewire", c"bluetooth"] {
+            assert_eq!(observed(&[(c"device.bus", bus)], 0).usb, Ok(None));
+        }
+        assert_eq!(observed(&[], SOURCE_NETWORK).usb, Ok(None));
+        assert!(
+            observed(&[], 0).usb.is_err(),
+            "missing facts are unknown, not proof of a virtual device"
+        );
+        assert!(observed(&[(c"node.virtual", c"false")], 0).usb.is_err());
+        assert!(observed(&[(c"device.bus", c"unknown")], 0).usb.is_err());
+        assert!(
+            observed(
+                &[
+                    (c"device.bus", c"usb"),
+                    (c"device.serial", c"GENKI_ShadowCast_3_fixture")
+                ],
+                0
+            )
+            .usb
+            .is_err()
+        );
+        assert!(
+            observed(
+                &[(c"device.bus", c"usb"), (c"alsa.card", c"not-decimal")],
+                0
+            )
+            .usb
+            .is_err()
+        );
+    }
+
+    #[test]
     fn shared_subscription_preserves_output_and_exact_loopback_capture_lifecycle() {
         let notifications = Notifications::default();
         notifications.loopback_capture.set(Some(8));
@@ -1546,6 +1685,8 @@ mod tests {
                 identity: selected.clone(),
                 description: "Capture".into(),
             },
+            alsa_card: None,
+            known_non_usb: false,
             index,
             native_serial: Some(71),
             rate: 48000,

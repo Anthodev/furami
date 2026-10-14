@@ -113,6 +113,16 @@ protected:
     bool event(QEvent *event) override
     {
         Q_ASSERT(QThread::currentThread() == thread());
+        if (m_bridge && !m_poisoned
+            && (event->type() == QEvent::Wheel || event->type() == QEvent::TouchBegin
+                || event->type() == QEvent::TouchUpdate)) {
+            const bool pressed = event->type() == QEvent::TouchBegin;
+            m_bridge->noteNativePointerActivity(pressed);
+            if (pressed && m_bridge->popupOpen()) {
+                event->accept();
+                return true;
+            }
+        }
         if (event->type() == QEvent::FocusIn || event->type() == QEvent::FocusOut) {
             qInfo().noquote() << QStringLiteral("input_focus_window source=host event=%1 generation=%2")
                 .arg(event->type() == QEvent::FocusIn ? QStringLiteral("FocusIn") : QStringLiteral("FocusOut"))
@@ -165,11 +175,30 @@ protected:
             event->ignore();
     }
 
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        if (!m_poisoned && m_bridge) {
+            m_bridge->noteNativePointerActivity(false);
+            event->accept();
+        } else {
+            event->ignore();
+        }
+    }
+
     void mousePressEvent(QMouseEvent *event) override
     {
         qInfo().noquote() << QStringLiteral("input_event source=host kind=mouse_press generation=%1 button=%2 x=%3 y=%4")
             .arg(m_generation).arg(static_cast<int>(event->button()))
             .arg(event->position().x()).arg(event->position().y());
+        if (!m_poisoned && m_bridge) {
+            m_bridge->noteNativePointerActivity(true);
+            if (m_bridge->popupOpen()) {
+                // A mandatory confirmation retained by QML owns this press.
+                // Its dismiss hook has already restored the bottom tool focus.
+                event->accept();
+                return;
+            }
+        }
         if (!m_poisoned && m_bridge && event->button() == Qt::LeftButton) {
             m_bridge->focusVideo();
             event->accept();
@@ -191,7 +220,6 @@ FuramiBridge::FuramiBridge(rust::Box<RuntimeCoordinator> gate)
 {
     assertGuiThread();
     QQmlEngine::setObjectOwnership(this, QQmlEngine::CppOwnership);
-    m_captureSelected = gate_capture_selected(*m_gate);
     applyUpdate(gate_poll(*m_gate));
     // X11 may never acknowledge a WM state request. This deadline abandons
     // intent/focus hooks only: it proves neither rejection nor success.
@@ -201,6 +229,11 @@ FuramiBridge::FuramiBridge(rust::Box<RuntimeCoordinator> gate)
         if (m_fullscreenChoicePending || m_fullscreenFocusRestorePending)
             cancelFullscreenChoice("deadline");
     });
+    m_chromeIdleTimer.setSingleShot(true);
+    m_chromeIdleTimer.setTimerType(Qt::PreciseTimer);
+    m_chromeIdleTimer.setInterval(5000);
+    connect(&m_chromeIdleTimer, &QTimer::timeout, this, &FuramiBridge::chromeInactivity);
+    connect(qGuiApp, &QGuiApplication::focusWindowChanged, this, &FuramiBridge::refreshChromeFamilyActive);
     m_pollTimer.setInterval(16);
     connect(&m_pollTimer, &QTimer::timeout, this, [this] {
         assertGuiThread();
@@ -214,6 +247,7 @@ FuramiBridge::~FuramiBridge()
 {
     assertGuiThread();
     m_pollTimer.stop();
+    m_chromeIdleTimer.stop();
     if (m_qualificationInput) {
         m_qualificationInput->setEnabled(false);
         delete m_qualificationInput.data();
@@ -231,7 +265,9 @@ void FuramiBridge::assertGuiThread() const
 
 QWindow *FuramiBridge::hostWindow() const { assertGuiThread(); return m_host.data(); }
 QString FuramiBridge::phase() const { assertGuiThread(); return m_failed ? QStringLiteral("Failed") : m_actualPhase; }
+QString FuramiBridge::uiSnapshot() const { assertGuiThread(); return m_uiSnapshot; }
 QString FuramiBridge::diagnostic() const { assertGuiThread(); return m_diagnostic; }
+QString FuramiBridge::contextDiagnostic() const { assertGuiThread(); return m_contextDiagnostic; }
 bool FuramiBridge::paused() const { assertGuiThread(); return m_paused; }
 bool FuramiBridge::presentationSuppressed() const { assertGuiThread(); return m_presentationSuppressed; }
 int FuramiBridge::volumePercent() const { assertGuiThread(); return m_volumePercent; }
@@ -255,7 +291,6 @@ QString FuramiBridge::outputSelectedKey() const { assertGuiThread(); return m_ou
 QString FuramiBridge::outputEffective() const { assertGuiThread(); return m_outputEffective; }
 QString FuramiBridge::outputStatus() const { assertGuiThread(); return m_outputStatus; }
 bool FuramiBridge::outputNeedsAction() const { assertGuiThread(); return m_outputNeedsAction; }
-bool FuramiBridge::captureSelected() const { assertGuiThread(); return m_captureSelected; }
 bool FuramiBridge::canOpen() const { assertGuiThread(); return m_canOpen; }
 bool FuramiBridge::canRestart() const { assertGuiThread(); return m_canRestart; }
 QString FuramiBridge::restartGeneration() const { assertGuiThread(); return QString::number(m_restartGeneration); }
@@ -263,8 +298,8 @@ QString FuramiBridge::audioStatus() const { assertGuiThread(); return m_audioSta
 QString FuramiBridge::audioDiagnostic() const { assertGuiThread(); return m_audioDiagnostic; }
 QString FuramiBridge::audioSource() const { assertGuiThread(); return m_audioSource; }
 bool FuramiBridge::textEntryActive() const { assertGuiThread(); return m_textEntryActive; }
-bool FuramiBridge::panelVisible() const { assertGuiThread(); return m_panelVisible; }
 bool FuramiBridge::popupOpen() const { assertGuiThread(); return m_popupOpen; }
+bool FuramiBridge::chromeFamilyActive() const { assertGuiThread(); return m_chromeFamilyActive; }
 bool FuramiBridge::quitAuthorized() const { assertGuiThread(); return m_quitAuthorized; }
 // Launch (not UI) failure: only unauthorized root destruction or a poisoned native lifetime is fatal to startup.
 // A recoverable session failure sets m_failed for the UI but still allows the authorized loop exit to succeed.
@@ -274,11 +309,10 @@ QString FuramiBridge::settingsPath() const { assertGuiThread(); return m_setting
 bool FuramiBridge::settingsRefused() const { assertGuiThread(); return m_settingsRefused; }
 QString FuramiBridge::savedSelection() const { assertGuiThread(); return m_savedSelection; }
 QString FuramiBridge::startupReason() const { assertGuiThread(); return m_startupReason; }
-bool FuramiBridge::draftDirty() const { assertGuiThread(); return m_draftDirty; }
 QString FuramiBridge::closeDialog() const { assertGuiThread(); return m_closeDialog; }
-QString FuramiBridge::closeRevision() const { assertGuiThread(); return QString::number(m_closeRevision); }
 QString FuramiBridge::resetToken() const { assertGuiThread(); return QString::number(m_resetToken); }
 bool FuramiBridge::fullscreenPreference() const { assertGuiThread(); return m_fullscreenPreference; }
+bool FuramiBridge::statsHiddenPreference() const { assertGuiThread(); return m_statsHiddenPreference; }
 bool FuramiBridge::closing() const { assertGuiThread(); return m_closing; }
 int FuramiBridge::screenAvailableWidth() const
 {
@@ -299,9 +333,231 @@ void FuramiBridge::watchScreenGeometry()
     QObject::disconnect(m_screenGeometryConnection);
     if (m_root && m_root->screen()) {
         m_screenGeometryConnection = connect(m_root->screen(), &QScreen::availableGeometryChanged,
-            this, [this](const QRect &) { emit screenGeometryChanged(); });
+            this, [this](const QRect &) { emit screenGeometryChanged(); scheduleChromeGeometry(); });
     }
     emit screenGeometryChanged();
+    scheduleChromeGeometry();
+}
+
+bool FuramiBridge::isChromeFamilyWindow(const QWindow *window) const
+{
+    // Qt's ownership chain follows native parents, then the transient parent
+    // of a top-level popup. Only our registered objects establish membership.
+    for (const auto *ancestor = window; ancestor; ancestor = ancestor->parent(QWindow::IncludeTransients)) {
+        if (ancestor == m_root.data() || ancestor == m_host.data()
+            || ancestor == m_topChromeWindow.data() || ancestor == m_volumeChromeWindow.data()
+            || ancestor == m_bottomChromeWindow.data())
+            return true;
+    }
+    return false;
+}
+
+void FuramiBridge::refreshChromeFamilyActive(QWindow *focused)
+{
+    assertGuiThread();
+    // focusWindowChanged precedes QWindow::activeChanged: use its new pointer,
+    // never the root/Tool active properties from the previous focus owner.
+    const bool active = isChromeFamilyWindow(focused);
+    if (m_chromeFamilyActive == active)
+        return;
+    m_chromeFamilyActive = active;
+    if (!active)
+        m_chromeIdleTimer.stop();
+    emit chromeFamilyActiveChanged();
+    if (!m_chromeFamilyActive) {
+        // QML's outer gate passively invalidates popup epochs. Do not use the
+        // actionable dismiss hook here: it may restore an invoker's focus.
+        for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
+            if (window)
+                window->hide();
+        }
+    }
+}
+
+void FuramiBridge::setChromeIdleArmed(bool armed)
+{
+    assertGuiThread();
+    if (armed && m_chromeFamilyActive && m_root && m_chromeRegistered && !m_bootstrapFailed && !m_closing
+        && !m_quitAuthorized && m_root->isVisible() && m_root->visibility() != QWindow::Minimized) {
+        m_chromeIdleTimer.start();
+    } else {
+        m_chromeIdleTimer.stop();
+    }
+}
+
+void FuramiBridge::dismissChromePopup()
+{
+    assertGuiThread();
+    if (m_chromeFamilyActive && m_root && m_root->isVisible()
+        && m_root->visibility() != QWindow::Minimized && m_chromeRegistered && m_popupOpen
+        && !QMetaObject::invokeMethod(m_root, "dismissChromePopup", Qt::DirectConnection))
+        failChrome(QStringLiteral("QML root dismissChromePopup hook disappeared"));
+}
+
+void FuramiBridge::hideChromeWindows()
+{
+    assertGuiThread();
+    m_chromeIdleTimer.stop();
+    dismissChromePopup();
+    for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
+        if (window)
+            window->hide();
+    }
+}
+
+void FuramiBridge::noteNativePointerActivity(bool pressed)
+{
+    assertGuiThread();
+    if (!m_chromeFamilyActive || m_bootstrapFailed || m_quitAuthorized)
+        return;
+    emit pointerActivity();
+    if (pressed)
+        dismissChromePopup();
+}
+
+void FuramiBridge::failChrome(const QString &diagnostic)
+{
+    assertGuiThread();
+    if (m_bootstrapFailed)
+        return;
+    m_bootstrapFailed = true;
+    m_failed = true;
+    m_nativeDiagnostic = diagnostic;
+    m_diagnostic = diagnostic;
+    m_contextDiagnostic = diagnostic;
+    m_chromeIdleTimer.stop();
+    for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
+        if (window)
+            window->hide();
+    }
+    qCritical().noquote() << "native_chrome_failure" << diagnostic;
+    emit stateChanged();
+    // A failed UI association is fatal to bootstrap, not permission to tear
+    // down the permanent video parent ahead of the existing owner barrier.
+    applyUpdate(gate_quit(*m_gate));
+}
+
+void FuramiBridge::registerChromeWindows(QWindow *top, QWindow *volume, QWindow *bottom)
+{
+    assertGuiThread();
+    QQuickWindow *windows[] = {qobject_cast<QQuickWindow *>(top), qobject_cast<QQuickWindow *>(volume),
+                              qobject_cast<QQuickWindow *>(bottom)};
+    const char *names[] = {"topChromeWindow", "volumeChromeWindow", "bottomChromeWindow"};
+    const char *roots[] = {"topChromeRoot", "volumeChromeRoot", "bottomChromeRoot"};
+    QString diagnostic;
+    if (m_chromeRegistered || !m_root || m_quitAuthorized || m_bootstrapFailed) {
+        diagnostic = QStringLiteral("chrome registration requires one live permanent root and an empty fixed registry");
+    } else if (m_root->metaObject()->indexOfMethod("syncChromeGeometry()") < 0
+        || m_root->metaObject()->indexOfMethod("dismissChromePopup()") < 0) {
+        diagnostic = QStringLiteral("QML root chrome geometry/dismiss hooks are missing");
+    } else if (top == volume || top == bottom || volume == bottom) {
+        diagnostic = QStringLiteral("chrome registration requires three distinct QQuickWindows");
+    } else {
+        for (int i = 0; i < 3; ++i) {
+            auto *window = windows[i];
+            auto *content = window ? window->findChild<QQuickItem *>(QLatin1String(roots[i])) : nullptr;
+            if (!window || window->objectName() != QLatin1String(names[i])
+                || window->parent() || window->transientParent() != m_root.data()
+                || (window->flags() & Qt::WindowType_Mask) != Qt::Tool
+                || !window->flags().testFlag(Qt::FramelessWindowHint)
+                || !content || content->window() != window
+                || content->metaObject()->indexOfMethod("focusBoundary(QVariant)") < 0) {
+                diagnostic = QStringLiteral("invalid fixed chrome window %1: expected named transient top-level frameless Tool and focusBoundary(QVariant) content")
+                    .arg(QString::fromLatin1(names[i]));
+                break;
+            }
+        }
+    }
+    if (!diagnostic.isEmpty()) {
+        for (auto *window : {top, volume, bottom}) {
+            if (window && window != m_root.data() && window != m_host.data())
+                window->hide();
+        }
+        failChrome(diagnostic);
+        return;
+    }
+    m_topChromeWindow = windows[0];
+    m_volumeChromeWindow = windows[1];
+    m_bottomChromeWindow = windows[2];
+    m_chromeRegistered = true;
+    refreshChromeFamilyActive(QGuiApplication::focusWindow());
+    for (auto *window : windows) {
+        connect(window, &QObject::destroyed, this, [this] {
+            if (m_root && !m_quitAuthorized)
+                failChrome(QStringLiteral("registered chrome QQuickWindow was destroyed before authorized root teardown"));
+        });
+        connect(window, &QWindow::visibleChanged, this, [this](bool) { scheduleGeometryLog(); });
+    }
+    qInfo().noquote() << QStringLiteral("native_chrome_registered root=%1 count=3 native_parent=null flags=Tool_Frameless")
+        .arg(m_rootXid);
+    scheduleChromeGeometry();
+}
+
+void FuramiBridge::scheduleChromeGeometry()
+{
+    assertGuiThread();
+    if (m_chromeGeometryPending || !m_root || !m_chromeRegistered || m_bootstrapFailed || m_quitAuthorized)
+        return;
+    m_chromeGeometryPending = true;
+    QTimer::singleShot(0, this, [this] {
+        m_chromeGeometryPending = false;
+        if (!m_root || !m_chromeRegistered || m_bootstrapFailed || m_quitAuthorized)
+            return;
+        for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
+            if (!window || window->parent() || window->transientParent() != m_root.data()
+                || (window->flags() & Qt::WindowType_Mask) != Qt::Tool
+                || !window->flags().testFlag(Qt::FramelessWindowHint)) {
+                failChrome(QStringLiteral("registered chrome lost its fixed transient top-level Tool association"));
+                return;
+            }
+        }
+        if (!QMetaObject::invokeMethod(m_root, "syncChromeGeometry", Qt::DirectConnection))
+            failChrome(QStringLiteral("QML root syncChromeGeometry hook disappeared"));
+    });
+}
+
+void FuramiBridge::focusNextChrome(const QString &region, bool backward)
+{
+    assertGuiThread();
+    if (!m_chromeFamilyActive || !m_chromeRegistered || !m_root || m_popupOpen || m_bootstrapFailed || m_quitAuthorized
+        || !m_root->isVisible() || m_root->visibility() == QWindow::Minimized)
+        return;
+    QQuickWindow *target = nullptr;
+    const char *contentName = nullptr;
+    if (region == QLatin1String("video")) {
+        target = backward ? m_bottomChromeWindow.data() : m_topChromeWindow.data();
+        contentName = backward ? "bottomChromeRoot" : "topChromeRoot";
+    } else if (region == QLatin1String("top")) {
+        if (!backward) {
+            target = m_volumeChromeWindow.data();
+            contentName = "volumeChromeRoot";
+        }
+    } else if (region == QLatin1String("volume")) {
+        target = backward ? m_topChromeWindow.data() : m_bottomChromeWindow.data();
+        contentName = backward ? "topChromeRoot" : "bottomChromeRoot";
+    } else if (region == QLatin1String("bottom")) {
+        if (backward) {
+            target = m_volumeChromeWindow.data();
+            contentName = "volumeChromeRoot";
+        }
+    } else {
+        failChrome(QStringLiteral("unknown chrome focus region"));
+        return;
+    }
+    if (!contentName) {
+        focusVideo();
+        return;
+    }
+    auto *content = target ? target->findChild<QQuickItem *>(QLatin1String(contentName)) : nullptr;
+    if (!content || !QMetaObject::invokeMethod(content, "focusBoundary", Qt::DirectConnection,
+            Q_ARG(QVariant, QVariant(backward)))) {
+        failChrome(QStringLiteral("registered chrome focus boundary disappeared"));
+        return;
+    }
+    target->requestActivate();
+    qInfo().noquote() << QStringLiteral("input_focus_handoff source=%1 direction=%2 target=%3 root=%4 generation=%5")
+        .arg(region, backward ? QStringLiteral("backward") : QStringLiteral("forward"), target->objectName())
+        .arg(m_rootXid).arg(m_generation);
 }
 
 void FuramiBridge::setTextEntryActive(bool active)
@@ -315,27 +571,13 @@ void FuramiBridge::setTextEntryActive(bool active)
     emit textEntryActiveChanged();
 }
 
-void FuramiBridge::setPanelVisible(bool visible)
-{
-    assertGuiThread();
-    if (m_panelVisible == visible || (!visible && m_popupOpen))
-        return;
-    m_panelVisible = visible;
-    qInfo().noquote() << QStringLiteral("qt_panel visible=%1 root=%2 generation=%3")
-        .arg(boolean(visible)).arg(m_rootXid).arg(m_generation);
-    emit panelVisibleChanged();
-    if (!visible)
-        focusVideo();
-    scheduleGeometryLog();
-}
-
 void FuramiBridge::setPopupOpen(bool open)
 {
     assertGuiThread();
     if (m_popupOpen == open)
         return;
     m_popupOpen = open;
-    qInfo().noquote() << QStringLiteral("qt_panel_popup open=%1 policy=panel_only_no_scrim root=%2")
+    qInfo().noquote() << QStringLiteral("qt_chrome_popup open=%1 policy=bounded_tool_local_popup root=%2")
         .arg(boolean(open)).arg(m_rootXid);
     emit popupOpenChanged();
     scheduleGeometryLog();
@@ -355,12 +597,15 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
         diagnostic = QStringLiteral("QML root has no valid native X11 surface");
         return false;
     }
+    refreshChromeFamilyActive(QGuiApplication::focusWindow());
     root->setCursor(Qt::ArrowCursor);
     m_fullscreenObserved = root->visibility() == QWindow::FullScreen;
     qInfo().noquote() << QStringLiteral("native_root root=%1 container=videoContainer generation=0")
         .arg(m_rootXid);
-    connect(root, &QWindow::widthChanged, this, [this] { scheduleGeometryLog(); });
-    connect(root, &QWindow::heightChanged, this, [this] { scheduleGeometryLog(); });
+    connect(root, &QWindow::widthChanged, this, [this] { scheduleGeometryLog(); scheduleChromeGeometry(); });
+    connect(root, &QWindow::heightChanged, this, [this] { scheduleGeometryLog(); scheduleChromeGeometry(); });
+    connect(root, &QWindow::xChanged, this, [this] { scheduleChromeGeometry(); });
+    connect(root, &QWindow::yChanged, this, [this] { scheduleChromeGeometry(); });
     connect(root, &QWindow::screenChanged, this, [this] { watchScreenGeometry(); scheduleGeometryLog(); });
     watchScreenGeometry();
     connect(root, &QQuickWindow::activeFocusItemChanged, this, [this] {
@@ -377,9 +622,15 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
     connect(container, &QQuickItem::heightChanged, this, [this] { scheduleGeometryLog(); });
     connect(root, &QObject::destroyed, this, [this] {
         assertGuiThread();
+        m_chromeIdleTimer.stop();
+        for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
+            if (window)
+                window->hide();
+        }
         cancelFullscreenChoice("root-destroyed");
         m_root.clear();
         m_container.clear();
+        refreshChromeFamilyActive(QGuiApplication::focusWindow());
         qInfo().noquote() << QStringLiteral("native_root_destroyed root=%1 generation=%2 authorized=%3")
             .arg(m_rootXid).arg(m_generation).arg(boolean(m_quitAuthorized));
         if (!m_quitAuthorized) {
@@ -389,6 +640,7 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
             m_failed = true;
             m_nativeDiagnostic = QStringLiteral("application root QObject was destroyed without authorized application close");
             m_diagnostic = m_nativeDiagnostic;
+            m_contextDiagnostic = m_nativeDiagnostic;
             emit stateChanged();
             qCritical().noquote() << QStringLiteral("native_root_destroyed_uncontrolled root=%1 generation=%2")
                 .arg(m_rootXid).arg(m_generation);
@@ -398,10 +650,13 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
         }
     });
     connect(root, &QWindow::visibilityChanged, this, [this](QWindow::Visibility visibility) {
-        if (visibility == QWindow::Hidden || visibility == QWindow::Minimized)
+        if (visibility == QWindow::Hidden || visibility == QWindow::Minimized) {
             cancelFullscreenChoice("not-visible");
-        else if (m_fullscreenChoicePending && m_root)
+            hideChromeWindows();
+        } else if (m_fullscreenChoicePending && m_root) {
             m_root->update();
+        }
+        scheduleChromeGeometry();
     });
     QTimer::singleShot(0, this, [this] {
         if (!m_root) return;
@@ -425,7 +680,7 @@ bool FuramiBridge::enableQualificationInput(QString &diagnostic)
     m_qualificationInput = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read, this);
     connect(m_qualificationInput.data(), &QSocketNotifier::activated, this,
         [this](QSocketDescriptor, QSocketNotifier::Type) { readQualificationInput(); });
-    qInfo().noquote() << "qualification_stdin_enabled grammar=snapshot|draft-video|draft-identity|draft-audio|draft-source|draft-filters|draft-renderer|open|apply|restart|reconnect|volume|mute|close|quit draft_video=revision,auto_or_FourCC,WIDTHxHEIGHT,N/D state=phase,apply,attempt,cleanup revision=required_for_draft_apply filter_json=strict_FilterChain limits=legacy:256,filter:65536_bytes";
+    qInfo().noquote() << "qualification_stdin_enabled grammar=snapshot|draft-video|draft-identity|draft-audio|draft-source|draft-filters|draft-renderer|open|apply|restart|reconnect|volume|mute|close|quit|fullscreen|application-close|reset-confirm|open-close-during-opening|force-surface-loss draft_video=revision,auto_or_FourCC,WIDTHxHEIGHT,N/D state=phase,apply,attempt,cleanup revision=required_for_draft_apply filter_json=strict_FilterChain limits=legacy:256,filter:65536_bytes";
     return true;
 }
 
@@ -459,6 +714,8 @@ void FuramiBridge::readQualificationInput()
                     if (command == "fullscreen") toggleFullscreen();
                     else if (command == "application-close") requestApplicationClose();
                     else if (command == "reset-confirm") decideSettingsReset(QString::number(m_resetToken), true);
+                    else if (command == "open-close-during-opening") openAndCloseDuringOpeningForProof();
+                    else if (command == "force-surface-loss") forceSurfaceLossForProof();
                     else {
                         if (command == "close-discard" || command.startsWith("quit ")) observeFullscreenChoice();
                         applyUpdate(gate_qualification_command(*m_gate, asRust(command)));
@@ -488,6 +745,132 @@ void FuramiBridge::openCapture()
     applyUpdate(gate_open(*m_gate));
 }
 
+void FuramiBridge::refreshCatalogs()
+{
+    assertGuiThread();
+    applyUpdate(gate_refresh_catalogs(*m_gate));
+}
+
+void FuramiBridge::selectCapture(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey)
+{
+    assertGuiThread();
+    applyUpdate(gate_select_capture(*m_gate, asRust(selectionRevision.toUtf8()), asRust(catalogRevision.toUtf8()), asRust(rowKey.toUtf8())));
+}
+
+void FuramiBridge::selectSize(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey)
+{
+    assertGuiThread();
+    applyUpdate(gate_select_size(*m_gate, asRust(selectionRevision.toUtf8()), asRust(catalogRevision.toUtf8()), asRust(rowKey.toUtf8())));
+}
+
+void FuramiBridge::setSize(const QString &selectionRevision, const QString &catalogRevision, const QString &width, const QString &height)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_size(*m_gate, asRust(selectionRevision.toUtf8()), asRust(catalogRevision.toUtf8()), asRust(width.toUtf8()), asRust(height.toUtf8())));
+}
+
+void FuramiBridge::selectRate(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey)
+{
+    assertGuiThread();
+    applyUpdate(gate_select_rate(*m_gate, asRust(selectionRevision.toUtf8()), asRust(catalogRevision.toUtf8()), asRust(rowKey.toUtf8())));
+}
+
+void FuramiBridge::setRate(const QString &selectionRevision, const QString &catalogRevision, const QString &exactRate)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_rate(*m_gate, asRust(selectionRevision.toUtf8()), asRust(catalogRevision.toUtf8()), asRust(exactRate.toUtf8())));
+}
+
+void FuramiBridge::selectFormat(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey)
+{
+    assertGuiThread();
+    applyUpdate(gate_select_format(*m_gate, asRust(selectionRevision.toUtf8()), asRust(catalogRevision.toUtf8()), asRust(rowKey.toUtf8())));
+}
+
+void FuramiBridge::setAudioEnabled(const QString &selectionRevision, bool enabled)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_audio_enabled(*m_gate, asRust(selectionRevision.toUtf8()), enabled));
+}
+
+void FuramiBridge::selectAudioInput(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey)
+{
+    assertGuiThread();
+    applyUpdate(gate_select_audio_input(*m_gate, asRust(selectionRevision.toUtf8()), asRust(catalogRevision.toUtf8()), asRust(rowKey.toUtf8())));
+}
+
+void FuramiBridge::setFilterEnabled(const QString &selectionRevision, const QString &entryKey, bool enabled)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_filter_enabled(*m_gate, asRust(selectionRevision.toUtf8()), asRust(entryKey.toUtf8()), enabled));
+}
+
+void FuramiBridge::addFilter(const QString &selectionRevision, const QString &kind)
+{
+    assertGuiThread();
+    applyUpdate(gate_add_filter(*m_gate, asRust(selectionRevision.toUtf8()), asRust(kind.toUtf8())));
+}
+
+void FuramiBridge::removeFilter(const QString &selectionRevision, const QString &entryKey)
+{
+    assertGuiThread();
+    applyUpdate(gate_remove_filter(*m_gate, asRust(selectionRevision.toUtf8()), asRust(entryKey.toUtf8())));
+}
+
+void FuramiBridge::setScale(const QString &selectionRevision, const QString &kernel)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_scale(*m_gate, asRust(selectionRevision.toUtf8()), asRust(kernel.toUtf8())));
+}
+
+void FuramiBridge::setCscale(const QString &selectionRevision, const QString &kernel)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_cscale(*m_gate, asRust(selectionRevision.toUtf8()), asRust(kernel.toUtf8())));
+}
+
+void FuramiBridge::setDscale(const QString &selectionRevision, const QString &kernel)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_dscale(*m_gate, asRust(selectionRevision.toUtf8()), asRust(kernel.toUtf8())));
+}
+
+void FuramiBridge::setScaleAntiring(const QString &selectionRevision, double value)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_scale_antiring(*m_gate, asRust(selectionRevision.toUtf8()), value));
+}
+
+void FuramiBridge::setDither(const QString &selectionRevision, const QString &mode)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_dither(*m_gate, asRust(selectionRevision.toUtf8()), asRust(mode.toUtf8())));
+}
+
+void FuramiBridge::setDebandEnabled(const QString &selectionRevision, bool enabled)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_deband_enabled(*m_gate, asRust(selectionRevision.toUtf8()), enabled));
+}
+
+void FuramiBridge::setDebandIterations(const QString &selectionRevision, int value)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_deband_iterations(*m_gate, asRust(selectionRevision.toUtf8()), value));
+}
+
+void FuramiBridge::setDebandGrain(const QString &selectionRevision, double value)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_deband_grain(*m_gate, asRust(selectionRevision.toUtf8()), value));
+}
+
+void FuramiBridge::setInterpolation(const QString &selectionRevision, bool enabled)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_interpolation(*m_gate, asRust(selectionRevision.toUtf8()), enabled));
+}
+
 void FuramiBridge::restartCapture(const QString &expectedGeneration)
 {
     assertGuiThread();
@@ -495,7 +878,7 @@ void FuramiBridge::restartCapture(const QString &expectedGeneration)
     const auto generation = expectedGeneration.toULongLong(&valid);
     if (!valid || !m_canRestart || m_bootstrapFailed)
         return;
-    qInfo().noquote() << QStringLiteral("input_intent action=RestartCapture source=panel generation=%1 current_attempt=%2 can_restart=%3")
+    qInfo().noquote() << QStringLiteral("input_intent action=RestartCapture source=ui generation=%1 current_attempt=%2 can_restart=%3")
         .arg(generation).arg(m_restartGeneration).arg(boolean(m_canRestart));
     applyUpdate(gate_restart(*m_gate, generation));
 }
@@ -507,7 +890,7 @@ void FuramiBridge::reconnectCapture(const QString &expectedGeneration)
     const auto generation = expectedGeneration.toULongLong(&valid);
     if (!valid || m_bootstrapFailed)
         return;
-    qInfo().noquote() << QStringLiteral("input_intent action=ReconnectCapture source=panel generation=%1 current_attempt=%2")
+    qInfo().noquote() << QStringLiteral("input_intent action=ReconnectCapture source=ui generation=%1 current_attempt=%2")
         .arg(generation).arg(m_restartGeneration);
     applyUpdate(gate_reconnect(*m_gate, generation));
 }
@@ -528,7 +911,7 @@ void FuramiBridge::chooseRecovery(const QString &expectedGeneration, const QStri
     const auto candidate = identity.value(2).toULongLong(&validCandidate);
     if (!validGeneration || !validWatch || !validEpoch || !validCandidate || m_bootstrapFailed)
         return;
-    qInfo().noquote() << QStringLiteral("input_intent action=ChooseRecovery source=panel generation=%1 watch=%2 epoch=%3 candidate=%4")
+    qInfo().noquote() << QStringLiteral("input_intent action=ChooseRecovery source=ui generation=%1 watch=%2 epoch=%3 candidate=%4")
         .arg(generation).arg(watch).arg(epoch).arg(candidate);
     applyUpdate(gate_choose_recovery(*m_gate, generation, watch, epoch, candidate));
 }
@@ -536,7 +919,7 @@ void FuramiBridge::chooseRecovery(const QString &expectedGeneration, const QStri
 void FuramiBridge::closeCapture()
 {
     assertGuiThread();
-    qInfo().noquote() << QStringLiteral("input_intent action=CloseSession source=panel generation=%1 phase=%2")
+    qInfo().noquote() << QStringLiteral("input_intent action=CloseSession source=ui generation=%1 phase=%2")
         .arg(m_generation).arg(m_actualPhase);
     applyUpdate(gate_close(*m_gate, m_generation, false));
 }
@@ -592,9 +975,9 @@ void FuramiBridge::selectOutput(const QString &rowKey, const QString &catalogRev
 void FuramiBridge::openAndCloseDuringOpeningForProof()
 {
     assertGuiThread();
-    if (!m_canOpen || m_bootstrapFailed)
+    if (!m_qualificationInput || !m_canOpen || m_bootstrapFailed)
         return;
-    qInfo().noquote() << "input_intent action=OpenAndCloseDuringOpening source=panel";
+    qInfo().noquote() << "input_intent action=OpenAndCloseDuringOpening source=qualification";
     m_closeOnNextOpening = true;
     applyUpdate(gate_open(*m_gate));
 }
@@ -602,9 +985,9 @@ void FuramiBridge::openAndCloseDuringOpeningForProof()
 void FuramiBridge::forceSurfaceLossForProof()
 {
     assertGuiThread();
-    if (m_actualPhase != QStringLiteral("Ready") || m_failed || !m_host || m_poisoned)
+    if (!m_qualificationInput || m_actualPhase != QStringLiteral("Ready") || m_failed || !m_host || m_poisoned)
         return;
-    qInfo().noquote() << QStringLiteral("input_intent action=ForceSurfaceLoss source=panel root=%1 host=%2 generation=%3")
+    qInfo().noquote() << QStringLiteral("input_intent action=ForceSurfaceLoss source=qualification root=%1 host=%2 generation=%3")
         .arg(m_rootXid).arg(m_lastHostXid).arg(m_generation);
     // This is deliberately unauthorized. Only the real platform event reports loss.
     m_host->destroy();
@@ -624,13 +1007,6 @@ void FuramiBridge::requestApplicationClose()
     applyUpdate(gate_request_application_close(*m_gate));
 }
 
-void FuramiBridge::decideClose(bool discard, const QString &revision)
-{
-    assertGuiThread();
-    bool valid = false;
-    const auto value = revision.toULongLong(&valid);
-    if (valid) applyUpdate(gate_decide_close(*m_gate, discard, value));
-}
 void FuramiBridge::retrySave() { assertGuiThread(); applyUpdate(gate_retry_save(*m_gate)); }
 void FuramiBridge::closeWithoutSave() { assertGuiThread(); applyUpdate(gate_close_without_save(*m_gate)); }
 void FuramiBridge::requestSettingsReset() { assertGuiThread(); applyUpdate(gate_request_reset(*m_gate)); }
@@ -726,10 +1102,10 @@ void FuramiBridge::cancelFullscreenChoice(const char *reason)
     m_fullscreenNativeTransitionObserved = false;
 }
 
-void FuramiBridge::togglePanel()
+void FuramiBridge::setStatsHidden(bool hidden)
 {
     assertGuiThread();
-    setPanelVisible(!m_panelVisible);
+    applyUpdate(gate_set_stats_hidden(*m_gate, hidden));
 }
 
 void FuramiBridge::toggleFullscreen()
@@ -764,7 +1140,11 @@ void FuramiBridge::toggleFullscreen()
             || m_root->visibility() == QWindow::Maximized)) {
             m_windowedGeometry = m_root->geometry();
             m_windowedVisibility = m_root->visibility();
-            m_fullscreenFocusItem = m_root->activeFocusItem();
+            auto *focused = QGuiApplication::focusWindow();
+            m_fullscreenFocusWindow = m_topChromeWindow && focused == m_topChromeWindow.data() ? m_topChromeWindow.data()
+                : m_volumeChromeWindow && focused == m_volumeChromeWindow.data() ? m_volumeChromeWindow.data()
+                : m_bottomChromeWindow && focused == m_bottomChromeWindow.data() ? m_bottomChromeWindow.data() : m_root.data();
+            m_fullscreenFocusItem = m_fullscreenFocusWindow->activeFocusItem();
             m_fullscreenNativeFocus = m_host && QGuiApplication::focusWindow() == m_host.data();
         }
         m_root->showFullScreen();
@@ -786,13 +1166,22 @@ void FuramiBridge::restoreFullscreenFocus()
     m_fullscreenFocusRestorePending = false;
     if (!m_fullscreenChoicePending)
         m_fullscreenChoiceDeadline.stop();
-    if (!m_root->isActive() || m_quitAuthorized)
+    if (!m_chromeFamilyActive || m_quitAuthorized || m_popupOpen)
         return;
+    auto *targetWindow = m_fullscreenFocusWindow.data();
+    if (!targetWindow || !targetWindow->isVisible()
+        || (targetWindow != m_root.data() && targetWindow != m_topChromeWindow.data()
+            && targetWindow != m_volumeChromeWindow.data() && targetWindow != m_bottomChromeWindow.data()))
+        targetWindow = m_root.data();
     auto *target = m_fullscreenFocusItem.data();
-    if (!target || target->window() != m_root.data() || !target->isVisible() || !target->isEnabled())
+    if (!target || target->window() != targetWindow || !target->isVisible() || !target->isEnabled()) {
+        targetWindow = m_root.data();
         target = m_container.data();
-    if (target)
+    }
+    if (target) {
         target->forceActiveFocus(Qt::OtherFocusReason);
+        targetWindow->requestActivate();
+    }
     // Only the current published host may regain native focus; no saved host/XID.
     if (m_fullscreenNativeFocus && m_root->isActive() && m_host && m_published
         && !m_poisoned && !m_host->poisoned() && m_host->parent() == m_root.data()
@@ -806,10 +1195,18 @@ void FuramiBridge::restoreFullscreenFocus()
 void FuramiBridge::focusVideo()
 {
     assertGuiThread();
-    if (!m_host || m_poisoned || m_failed || !m_container)
+    if (m_popupOpen)
+        return;
+    if (!m_chromeFamilyActive || !m_root || !m_container || m_quitAuthorized || m_closing || m_bootstrapFailed
+        || !m_root->isVisible() || m_root->visibility() == QWindow::Minimized)
         return;
     m_container->forceActiveFocus(Qt::MouseFocusReason);
-    m_host->requestActivate();
+    if (m_host && m_published && !m_poisoned && !m_failed && !m_host->poisoned()
+        && m_host->parent() == m_root.data()
+        && m_container->property("window").value<QWindow *>() == m_host.data())
+        m_host->requestActivate();
+    else
+        m_root->requestActivate();
     qInfo().noquote() << QStringLiteral("input_intent action=FocusVideo root=%1 host=%2 generation=%3 cursor=Qt_ArrowCursor")
         .arg(m_rootXid).arg(m_lastHostXid).arg(m_generation);
 }
@@ -821,25 +1218,23 @@ bool FuramiBridge::handleKey(QKeyEvent *event, const char *source)
         .arg(QString::fromLatin1(source)).arg(event->key()).arg(boolean(event->isAutoRepeat()))
         .arg(boolean(m_textEntryActive)).arg(boolean(m_popupOpen)).arg(m_generation);
     const int key = event->key();
-    if (qstrcmp(source, "host") == 0 && m_root && m_container
+    const bool videoFocus = m_root && m_container
+        && (qstrcmp(source, "host") == 0
+            || (qstrcmp(source, "root") == 0 && m_root->isActive()
+                && (!m_root->activeFocusItem() || m_root->activeFocusItem() == m_container.data())));
+    if (!m_popupOpen && videoFocus && m_chromeRegistered
         && (key == Qt::Key_Tab || key == Qt::Key_Backtab)
         && !(event->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier))) {
-        const bool forward = key == Qt::Key_Tab && !event->modifiers().testFlag(Qt::ShiftModifier);
-        auto *target = m_container->nextItemInFocusChain(forward);
-        if (target && target != m_container.data() && target->window() == m_root.data()) {
-            const auto reason = forward ? Qt::TabFocusReason : Qt::BacktabFocusReason;
-            // A native child deactivates the root. Record the real Qt chain target,
-            // then request native focus back; root FocusIn activates that target.
-            target->forceActiveFocus(reason);
-            m_root->requestActivate();
-            qInfo().noquote() << QStringLiteral("input_focus_handoff source=host direction=%1 target=%2 root=%3 generation=%4")
-                .arg(forward ? QStringLiteral("forward") : QStringLiteral("backward"))
-                .arg(target->objectName()).arg(m_rootXid).arg(m_generation);
-            event->accept();
-            return true;
-        }
+        const bool backward = key == Qt::Key_Backtab || event->modifiers().testFlag(Qt::ShiftModifier);
+        focusNextChrome(QStringLiteral("video"), backward);
+        event->accept();
+        return true;
     }
-    if (m_popupOpen)
+    if (key != Qt::Key_Space && key != Qt::Key_F11 && key != Qt::Key_Escape)
+        return false;
+    if (event->modifiers() != Qt::NoModifier)
+        return false;
+    if (key == Qt::Key_Space && m_popupOpen)
         return false;
     if (key == Qt::Key_Space) {
         if (m_textEntryActive || event->modifiers() != Qt::NoModifier)
@@ -851,11 +1246,7 @@ bool FuramiBridge::handleKey(QKeyEvent *event, const char *source)
         // A stale host-origin event is not permission to bypass a focused control.
         if (qstrcmp(source, "host") == 0 ? !(hostOwnsFocus || containerOwnsFocus) : !containerOwnsFocus)
             return false;
-    } else if (event->modifiers() != Qt::NoModifier) {
-        return false;
     }
-    if (key != Qt::Key_Space && key != Qt::Key_F11 && key != Qt::Key_Escape)
-        return false;
     if (event->isAutoRepeat()) {
         event->accept();
         return true;
@@ -864,12 +1255,12 @@ bool FuramiBridge::handleKey(QKeyEvent *event, const char *source)
         togglePause();
     } else if (key == Qt::Key_F11) {
         toggleFullscreen();
+    } else if (m_popupOpen) {
+        dismissChromePopup();
     } else if (m_root && m_root->visibility() == QWindow::FullScreen) {
         toggleFullscreen();
     } else {
-        qInfo().noquote() << QStringLiteral("input_intent action=HidePanel source=%1 generation=%2")
-            .arg(QString::fromLatin1(source)).arg(m_generation);
-        setPanelVisible(false);
+        return false;
     }
     event->accept();
     return true;
@@ -896,7 +1287,62 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
         requestApplicationClose();
         return true;
     }
+    auto *chrome = watched == m_topChromeWindow ? m_topChromeWindow.data()
+        : watched == m_volumeChromeWindow ? m_volumeChromeWindow.data()
+        : watched == m_bottomChromeWindow ? m_bottomChromeWindow.data() : nullptr;
+    if (chrome) {
+        if (event->type() == QEvent::FocusIn || event->type() == QEvent::FocusOut) {
+            qInfo().noquote() << QStringLiteral("input_focus_window source=%1 event=%2 root=%3 generation=%4")
+                .arg(chrome->objectName(), event->type() == QEvent::FocusIn
+                    ? QStringLiteral("FocusIn") : QStringLiteral("FocusOut"))
+                .arg(m_rootXid).arg(m_generation);
+        }
+        if (event->type() == QEvent::WindowStateChange) {
+            if (!m_root || !m_root->isVisible() || m_root->visibility() == QWindow::Minimized)
+                hideChromeWindows();
+            else if (chrome->windowState() != Qt::WindowNoState)
+                chrome->setWindowState(Qt::WindowNoState);
+            scheduleChromeGeometry();
+        }
+        if (event->type() == QEvent::Close && !m_quitAuthorized) {
+            event->ignore();
+            dismissChromePopup();
+            if (m_popupOpen)
+                return true;
+            chrome->hide();
+            m_chromeIdleTimer.stop();
+            focusVideo();
+            return true;
+        }
+        if (event->type() == QEvent::KeyPress)
+            return handleKey(static_cast<QKeyEvent *>(event), "chrome");
+        if (event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonPress
+            || event->type() == QEvent::Wheel || event->type() == QEvent::TouchBegin
+            || event->type() == QEvent::TouchUpdate)
+            noteNativePointerActivity(false);
+        if (event->type() == QEvent::Move || event->type() == QEvent::Resize) {
+            scheduleChromeGeometry();
+            scheduleGeometryLog();
+        }
+        if (event->type() == QEvent::Show) {
+            if (!m_chromeFamilyActive || !m_root || !m_root->isVisible() || m_root->visibility() == QWindow::Minimized
+                || m_quitAuthorized || m_bootstrapFailed)
+                chrome->hide();
+            else
+                chrome->raise();
+        }
+    }
     if (watched == m_root) {
+        if (event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonPress
+            || event->type() == QEvent::Wheel || event->type() == QEvent::TouchBegin
+            || event->type() == QEvent::TouchUpdate) {
+            const bool pressed = event->type() == QEvent::MouseButtonPress || event->type() == QEvent::TouchBegin;
+            noteNativePointerActivity(pressed);
+            if (pressed && m_popupOpen) {
+                event->accept();
+                return true;
+            }
+        }
         if (event->type() == QEvent::FocusIn || event->type() == QEvent::FocusOut) {
             qInfo().noquote() << QStringLiteral("input_focus_window source=root event=%1 root=%2 generation=%3")
                 .arg(event->type() == QEvent::FocusIn ? QStringLiteral("FocusIn") : QStringLiteral("FocusOut"))
@@ -909,6 +1355,8 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
             requestApplicationClose();
             return true;
         }
+        if (event->type() == QEvent::Close && m_quitAuthorized)
+            hideChromeWindows();
         if (event->type() == QEvent::KeyPress)
             return handleKey(static_cast<QKeyEvent *>(event), "root");
         if (event->type() == QEvent::WindowStateChange && event->spontaneous()) {
@@ -944,11 +1392,12 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
                 }
             }
         }
-        if (event->type() == QEvent::Resize || event->type() == QEvent::WindowStateChange) {
+        if (event->type() == QEvent::Move || event->type() == QEvent::Resize || event->type() == QEvent::WindowStateChange) {
             if ((m_fullscreenChoicePending || m_fullscreenFocusRestorePending)
                 && m_fullscreenNativeTransitionObserved)
                 m_root->update();
             scheduleGeometryLog();
+            scheduleChromeGeometry();
         }
     }
     return QObject::eventFilter(watched, event);
@@ -962,6 +1411,8 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     if (update.restart_generation != m_restartGeneration && !m_bootstrapFailed)
         m_nativeDiagnostic.clear();
     m_actualPhase = phaseName(update.phase);
+    if (!update.ui_snapshot.empty())
+        m_uiSnapshot = fromRust(update.ui_snapshot);
     m_generation = update.generation;
     m_restartGeneration = update.restart_generation;
     m_canRestart = update.can_restart && !m_bootstrapFailed;
@@ -1001,11 +1452,10 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     m_settingsRefused = update.settings_refused;
     m_savedSelection = fromRust(update.saved_selection);
     m_startupReason = fromRust(update.startup_reason);
-    m_draftDirty = update.draft_dirty;
     m_closeDialog = fromRust(update.close_dialog);
-    m_closeRevision = update.close_revision;
     m_resetToken = update.reset_token;
     m_fullscreenPreference = update.fullscreen;
+    m_statsHiddenPreference = update.stats_hidden;
     m_closing = update.closing;
     m_outputRows = fromRust(update.output_rows);
     m_outputCatalogRevision = update.output_catalog_revision;
@@ -1017,9 +1467,12 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     if (m_closing)
         cancelFullscreenChoice("application-close");
     m_diagnostic = fromRust(update.diagnostic);
+    m_contextDiagnostic = fromRust(update.context_diagnostic);
     if (m_failed && !m_nativeDiagnostic.isEmpty()) {
         m_diagnostic = m_diagnostic.isEmpty() ? m_nativeDiagnostic
             : m_nativeDiagnostic + QStringLiteral("; ") + m_diagnostic;
+        m_contextDiagnostic = m_contextDiagnostic.isEmpty() ? m_nativeDiagnostic
+            : m_nativeDiagnostic + QStringLiteral("; ") + m_contextDiagnostic;
     }
     qInfo().noquote() << QStringLiteral("ui_phase phase=%1 visible_phase=%2 product_phase=%3 generation=%4 failed=%5 paused=%6 restart_generation=%7 can_restart=%8 audio_status=%9 audio_source=%10 audio_desired=%11 audio_diagnostic=%12 recovery_evidence=%13 recovery_stage=%14 diagnostic=%15 playback_status=%16 volume=%17 muted=%18 can_toggle_pause=%19 can_set_gain=%20")
         .arg(m_actualPhase, phase(), m_productPhase).arg(m_generation).arg(boolean(m_failed))
@@ -1047,6 +1500,7 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     if (update.quit) {
         Q_ASSERT(m_nativeGeneration == 0);
         m_quitAuthorized = true;
+        hideChromeWindows();
         qInfo().noquote() << QStringLiteral("qt_quit_authorized generation=%1 root=%2")
             .arg(update.generation).arg(m_rootXid);
         QTimer::singleShot(0, qGuiApp, &QCoreApplication::quit);
@@ -1071,12 +1525,14 @@ void FuramiBridge::createNative(std::uint64_t generation)
     auto *host = new HostWindow(this, generation);
     QQmlEngine::setObjectOwnership(host, QQmlEngine::CppOwnership);
     m_host = host;
+    refreshChromeFamilyActive(QGuiApplication::focusWindow());
     connect(host, &QObject::destroyed, this, [this, generation] {
         assertGuiThread();
         qInfo().noquote() << QStringLiteral("native_object_destroyed generation=%1 host=%2 authorized=%3")
             .arg(generation).arg(m_lastHostXid).arg(boolean(m_releasing));
         if (!m_releasing && generation == m_nativeGeneration) {
             m_host.clear();
+            refreshChromeFamilyActive(QGuiApplication::focusWindow());
             // WindowContainer first receives its own windowDestroyed notification.
             QTimer::singleShot(0, this, [this] { emit hostWindowChanged(); });
             if (!m_poisoned)
@@ -1232,6 +1688,7 @@ void FuramiBridge::releaseNative(std::uint64_t generation)
         }
     }
     m_host.clear();
+    refreshChromeFamilyActive(QGuiApplication::focusWindow());
     emit hostWindowChanged();
     // Clear only after platform destruction, while QPointer guards parent-driven deletion.
     if (m_container)
@@ -1268,25 +1725,102 @@ void FuramiBridge::logGeometry()
         return;
     const auto video = m_container->mapRectToScene(QRectF(0, 0, m_container->width(), m_container->height()));
     const qreal dpr = m_root->devicePixelRatio();
-    qInfo().noquote() << QStringLiteral("qt_geometry root=%1 generation=%2 root_width=%3 root_height=%4 video_x=%5 video_y=%6 video_width=%7 video_height=%8 panel=%9 dpr=%10")
+    qInfo().noquote() << QStringLiteral("qt_geometry root=%1 generation=%2 root_width=%3 root_height=%4 video_x=%5 video_y=%6 video_width=%7 video_height=%8 dpr=%9")
         .arg(m_rootXid).arg(m_generation).arg(m_root->width()).arg(m_root->height())
-        .arg(video.x()).arg(video.y()).arg(video.width()).arg(video.height()).arg(boolean(m_panelVisible)).arg(dpr);
-    const char *names[] = {"openProof", "restartCapture", "closeProof", "closeDuringOpenProof", "forceSurfaceLossProof",
-                          "togglePlayback", "playbackVolume", "playbackMute",
-                          "proofText", "togglePanelProof", "fullscreenProof", "popupOpenProof",
-                          "closePopupProof", "videoContainer", "proofPanel", "savedSelection",
-                          "startupRestoreReason", "settingsStatus", "resetSettings",
-                          "cancelDirtyClose", "discardDirtyClose", "retrySettingsSave",
-                          "closeWithoutSaving", "cancelSettingsReset", "confirmSettingsReset"};
-    for (const auto *name : names) {
-        auto *item = m_root->findChild<QQuickItem *>(QString::fromLatin1(name));
-        if (!item)
+        .arg(video.x()).arg(video.y()).arg(video.width()).arg(video.height()).arg(dpr);
+    for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
+        if (!window)
             continue;
-        const auto rect = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
-        qInfo().noquote() << QStringLiteral("proof_control object=%1 x=%2 y=%3 width=%4 height=%5 visible=%6 enabled=%7")
-            .arg(QString::fromLatin1(name)).arg(qRound(rect.x() * dpr)).arg(qRound(rect.y() * dpr))
+        const auto local = m_root->mapFromGlobal(window->position());
+        qInfo().noquote() << QStringLiteral("qt_chrome_geometry object=%1 root=%2 x=%3 y=%4 global_x=%5 global_y=%6 width=%7 height=%8 visible=%9 native_parent_null=%10 transient_root=%11")
+            .arg(window->objectName()).arg(m_rootXid).arg(local.x()).arg(local.y())
+            .arg(window->x()).arg(window->y()).arg(window->width()).arg(window->height())
+            .arg(boolean(window->isVisible())).arg(boolean(window->parent() == nullptr))
+            .arg(boolean(window->transientParent() == m_root.data()));
+    }
+    const auto logControl = [&](const QString &name, QQuickItem *item) {
+        if (!item || !item->window())
+            return;
+        const auto scene = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
+        const auto origin = m_root->mapFromGlobal(item->window()->mapToGlobal(scene.topLeft()));
+        const QRectF rect(origin, scene.size());
+        qInfo().noquote() << QStringLiteral("ui_control object=%1 x=%2 y=%3 width=%4 height=%5 visible=%6 enabled=%7")
+            .arg(name).arg(qRound(rect.x() * dpr)).arg(qRound(rect.y() * dpr))
             .arg(qRound(rect.width() * dpr)).arg(qRound(rect.height() * dpr))
-            .arg(boolean(item->isVisible())).arg(boolean(item->isEnabled()));
+            .arg(boolean(item->isVisible() && item->window()->isVisible())).arg(boolean(item->isEnabled()));
+    };
+    const char *names[] = {
+        "videoContainer", "topChromeRoot", "volumeChromeRoot", "bottomChromeRoot",
+        "ribbonSource", "ribbonOutput", "ribbonResolution", "ribbonRate", "ribbonFullscreen",
+        "volumeSlider", "volumeMute", "optionsTrigger",
+        "menuOpenCapture", "menuPauseResume", "menuRestart", "menuReconnect", "menuSettings", "menuCloseCapture",
+        "menuBack", "menuBackSection", "menuIntentError",
+        "settingsCaptureEntry", "settingsAudioEntry", "settingsFiltersEntry", "settingsRendererEntry", "settingsPreferencesEntry",
+        "contextIntentError", "contextDiagnostic",
+        "contextOutputAction", "contextRecoveryStage", "recoveryUse",
+        "sourceRefresh", "captureFormatSelector", "captureRefresh",
+        "audioCaptureEnabled", "audioInputSelector", "audioMute", "audioOutputSelector", "audioOutputMute",
+        "renderChoice_scale", "renderChoice_cscale", "renderChoice_dscale", "renderChoice_scale_antiring",
+        "renderChoice_dither", "renderChoice_deband", "renderChoice_deband_iterations", "renderChoice_deband_grain", "renderChoice_interpolation",
+        "renderToggle_scale", "renderToggle_cscale", "renderToggle_dscale", "renderToggle_scale_antiring",
+        "renderToggle_dither", "renderToggle_deband", "renderToggle_deband_iterations", "renderToggle_deband_grain", "renderToggle_interpolation",
+        "renderValue_scale", "renderValue_cscale", "renderValue_dscale", "renderValue_scale_antiring",
+        "renderValue_dither", "renderValue_deband", "renderValue_deband_iterations", "renderValue_deband_grain", "renderValue_interpolation",
+        "sizeWidthField", "sizeHeightField", "rateExactField", "sizeRateCatalogError",
+        "filtersError", "rendererNotice",
+        "preferencesStatus", "preferencesStartup", "preferencesPath", "preferencesImmediate",
+        "preferencesReset", "preferencesRefused",
+        "sourceCatalogError", "sourceCapability", "outputMissing", "outputStatus",
+        "saveFailureRetry", "saveFailureClose", "resetCancel", "resetConfirm",
+        "backdropTitle", "backdropDetail", "backdropDiagnostic"
+    };
+    for (const auto *name : names) {
+        auto *item = m_root->findChild<QQuickItem *>(QLatin1String(name));
+        if (!item) {
+            for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
+                if (window)
+                    item = window->findChild<QQuickItem *>(QLatin1String(name));
+                if (item)
+                    break;
+            }
+        }
+        logControl(QString::fromLatin1(name), item);
+    }
+    // Real product rows carry model-derived suffixes; one local children() walk over the four
+    // owned subtrees finds them without a per-name recursive search or an inspector registry.
+    const char *dynamicPrefixes[] = {
+        "sourceRow_", "outputRow_", "sizeRow_", "rateRow_",
+        "filterToggle_", "filterAdd_",
+        "captureFormatSelector_row_", "audioInputSelector_row_", "audioOutputSelector_row_",
+        "renderChoice_scale_row_", "renderChoice_cscale_row_", "renderChoice_dscale_row_",
+        "renderChoice_scale_antiring_row_", "renderChoice_dither_row_", "renderChoice_deband_row_",
+        "renderChoice_deband_iterations_row_", "renderChoice_deband_grain_row_", "renderChoice_interpolation_row_"
+    };
+    const auto ownsWindow = [&](QQuickWindow *window) {
+        return window == m_root.data() || window == m_topChromeWindow.data()
+            || window == m_volumeChromeWindow.data() || window == m_bottomChromeWindow.data();
+    };
+    const auto walk = [&](const auto &self, QObject *parent) -> void {
+        const QList<QObject *> &children = parent->children();
+        for (QObject *child : children) {
+            if (auto *item = qobject_cast<QQuickItem *>(child)) {
+                const QString &objectName = item->objectName();
+                if (!objectName.isEmpty() && ownsWindow(item->window())) {
+                    for (const auto *prefix : dynamicPrefixes) {
+                        if (objectName.startsWith(QLatin1String(prefix))) {
+                            logControl(objectName, item);
+                            break;
+                        }
+                    }
+                }
+            }
+            self(self, child);
+        }
+    };
+    walk(walk, m_root.data());
+    for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
+        if (window)
+            walk(walk, window);
     }
 }
 
@@ -1351,7 +1885,9 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
     QObject::connect(&engine, &QObject::destroyed, &application, [] {
         qInfo().noquote() << "qt_engine_destroy";
     });
-    engine.setInitialProperties({{QStringLiteral("bridge"), QVariant::fromValue(&bridge)}});
+    // Keep Tools hidden until bindRoot creates their permanent native transient parent.
+    engine.setInitialProperties({{QStringLiteral("bridge"), QVariant::fromValue(&bridge)},
+                                 {QStringLiteral("visible"), false}});
     QPointer<QQuickWindow> root;
     QString rootDiagnostic;
     bool creationComplete = false;
@@ -1375,6 +1911,7 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
         return launchFailure(rootDiagnostic);
     if (qualificationStdin && !bridge.enableQualificationInput(rootDiagnostic))
         return launchFailure(rootDiagnostic);
+    root->show();
     int exitCode = application.exec();
     if (!bridge.quitAuthorized()) {
         // An unsolicited loop exit cannot discard a live owner or its native parent.

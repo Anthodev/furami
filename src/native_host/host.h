@@ -32,6 +32,7 @@ class FuramiBridge : public QObject {
     QML_UNCREATABLE("Owned by Furami bootstrap")
     Q_PROPERTY(QWindow *hostWindow READ hostWindow NOTIFY hostWindowChanged)
     Q_PROPERTY(QString phase READ phase NOTIFY stateChanged)
+    Q_PROPERTY(QString uiSnapshot READ uiSnapshot NOTIFY stateChanged)
     Q_PROPERTY(QString diagnostic READ diagnostic NOTIFY stateChanged)
     Q_PROPERTY(bool paused READ paused NOTIFY stateChanged)
     Q_PROPERTY(bool presentationSuppressed READ presentationSuppressed NOTIFY stateChanged)
@@ -45,9 +46,8 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(QString recoveryStage READ recoveryStage NOTIFY stateChanged)
     Q_PROPERTY(QString recoveryCandidates READ recoveryCandidates NOTIFY stateChanged)
     Q_PROPERTY(bool textEntryActive READ textEntryActive WRITE setTextEntryActive NOTIFY textEntryActiveChanged)
-    Q_PROPERTY(bool panelVisible READ panelVisible WRITE setPanelVisible NOTIFY panelVisibleChanged)
     Q_PROPERTY(bool popupOpen READ popupOpen WRITE setPopupOpen NOTIFY popupOpenChanged)
-    Q_PROPERTY(bool captureSelected READ captureSelected CONSTANT)
+    Q_PROPERTY(bool chromeFamilyActive READ chromeFamilyActive NOTIFY chromeFamilyActiveChanged)
     Q_PROPERTY(bool canOpen READ canOpen NOTIFY stateChanged)
     Q_PROPERTY(bool canRestart READ canRestart NOTIFY stateChanged)
     Q_PROPERTY(QString restartGeneration READ restartGeneration NOTIFY stateChanged)
@@ -67,11 +67,11 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(bool settingsRefused READ settingsRefused NOTIFY stateChanged)
     Q_PROPERTY(QString savedSelection READ savedSelection NOTIFY stateChanged)
     Q_PROPERTY(QString startupReason READ startupReason NOTIFY stateChanged)
-    Q_PROPERTY(bool draftDirty READ draftDirty NOTIFY stateChanged)
     Q_PROPERTY(QString closeDialog READ closeDialog NOTIFY stateChanged)
-    Q_PROPERTY(QString closeRevision READ closeRevision NOTIFY stateChanged)
     Q_PROPERTY(QString resetToken READ resetToken NOTIFY stateChanged)
     Q_PROPERTY(bool fullscreenPreference READ fullscreenPreference NOTIFY stateChanged)
+    Q_PROPERTY(bool statsHiddenPreference READ statsHiddenPreference NOTIFY stateChanged)
+    Q_PROPERTY(QString contextDiagnostic READ contextDiagnostic NOTIFY stateChanged)
     Q_PROPERTY(bool closing READ closing NOTIFY stateChanged)
     Q_PROPERTY(int screenAvailableWidth READ screenAvailableWidth NOTIFY screenGeometryChanged)
     Q_PROPERTY(int screenAvailableHeight READ screenAvailableHeight NOTIFY screenGeometryChanged)
@@ -82,7 +82,9 @@ public:
 
     QWindow *hostWindow() const;
     QString phase() const;
+    QString uiSnapshot() const;
     QString diagnostic() const;
+    QString contextDiagnostic() const;
     bool paused() const;
     bool presentationSuppressed() const;
     int volumePercent() const;
@@ -95,9 +97,8 @@ public:
     QString recoveryStage() const;
     QString recoveryCandidates() const;
     bool textEntryActive() const;
-    bool panelVisible() const;
     bool popupOpen() const;
-    bool captureSelected() const;
+    bool chromeFamilyActive() const;
     bool canOpen() const;
     bool canRestart() const;
     QString restartGeneration() const;
@@ -117,16 +118,14 @@ public:
     bool settingsRefused() const;
     QString savedSelection() const;
     QString startupReason() const;
-    bool draftDirty() const;
     QString closeDialog() const;
-    QString closeRevision() const;
     QString resetToken() const;
     bool fullscreenPreference() const;
+    bool statsHiddenPreference() const;
     bool closing() const;
     int screenAvailableWidth() const;
     int screenAvailableHeight() const;
     void setTextEntryActive(bool active);
-    void setPanelVisible(bool visible);
     void setPopupOpen(bool open);
 
     bool bindRoot(QQuickWindow *root, QQuickItem *container, QString &diagnostic);
@@ -135,6 +134,27 @@ public:
     bool launchFailed() const;
 
     Q_INVOKABLE void openCapture();
+    Q_INVOKABLE void refreshCatalogs();
+    Q_INVOKABLE void selectCapture(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey);
+    Q_INVOKABLE void selectSize(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey);
+    Q_INVOKABLE void setSize(const QString &selectionRevision, const QString &catalogRevision, const QString &width, const QString &height);
+    Q_INVOKABLE void selectRate(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey);
+    Q_INVOKABLE void setRate(const QString &selectionRevision, const QString &catalogRevision, const QString &exactRate);
+    Q_INVOKABLE void selectFormat(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey);
+    Q_INVOKABLE void setAudioEnabled(const QString &selectionRevision, bool enabled);
+    Q_INVOKABLE void selectAudioInput(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey);
+    Q_INVOKABLE void setFilterEnabled(const QString &selectionRevision, const QString &entryKey, bool enabled);
+    Q_INVOKABLE void addFilter(const QString &selectionRevision, const QString &kind);
+    Q_INVOKABLE void removeFilter(const QString &selectionRevision, const QString &entryKey);
+    Q_INVOKABLE void setScale(const QString &selectionRevision, const QString &kernel);
+    Q_INVOKABLE void setCscale(const QString &selectionRevision, const QString &kernel);
+    Q_INVOKABLE void setDscale(const QString &selectionRevision, const QString &kernel);
+    Q_INVOKABLE void setScaleAntiring(const QString &selectionRevision, double value);
+    Q_INVOKABLE void setDither(const QString &selectionRevision, const QString &mode);
+    Q_INVOKABLE void setDebandEnabled(const QString &selectionRevision, bool enabled);
+    Q_INVOKABLE void setDebandIterations(const QString &selectionRevision, int value);
+    Q_INVOKABLE void setDebandGrain(const QString &selectionRevision, double value);
+    Q_INVOKABLE void setInterpolation(const QString &selectionRevision, bool enabled);
     Q_INVOKABLE void restartCapture(const QString &expectedGeneration);
     Q_INVOKABLE void reconnectCapture(const QString &expectedGeneration);
     Q_INVOKABLE void chooseRecovery(const QString &expectedGeneration, const QString &token);
@@ -143,17 +163,21 @@ public:
     Q_INVOKABLE void setVolume(int percent);
     Q_INVOKABLE void setMuted(bool muted);
     Q_INVOKABLE void selectOutput(const QString &rowKey, const QString &catalogRevision);
-    Q_INVOKABLE void openAndCloseDuringOpeningForProof();
-    Q_INVOKABLE void forceSurfaceLossForProof();
+    void openAndCloseDuringOpeningForProof();
+    void forceSurfaceLossForProof();
     Q_INVOKABLE void requestApplicationClose();
-    Q_INVOKABLE void decideClose(bool discard, const QString &revision);
     Q_INVOKABLE void retrySave();
     Q_INVOKABLE void closeWithoutSave();
     Q_INVOKABLE void requestSettingsReset();
     Q_INVOKABLE void decideSettingsReset(const QString &token, bool confirmed);
-    Q_INVOKABLE void togglePanel();
     Q_INVOKABLE void toggleFullscreen();
+    Q_INVOKABLE void setStatsHidden(bool hidden);
     Q_INVOKABLE void focusVideo();
+    Q_INVOKABLE void registerChromeWindows(QWindow *top, QWindow *volume, QWindow *bottom);
+    Q_INVOKABLE void focusNextChrome(const QString &region, bool backward);
+    Q_INVOKABLE void setChromeIdleArmed(bool armed);
+
+    void noteNativePointerActivity(bool pressed);
 
     void schedulePublication(std::uint64_t generation);
     void surfaceLost(std::uint64_t generation, std::uint64_t previousXid);
@@ -164,9 +188,11 @@ signals:
     void hostWindowChanged();
     void stateChanged();
     void textEntryActiveChanged();
-    void panelVisibleChanged();
     void popupOpenChanged();
+    void chromeFamilyActiveChanged();
     void screenGeometryChanged();
+    void pointerActivity();
+    void chromeInactivity();
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -186,9 +212,16 @@ private:
     void synchronizeFullscreenChoice();
     void cancelFullscreenChoice(const char *reason);
     void watchScreenGeometry();
+    void scheduleChromeGeometry();
+    void hideChromeWindows();
+    void dismissChromePopup();
+    void failChrome(const QString &diagnostic);
+    bool isChromeFamilyWindow(const QWindow *window) const;
+    void refreshChromeFamilyActive(QWindow *focused);
 
     rust::Box<RuntimeCoordinator> m_gate;
     QTimer m_pollTimer;
+    QTimer m_chromeIdleTimer;
     QPointer<HostWindow> m_host;
     QPointer<QSocketNotifier> m_qualificationInput;
     QByteArray m_qualificationLine;
@@ -196,9 +229,17 @@ private:
     bool m_dropQualificationLine = false;
     QPointer<QQuickWindow> m_root;
     QPointer<QQuickItem> m_container;
+    QPointer<QQuickWindow> m_topChromeWindow;
+    QPointer<QQuickWindow> m_volumeChromeWindow;
+    QPointer<QQuickWindow> m_bottomChromeWindow;
+    bool m_chromeRegistered = false;
+    bool m_chromeFamilyActive = false;
+    bool m_chromeGeometryPending = false;
     QString m_actualPhase = QStringLiteral("Idle");
+    QString m_uiSnapshot;
     QRect m_windowedGeometry;
     QWindow::Visibility m_windowedVisibility = QWindow::Windowed;
+    QPointer<QQuickWindow> m_fullscreenFocusWindow;
     QPointer<QQuickItem> m_fullscreenFocusItem;
     bool m_fullscreenNativeFocus = false;
     bool m_fullscreenFocusRestorePending = false;
@@ -211,6 +252,7 @@ private:
     QMetaObject::Connection m_fullscreenSyncConnection;
     QMetaObject::Connection m_fullscreenSwapConnection;
     QString m_diagnostic;
+    QString m_contextDiagnostic;
     QString m_nativeDiagnostic;
     std::uint64_t m_generation = 0;
     std::uint64_t m_restartGeneration = 0;
@@ -231,7 +273,6 @@ private:
     std::uint64_t m_closeDuringOpening = 0;
     bool m_closeOnNextOpening = false;
     bool m_failed = false;
-    bool m_captureSelected = false;
     bool m_bootstrapFailed = false;
     bool m_paused = false;
     // Per-host latch: a prepared-paused owner is never shown, even during
@@ -254,15 +295,13 @@ private:
     bool m_settingsRefused = false;
     QString m_savedSelection;
     QString m_startupReason;
-    bool m_draftDirty = false;
     QString m_closeDialog;
-    std::uint64_t m_closeRevision = 0;
     std::uint64_t m_resetToken = 0;
     bool m_fullscreenPreference = false;
+    bool m_statsHiddenPreference = false;
     bool m_fullscreenChoicePending = false;
     bool m_closing = false;
     bool m_textEntryActive = false;
-    bool m_panelVisible = true;
     bool m_popupOpen = false;
     bool m_published = false;
     bool m_poisoned = false;

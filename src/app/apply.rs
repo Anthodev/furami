@@ -83,7 +83,7 @@ where
     deferred_ready: Option<(AttemptKey, OpenReceipt)>,
     verified_applied: Option<VerifiedApplied>,
     admitted_apply: Option<ApplyId>,
-    strict_startup_apply: Option<ApplyId>,
+    strict_restore_apply: Option<ApplyId>,
     treatment_apply: Option<PreparedTreatmentApply<R::PreparedTreatments>>,
     // One-owner event arbitration may record model failures before blockers,
     // but adapter effects (including resource-free retirement) wait for them.
@@ -116,7 +116,7 @@ where
             deferred_ready: None,
             verified_applied: None,
             admitted_apply: None,
-            strict_startup_apply: None,
+            strict_restore_apply: None,
             treatment_apply: None,
             defer_effects: false,
             deferred_effect: None,
@@ -203,23 +203,34 @@ where
         if !self.startup_restore_candidate(apply) {
             return Err(CommandRejection::StaleState);
         }
-        self.strict_startup_apply = Some(apply);
+        self.strict_restore_apply = Some(apply);
+        Ok(())
+    }
+    /// Restoring a source profile keeps its explicit enabled input strict even
+    /// when this Candidate replaces an incumbent. It never authorizes rollback.
+    pub fn require_profile_restore_audio(
+        &mut self,
+        apply: ApplyId,
+    ) -> Result<(), CommandRejection> {
+        self.check_drain()?;
+        if !self.restore_candidate(apply) {
+            return Err(CommandRejection::StaleState);
+        }
+        self.strict_restore_apply = Some(apply);
         Ok(())
     }
     fn startup_restore_candidate(&self, apply: ApplyId) -> bool {
-        self.model.last_valid().is_none()
-            && (self.model.validation_request().is_some_and(|request| {
-                request.key.apply == apply && request.key.purpose == AttemptPurpose::Candidate
-            }) || self.model.opening().is_some_and(|(key, _)| {
-                key.apply == apply && key.purpose == AttemptPurpose::Candidate
-            }))
+        self.model.last_valid().is_none() && self.restore_candidate(apply)
+    }
+    fn restore_candidate(&self, apply: ApplyId) -> bool {
+        self.model.has_pending_user_apply(apply) && self.model.treating().is_none()
     }
     fn retire_startup_restore_guard(&mut self) {
         if self
-            .strict_startup_apply
-            .is_some_and(|apply| !self.startup_restore_candidate(apply))
+            .strict_restore_apply
+            .is_some_and(|apply| !self.restore_candidate(apply))
         {
-            self.strict_startup_apply = None;
+            self.strict_restore_apply = None;
         }
     }
     pub fn edit_draft(
@@ -243,18 +254,57 @@ where
         expected_state: StateIdentity,
         expected_revision: DraftRevision,
     ) -> Result<ApplyAdmission, CommandRejection> {
+        self.apply_with_source_binding(expected_state, expected_revision, None)
+    }
+    /// Applies the draft to a catalog-selected session-only physical capture route.
+    /// The borrowed pair is node syspath first, USB syspath second.
+    pub fn apply_selected_capture(
+        &mut self,
+        expected_state: StateIdentity,
+        expected_revision: DraftRevision,
+        physical_node: (&std::path::Path, &std::path::Path),
+    ) -> Result<ApplyAdmission, CommandRejection> {
+        self.apply_with_source_binding(expected_state, expected_revision, Some(physical_node))
+    }
+    /// Checks the common admission guards before a UI-only partial draft is installed.
+    pub(crate) fn check_apply_ready(
+        &self,
+        expected_state: StateIdentity,
+        expected_revision: DraftRevision,
+    ) -> Result<(), CommandRejection> {
         self.check_drain()?;
+        self.model.check_command(expected_state)?;
+        if expected_revision != self.model.draft().revision {
+            return Err(CommandRejection::StaleRevision);
+        }
+        Ok(())
+    }
+    fn apply_with_source_binding(
+        &mut self,
+        expected_state: StateIdentity,
+        expected_revision: DraftRevision,
+        physical_node: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> Result<ApplyAdmission, CommandRejection> {
+        self.check_apply_ready(expected_state, expected_revision)?;
         let draft = &self.model.draft().settings;
         if self.model.active().is_some_and(|active| {
             active.applied().settings().video.same_request(&draft.video)
                 && active.applied().settings().audio == draft.audio
+                && physical_node
+                    .is_none_or(|binding| active.applied().physical_node() == Some(binding))
                 && (active.playback() == PlaybackState::Live
                     || (active.playback() == PlaybackState::Paused
                         && active.applied().settings().filters == draft.filters))
         }) {
             return self.apply_treatments(expected_state, expected_revision);
         }
-        let (apply, effect) = self.model.apply(expected_state, expected_revision)?;
+        let (apply, effect) = match physical_node {
+            Some(binding) => {
+                self.model
+                    .apply_selected_capture(expected_state, expected_revision, binding)?
+            }
+            None => self.model.apply(expected_state, expected_revision)?,
+        };
         self.verified_applied = None;
         self.admitted_apply = Some(apply);
         self.drive(Some(effect))?;
@@ -1606,20 +1656,24 @@ where
             }),
             AudioOutcome::Silent { .. } | AudioOutcome::Disabled => true,
         };
-        let startup_audio_matches = self.strict_startup_apply != Some(key.apply)
+        let startup_audio_matches = self.strict_restore_apply != Some(key.apply)
             || key.purpose != AttemptPurpose::Candidate
             || !settings.audio.enabled()
-            || matches!(&receipt.audio, AudioOutcome::Active { .. })
-            || (matches!(
-                &receipt.audio,
-                AudioOutcome::Silent {
-                    reason: AudioSilence::Output(_),
-                    ..
-                }
-            ) && self
+            || (self
                 .model
                 .observation()
-                .is_some_and(|observation| observation.audio == SourcePresence::Present));
+                .zip(self.lease.as_ref())
+                .is_some_and(|(observation, lease)| {
+                    observation.stamp == lease.watch && observation.audio == SourcePresence::Present
+                })
+                && matches!(
+                    &receipt.audio,
+                    AudioOutcome::Active { .. }
+                        | AudioOutcome::Silent {
+                            reason: AudioSilence::Output(_),
+                            ..
+                        }
+                ));
         if !receipt.matches(settings)
             || !receipt.matches_treatments(key)
             || !readiness_matches
@@ -1632,7 +1686,7 @@ where
                 if startup_audio_matches {
                     "receipt settings, filter proof or requested audio outcome mismatch"
                 } else {
-                    "startup restore requires active requested audio"
+                    "profile or startup restore requires the exact healthy requested audio source"
                 },
             );
             let effect = self.model.open_failed(key, failure);
@@ -5467,6 +5521,389 @@ mod tests {
     }
 
     #[test]
+    fn selected_sibling_capture_opens_before_reopen_operations_keep_its_physical_pin() {
+        let binding = (
+            std::path::Path::new("/sys/dev/video1"),
+            std::path::Path::new("/sys/usb/fixture"),
+        );
+        for operation in 0..4 {
+            let mut engine = native_node_engine();
+            let old = initial(&mut engine);
+            let mut candidate = engine.model().draft().settings.clone();
+            candidate.video.selected_node = Some("/dev/video1".into());
+            let applied = engine.model().active().unwrap().applied().settings();
+            assert!(applied.video.same_request(&candidate.video));
+            assert_eq!(applied.audio, candidate.audio);
+            let revision = engine
+                .edit_draft(engine.model().draft().revision, candidate)
+                .unwrap();
+            let requests = engine.validator.requests.len();
+            assert!(matches!(
+                engine
+                    .apply_selected_capture(engine.model().state_identity(), revision, binding)
+                    .unwrap(),
+                ApplyAdmission::Open { .. }
+            ));
+            let request = &engine.validator.requests[requests];
+            assert_eq!(
+                request
+                    .pinned_node
+                    .as_ref()
+                    .map(|(node, usb)| (node.as_path(), usb.as_path())),
+                Some(binding)
+            );
+            assert_eq!(engine.model().validation_request(), Some(request));
+            assert_eq!(engine.model().active().unwrap().attempt(), old);
+            assert!(engine.runner.stops.is_empty());
+            assert!(engine.runner.treatment_intents.is_empty());
+            assert_eq!(engine.runner.opens.len(), 1);
+            validate(&mut engine);
+            assert_eq!(engine.model().phase(), ProductPhase::ClosingOld);
+            assert_eq!(engine.runner.opens.len(), 1);
+            engine.runner.barrier(old);
+            engine.poll();
+            engine.runner.verified();
+            engine.poll();
+            let active = engine.model().active().unwrap();
+            assert_eq!(active.applied().physical_node(), Some(binding));
+            let selected = active.attempt();
+            match operation {
+                0 => {
+                    engine.restart(engine.model().state_identity()).unwrap();
+                }
+                1 => {
+                    confirm_pause(&mut engine, selected);
+                    engine
+                        .resume(engine.model().state_identity(), selected)
+                        .unwrap();
+                }
+                2 | 3 => {
+                    eof(&mut engine, selected);
+                    engine.runner.barrier(selected);
+                    engine.poll();
+                    if operation == 3 {
+                        let mode = engine
+                            .model()
+                            .last_valid()
+                            .unwrap()
+                            .settings()
+                            .video
+                            .fixture_mode();
+                        engine.validator.native_snapshot = Some(
+                            crate::capture::linux::session_fixture(&["/dev/video0"], mode),
+                        );
+                        validate(&mut engine);
+                        assert!(engine.model().active().is_none());
+                        engine.validator.native_snapshot =
+                            Some(crate::capture::linux::session_fixture(
+                                &["/dev/video0", "/dev/video1"],
+                                mode,
+                            ));
+                        engine.reconnect(engine.model().state_identity()).unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                engine
+                    .model()
+                    .validation_request()
+                    .unwrap()
+                    .pinned_node
+                    .as_ref()
+                    .map(|(node, usb)| (node.as_path(), usb.as_path())),
+                Some(binding)
+            );
+            validate(&mut engine);
+            if operation < 2 {
+                engine.runner.barrier(selected);
+                engine.poll();
+            }
+            engine.runner.verified();
+            engine.poll();
+            assert_eq!(
+                engine.model().active().unwrap().applied().physical_node(),
+                Some(binding),
+                "operation {operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_missing_sibling_keeps_incumbent_and_failed_open_restores_its_pin() {
+        let prior_binding = (
+            std::path::Path::new("/sys/dev/video0"),
+            std::path::Path::new("/sys/usb/fixture"),
+        );
+        let selected_binding = (std::path::Path::new("/sys/dev/video1"), prior_binding.1);
+        for missing in [true, false] {
+            let mut engine = native_node_engine();
+            let old = initial(&mut engine);
+            let prior = engine.model().last_valid().unwrap().clone();
+            let mut candidate = engine.model().draft().settings.clone();
+            candidate.video.selected_node = Some("/dev/video1".into());
+            let revision = engine
+                .edit_draft(engine.model().draft().revision, candidate.clone())
+                .unwrap();
+            engine
+                .apply_selected_capture(engine.model().state_identity(), revision, selected_binding)
+                .unwrap();
+            if missing {
+                engine.validator.native_snapshot = Some(crate::capture::linux::session_fixture(
+                    &["/dev/video0"],
+                    prior.settings().video.fixture_mode(),
+                ));
+            }
+            validate(&mut engine);
+            if missing {
+                assert_eq!(engine.model().active().unwrap().attempt(), old);
+                assert!(engine.runner.stops.is_empty());
+                assert_eq!(engine.runner.opens.len(), 1);
+                let rejection = engine.model().validation_rejection().unwrap();
+                assert_eq!(rejection.failure.cause, Cause::RequestedModeRefused);
+                assert_eq!(
+                    rejection
+                        .request
+                        .pinned_node
+                        .as_ref()
+                        .map(|(node, usb)| (node.as_path(), usb.as_path())),
+                    Some(selected_binding)
+                );
+            } else {
+                engine.runner.barrier(old);
+                engine.poll();
+                let failed = engine.runner.opens.last().unwrap().0.attempt;
+                engine.runner.fail("selected sibling failed");
+                engine.poll();
+                assert_eq!(engine.model().last_valid(), Some(&prior));
+                engine.runner.barrier(failed);
+                engine.poll();
+                assert_eq!(
+                    engine
+                        .model()
+                        .validation_request()
+                        .unwrap()
+                        .pinned_node
+                        .as_ref()
+                        .map(|(node, usb)| (node.as_path(), usb.as_path())),
+                    Some(prior_binding)
+                );
+                validate(&mut engine);
+                engine.runner.verified();
+                engine.poll();
+                assert_eq!(
+                    engine.model().phase(),
+                    ProductPhase::ErrorWithActiveRestored
+                );
+                assert_eq!(engine.runner.opens.len(), 3);
+            }
+            assert_eq!(engine.model().last_valid(), Some(&prior));
+            assert_eq!(
+                engine.model().active().unwrap().applied().physical_node(),
+                Some(prior_binding)
+            );
+            assert_eq!(engine.model().draft().settings, candidate);
+        }
+    }
+
+    #[test]
+    fn selected_same_source_preserves_live_and_paused_treatment_eligibility_and_pin() {
+        let binding = (
+            std::path::Path::new("/sys/dev/video0"),
+            std::path::Path::new("/sys/usb/fixture"),
+        );
+        for edit in 0..3 {
+            let mut engine = native_node_engine();
+            let old = initial(&mut engine);
+            if edit == 2 {
+                confirm_pause(&mut engine, old);
+            }
+            let mut candidate = engine.model().draft().settings.clone();
+            if edit == 0 {
+                candidate.filters = filter_settings("selected live source").filters;
+            } else {
+                candidate.renderer = altered_renderer(&candidate.renderer);
+            }
+            let revision = engine
+                .edit_draft(engine.model().draft().revision, candidate.clone())
+                .unwrap();
+            let requests = engine.validator.requests.len();
+            let ApplyAdmission::Treatments { key, .. } = engine
+                .apply_selected_capture(engine.model().state_identity(), revision, binding)
+                .unwrap()
+            else {
+                panic!("same admitted physical source keeps eligible treatment route");
+            };
+            assert_eq!(key.attempt, old);
+            assert_eq!(engine.validator.requests.len(), requests);
+            assert!(engine.model().validation_request().is_none());
+            filter_success(&mut engine, key);
+            engine.poll();
+            let active = engine.model().active().unwrap();
+            assert_eq!(active.attempt(), old);
+            assert_eq!(active.applied().physical_node(), Some(binding));
+            assert_eq!(active.applied().settings().filters, candidate.filters);
+            assert_eq!(active.applied().settings().renderer, candidate.renderer);
+            assert_eq!(
+                active.playback(),
+                if edit == 2 {
+                    PlaybackState::Paused
+                } else {
+                    PlaybackState::Live
+                }
+            );
+            assert_eq!(engine.runner.opens.len(), 1);
+            assert!(engine.runner.stops.is_empty());
+        }
+    }
+
+    #[test]
+    fn selected_same_source_full_mode_audio_and_paused_filter_candidates_keep_pin() {
+        let binding = (
+            std::path::Path::new("/sys/dev/video0"),
+            std::path::Path::new("/sys/usb/fixture"),
+        );
+        for edit in 0..3 {
+            let mut engine = native_node_engine();
+            let old = initial(&mut engine);
+            let mut candidate = engine.model().draft().settings.clone();
+            match edit {
+                0 => candidate.video.mode.rate = FrameRate::new(30, 1).unwrap(),
+                1 => {
+                    candidate.audio = AudioSelection::Enabled {
+                        source: crate::domain::capture::AudioSourceIdentity::new(
+                            "selected.capture".into(),
+                            vec![],
+                        )
+                        .unwrap(),
+                    };
+                }
+                2 => {
+                    confirm_pause(&mut engine, old);
+                    candidate.filters = filter_settings("paused explicit source").filters;
+                }
+                _ => unreachable!(),
+            }
+            let revision = engine
+                .edit_draft(engine.model().draft().revision, candidate.clone())
+                .unwrap();
+            assert!(matches!(
+                engine
+                    .apply_selected_capture(engine.model().state_identity(), revision, binding)
+                    .unwrap(),
+                ApplyAdmission::Open { .. }
+            ));
+            let request = engine.model().validation_request().unwrap();
+            assert_eq!(
+                request
+                    .pinned_node
+                    .as_ref()
+                    .map(|(node, usb)| (node.as_path(), usb.as_path())),
+                Some(binding)
+            );
+            assert!(request.settings.video.same_request(&candidate.video));
+            assert_eq!(request.settings.audio, candidate.audio);
+            assert_eq!(request.settings.filters, candidate.filters);
+            assert!(request.settings.video.resolved_fourcc.is_none());
+            assert_eq!(engine.model().active().unwrap().attempt(), old);
+            assert!(engine.runner.stops.is_empty());
+            assert!(engine.runner.treatment_intents.is_empty());
+        }
+    }
+
+    #[test]
+    fn selected_source_rejects_stale_state_revision_and_closing_without_effects() {
+        let binding = (
+            std::path::Path::new("/sys/dev/video1"),
+            std::path::Path::new("/sys/usb/fixture"),
+        );
+        let mut engine = native_node_engine();
+        let stale_state = engine.model().state_identity();
+        initial(&mut engine);
+        let stale_revision = engine.model().draft().revision;
+        let revision = engine
+            .edit_draft(stale_revision, engine.model().draft().settings.clone())
+            .unwrap();
+        for stale in [true, false] {
+            let state = engine.model().state_identity();
+            let requests = engine.validator.requests.len();
+            assert_eq!(
+                engine.apply_selected_capture(
+                    if stale { stale_state } else { state },
+                    if stale { revision } else { stale_revision },
+                    binding,
+                ),
+                Err(if stale {
+                    CommandRejection::StaleState
+                } else {
+                    CommandRejection::StaleRevision
+                })
+            );
+            assert_eq!(engine.model().state_identity(), state);
+            assert_eq!(engine.validator.requests.len(), requests);
+            assert!(engine.model().validation_request().is_none());
+            assert_eq!(engine.runner.opens.len(), 1);
+            assert!(engine.runner.stops.is_empty());
+            assert!(engine.runner.treatment_intents.is_empty());
+        }
+        engine.close(engine.model().state_identity()).unwrap();
+        let state = engine.model().state_identity();
+        let requests = engine.validator.requests.len();
+        let stops = engine.runner.stops.len();
+        assert_eq!(
+            engine.apply_selected_capture(state, revision, binding),
+            Err(CommandRejection::CleanupIncomplete)
+        );
+        assert_eq!(engine.model().state_identity(), state);
+        assert_eq!(engine.validator.requests.len(), requests);
+        assert_eq!(engine.runner.stops.len(), stops);
+        assert!(engine.model().validation_request().is_none());
+        assert!(engine.runner.treatment_intents.is_empty());
+    }
+
+    #[test]
+    fn selected_source_without_admitted_physical_proof_cannot_take_hot_route() {
+        let mut engine = engine();
+        let old = initial(&mut engine);
+        assert!(
+            engine
+                .model()
+                .active()
+                .unwrap()
+                .applied()
+                .physical_node()
+                .is_none()
+        );
+        let binding = (
+            std::path::Path::new("/sys/selected/video"),
+            std::path::Path::new("/sys/selected"),
+        );
+        assert!(matches!(
+            engine
+                .apply_selected_capture(
+                    engine.model().state_identity(),
+                    engine.model().draft().revision,
+                    binding,
+                )
+                .unwrap(),
+            ApplyAdmission::Open { .. }
+        ));
+        assert_eq!(engine.model().active().unwrap().attempt(), old);
+        assert!(engine.runner.treatment_intents.is_empty());
+        assert!(engine.runner.stops.is_empty());
+        assert_eq!(
+            engine
+                .model()
+                .validation_request()
+                .unwrap()
+                .pinned_node
+                .as_ref()
+                .map(|(node, usb)| (node.as_path(), usb.as_path())),
+            Some(binding)
+        );
+    }
+
+    #[test]
     fn session_node_binding_reopens_cli_node_across_restart_resume_recovery_and_reconnect() {
         for operation in 0..4 {
             let mut engine = native_node_engine();
@@ -6008,9 +6445,9 @@ mod tests {
                 Validator::default(),
                 Runner::default(),
             );
-            let apply = apply(&mut engine);
+            let admitted = apply(&mut engine);
             if strict {
-                engine.require_startup_restore_audio(apply).unwrap();
+                engine.require_startup_restore_audio(admitted).unwrap();
             }
             let absent = observation(
                 &engine,
@@ -6035,7 +6472,7 @@ mod tests {
             assert_eq!(engine.model.active().is_some(), !strict);
             assert_eq!(engine.model.last_valid().is_some(), !strict);
             assert_eq!(engine.take_verified_applied().is_some(), !strict);
-            assert!(engine.strict_startup_apply.is_none());
+            assert!(engine.strict_restore_apply.is_none());
             if strict {
                 assert_eq!(engine.runner.stops, vec![(key.attempt, StopReason::Failed)]);
                 engine.runner.barrier(key.attempt);
@@ -6096,7 +6533,7 @@ mod tests {
         };
         assert_eq!(received, key);
         assert_eq!(applied.settings(), &desired);
-        assert!(engine.strict_startup_apply.is_none());
+        assert!(engine.strict_restore_apply.is_none());
         let absent = observation(
             &engine,
             2,
@@ -6121,6 +6558,84 @@ mod tests {
     }
 
     #[test]
+    fn profile_restore_guard_keeps_strict_audio_across_incumbent_replacement_window() {
+        use crate::domain::capture::{AudioError, AudioSourceIdentity, VideoPresence};
+        let source = AudioSourceIdentity::new("exact.capture".into(), vec![]).unwrap();
+        let mut engine = engine();
+        let _incumbent = initial(&mut engine);
+        let mut replacement = settings(30);
+        replacement.audio = AudioSelection::Enabled {
+            source: source.clone(),
+        };
+        engine
+            .edit_draft(engine.model().draft().revision, replacement.clone())
+            .unwrap();
+        let admitted = apply(&mut engine);
+        engine.require_profile_restore_audio(admitted).unwrap();
+        // The strict verdict keys the CURRENT observation: push the absent
+        // source before validation so the receipt is judged against epoch 2.
+        let absent = observation(
+            &engine,
+            2,
+            VideoPresence::Present,
+            SourcePresence::Absent(AudioError::Cancelled),
+            None,
+        );
+        observe(&mut engine, absent);
+        validate(&mut engine);
+        // The old owner replacement window has neither a pending validation
+        // request nor an opening key: the guard must survive until rollback.
+        assert!(
+            engine.model().validation_request().is_none() && engine.model().opening().is_none()
+        );
+        assert_eq!(engine.strict_restore_apply, Some(admitted));
+        // The runner still holds the incumbent's opening key: retire that old
+        // owner through its replacement barrier before B actually opens, the
+        // same deterministic sequencing the switch fixtures use.
+        let old_key = engine.runner.opens.last().unwrap().0;
+        assert_ne!(old_key.apply, admitted);
+        engine.runner.barrier(old_key.attempt);
+        engine.poll();
+        let key = engine.runner.opens.last().unwrap().0;
+        assert_eq!(key.apply, admitted);
+        assert_ne!(key.attempt, old_key.attempt);
+        assert_eq!(engine.strict_restore_apply, Some(admitted));
+        let mut opened = receipt(replacement.clone(), key);
+        opened.audio = AudioOutcome::Silent {
+            source,
+            reason: crate::domain::capture::AudioSilence::WaitingForSource(AudioError::Cancelled),
+        };
+        engine.runner.events.push_back(SessionEvent::OpenVerified {
+            key,
+            receipt: Box::new(opened),
+        });
+        engine.poll();
+        assert_eq!(engine.strict_restore_apply, None);
+        assert!(engine.take_verified_applied().is_none());
+        // A's physical owner was retired before B opened. Rejection starts
+        // rollback; no active stream can exist until B's own shutdown barrier
+        // and fresh validation of the prior settings have both completed.
+        assert!(engine.model().active().is_none());
+        assert!(engine.model().failures().unwrap().candidate.is_some());
+        assert!(engine.model().draft().settings.same_request(&replacement));
+        engine.runner.barrier(key.attempt);
+        engine.poll();
+        let restore = engine.model().validation_request().unwrap();
+        assert_eq!(restore.key.purpose, AttemptPurpose::Restore);
+        assert!(restore.settings.same_request(&settings(60)));
+        validate(&mut engine);
+        let restore_key = engine.runner.opens.last().unwrap().0;
+        assert_eq!(restore_key.purpose, AttemptPurpose::Restore);
+        assert_ne!(restore_key.attempt, _incumbent);
+        engine.runner.verified();
+        engine.poll();
+        let active = engine.model().active().expect("prior settings restored");
+        assert!(active.applied().settings().same_request(&settings(60)));
+        assert!(engine.model().draft().settings.same_request(&replacement));
+        assert!(engine.take_verified_applied().is_none());
+    }
+
+    #[test]
     fn strict_startup_guard_rejects_stale_ids_and_retires_on_failure_or_cancel() {
         for canceled in [false, true] {
             let mut engine = engine();
@@ -6130,10 +6645,10 @@ mod tests {
                 Err(CommandRejection::StaleState)
             );
             engine.require_startup_restore_audio(id).unwrap();
-            assert_eq!(engine.strict_startup_apply, Some(id));
+            assert_eq!(engine.strict_restore_apply, Some(id));
             if canceled {
                 engine.close(engine.model.state_identity()).unwrap();
-                assert!(engine.strict_startup_apply.is_none());
+                assert!(engine.strict_restore_apply.is_none());
                 validate(&mut engine);
             } else {
                 engine.validator.finish(Err(failure(
@@ -6143,7 +6658,7 @@ mod tests {
                 )));
                 engine.poll();
             }
-            assert!(engine.strict_startup_apply.is_none());
+            assert!(engine.strict_restore_apply.is_none());
             assert!(engine.take_verified_applied().is_none());
             let next = apply(&mut engine);
             assert_ne!(next, id);

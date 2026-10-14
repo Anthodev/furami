@@ -35,6 +35,7 @@ pub(crate) mod ffi {
     }
     #[derive(Debug)]
     struct UiUpdate {
+        ui_snapshot: String,
         changed: bool,
         phase: GatePhase,
         generation: u64,
@@ -48,6 +49,7 @@ pub(crate) mod ffi {
         audio_desired: String,
         failed: bool,
         diagnostic: String,
+        context_diagnostic: String,
         recovery_evidence: String,
         recovery_stage: String,
         candidates: String,
@@ -66,11 +68,10 @@ pub(crate) mod ffi {
         settings_refused: bool,
         saved_selection: String,
         startup_reason: String,
-        draft_dirty: bool,
         close_dialog: String,
-        close_revision: u64,
         reset_token: u64,
         fullscreen: bool,
+        stats_hidden: bool,
         closing: bool,
         output_rows: String,
         output_catalog_revision: u64,
@@ -92,14 +93,118 @@ pub(crate) mod ffi {
     }
     extern "Rust" {
         type RuntimeCoordinator;
-        fn gate_capture_selected(gate: &RuntimeCoordinator) -> bool;
+        fn gate_refresh_catalogs(gate: &mut RuntimeCoordinator) -> UiUpdate;
+        fn gate_select_capture(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            catalog_revision: &str,
+            row_key: &str,
+        ) -> UiUpdate;
+        fn gate_select_size(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            catalog_revision: &str,
+            row_key: &str,
+        ) -> UiUpdate;
+        fn gate_set_size(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            catalog_revision: &str,
+            width: &str,
+            height: &str,
+        ) -> UiUpdate;
+        fn gate_select_rate(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            catalog_revision: &str,
+            row_key: &str,
+        ) -> UiUpdate;
+        fn gate_set_rate(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            catalog_revision: &str,
+            exact_rate: &str,
+        ) -> UiUpdate;
+        fn gate_select_format(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            catalog_revision: &str,
+            row_key: &str,
+        ) -> UiUpdate;
+        fn gate_set_audio_enabled(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            enabled: bool,
+        ) -> UiUpdate;
+        fn gate_select_audio_input(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            catalog_revision: &str,
+            row_key: &str,
+        ) -> UiUpdate;
+        fn gate_set_filter_enabled(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            entry_key: &str,
+            enabled: bool,
+        ) -> UiUpdate;
+        fn gate_add_filter(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            kind: &str,
+        ) -> UiUpdate;
+        fn gate_remove_filter(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            entry_key: &str,
+        ) -> UiUpdate;
+        fn gate_set_scale(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            kernel: &str,
+        ) -> UiUpdate;
+        fn gate_set_cscale(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            kernel: &str,
+        ) -> UiUpdate;
+        fn gate_set_dscale(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            kernel: &str,
+        ) -> UiUpdate;
+        fn gate_set_scale_antiring(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            value: f64,
+        ) -> UiUpdate;
+        fn gate_set_dither(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            mode: &str,
+        ) -> UiUpdate;
+        fn gate_set_deband_enabled(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            enabled: bool,
+        ) -> UiUpdate;
+        fn gate_set_deband_iterations(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            value: i32,
+        ) -> UiUpdate;
+        fn gate_set_deband_grain(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            value: f64,
+        ) -> UiUpdate;
+        fn gate_set_interpolation(
+            gate: &mut RuntimeCoordinator,
+            selection_revision: &str,
+            enabled: bool,
+        ) -> UiUpdate;
         fn gate_ui_ready(gate: &mut RuntimeCoordinator) -> UiUpdate;
         fn gate_request_application_close(gate: &mut RuntimeCoordinator) -> UiUpdate;
-        fn gate_decide_close(
-            gate: &mut RuntimeCoordinator,
-            discard: bool,
-            revision: u64,
-        ) -> UiUpdate;
         fn gate_retry_save(gate: &mut RuntimeCoordinator) -> UiUpdate;
         fn gate_close_without_save(gate: &mut RuntimeCoordinator) -> UiUpdate;
         fn gate_request_reset(gate: &mut RuntimeCoordinator) -> UiUpdate;
@@ -109,6 +214,7 @@ pub(crate) mod ffi {
             confirmed: bool,
         ) -> UiUpdate;
         fn gate_set_fullscreen(gate: &mut RuntimeCoordinator, fullscreen: bool) -> UiUpdate;
+        fn gate_set_stats_hidden(gate: &mut RuntimeCoordinator, hidden: bool) -> UiUpdate;
         fn gate_open(gate: &mut RuntimeCoordinator) -> UiUpdate;
         fn gate_restart(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
         fn gate_reconnect(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
@@ -147,6 +253,7 @@ pub(crate) mod ffi {
 impl From<runtime::UiUpdate> for ffi::UiUpdate {
     fn from(update: runtime::UiUpdate) -> Self {
         Self {
+            ui_snapshot: update.ui_snapshot,
             changed: update.changed,
             phase: match update.phase {
                 GatePhase::Idle => ffi::GatePhase::Idle,
@@ -169,6 +276,7 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
             audio_desired: update.audio_desired,
             failed: update.failed,
             diagnostic: update.diagnostic,
+            context_diagnostic: update.context_diagnostic,
             recovery_evidence: update.recovery_evidence,
             recovery_stage: update.recovery_stage,
             // Candidate entries are newline-joined; C++ splits for the
@@ -190,11 +298,10 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
             settings_refused: update.settings_refused,
             saved_selection: update.saved_selection,
             startup_reason: update.startup_reason,
-            draft_dirty: update.draft_dirty,
             close_dialog: update.close_dialog,
-            close_revision: update.close_revision,
             reset_token: update.reset_token,
             fullscreen: update.fullscreen,
+            stats_hidden: update.stats_hidden,
             closing: update.closing,
             output_rows: update.output_rows,
             output_catalog_revision: update.output_catalog_revision,
@@ -206,17 +313,171 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
         }
     }
 }
-fn gate_capture_selected(gate: &RuntimeCoordinator) -> bool {
-    gate.capture_selected()
+fn gate_refresh_catalogs(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
+    gate.refresh_catalogs().into()
+}
+fn gate_select_capture(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    catalog_revision: &str,
+    row_key: &str,
+) -> ffi::UiUpdate {
+    gate.select_capture(selection_revision, catalog_revision, row_key)
+        .into()
+}
+fn gate_select_size(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    catalog_revision: &str,
+    row_key: &str,
+) -> ffi::UiUpdate {
+    gate.select_size(selection_revision, catalog_revision, row_key)
+        .into()
+}
+fn gate_set_size(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    catalog_revision: &str,
+    width: &str,
+    height: &str,
+) -> ffi::UiUpdate {
+    gate.set_size(selection_revision, catalog_revision, width, height)
+        .into()
+}
+fn gate_select_rate(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    catalog_revision: &str,
+    row_key: &str,
+) -> ffi::UiUpdate {
+    gate.select_rate(selection_revision, catalog_revision, row_key)
+        .into()
+}
+fn gate_set_rate(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    catalog_revision: &str,
+    exact_rate: &str,
+) -> ffi::UiUpdate {
+    gate.set_rate(selection_revision, catalog_revision, exact_rate)
+        .into()
+}
+fn gate_select_format(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    catalog_revision: &str,
+    row_key: &str,
+) -> ffi::UiUpdate {
+    gate.select_format(selection_revision, catalog_revision, row_key)
+        .into()
+}
+fn gate_set_audio_enabled(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    enabled: bool,
+) -> ffi::UiUpdate {
+    gate.set_audio_enabled(selection_revision, enabled).into()
+}
+fn gate_select_audio_input(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    catalog_revision: &str,
+    row_key: &str,
+) -> ffi::UiUpdate {
+    gate.select_audio_input(selection_revision, catalog_revision, row_key)
+        .into()
+}
+fn gate_set_filter_enabled(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    entry_key: &str,
+    enabled: bool,
+) -> ffi::UiUpdate {
+    gate.set_filter_enabled(selection_revision, entry_key, enabled)
+        .into()
+}
+fn gate_add_filter(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    kind: &str,
+) -> ffi::UiUpdate {
+    gate.add_filter(selection_revision, kind).into()
+}
+fn gate_remove_filter(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    entry_key: &str,
+) -> ffi::UiUpdate {
+    gate.remove_filter(selection_revision, entry_key).into()
+}
+fn gate_set_scale(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    kernel: &str,
+) -> ffi::UiUpdate {
+    gate.set_scale(selection_revision, kernel).into()
+}
+fn gate_set_cscale(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    kernel: &str,
+) -> ffi::UiUpdate {
+    gate.set_cscale(selection_revision, kernel).into()
+}
+fn gate_set_dscale(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    kernel: &str,
+) -> ffi::UiUpdate {
+    gate.set_dscale(selection_revision, kernel).into()
+}
+fn gate_set_scale_antiring(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    value: f64,
+) -> ffi::UiUpdate {
+    gate.set_scale_antiring(selection_revision, value).into()
+}
+fn gate_set_dither(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    mode: &str,
+) -> ffi::UiUpdate {
+    gate.set_dither(selection_revision, mode).into()
+}
+fn gate_set_deband_enabled(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    enabled: bool,
+) -> ffi::UiUpdate {
+    gate.set_deband_enabled(selection_revision, enabled).into()
+}
+fn gate_set_deband_iterations(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    value: i32,
+) -> ffi::UiUpdate {
+    gate.set_deband_iterations(selection_revision, value).into()
+}
+fn gate_set_deband_grain(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    value: f64,
+) -> ffi::UiUpdate {
+    gate.set_deband_grain(selection_revision, value).into()
+}
+fn gate_set_interpolation(
+    gate: &mut RuntimeCoordinator,
+    selection_revision: &str,
+    enabled: bool,
+) -> ffi::UiUpdate {
+    gate.set_interpolation(selection_revision, enabled).into()
 }
 fn gate_ui_ready(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
     gate.ui_ready().into()
 }
 fn gate_request_application_close(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
     gate.request_application_close().into()
-}
-fn gate_decide_close(gate: &mut RuntimeCoordinator, discard: bool, revision: u64) -> ffi::UiUpdate {
-    gate.decide_close(discard, revision).into()
 }
 fn gate_retry_save(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
     gate.retry_save().into()
@@ -232,6 +493,9 @@ fn gate_decide_reset(gate: &mut RuntimeCoordinator, token: u64, confirmed: bool)
 }
 fn gate_set_fullscreen(gate: &mut RuntimeCoordinator, fullscreen: bool) -> ffi::UiUpdate {
     gate.set_fullscreen(fullscreen).into()
+}
+fn gate_set_stats_hidden(gate: &mut RuntimeCoordinator, hidden: bool) -> ffi::UiUpdate {
+    gate.set_stats_hidden(hidden).into()
 }
 fn gate_open(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
     gate.open().into()

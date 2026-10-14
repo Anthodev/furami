@@ -1,17 +1,18 @@
-//! Application persistence policy: only correlated user Apply receipts authorize
-//! complete applied writes; draft content is solely a close-negotiation baseline.
+//! Correlated, verified user transactions and genuinely adapted startup receipts
+//! authorize source-profile updates. Safe close saves the complete working
+//! collection and globals, never an uncommitted candidate.
 use std::{ffi::OsStr, path::PathBuf};
 
 use crate::{
     app::apply::VerifiedApplied,
     domain::{
-        capture::{AudioSourceIdentity, PlaybackGain},
-        state::{
-            AppliedSettings, ApplyAdmission, ApplyId, AttemptKey, AttemptPurpose, Draft,
-            DraftRevision, DraftSettings,
-        },
+        capture::{AudioSelection, AudioSourceIdentity, DeviceIdentity, PlaybackGain},
+        state::{ApplyAdmission, ApplyId, AttemptKey, AttemptPurpose, Draft, DraftSettings},
     },
-    settings::{Durability, LoadOutcome, LocalPreferences, SettingsStore, WriteOutcome},
+    settings::{
+        Durability, LoadOutcome, LocalPreferences, ProfileBinding, SettingsStore, SourceProfiles,
+        WriteOutcome,
+    },
 };
 
 pub fn resolve_settings_path(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf, String> {
@@ -29,11 +30,53 @@ pub fn resolve_settings_path(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Resul
     Ok(root.join(".config/furami/settings.json"))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupAudioPolicy {
+    AutoCard,
+    Explicit,
+    /// Explicit CLI input audio survives source switches until an audio UI action.
+    Cli,
+}
 #[derive(Debug, PartialEq)]
 pub struct StartupSelection {
     pub draft: Option<DraftSettings>,
     pub auto_open: bool,
+    pub adapt_video: bool,
+    pub restore_profile: bool,
+    pub source_binding: Option<ProfileBinding>,
+    /// Fresh preflight locators, never persisted and never capture authority.
+    pub topology_pin: Option<(PathBuf, PathBuf)>,
     pub reason: String,
+    pub audio_policy: StartupAudioPolicy,
+    pub bootstrap_audio: crate::domain::capture::AudioSelection,
+}
+
+#[derive(Debug)]
+pub enum StartupVideoError {
+    Incompatible(String),
+    Unavailable(String),
+}
+impl From<String> for StartupVideoError {
+    fn from(reason: String) -> Self {
+        Self::Unavailable(reason)
+    }
+}
+impl From<&str> for StartupVideoError {
+    fn from(reason: &str) -> Self {
+        Self::Unavailable(reason.into())
+    }
+}
+impl StartupVideoError {
+    pub fn from_failure(error: crate::domain::failure::ApplyFailure) -> Self {
+        use crate::domain::failure::{Cause, FailureCategory, ValidationLayer};
+        if error.category == FailureCategory::Validation(ValidationLayer::Mode)
+            && error.cause == Cause::RequestedModeRefused
+        {
+            Self::Incompatible(error.to_string())
+        } else {
+            Self::Unavailable(error.to_string())
+        }
+    }
 }
 
 /// Discovery is not atomic. Normal opening revalidates, and its initial audio
@@ -41,16 +84,22 @@ pub struct StartupSelection {
 pub fn decide_startup(
     saved: Option<DraftSettings>,
     explicit: Option<DraftSettings>,
-    check_video: impl FnOnce(&DraftSettings) -> Result<(), String>,
+    check_video: impl FnOnce(&DraftSettings) -> Result<(), StartupVideoError>,
     audio: Result<&[AudioSourceIdentity], String>,
 ) -> StartupSelection {
     if let Some(draft) = explicit {
-        return StartupSelection { draft: Some(draft), auto_open: false, reason: "Explicit command-line selection; saved capture auto-open suspended until a user Apply.".into() };
+        return StartupSelection { restore_profile: false, source_binding: None, topology_pin: None, draft: Some(draft), auto_open: false, adapt_video: false, reason: "Explicit command-line selection; saved capture auto-open suspended until a user capture transaction.".into(), audio_policy: StartupAudioPolicy::Explicit, bootstrap_audio: Default::default() };
     }
     let Some(mut draft) = saved else {
         return StartupSelection {
+            restore_profile: false,
+            source_binding: None,
+            topology_pin: None,
             draft: None,
             auto_open: false,
+            adapt_video: false,
+            audio_policy: StartupAudioPolicy::AutoCard,
+            bootstrap_audio: Default::default(),
             reason:
                 "No saved capture selection. Local preferences remain available without a stream."
                     .into(),
@@ -59,27 +108,59 @@ pub fn decide_startup(
     if draft.video.mode.format_policy == crate::domain::capture::InputFormatPolicy::Auto {
         draft.video.resolved_fourcc = None;
     }
-    let result = check_video(&draft).and_then(|()| {
-        if !draft.audio.enabled() { return Ok(()); }
+    let video = check_video(&draft);
+    let audio_result = (|| {
+        if !draft.audio.enabled() {
+            return Ok(());
+        }
         let sources = audio?;
-        let source = draft.audio.source().ok_or("Saved enabled audio has no source.")?;
-        let mut matches = sources.iter().filter(|observed| source.compatible_with(observed));
+        let source = draft
+            .audio
+            .source()
+            .ok_or("Saved enabled audio has no source.")?;
+        let mut matches = sources
+            .iter()
+            .filter(|observed| source.compatible_with(observed));
         match (matches.next(), matches.next()) {
             (Some(_), None) => Ok(()),
-            (None, _) => Err(format!("Saved enabled audio source {:?} is absent or its stable identity differs. No stream opened.", source.name())),
-            _ => Err(format!("Saved enabled audio source {:?} is ambiguous. No stream opened.", source.name())),
+            (None, _) => Err(format!(
+                "Saved enabled audio source {:?} is absent or its stable identity differs. No stream opened.",
+                source.name()
+            )),
+            _ => Err(format!(
+                "Saved enabled audio source {:?} is ambiguous. No stream opened.",
+                source.name()
+            )),
         }
-    });
+    })();
+    let (adapt_video, result) = match (video, audio_result) {
+        (_, Err(reason)) => (false, Err(reason)),
+        (Ok(()), Ok(())) => (false, Ok(())),
+        (Err(StartupVideoError::Incompatible(reason)), Ok(())) => (true, Err(reason)),
+        (Err(StartupVideoError::Unavailable(reason)), Ok(())) => (false, Err(reason)),
+    };
     match result {
         Ok(()) => StartupSelection {
+            restore_profile: true,
+            source_binding: None,
+            topology_pin: None,
             draft: Some(draft),
             auto_open: true,
+            adapt_video: false,
+            audio_policy: StartupAudioPolicy::Explicit,
+            bootstrap_audio: Default::default(),
             reason: "Saved sources and exact capture tuple are available; restoring live capture."
                 .into(),
         },
         Err(reason) => StartupSelection {
+            restore_profile: true,
+            source_binding: None,
+            topology_pin: None,
             draft: Some(draft),
             auto_open: false,
+            adapt_video,
+            audio_policy: StartupAudioPolicy::Explicit,
+            bootstrap_audio: Default::default(),
             reason: format!("Saved selection pre-filled, not active: {reason}"),
         },
     }
@@ -88,23 +169,33 @@ pub fn decide_startup(
 #[derive(Clone, Debug, PartialEq)]
 enum CloseState {
     Open,
-    ConfirmDraft {
-        revision: DraftRevision,
-        settings: Box<DraftSettings>,
-    },
     Draining,
     SaveFailed,
     DurabilityWarning,
     Allowed,
 }
 
+enum ReceiptOrigin {
+    User,
+    StartupAdaptation {
+        /// Captured at admission, never read back from mutable profile state.
+        preserved_audio: Option<AudioSelection>,
+    },
+}
+struct AdmittedProfile {
+    admission: ApplyAdmission,
+    submitted: Draft,
+    binding: ProfileBinding,
+    origin: ReceiptOrigin,
+}
+
 pub struct PersistenceSession {
     store: Option<SettingsStore>,
     preferences: LocalPreferences,
-    baseline: Option<DraftSettings>,
-    user_apply: Option<(ApplyAdmission, Draft)>,
+    user_apply: Option<AdmittedProfile>,
     user_open: Option<AttemptKey>,
-    pending_applied: Option<AppliedSettings>,
+    profiles: SourceProfiles,
+    last_source: Option<DeviceIdentity>,
     close: CloseState,
     reset_token: Option<u64>,
     next_reset_token: u64,
@@ -118,10 +209,10 @@ impl PersistenceSession {
         let mut session = Self {
             store: None,
             preferences: LocalPreferences::default(),
-            baseline: None,
             user_apply: None,
             user_open: None,
-            pending_applied: None,
+            profiles: SourceProfiles::default(),
+            last_source: None,
             close: CloseState::Open,
             reset_token: None,
             next_reset_token: 0,
@@ -138,7 +229,8 @@ impl PersistenceSession {
                     LoadOutcome::Missing => "First-use session preferences (not restored); they save at safe application close.".into(),
                     LoadOutcome::Loaded(document) => {
                         session.preferences = document.preferences;
-                        session.baseline = document.applied;
+                        session.profiles = document.profiles;
+                        session.last_source = document.last_source;
                         "Saved local preferences restored.".into()
                     }
                     LoadOutcome::Refused(error) => format!("Settings file refused: {error}. Original preserved. ALL automatic saves are blocked; session preference changes will NOT survive relaunch until explicit reset. Current values are initial session values, not restored."),
@@ -166,14 +258,47 @@ impl PersistenceSession {
     pub fn set_fullscreen_preference(&mut self, fullscreen: bool) {
         self.preferences.fullscreen = fullscreen;
     }
+    /// Replaces stream-stat visibility without changing other preferences.
+    pub fn set_stats_hidden_preference(&mut self, hidden: bool) {
+        self.preferences.stats_hidden = hidden;
+    }
     pub fn saved_selection(&self) -> Option<DraftSettings> {
-        self.store
-            .as_ref()
-            .and_then(|store| store.snapshot())
-            .and_then(|document| document.applied.clone())
+        let identity = self.last_source.as_ref()?;
+        self.profiles
+            .entries()
+            .iter()
+            .find(|profile| &profile.settings().video.identity == identity)
+            .map(|profile| profile.settings().clone())
+    }
+    pub fn source_profile(
+        &self,
+        identity: &DeviceIdentity,
+        serial_unique: bool,
+    ) -> Option<&DraftSettings> {
+        self.profiles.lookup(identity, serial_unique)
+    }
+    pub fn observe_profile_identities<'a, I>(&mut self, physical: I)
+    where
+        I: Iterator<Item = &'a DeviceIdentity> + Clone,
+    {
+        self.profiles.observe(physical);
+    }
+    pub fn profile_binding(
+        &self,
+        identity: &DeviceIdentity,
+        serial_unique: bool,
+    ) -> ProfileBinding {
+        self.profiles.binding_for(identity, serial_unique)
+    }
+    pub fn saved_binding(&self) -> Option<ProfileBinding> {
+        let identity = self.last_source.as_ref()?;
+        self.profiles
+            .entries()
+            .iter()
+            .find(|profile| &profile.settings().video.identity == identity)
+            .map(|profile| profile.binding())
     }
     pub fn prepare_startup(&mut self, selection: &StartupSelection) {
-        self.baseline = selection.draft.clone();
         self.startup_reason = selection.reason.clone();
     }
     pub fn startup_failed(&mut self, reason: String) {
@@ -202,21 +327,68 @@ impl PersistenceSession {
     pub fn startup_reason(&self) -> &str {
         &self.startup_reason
     }
-    pub fn draft_dirty(&self, draft: Option<&DraftSettings>) -> bool {
-        match (draft, self.baseline.as_ref()) {
-            (Some(draft), Some(baseline)) => !draft.same_request(baseline),
-            (None, None) => false,
-            _ => true,
-        }
+    pub fn admit_user_apply(
+        &mut self,
+        admission: ApplyAdmission,
+        submitted: Draft,
+        binding: ProfileBinding,
+    ) {
+        self.admit_profile(admission, submitted, binding, ReceiptOrigin::User);
     }
-    pub fn admit_user_apply(&mut self, admission: ApplyAdmission, submitted: Draft) {
-        self.user_apply = Some((admission, submitted));
+    pub fn admit_startup_adaptation(
+        &mut self,
+        admission: ApplyAdmission,
+        submitted: Draft,
+        binding: ProfileBinding,
+        audio_policy: StartupAudioPolicy,
+    ) {
+        let preserved_audio = if audio_policy == StartupAudioPolicy::Cli {
+            let identity = &submitted.settings.video.identity;
+            let Some(profile) = self.profiles.entries().iter().find(|profile| {
+                profile.binding() == binding
+                    && (profile.settings().video.identity == *identity
+                        || (binding == ProfileBinding::Serial
+                            && identity.serial().is_some()
+                            && profile.settings().video.identity.serial() == identity.serial()
+                            && profile.settings().video.identity.vendor_id()
+                                == identity.vendor_id()
+                            && profile.settings().video.identity.product_id()
+                                == identity.product_id()))
+            }) else {
+                self.user_apply = None;
+                self.user_open = None;
+                return;
+            };
+            Some(profile.settings().audio.clone())
+        } else {
+            None
+        };
+        self.admit_profile(
+            admission,
+            submitted,
+            binding,
+            ReceiptOrigin::StartupAdaptation { preserved_audio },
+        );
+    }
+    fn admit_profile(
+        &mut self,
+        admission: ApplyAdmission,
+        submitted: Draft,
+        binding: ProfileBinding,
+        origin: ReceiptOrigin,
+    ) {
+        self.user_apply = Some(AdmittedProfile {
+            admission,
+            submitted,
+            binding,
+            origin,
+        });
         self.user_open = None;
     }
     pub fn authorized_apply(&self) -> Option<ApplyId> {
         self.user_apply
             .as_ref()
-            .map(|(admission, _)| admission.id())
+            .map(|admitted| admitted.admission.id())
     }
     pub fn cancel_user_apply(&mut self, apply: ApplyId) {
         if self.authorized_apply() == Some(apply) {
@@ -228,21 +400,38 @@ impl PersistenceSession {
         if self
             .user_apply
             .as_ref()
-            .is_some_and(|(admission, _)| matches!(admission, ApplyAdmission::Open { apply } if *apply == key.apply))
+            .is_some_and(|admitted| matches!(&admitted.admission, ApplyAdmission::Open { apply } if *apply == key.apply))
             && key.purpose == AttemptPurpose::Candidate
         {
             self.user_open = Some(key);
         }
     }
     pub fn verified_applied(&mut self, event: VerifiedApplied) {
-        let Some((admission, submitted)) = &self.user_apply else {
+        let Some(AdmittedProfile {
+            admission,
+            submitted,
+            binding,
+            origin,
+        }) = &self.user_apply
+        else {
             return;
+        };
+        let binding = *binding;
+        let same_source = |observed: &DeviceIdentity| {
+            let expected = &submitted.settings.video.identity;
+            observed == expected
+                || (binding == ProfileBinding::Serial
+                    && expected.serial().is_some()
+                    && expected.serial() == observed.serial()
+                    && expected.vendor_id() == observed.vendor_id()
+                    && expected.product_id() == observed.product_id())
         };
         let applied = match (admission, event) {
             (ApplyAdmission::Open { apply }, VerifiedApplied::Open { key, applied })
                 if *apply == key.apply
                     && key.purpose == AttemptPurpose::Candidate
                     && self.user_open == Some(key)
+                    && same_source(&applied.settings().video.identity)
                     && applied.settings().video.mode == submitted.settings.video.mode
                     && applied.settings().video.resolved_mode().is_some()
                     && applied.settings().audio == submitted.settings.audio
@@ -262,6 +451,7 @@ impl PersistenceSession {
                     applied,
                 },
             ) if *admitted == key
+                && matches!(origin, ReceiptOrigin::User)
                 && key.pass == crate::domain::state::TreatmentPass::Candidate
                 && *admitted_revision == revision
                 && submitted.revision == revision
@@ -272,15 +462,17 @@ impl PersistenceSession {
             }
             _ => return,
         };
-        let Some((_, submitted)) = self.user_apply.take() else {
-            return;
-        };
+        self.last_source = Some(applied.settings().video.identity.clone());
+        match origin {
+            ReceiptOrigin::StartupAdaptation {
+                preserved_audio: Some(audio),
+            } => self
+                .profiles
+                .upsert_verified_preserving_audio(&applied, binding, audio),
+            _ => self.profiles.upsert_verified(&applied, binding),
+        }
+        self.user_apply = None;
         self.user_open = None;
-        // Fresh validation may normalize a unique serial device's topology.
-        // Cleanliness describes the submitted user selection, not that fresh
-        // receipt; a newer draft edit must remain different from this baseline.
-        self.baseline = Some(submitted.settings);
-        self.pending_applied = Some(applied);
         self.save();
     }
     fn save(&mut self) -> bool {
@@ -288,10 +480,11 @@ impl PersistenceSession {
             self.write_status = "Save unavailable: no valid configuration location. Session preferences are not durable.".into();
             return false;
         };
-        let outcome = match &self.pending_applied {
-            Some(applied) => store.save_applied(applied, self.preferences.clone()),
-            None => store.save_preferences(self.preferences.clone()),
-        };
+        let outcome = store.save_profiles(
+            &self.profiles,
+            self.last_source.as_ref(),
+            self.preferences.clone(),
+        );
         match outcome {
             Err(error) => {
                 self.write_status = format!(
@@ -301,7 +494,6 @@ impl PersistenceSession {
                 false
             }
             Ok(WriteOutcome::Committed { durability }) => {
-                self.pending_applied = None;
                 self.durability_unconfirmed = matches!(&durability, Durability::Unconfirmed(_));
                 self.write_status = match durability {
                     Durability::Confirmed => format!("Saved to {}.", store.path().display()),
@@ -315,75 +507,23 @@ impl PersistenceSession {
         }
     }
     pub fn mutations_open(&self) -> bool {
-        matches!(
-            self.close,
-            CloseState::Open | CloseState::ConfirmDraft { .. }
-        )
+        self.close == CloseState::Open
     }
-    /// Returns true exactly when the native owner should begin normal teardown.
-    pub fn request_close(&mut self, draft: Option<(&DraftSettings, DraftRevision)>) -> bool {
-        if !matches!(self.close, CloseState::Open) {
+    /// Start normal teardown immediately. Only a previously verified pending
+    /// receipt (if a save failed) and current preferences can be saved at drain.
+    pub fn request_close(&mut self) -> bool {
+        if self.close != CloseState::Open {
             return false;
         }
         self.reset_token = None;
         if let Some(apply) = self.authorized_apply() {
             self.cancel_user_apply(apply);
         }
-        if let Some((settings, revision)) =
-            draft.filter(|(settings, _)| self.draft_dirty(Some(settings)))
-        {
-            self.close = CloseState::ConfirmDraft {
-                revision,
-                settings: Box::new(settings.clone()),
-            };
-            false
-        } else {
-            self.close = CloseState::Draining;
-            true
-        }
-    }
-    pub fn decide_dirty_close(
-        &mut self,
-        discard: bool,
-        revision: DraftRevision,
-        draft: Option<(&DraftSettings, DraftRevision)>,
-    ) -> bool {
-        let CloseState::ConfirmDraft {
-            revision: expected,
-            settings,
-        } = &self.close
-        else {
-            return false;
-        };
-        if !discard {
-            self.close = CloseState::Open;
-            return false;
-        }
-        let Some((current, current_revision)) = draft else {
-            return false;
-        };
-        if revision != *expected || current_revision != *expected || current != settings.as_ref() {
-            self.close = CloseState::ConfirmDraft {
-                revision: current_revision,
-                settings: Box::new(current.clone()),
-            };
-            return false;
-        }
         self.close = CloseState::Draining;
-        if let Some(apply) = self.authorized_apply() {
-            self.cancel_user_apply(apply);
-        }
         true
-    }
-    pub fn close_revision(&self) -> u64 {
-        match self.close {
-            CloseState::ConfirmDraft { revision, .. } => revision.get(),
-            _ => 0,
-        }
     }
     pub fn close_dialog(&self) -> &'static str {
         match self.close {
-            CloseState::ConfirmDraft { .. } => "draft",
             CloseState::SaveFailed => "save",
             CloseState::DurabilityWarning => "warning",
             _ => "",
@@ -462,16 +602,18 @@ impl PersistenceSession {
             }
             Ok(WriteOutcome::Committed { durability }) => {
                 // An older in-flight Apply or retry cannot resurrect cleared saved capture.
-                self.pending_applied = None;
+                self.profiles = SourceProfiles::default();
+                self.last_source = None;
                 self.user_apply = None;
                 self.user_open = None;
-                self.load_status = "Saved file explicitly reset; capture is not saved. Live capture and draft unchanged.".into();
+                self.load_status = "Saved file explicitly reset; capture is not saved. Live capture and selection unchanged.".into();
                 self.write_status = match durability {
                     Durability::Confirmed => {
-                        "Reset committed with current session preferences and applied:null.".into()
+                        "Reset committed with current session preferences and no source profiles."
+                            .into()
                     }
                     Durability::Unconfirmed(error) => format!(
-                        "Reset committed (applied:null), but crash durability is NOT confirmed: {error}"
+                        "Reset committed (no source profiles), but crash durability is NOT confirmed: {error}"
                     ),
                 };
             }
@@ -487,7 +629,7 @@ mod tests {
             AudioSelection, CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize,
             ModeRequest, PlaybackGain, UsbTopology,
         },
-        state::{ModelEffect, ProductModel},
+        state::{DraftRevision, ModelEffect, ProductModel},
     };
     use std::{
         fs,
@@ -604,15 +746,34 @@ mod tests {
         let VerifiedApplied::Open { key, .. } = &event else {
             panic!("Open fixture")
         };
-        session.admit_user_apply(ApplyAdmission::Open { apply: key.apply }, submitted);
+        session.admit_user_apply(
+            ApplyAdmission::Open { apply: key.apply },
+            submitted,
+            ProfileBinding::Serial,
+        );
         session.observe_opening(*key);
         session.verified_applied(event);
     }
-    fn load_document(path: PathBuf) -> crate::settings::StoredDocument {
+    struct LoadedSelection {
+        applied: Option<DraftSettings>,
+        preferences: LocalPreferences,
+    }
+    fn load_document(path: PathBuf) -> LoadedSelection {
         let (_, LoadOutcome::Loaded(document)) = SettingsStore::load(path) else {
             panic!("document not loadable")
         };
-        *document
+        let applied = document.last_source.as_ref().and_then(|identity| {
+            document
+                .profiles
+                .entries()
+                .iter()
+                .find(|profile| &profile.settings().video.identity == identity)
+                .map(|profile| profile.settings().clone())
+        });
+        LoadedSelection {
+            applied,
+            preferences: document.preferences,
+        }
     }
     fn preferences(percent: u8) -> LocalPreferences {
         LocalPreferences {
@@ -641,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_auto_rechecks_current_capabilities_without_historical_pin_or_dirty_change() {
+    fn saved_auto_rechecks_current_capabilities_without_historical_pin() {
         use crate::domain::capture::InputFormatPolicy;
         let mut saved = selection(60000);
         saved.video.mode.format_policy = InputFormatPolicy::Auto;
@@ -656,21 +817,10 @@ mod tests {
             Ok(&[]),
         );
         assert!(startup.auto_open);
-        let temp = Temp::new();
-        let mut session = PersistenceSession::load(Ok(temp.file()));
-        session.prepare_startup(&startup);
-        assert!(
-            !session.draft_dirty(Some(&saved)),
-            "resolution is not a user selection edit"
-        );
-        let mut changed = saved;
-        changed.video.mode.format_policy = InputFormatPolicy::Manual {
-            fourcc: changed.video.resolved_fourcc.unwrap(),
-        };
-        assert!(
-            session.draft_dirty(Some(&changed)),
-            "auto to same concrete manual pin is a real edit"
-        );
+        assert_eq!(startup.audio_policy, StartupAudioPolicy::Explicit);
+        let restored = startup.draft.unwrap();
+        assert_eq!(restored.video.mode, saved.video.mode);
+        assert!(restored.video.resolved_fourcc.is_none());
     }
     #[test]
     fn startup_present_exact_tuple_opens_but_absent_unknown_or_unsupported_prefills() {
@@ -827,15 +977,12 @@ mod tests {
                         revision,
                         settings: submitted.clone(),
                     },
+                    ProfileBinding::Serial,
                 );
                 session.observe_opening(key);
                 session.verified_applied(receipt.clone());
                 assert_eq!(load_document(temp.file()).applied, Some(submitted.clone()));
                 assert_eq!(session.authorized_apply(), None);
-                assert!(!session.draft_dirty(Some(&submitted)));
-                let mut newer = submitted.clone();
-                newer.filters = FilterChain::default();
-                assert!(session.draft_dirty(Some(&newer)));
                 let bytes = fs::read(temp.file()).unwrap();
                 session.verified_applied(receipt);
                 assert_eq!(fs::read(temp.file()).unwrap(), bytes);
@@ -867,6 +1014,7 @@ mod tests {
                 revision: DraftRevision::new(3),
                 settings: selection(60000),
             },
+            ProfileBinding::Serial,
         );
         session.observe_opening(*open);
         session.verified_applied(receipt.clone());
@@ -882,6 +1030,7 @@ mod tests {
                 revision: DraftRevision::new(4),
                 settings: selection(60000),
             },
+            ProfileBinding::Serial,
         );
         session.observe_opening(*open);
         session.cancel_user_apply(key.apply);
@@ -914,6 +1063,7 @@ mod tests {
                     },
                     settings: selection(60000),
                 },
+                ProfileBinding::Serial,
             );
             let mut received = key;
             let mut received_revision = revision;
@@ -951,11 +1101,11 @@ mod tests {
             });
             assert!(!temp.file().exists(), "mismatch {mismatch} must not write");
             assert_eq!(session.authorized_apply(), Some(key.apply));
-            assert!(session.baseline.is_none());
+            assert!(session.profiles.entries().is_empty());
         }
     }
     #[test]
-    fn exact_filter_receipt_saves_once_keeps_newer_draft_dirty_and_cancellation_revokes_it() {
+    fn exact_filter_receipt_saves_once_and_cancellation_revokes_it() {
         use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
         let VerifiedApplied::Open { key: open, applied } = event(selection(60000)) else {
             panic!("fixture")
@@ -980,6 +1130,7 @@ mod tests {
                     revision,
                     settings: selection(60000),
                 },
+                ProfileBinding::Serial,
             );
             if cancelled {
                 session.cancel_user_apply(key.apply);
@@ -987,9 +1138,7 @@ mod tests {
             session.verified_applied(receipt.clone());
             assert_eq!(temp.file().exists(), !cancelled);
             assert_eq!(session.authorized_apply(), None);
-            assert!(session.draft_dirty(Some(&selection(30000))));
             if !cancelled {
-                assert!(!session.draft_dirty(Some(&selection(60000))));
                 assert_eq!(load_document(temp.file()).applied, Some(selection(60000)));
                 let bytes = fs::read(temp.file()).unwrap();
                 session.verified_applied(receipt.clone());
@@ -1014,6 +1163,7 @@ mod tests {
                 revision: DraftRevision::new(0),
                 settings: selection(60000),
             },
+            ProfileBinding::Serial,
         );
         let wrong_key = AttemptKey {
             attempt: crate::domain::state::AttemptId::new(key.attempt.get() + 1).unwrap(),
@@ -1032,64 +1182,30 @@ mod tests {
         assert_eq!(fs::read(temp.file()).unwrap(), bytes);
     }
     #[test]
-    fn dirty_is_content_equality_and_preferences_never_dirty_selection() {
+    fn close_drains_once_without_saving_uncommitted_startup_selection() {
         let temp = Temp::new();
         let mut session = PersistenceSession::load(Ok(temp.file()));
-        let original = selection(60000);
-        session.prepare_startup(&StartupSelection {
-            draft: Some(original.clone()),
-            auto_open: false,
-            reason: String::new(),
-        });
-        assert!(!session.draft_dirty(Some(&original)));
-        assert!(session.draft_dirty(Some(&selection(30000))));
+        let startup = decide_startup(None, Some(selection(30000)), |_| Ok(()), Ok(&[]));
+        session.prepare_startup(&startup);
         session.set_preferences(preferences(17));
-        assert!(!session.draft_dirty(Some(&original)));
-    }
-    #[test]
-    fn close_cancel_never_drains_and_stale_discard_requires_new_decision() {
-        let temp = Temp::new();
-        let mut session = PersistenceSession::load(Ok(temp.file()));
-        user_apply(&mut session, selection(60000));
-        let draft = selection(30000);
-        assert!(!session.request_close(Some((&draft, DraftRevision::new(1)))));
-        assert!(!session.request_close(Some((&draft, DraftRevision::new(1)))));
-        assert!(!session.decide_dirty_close(
-            false,
-            DraftRevision::new(1),
-            Some((&draft, DraftRevision::new(1)))
-        ));
-        assert!(session.mutations_open());
-        assert_eq!(session.close_dialog(), "");
-        session.request_close(Some((&draft, DraftRevision::new(1))));
-        let latest = selection(24000);
-        assert!(!session.decide_dirty_close(
-            true,
-            DraftRevision::new(1),
-            Some((&latest, DraftRevision::new(2)))
-        ));
-        assert!(session.mutations_open());
-        assert_eq!(session.close_revision(), 2);
-        assert!(session.decide_dirty_close(
-            true,
-            DraftRevision::new(2),
-            Some((&latest, DraftRevision::new(2)))
-        ));
+        assert!(session.request_close());
+        assert!(!session.request_close());
         assert!(!session.mutations_open());
+        assert_eq!(session.close_dialog(), "");
+        assert!(!session.quit_allowed());
+        session.drained();
+        assert!(session.quit_allowed());
+        let document = load_document(temp.file());
+        assert_eq!(document.applied, None);
+        assert_eq!(document.preferences, preferences(17));
     }
     #[test]
-    fn discard_saves_applied_not_draft_and_latest_preferences_after_drain() {
+    fn close_saves_only_verified_applied_and_latest_preferences_after_drain() {
         let temp = Temp::new();
         let mut session = PersistenceSession::load(Ok(temp.file()));
         user_apply(&mut session, selection(60000));
-        let draft = selection(30000);
         session.set_preferences(preferences(23));
-        session.request_close(Some((&draft, DraftRevision::new(1))));
-        assert!(session.decide_dirty_close(
-            true,
-            DraftRevision::new(1),
-            Some((&draft, DraftRevision::new(1)))
-        ));
+        assert!(session.request_close());
         assert!(!session.quit_allowed());
         session.drained();
         assert!(session.quit_allowed());
@@ -1102,11 +1218,14 @@ mod tests {
         let temp = Temp::new();
         let mut session = PersistenceSession::load(Ok(temp.file()));
         session.set_preferences(preferences(41));
-        assert!(session.request_close(None));
+        session.set_stats_hidden_preference(true);
+        assert!(session.request_close());
         session.drained();
         assert!(session.quit_allowed());
         let reloaded = PersistenceSession::load(Ok(temp.file()));
-        assert_eq!(reloaded.preferences(), &preferences(41));
+        let mut expected = preferences(41);
+        expected.stats_hidden = true;
+        assert_eq!(reloaded.preferences(), &expected);
         assert!(reloaded.saved_selection().is_none());
     }
     #[test]
@@ -1124,7 +1243,7 @@ mod tests {
             session.request_reset();
             session.decide_reset(session.reset_token(), false);
             assert_eq!(fs::read(temp.file()).unwrap(), original);
-            assert!(session.request_close(Some((&selection(60000), DraftRevision::new(0)))));
+            assert!(session.request_close());
             session.drained();
             assert!(!session.quit_allowed());
             assert_eq!(session.close_dialog(), "save");
@@ -1140,19 +1259,21 @@ mod tests {
         fs::write(temp.file(), b"refused").unwrap();
         let mut session = PersistenceSession::load(Ok(temp.file()));
         user_apply(&mut session, selection(60000));
-        let baseline = session.baseline.clone();
         session.set_preferences(preferences(12));
+        session.set_stats_hidden_preference(true);
         session.request_reset();
         let token = session.reset_token();
         session.decide_reset(token + 1, true);
         assert!(session.refused());
         session.decide_reset(token, true);
         assert!(!session.refused());
-        assert_eq!(session.baseline, baseline);
-        assert_eq!(session.preferences(), &preferences(12));
+        let mut expected = preferences(12);
+        expected.stats_hidden = true;
+        assert_eq!(session.preferences(), &expected);
         assert_eq!(load_document(temp.file()).applied, None);
+        assert!(load_document(temp.file()).preferences.stats_hidden);
         session.decide_reset(token, true);
-        session.request_close(Some((&selection(60000), DraftRevision::new(0))));
+        session.request_close();
         session.drained();
         assert_eq!(load_document(temp.file()).applied, None);
     }
@@ -1164,10 +1285,10 @@ mod tests {
         let mut session = PersistenceSession::load(Ok(path.clone()));
         fs::write(&blocked, b"not a directory").unwrap();
         user_apply(&mut session, selection(60000));
-        assert!(session.pending_applied.is_some());
+        assert_eq!(session.profiles.entries().len(), 1);
         assert!(session.status().contains("Save failed"));
         session.set_preferences(preferences(9));
-        assert!(session.request_close(Some((&selection(60000), DraftRevision::new(0)))));
+        assert!(session.request_close());
         session.drained();
         assert_eq!(session.close_dialog(), "save");
         fs::remove_file(&blocked).unwrap();
@@ -1230,6 +1351,7 @@ mod tests {
                     revision,
                     settings: submitted.clone(),
                 },
+                ProfileBinding::Serial,
             );
             session.verified_applied(VerifiedApplied::Treatments {
                 key,
@@ -1240,17 +1362,17 @@ mod tests {
             assert_eq!(fs::read(temp.file()).unwrap(), old, "fault {fault:?}");
             assert!(session.status().contains("Save failed"));
             assert!(
-                session.pending_applied.is_some(),
+                !session.profiles.entries().is_empty(),
                 "runtime success survives persistence refusal"
             );
             session.set_preferences(preferences(23));
-            assert!(session.request_close(Some((&submitted, revision))));
+            assert!(session.request_close());
             // Each injected fault is one-shot. Fail the safe-close attempt too
             // so the explicit retry below, not automatic close, publishes it.
             session.store = Some(SettingsStore::with_injected_fault(temp.file(), fault));
             session.drained();
             assert_eq!(fs::read(temp.file()).unwrap(), old, "close fault {fault:?}");
-            assert!(session.pending_applied.is_some());
+            assert!(!session.profiles.entries().is_empty());
             assert!(
                 !session.quit_allowed(),
                 "failed close save must retain the quit barrier"
@@ -1261,15 +1383,11 @@ mod tests {
             let document = load_document(temp.file());
             assert_eq!(document.applied, Some(submitted.clone()));
             assert_eq!(document.preferences, preferences(23));
-            // The frozen candidate's renderer is what persists; a newer renderer
-            // draft stays unpublished and dirty.
+            // A later uncommitted renderer cannot replace the frozen receipt.
             assert_eq!(
                 document.applied.as_ref().unwrap().renderer,
                 reference_renderer()
             );
-            let mut newer = submitted.clone();
-            newer.renderer = crate::domain::render::RendererSettings::default();
-            assert!(session.draft_dirty(Some(&newer)));
         }
     }
 
@@ -1335,11 +1453,12 @@ mod tests {
                     revision: DraftRevision::new(1),
                     settings: submitted.clone(),
                 },
+                ProfileBinding::Serial,
             );
             session.observe_opening(*key);
             session.verified_applied(receipt);
             assert!(!temp.file().exists());
-            assert!(session.baseline.is_none());
+            assert!(session.profiles.entries().is_empty());
         }
     }
     fn qualify_relocated_user_apply(edit_during_apply: bool) {
@@ -1359,7 +1478,11 @@ mod tests {
         let (apply, _) = model
             .apply(model.state_identity(), frozen.revision)
             .unwrap();
-        session.admit_user_apply(ApplyAdmission::Open { apply }, frozen);
+        session.admit_user_apply(
+            ApplyAdmission::Open { apply },
+            frozen,
+            ProfileBinding::Serial,
+        );
         let original_request = model.validation_request().unwrap().clone();
         if edit_during_apply {
             model
@@ -1388,26 +1511,311 @@ mod tests {
         });
         let document = load_document(temp.file());
         assert_eq!(document.applied, Some(normalized));
-        assert_eq!(session.baseline, Some(submitted));
         assert_eq!(
-            session.draft_dirty(Some(&model.draft().settings)),
-            edit_during_apply
+            model.draft().settings.video.mode,
+            selection(if edit_during_apply { 30000 } else { 60000 })
+                .video
+                .mode
         );
-        let close = session.request_close(Some((&model.draft().settings, model.draft().revision)));
-        assert_eq!(close, !edit_during_apply);
-        assert_eq!(
-            session.close_dialog(),
-            if edit_during_apply { "draft" } else { "" }
-        );
+        assert!(session.request_close());
+        assert_eq!(session.close_dialog(), "");
+        session.drained();
+        assert_eq!(load_document(temp.file()).applied, document.applied);
     }
 
     #[test]
-    fn relocated_verified_identity_saves_fresh_topology_but_unedited_submitted_selection_is_clean()
-    {
+    fn relocated_verified_identity_saves_fresh_topology_without_saving_candidate_on_close() {
         qualify_relocated_user_apply(false);
     }
     #[test]
-    fn relocated_verified_identity_never_marks_edits_during_apply_clean_or_persists_them() {
+    fn relocated_verified_identity_never_saves_edits_during_apply_or_on_close() {
         qualify_relocated_user_apply(true);
+    }
+    fn other_source() -> DraftSettings {
+        let mut settings = selection(30000);
+        settings.video.identity = DeviceIdentity::new(
+            0x1234,
+            0xabcd,
+            UsbTopology::new("pci-test".into(), vec![NonZeroU8::new(2).unwrap()]).unwrap(),
+            Some("source-b".into()),
+        )
+        .unwrap();
+        settings.audio = AudioSelection::Disabled {
+            retained: Some(source("saved-b")),
+        };
+        settings.renderer = reference_renderer();
+        settings
+    }
+
+    #[test]
+    fn failed_save_a_then_success_b_and_close_retry_keep_both_verified_profiles() {
+        use crate::settings::WriteFaultPoint;
+        let temp = Temp::new();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        session.store = Some(SettingsStore::with_injected_fault(
+            temp.file(),
+            WriteFaultPoint::BeforeRename,
+        ));
+        let a = selection(60000);
+        let b = other_source();
+        user_apply(&mut session, a.clone());
+        assert!(!temp.file().exists());
+        assert!(session.store.as_ref().unwrap().snapshot().is_none());
+        assert_eq!(session.source_profile(&a.video.identity, true), Some(&a));
+        user_apply(&mut session, b.clone());
+        let restored = PersistenceSession::load(Ok(temp.file()));
+        assert_eq!(restored.source_profile(&a.video.identity, true), Some(&a));
+        assert_eq!(restored.source_profile(&b.video.identity, true), Some(&b));
+        assert_eq!(restored.saved_selection(), Some(b.clone()));
+        session.store = Some(SettingsStore::with_injected_fault(
+            temp.file(),
+            WriteFaultPoint::BeforeRename,
+        ));
+        session.set_preferences(preferences(0));
+        session.request_close();
+        session.drained();
+        assert!(!session.quit_allowed());
+        session.retry_close_save();
+        assert!(session.quit_allowed());
+        let restored = PersistenceSession::load(Ok(temp.file()));
+        assert_eq!(restored.source_profile(&a.video.identity, true), Some(&a));
+        assert_eq!(restored.source_profile(&b.video.identity, true), Some(&b));
+        assert_eq!(restored.preferences(), &preferences(0));
+    }
+
+    #[test]
+    fn adapted_startup_only_saves_correlated_verified_receipt_and_reset_revokes_it() {
+        for reset in [false, true] {
+            let temp = Temp::new();
+            let mut session = PersistenceSession::load(Ok(temp.file()));
+            user_apply(&mut session, selection(60000));
+            let before = fs::read(temp.file()).unwrap();
+            let adapted = selection(30000);
+            let receipt = event(adapted.clone());
+            let VerifiedApplied::Open { key, .. } = &receipt else {
+                panic!("open proof")
+            };
+            session.admit_startup_adaptation(
+                ApplyAdmission::Open { apply: key.apply },
+                Draft {
+                    revision: DraftRevision::new(0),
+                    settings: adapted.clone(),
+                },
+                ProfileBinding::Serial,
+                StartupAudioPolicy::Explicit,
+            );
+            assert_eq!(fs::read(temp.file()).unwrap(), before);
+            session.observe_opening(*key);
+            if reset {
+                session.request_reset();
+                session.decide_reset(session.reset_token(), true);
+            }
+            session.verified_applied(receipt);
+            assert_eq!(session.saved_selection(), (!reset).then_some(adapted));
+            session.request_close();
+            session.drained();
+            assert_eq!(
+                PersistenceSession::load(Ok(temp.file())).saved_selection(),
+                session.saved_selection()
+            );
+        }
+    }
+
+    #[test]
+    fn cli_startup_adaptation_captures_historical_audio_and_still_checks_actual_receipt() {
+        for reset in [false, true] {
+            let temp = Temp::new();
+            let mut session = PersistenceSession::load(Ok(temp.file()));
+            let mut original = selection(60000);
+            original.audio = AudioSelection::Enabled {
+                source: source("saved-a"),
+            };
+            user_apply(&mut session, original.clone());
+            let mut submitted = selection(30000);
+            submitted.audio = AudioSelection::Enabled {
+                source: source("cli-b"),
+            };
+            let receipt = event(submitted.clone());
+            let VerifiedApplied::Open { key, .. } = &receipt else {
+                panic!("open")
+            };
+            let key = *key;
+            session.admit_startup_adaptation(
+                ApplyAdmission::Open { apply: key.apply },
+                Draft {
+                    revision: DraftRevision::new(0),
+                    settings: submitted.clone(),
+                },
+                ProfileBinding::Serial,
+                StartupAudioPolicy::Cli,
+            );
+            session.observe_opening(key);
+            // A later working-profile mutation cannot change the admitted
+            // historical audio authority, nor authorize a different receipt.
+            let mut later = submitted.clone();
+            later.audio = AudioSelection::Disabled {
+                retained: Some(source("later")),
+            };
+            let VerifiedApplied::Open { applied, .. } = event(later.clone()) else {
+                panic!("open")
+            };
+            session
+                .profiles
+                .upsert_verified(&applied, ProfileBinding::Serial);
+            session.verified_applied(VerifiedApplied::Open { key, applied });
+            assert_eq!(session.authorized_apply(), Some(key.apply));
+            assert_eq!(load_document(temp.file()).applied, Some(original.clone()));
+            if reset {
+                session.request_reset();
+                session.decide_reset(session.reset_token(), true);
+            }
+            session.verified_applied(receipt);
+            let mut projected = submitted;
+            projected.audio = original.audio;
+            assert_eq!(
+                session.saved_selection(),
+                (!reset).then_some(projected.clone())
+            );
+            if !reset {
+                assert_eq!(load_document(temp.file()).applied, Some(projected));
+                // A subsequent normal user transaction persists its real audio.
+                user_apply(&mut session, later.clone());
+                assert_eq!(load_document(temp.file()).applied, Some(later));
+            }
+        }
+    }
+
+    #[test]
+    fn cli_startup_adaptation_without_historical_profile_cannot_create_one() {
+        let temp = Temp::new();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        let submitted = selection(30000);
+        let receipt = event(submitted.clone());
+        let VerifiedApplied::Open { key, .. } = &receipt else {
+            panic!("open")
+        };
+        let key = *key;
+        session.admit_startup_adaptation(
+            ApplyAdmission::Open { apply: key.apply },
+            Draft {
+                revision: DraftRevision::new(0),
+                settings: submitted,
+            },
+            ProfileBinding::Serial,
+            StartupAudioPolicy::Cli,
+        );
+        assert_eq!(session.authorized_apply(), None);
+        session.observe_opening(key);
+        session.verified_applied(receipt);
+        assert!(session.saved_selection().is_none());
+        assert!(!temp.file().exists());
+    }
+
+    #[test]
+    fn startup_adapts_only_typed_video_incompatibility_and_never_overrides_audio_failure() {
+        let mut saved = selection(60000);
+        let adapted = decide_startup(
+            Some(saved.clone()),
+            None,
+            |_| {
+                Err(StartupVideoError::Incompatible(
+                    "size no longer advertised".into(),
+                ))
+            },
+            Ok(&[]),
+        );
+        assert!(adapted.adapt_video);
+        assert!(!adapted.auto_open);
+        assert_eq!(adapted.draft, Some(saved.clone()));
+        let unknown = decide_startup(
+            Some(saved.clone()),
+            None,
+            |_| Err(StartupVideoError::Unavailable("ioctl unavailable".into())),
+            Ok(&[]),
+        );
+        assert!(!unknown.adapt_video);
+        saved.audio = AudioSelection::Enabled {
+            source: source("missing"),
+        };
+        let missing_audio = decide_startup(
+            Some(saved.clone()),
+            None,
+            |_| Err(StartupVideoError::Incompatible("unsupported mode".into())),
+            Ok(&[]),
+        );
+        assert!(!missing_audio.adapt_video);
+        assert!(!missing_audio.auto_open);
+        assert_eq!(missing_audio.draft, Some(saved));
+        assert!(missing_audio.reason.contains("audio"));
+    }
+
+    #[test]
+    fn topology_admission_cannot_save_an_unrelated_or_relocated_identity() {
+        let temp = Temp::new();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        let submitted = selection(60000);
+        let mut wrong = submitted.clone();
+        wrong.video.identity = other_source().video.identity;
+        let receipt = event(wrong);
+        let VerifiedApplied::Open { key, .. } = &receipt else {
+            panic!("open proof")
+        };
+        session.admit_user_apply(
+            ApplyAdmission::Open { apply: key.apply },
+            Draft {
+                revision: DraftRevision::new(0),
+                settings: submitted,
+            },
+            ProfileBinding::Topology,
+        );
+        session.observe_opening(*key);
+        session.verified_applied(receipt);
+        assert!(session.saved_selection().is_none());
+        assert!(!temp.file().exists());
+    }
+    #[test]
+    fn migrated_v1_last_source_is_restored_without_write_until_authorized_close() {
+        let temp = Temp::new();
+        let saved = selection(60000);
+        let mut original_session = PersistenceSession::load(Ok(temp.file()));
+        user_apply(&mut original_session, saved.clone());
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.file()).unwrap()).unwrap();
+        let profile = document["profiles"][0]["settings"].take();
+        let object = document.as_object_mut().unwrap();
+        object.remove("profiles");
+        object.remove("last_source");
+        object.insert("schema_version".into(), serde_json::json!(1));
+        object.insert("applied".into(), profile);
+        let v1 = serde_json::to_vec(&document).unwrap();
+        fs::write(temp.file(), &v1).unwrap();
+        let mut migrated = PersistenceSession::load(Ok(temp.file()));
+        assert_eq!(migrated.saved_selection(), Some(saved.clone()));
+        assert_eq!(migrated.saved_binding(), Some(ProfileBinding::Serial));
+        assert_eq!(
+            migrated.source_profile(&saved.video.identity, true),
+            Some(&saved)
+        );
+        assert_eq!(fs::read(temp.file()).unwrap(), v1);
+        let absent = decide_startup(
+            migrated.saved_selection(),
+            None,
+            |_| Err("last source absent".into()),
+            Ok(&[]),
+        );
+        migrated.prepare_startup(&absent);
+        assert!(!absent.auto_open && !absent.adapt_video);
+        assert_eq!(absent.draft, Some(saved.clone()));
+        assert_eq!(fs::read(temp.file()).unwrap(), v1);
+        migrated.request_close();
+        migrated.drained();
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.file()).unwrap()).unwrap();
+        assert_eq!(written["schema_version"], 2);
+        assert!(written.get("applied").is_none());
+        assert_eq!(
+            PersistenceSession::load(Ok(temp.file())).saved_selection(),
+            Some(saved)
+        );
     }
 }

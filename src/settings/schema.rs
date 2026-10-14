@@ -1,10 +1,8 @@
-//! Responsibility: Strict v1 DTO, validated domain conversion, all-or-nothing decode/encode.
-//! Allowed dependencies: `domain`, serde serialization only.
+//! Responsibility: Strict versioned DTOs, validated conversion, atomic document codecs.
+//! Allowed dependencies: domain and settings value types, serde serialization only.
 //!
-//! The DTO is deliberately private: only `decode` and `encode` cross the
-//! boundary, and every value crossing back into the domain is rebuilt through
-//! its validating constructor. There is no migration path: a document whose
-//! `schema_version` is not 1 is refused outright.
+//! Version 1 migrates in memory through the same validated settings payload;
+//! version 2 is the only write format. Neither decoder accepts partial recovery.
 
 use std::fmt;
 use std::num::NonZeroU8;
@@ -14,6 +12,7 @@ use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+use super::profiles::{ProfileBinding, ProfileValidationError, SourceProfile, SourceProfiles};
 use super::store::{LocalPreferences, StoredDocument};
 use crate::domain::capture::{
     AudioError, AudioSelection, AudioSourceIdentity, CaptureDataError, CaptureModeRequest,
@@ -25,8 +24,8 @@ use crate::domain::output::{PersistentOutputChoice, SinkIdentity};
 use crate::domain::render::RendererSettings;
 use crate::domain::state::DraftSettings;
 
-/// On-disk schema version this module reads and writes.
-pub(crate) const SCHEMA_VERSION: u64 = 1;
+/// On-disk schema version written by this module; v1 is also read.
+pub(crate) const SCHEMA_VERSION: u64 = 2;
 
 /// Value-level rejection of a structurally valid document, on decode or on
 /// encode before any bytes are written.
@@ -46,6 +45,8 @@ pub enum SettingsValidationError {
     /// the verified opening. Guards both the encode and decode boundaries.
     #[error("applied video format policy does not match its resolved capture format")]
     VideoFormatPolicyMismatch,
+    #[error("source profile collection is invalid: {0}")]
+    Profiles(#[from] ProfileValidationError),
 }
 
 /// Internal decode failure taxonomy; `store` adds the file path.
@@ -53,7 +54,7 @@ pub enum SettingsValidationError {
 pub(crate) enum SchemaError {
     #[error("settings file is not valid JSON: {0}")]
     MalformedJson(#[source] serde_json::Error),
-    #[error("settings file violates schema v1: {0}")]
+    #[error("settings file violates its versioned schema: {0}")]
     Schema(#[source] serde_json::Error),
     #[error("settings file uses unsupported schema version {0}")]
     UnsupportedVersion(u64),
@@ -74,9 +75,8 @@ pub(crate) enum EncodeError {
 // DTO
 // ---------------------------------------------------------------------------
 
-/// Version discriminator for the second decode pass. It tolerates unknown
-/// sibling keys on purpose: a future v2 document must surface as
-/// `UnsupportedVersion`, never as a schema violation.
+/// Version discriminator for the strict decode pass. Unknown sibling keys are
+/// tolerated only here, preserving duplicate-version checks without a Value map.
 #[derive(Debug)]
 struct VersionProbe {
     schema_version: u64,
@@ -155,6 +155,28 @@ macro_rules! object_dto {
 struct DocumentV1 {
     applied: Option<AppliedV1>,
     preferences: PreferencesV1,
+}
+
+#[derive(Debug)]
+struct DocumentV2 {
+    profiles: Vec<ProfileV2>,
+    last_source: Option<DeviceIdentityV1>,
+    preferences: PreferencesV1,
+}
+
+object_dto! {
+    #[derive(Debug)]
+    struct ProfileV2 {
+        binding: BindingV2,
+        settings: AppliedV1,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum BindingV2 {
+    Serial,
+    Topology,
 }
 
 /// The applied section. `video` and `audio` stay mandatory; `filters` and
@@ -261,6 +283,7 @@ struct PreferencesV1 {
     /// before the output choice existed has no `output` key and means `Auto`.
     /// An explicit `null` is a schema violation, not `Auto`.
     output: Option<OutputV1>,
+    stats_hidden: bool,
 }
 
 #[derive(Debug)]
@@ -281,12 +304,19 @@ object_dto! {
 // Strict decoding
 // ---------------------------------------------------------------------------
 
-const DOCUMENT_FIELDS: &[&str] = &["schema_version", "applied", "preferences"];
+const DOCUMENT_V1_FIELDS: &[&str] = &["schema_version", "applied", "preferences"];
+const DOCUMENT_V2_FIELDS: &[&str] = &["schema_version", "profiles", "last_source", "preferences"];
 const APPLIED_FIELDS: &[&str] = &["video", "audio", "filters", "renderer"];
 const IDENTITY_FIELDS: &[&str] = &["vendor_id", "product_id", "topology", "serial"];
 const VIDEO_FIELDS: &[&str] = &["identity", "mode", "format_policy"];
 const AUDIO_FIELDS: &[&str] = &["kind", "source", "retained"];
-const PREFS_FIELDS: &[&str] = &["volume_percent", "muted", "fullscreen", "output"];
+const PREFS_FIELDS: &[&str] = &[
+    "volume_percent",
+    "muted",
+    "fullscreen",
+    "output",
+    "stats_hidden",
+];
 const OUTPUT_FIELDS: &[&str] = &["kind", "sink"];
 
 impl<'de> Deserialize<'de> for AppliedV1 {
@@ -387,7 +417,7 @@ impl<'de> Visitor<'de> for PreferencesVisitor {
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(
-            "a preferences object with volume_percent, muted, fullscreen and optional output",
+            "a preferences object with volume_percent, muted, fullscreen and optional output and stats_hidden",
         )
     }
 
@@ -399,6 +429,7 @@ impl<'de> Visitor<'de> for PreferencesVisitor {
         let mut muted: Option<bool> = None;
         let mut fullscreen: Option<bool> = None;
         let mut output: Option<Option<OutputV1>> = None;
+        let mut stats_hidden: Option<bool> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -429,6 +460,12 @@ impl<'de> Visitor<'de> for PreferencesVisitor {
                     // absent key defaults to `Auto`.
                     output = Some(Some(map.next_value::<OutputV1>()?));
                 }
+                "stats_hidden" => {
+                    if stats_hidden.is_some() {
+                        return Err(de::Error::duplicate_field("stats_hidden"));
+                    }
+                    stats_hidden = Some(map.next_value::<bool>()?);
+                }
                 other => return Err(de::Error::unknown_field(other, PREFS_FIELDS)),
             }
         }
@@ -439,6 +476,7 @@ impl<'de> Visitor<'de> for PreferencesVisitor {
             muted: muted.ok_or_else(|| de::Error::missing_field("muted"))?,
             fullscreen: fullscreen.ok_or_else(|| de::Error::missing_field("fullscreen"))?,
             output: output.flatten(),
+            stats_hidden: stats_hidden.unwrap_or(false),
         })
     }
 }
@@ -607,7 +645,7 @@ impl<'de> Deserialize<'de> for DocumentV1 {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_struct("DocumentV1", DOCUMENT_FIELDS, DocumentVisitor)
+        deserializer.deserialize_struct("DocumentV1", DOCUMENT_V1_FIELDS, DocumentVisitor)
     }
 }
 
@@ -651,7 +689,7 @@ impl<'de> Visitor<'de> for DocumentVisitor {
                     }
                     preferences = Some(map.next_value()?);
                 }
-                other => return Err(de::Error::unknown_field(other, DOCUMENT_FIELDS)),
+                other => return Err(de::Error::unknown_field(other, DOCUMENT_V1_FIELDS)),
             }
         }
 
@@ -662,7 +700,7 @@ impl<'de> Visitor<'de> for DocumentVisitor {
 
         // Unreachable through `decode` (the probe gates first) but keeps the
         // visitor self-contained if it is ever reused.
-        if schema_version != SCHEMA_VERSION {
+        if schema_version != 1 {
             return Err(de::Error::invalid_value(
                 de::Unexpected::Unsigned(schema_version),
                 &"schema_version 1",
@@ -672,6 +710,76 @@ impl<'de> Visitor<'de> for DocumentVisitor {
         Ok(DocumentV1 {
             applied,
             preferences,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for DocumentV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct("DocumentV2", DOCUMENT_V2_FIELDS, DocumentV2Visitor)
+    }
+}
+
+struct DocumentV2Visitor;
+
+impl<'de> Visitor<'de> for DocumentV2Visitor {
+    type Value = DocumentV2;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a version 2 source profile document object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut schema_version: Option<u64> = None;
+        let mut profiles: Option<Vec<ProfileV2>> = None;
+        let mut last_source: Option<Option<DeviceIdentityV1>> = None;
+        let mut preferences: Option<PreferencesV1> = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "schema_version" => {
+                    if schema_version.is_some() {
+                        return Err(de::Error::duplicate_field("schema_version"));
+                    }
+                    schema_version = Some(map.next_value()?);
+                }
+                "profiles" => {
+                    if profiles.is_some() {
+                        return Err(de::Error::duplicate_field("profiles"));
+                    }
+                    profiles = Some(map.next_value()?);
+                }
+                "last_source" => {
+                    if last_source.is_some() {
+                        return Err(de::Error::duplicate_field("last_source"));
+                    }
+                    last_source = Some(map.next_value()?);
+                }
+                "preferences" => {
+                    if preferences.is_some() {
+                        return Err(de::Error::duplicate_field("preferences"));
+                    }
+                    preferences = Some(map.next_value()?);
+                }
+                other => return Err(de::Error::unknown_field(other, DOCUMENT_V2_FIELDS)),
+            }
+        }
+        let version = schema_version.ok_or_else(|| de::Error::missing_field("schema_version"))?;
+        if version != SCHEMA_VERSION {
+            return Err(de::Error::invalid_value(
+                de::Unexpected::Unsigned(version),
+                &"schema_version 2",
+            ));
+        }
+        Ok(DocumentV2 {
+            profiles: profiles.ok_or_else(|| de::Error::missing_field("profiles"))?,
+            last_source: last_source.ok_or_else(|| de::Error::missing_field("last_source"))?,
+            preferences: preferences.ok_or_else(|| de::Error::missing_field("preferences"))?,
         })
     }
 }
@@ -831,22 +939,71 @@ impl<'de> Visitor<'de> for AudioVisitor {
 /// Three strictly separated passes over the same bytes:
 /// 1. syntax only (JSON well-formedness);
 /// 2. version discriminator, tolerant of unknown keys;
-/// 3. strict v1 shape, then validated domain conversion.
+/// 3. strict version-specific shape, then validated domain conversion.
 pub(crate) fn decode(bytes: &[u8]) -> Result<StoredDocument, SchemaError> {
     serde_json::from_slice::<IgnoredAny>(bytes).map_err(SchemaError::MalformedJson)?;
 
     let probe = serde_json::from_slice::<VersionProbe>(bytes).map_err(SchemaError::Schema)?;
-    if probe.schema_version != SCHEMA_VERSION {
-        return Err(SchemaError::UnsupportedVersion(probe.schema_version));
+    match probe.schema_version {
+        1 => {
+            let document =
+                serde_json::from_slice::<DocumentV1>(bytes).map_err(SchemaError::Schema)?;
+            stored_from_v1(document).map_err(SchemaError::InvalidValue)
+        }
+        SCHEMA_VERSION => {
+            let document =
+                serde_json::from_slice::<DocumentV2>(bytes).map_err(SchemaError::Schema)?;
+            stored_from_v2(document).map_err(SchemaError::InvalidValue)
+        }
+        version => Err(SchemaError::UnsupportedVersion(version)),
     }
-
-    let document = serde_json::from_slice::<DocumentV1>(bytes).map_err(SchemaError::Schema)?;
-    stored_from_document(document).map_err(SchemaError::InvalidValue)
 }
 
-fn stored_from_document(document: DocumentV1) -> Result<StoredDocument, SettingsValidationError> {
+fn stored_from_v1(document: DocumentV1) -> Result<StoredDocument, SettingsValidationError> {
+    let (profiles, last_source) = match document.applied {
+        Some(applied) => {
+            let settings = applied_from_dto(applied)?;
+            let identity = settings.video.identity.clone();
+            let binding = if identity.serial().is_some() {
+                ProfileBinding::Serial
+            } else {
+                ProfileBinding::Topology
+            };
+            (
+                SourceProfiles::new(vec![SourceProfile::new(binding, settings)?])?,
+                Some(identity),
+            )
+        }
+        None => (SourceProfiles::default(), None),
+    };
     Ok(StoredDocument {
-        applied: document.applied.map(applied_from_dto).transpose()?,
+        profiles,
+        last_source,
+        preferences: preferences_from_dto(document.preferences)?,
+    })
+}
+
+fn stored_from_v2(document: DocumentV2) -> Result<StoredDocument, SettingsValidationError> {
+    let entries = document
+        .profiles
+        .into_iter()
+        .map(|profile| {
+            let binding = match profile.binding {
+                BindingV2::Serial => ProfileBinding::Serial,
+                BindingV2::Topology => ProfileBinding::Topology,
+            };
+            Ok(SourceProfile::new(
+                binding,
+                applied_from_dto(profile.settings)?,
+            )?)
+        })
+        .collect::<Result<Vec<_>, SettingsValidationError>>()?;
+    let profiles = SourceProfiles::new(entries)?;
+    let last_source = document.last_source.map(identity_from_dto).transpose()?;
+    profiles.validate(last_source.as_ref())?;
+    Ok(StoredDocument {
+        profiles,
+        last_source,
         preferences: preferences_from_dto(document.preferences)?,
     })
 }
@@ -858,15 +1015,38 @@ fn stored_from_document(document: DocumentV1) -> Result<StoredDocument, Settings
 #[derive(Serialize)]
 struct DocumentWrite<'a> {
     schema_version: u64,
-    applied: Option<AppliedWrite<'a>>,
+    profiles: ProfilesWrite<'a>,
+    last_source: Option<DeviceIdentityWrite<'a>>,
     preferences: PreferencesWrite<'a>,
 }
 
-/// Borrowed wire view of the mutable preferences. `Auto` omits the `output`
-/// key entirely so documents stay byte-compatible with pre-output v1 readers;
-/// a manual choice serializes `{"kind":"manual","sink":…}`. Downgrade limit:
-/// such a document is refused by older builds (unknown `output` field); by
-/// design there is no migration path.
+struct ProfilesWrite<'a>(&'a SourceProfiles);
+
+impl Serialize for ProfilesWrite<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct ProfileWrite<'a> {
+            binding: BindingV2,
+            settings: AppliedWrite<'a>,
+        }
+        let mut sequence = serializer.serialize_seq(Some(self.0.entries().len()))?;
+        for profile in self.0.entries() {
+            let binding = match profile.binding() {
+                ProfileBinding::Serial => BindingV2::Serial,
+                ProfileBinding::Topology => BindingV2::Topology,
+            };
+            let settings = applied_to_dto(profile.settings());
+            sequence.serialize_element(&ProfileWrite { binding, settings })?;
+        }
+        sequence.end()
+    }
+}
+
+/// Borrowed preferences retain their existing optional output/stats markers.
+/// `Auto` omits the output key; manual choices carry only the user's identity.
 #[derive(Serialize)]
 struct PreferencesWrite<'a> {
     volume_percent: u8,
@@ -874,6 +1054,8 @@ struct PreferencesWrite<'a> {
     fullscreen: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<OutputWrite<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats_hidden: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -893,14 +1075,10 @@ struct SinkWrite<'a> {
 struct AppliedWrite<'a> {
     video: VideoWrite<'a>,
     audio: AudioWrite<'a>,
-    /// Borrowed, validated chain. Omitted only when the chain has no entries so
-    /// a pre-filters v1 document re-encodes byte-for-byte; a nonempty all-disabled
-    /// chain is serialized exactly.
+    /// Borrowed, validated chain; a nonempty all-disabled chain is preserved.
     #[serde(skip_serializing_if = "chain_is_empty")]
     filters: &'a FilterChain,
-    /// Borrowed, validated renderer. Omitted only when it is exactly the baseline
-    /// so a pre-renderer v1 document re-encodes byte-for-byte; any deviation
-    /// (including the reference fixture) is serialized in full.
+    /// Borrowed, validated renderer; every non-baseline value is written in full.
     #[serde(skip_serializing_if = "renderer_is_baseline")]
     renderer: &'a RendererSettings,
 }
@@ -909,8 +1087,7 @@ struct AppliedWrite<'a> {
 struct VideoWrite<'a> {
     identity: DeviceIdentityWrite<'a>,
     mode: CaptureModeV1,
-    /// Omitted for a manual pin so pre-policy v1 documents keep their exact
-    /// wire shape; only the automatic policy is recorded.
+    /// The existing payload convention: manual omits the marker, Auto records it.
     #[serde(skip_serializing_if = "Option::is_none")]
     format_policy: Option<FormatPolicyV1>,
 }
@@ -984,14 +1161,32 @@ fn renderer_is_baseline(renderer: &RendererSettings) -> bool {
 /// domain values: their borrowed wire views preserve those invariants without
 /// rebuilding strings/vectors or sorting already-normalized properties.
 pub(crate) fn encode(document: &StoredDocument) -> Result<Vec<u8>, EncodeError> {
-    let preferences = preferences_to_dto(&document.preferences)?;
-    let applied = match document.applied.as_ref() {
-        Some(applied) => Some(applied_to_dto(applied)?),
-        None => None,
-    };
+    encode_profiles(
+        &document.profiles,
+        document.last_source.as_ref(),
+        &document.preferences,
+    )
+}
+
+pub(crate) fn encode_profiles(
+    profiles: &SourceProfiles,
+    last_source: Option<&DeviceIdentity>,
+    preferences: &LocalPreferences,
+) -> Result<Vec<u8>, EncodeError> {
+    let preferences = preferences_to_dto(preferences)?;
+    profiles
+        .validate(last_source)
+        .map_err(SettingsValidationError::from)?;
+    // Public video requests are mutable, while each profile is privately held.
+    // Validate the complete collection before serialization, preserving typed
+    // errors for any invalid verified aggregate constructed by a caller.
+    for profile in profiles.entries() {
+        validate_video(&profile.settings().video)?;
+    }
     let document = DocumentWrite {
         schema_version: SCHEMA_VERSION,
-        applied,
+        profiles: ProfilesWrite(profiles),
+        last_source: last_source.map(identity_to_dto),
         preferences,
     };
     let mut bytes = serde_json::to_vec(&document).map_err(EncodeError::Serialize)?;
@@ -1003,13 +1198,14 @@ pub(crate) fn encode(document: &StoredDocument) -> Result<Vec<u8>, EncodeError> 
 // Domain conversions
 // ---------------------------------------------------------------------------
 
-fn applied_to_dto(applied: &DraftSettings) -> Result<AppliedWrite<'_>, SettingsValidationError> {
-    Ok(AppliedWrite {
-        video: video_to_dto(&applied.video)?,
+/// Borrowed wire views are built only after `encode` validates every profile.
+fn applied_to_dto(applied: &DraftSettings) -> AppliedWrite<'_> {
+    AppliedWrite {
+        video: video_to_dto(&applied.video),
         audio: audio_to_dto(&applied.audio),
         filters: &applied.filters,
         renderer: &applied.renderer,
-    })
+    }
 }
 
 fn applied_from_dto(applied: AppliedV1) -> Result<DraftSettings, SettingsValidationError> {
@@ -1021,36 +1217,28 @@ fn applied_from_dto(applied: AppliedV1) -> Result<DraftSettings, SettingsValidat
     })
 }
 
-fn video_to_dto(video: &VideoRequest) -> Result<VideoWrite<'_>, SettingsValidationError> {
-    // Only a proven concrete opening may be persisted: an unresolved request
-    // must never be written as if a mode had been verified.
+fn validate_video(video: &VideoRequest) -> Result<(), SettingsValidationError> {
     if video.resolved_fourcc.is_none() {
         return Err(SettingsValidationError::UnresolvedVideo);
     }
-    // The domain resolution invariant is the single authority on what a proven
-    // opening is: a manual pin must equal the resolved concrete and an
-    // automatic resolution must be one of YUYV/NV12/MJPG. A constructed
-    // document that violates it must refuse rather than persist a fake proof.
+    if video.resolved_mode().is_none() {
+        return Err(SettingsValidationError::VideoFormatPolicyMismatch);
+    }
+    Ok(())
+}
+
+fn video_to_dto(video: &VideoRequest) -> VideoWrite<'_> {
+    // The private writer is constructed only after the entire document passes
+    // typed validation. Do not repeat resolution or allocate intermediate views.
     let concrete = video
-        .resolved_mode()
-        .ok_or(SettingsValidationError::VideoFormatPolicyMismatch)?
-        .captured_fourcc;
+        .resolved_fourcc
+        .expect("document video validated before serialization");
     let format_policy = match video.mode.format_policy {
         InputFormatPolicy::Auto => Some(FormatPolicyV1::Auto),
         InputFormatPolicy::Manual { .. } => None,
     };
-    let identity = &video.identity;
-    let topology = identity.topology();
-    Ok(VideoWrite {
-        identity: DeviceIdentityWrite {
-            vendor_id: identity.vendor_id(),
-            product_id: identity.product_id(),
-            topology: UsbTopologyWrite {
-                controller: topology.controller(),
-                ports: topology.ports(),
-            },
-            serial: identity.serial(),
-        },
+    VideoWrite {
+        identity: identity_to_dto(&video.identity),
         mode: CaptureModeV1 {
             captured_fourcc: concrete.kernel_value(),
             width: video.mode.size.width(),
@@ -1061,7 +1249,7 @@ fn video_to_dto(video: &VideoRequest) -> Result<VideoWrite<'_>, SettingsValidati
             },
         },
         format_policy,
-    })
+    }
 }
 
 fn video_from_dto(video: VideoV1) -> Result<VideoRequest, SettingsValidationError> {
@@ -1070,14 +1258,7 @@ fn video_from_dto(video: VideoV1) -> Result<VideoRequest, SettingsValidationErro
         mode,
         format_policy,
     } = video;
-    let DeviceIdentityV1 {
-        vendor_id,
-        product_id,
-        topology,
-        serial,
-    } = identity;
-    let topology = UsbTopology::new(topology.controller, topology.ports)?;
-    let identity = DeviceIdentity::new(vendor_id, product_id, topology, serial)?;
+    let identity = identity_from_dto(identity)?;
 
     // The stored concrete format is the proven opening. An absent marker is the
     // legacy manual pin; the `"auto"` marker keeps the historical concrete as
@@ -1103,10 +1284,32 @@ fn video_from_dto(video: VideoV1) -> Result<VideoRequest, SettingsValidationErro
     // marker paired with a manual-only or unrecognized FourCC must be refused at
     // the same domain invariant that guards the encode side rather than loaded as
     // a poison baseline (startup Auto clearing repairs a live mode, not the store).
-    if request.resolved_mode().is_none() {
-        return Err(SettingsValidationError::VideoFormatPolicyMismatch);
-    }
+    validate_video(&request)?;
     Ok(request)
+}
+
+fn identity_to_dto(identity: &DeviceIdentity) -> DeviceIdentityWrite<'_> {
+    DeviceIdentityWrite {
+        vendor_id: identity.vendor_id(),
+        product_id: identity.product_id(),
+        topology: UsbTopologyWrite {
+            controller: identity.topology().controller(),
+            ports: identity.topology().ports(),
+        },
+        serial: identity.serial(),
+    }
+}
+
+fn identity_from_dto(
+    identity: DeviceIdentityV1,
+) -> Result<DeviceIdentity, SettingsValidationError> {
+    let topology = UsbTopology::new(identity.topology.controller, identity.topology.ports)?;
+    Ok(DeviceIdentity::new(
+        identity.vendor_id,
+        identity.product_id,
+        topology,
+        identity.serial,
+    )?)
 }
 
 fn audio_to_dto(selection: &AudioSelection) -> AudioWrite<'_> {
@@ -1167,6 +1370,7 @@ fn preferences_to_dto(
         muted: gain.muted,
         fullscreen: preferences.fullscreen,
         output,
+        stats_hidden: preferences.stats_hidden.then_some(true),
     })
 }
 
@@ -1188,5 +1392,6 @@ fn preferences_from_dto(
         gain: PlaybackGain::new(preferences.volume_percent, preferences.muted)?,
         fullscreen: preferences.fullscreen,
         output,
+        stats_hidden: preferences.stats_hidden,
     })
 }

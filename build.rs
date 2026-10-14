@@ -1,6 +1,8 @@
 use std::{path::Path, process::Command};
 
-use cxx_qt_build::{CppFile, CxxQtBuilder, MocArguments, QmlModule};
+use cxx_qt_build::{
+    CppFile, CxxQtBuilder, MocArguments, QResource, QResources, QmlFile, QmlModule,
+};
 
 fn tool_output(command: &mut Command, name: &str) -> String {
     let result = command
@@ -77,18 +79,46 @@ fn main() {
         Command::new("pkg-config").args(["--cflags", "x11", "xcb", "xcb-shape"]),
         "X11/XCB/XCB-SHAPE development prerequisites",
     );
-    let builder =
-        CxxQtBuilder::new_qml_module(QmlModule::new("dev.antho.furami").qml_file("qml/Main.qml"))
-            .file("src/ui/bridge.rs")
-            .qt_module("Quick")
-            .cpp_file("src/native_host/host.cpp")
-            .cpp_file(
-                CppFile::from("src/native_host/host.h")
-                    .compile(false)
-                    .moc(true)
-                    .moc_arguments(MocArguments::default().uri("dev.antho.furami")),
-            )
-            .include_dir("src/native_host");
+    // Every QML file in qml/ is registered explicitly in the module. The three
+    // token, projection and chrome-visibility files are singletons.
+    let mut qml_files: Vec<std::path::PathBuf> = std::fs::read_dir("qml")
+        .expect("qml directory")
+        .map(|entry| entry.expect("qml entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "qml"))
+        .collect();
+    qml_files.sort();
+    assert!(!qml_files.is_empty(), "no QML files found to register");
+    let singletons = ["qml/Brume.qml", "qml/Chrome.qml", "qml/Projection.qml"];
+    let qml_module = QmlModule::new("dev.antho.furami").qml_files(qml_files.iter().map(|path| {
+        let file = QmlFile::from(path.clone());
+        if path.to_str().is_some_and(|name| singletons.contains(&name)) {
+            file.singleton(true)
+        } else {
+            file
+        }
+    }));
+
+    // Bundled chrome icons and their attribution ship inside the binary; no
+    // icon is ever loaded from a URL or from an OS theme at runtime.
+    let mut resources: Vec<String> = std::fs::read_dir("qml/icons")
+        .expect("qml/icons directory")
+        .map(|entry| entry.expect("qml/icons entry").path())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    resources.sort();
+
+    let builder = CxxQtBuilder::new_qml_module(qml_module)
+        .qrc_resources(QResources::new().resource(QResource::new().files(resources)))
+        .file("src/ui/bridge.rs")
+        .qt_module("Quick")
+        .cpp_file("src/native_host/host.cpp")
+        .cpp_file(
+            CppFile::from("src/native_host/host.h")
+                .compile(false)
+                .moc(true)
+                .moc_arguments(MocArguments::default().uri("dev.antho.furami")),
+        )
+        .include_dir("src/native_host");
     // SAFETY: With CXX-Qt pinned to 0.10.0, this closure only appends pkg-config's
     // native prerequisite flags. It does not replace generated inputs or change
     // CXX-Qt's compiler language, C++ standard, or ownership configuration.

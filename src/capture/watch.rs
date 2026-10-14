@@ -311,7 +311,11 @@ pub(super) struct ObservationWorker {
 }
 impl ObservationWorker {
     pub(super) fn new() -> Self {
-        Self::spawn(None)
+        Self::spawn(
+            None,
+            #[cfg(test)]
+            None,
+        )
     }
     #[cfg(test)]
     pub(super) fn fixture() -> Self {
@@ -319,9 +323,20 @@ impl ObservationWorker {
     }
     #[cfg(test)]
     pub(super) fn fixture_with_audio_catalog(catalog: Vec<audio::AudioSource>) -> Self {
-        Self::spawn(Some(catalog))
+        Self::spawn(Some(catalog), None)
     }
-    fn spawn(fixture_catalog: Option<Vec<audio::AudioSource>>) -> Self {
+    /// Explicit advertised capabilities for unresolved Auto test requests.
+    #[cfg(test)]
+    pub(super) fn fixture_with_snapshot(
+        snapshot: linux::CaptureSnapshot,
+        catalog: Vec<audio::AudioSource>,
+    ) -> Self {
+        Self::spawn(Some(catalog), Some(snapshot))
+    }
+    fn spawn(
+        fixture_catalog: Option<Vec<audio::AudioSource>>,
+        #[cfg(test)] fixture_snapshot: Option<linux::CaptureSnapshot>,
+    ) -> Self {
         let pair = UnixStream::pair().and_then(|(reader, writer)| {
             reader.set_nonblocking(true)?;
             writer.set_nonblocking(true)?;
@@ -349,7 +364,13 @@ impl ObservationWorker {
                 .name("furami-capture-observation".into())
                 .spawn(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run(worker.clone(), reader, fixture_catalog);
+                        run(
+                            worker.clone(),
+                            reader,
+                            fixture_catalog,
+                            #[cfg(test)]
+                            fixture_snapshot,
+                        );
                     }));
                     let mut slots = worker.0.slots.lock();
                     if !worker.0.stop.load(Ordering::Acquire)
@@ -816,6 +837,7 @@ fn run(
     observer: Observer,
     mut reader: UnixStream,
     fixture_catalog: Option<Vec<audio::AudioSource>>,
+    #[cfg(test)] fixture_snapshot: Option<linux::CaptureSnapshot>,
 ) {
     let fixture = fixture_catalog.is_some();
     let mut monitor = if fixture {
@@ -946,10 +968,13 @@ fn run(
                 _ => {
                     #[cfg(test)]
                     if fixture {
-                        Ok(linux::session_fixture(
-                            &["/dev/video0"],
-                            requested.video.fixture_mode(),
-                        ))
+                        match &fixture_snapshot {
+                            Some(snapshot) => Ok(snapshot.clone()),
+                            None => Ok(linux::session_fixture(
+                                &["/dev/video0"],
+                                requested.video.fixture_mode(),
+                            )),
+                        }
                     } else {
                         discover_snapshot(&requested)
                     }

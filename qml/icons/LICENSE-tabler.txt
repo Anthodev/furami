@@ -1,0 +1,40 @@
+Furami chrome icons — attribution and license
+=============================================
+
+The outline glyphs shipped in this directory follow the Tabler Icons design
+language (24x24 grid, outline strokes, 2 px stroke width, round caps and
+joins). They were adapted for Furami's chrome and are bundled as resources so
+no icon is ever fetched from a URL or from an OS theme at runtime.
+
+The stroke colour is written as an opaque white so every glyph is a clean
+alpha mask: Qt Quick Controls tints buttons through CompositionMode_SourceIn
+and the MultiEffect path in BrumeIcon lifts the source to white before
+colourising, so the rendered colour is exactly the requested Brume token.
+
+Icons used: camera, headphones, maximize, minimize, refresh, settings,
+adjustments, filter, palette, check, x, play, pause, chevron-down, volume,
+volume-off.
+
+--------------------------------------------------------------------------
+Tabler Icons
+Copyright (c) 2020-2024 Paweł Kuna
+Licensed under the MIT License
+https://github.com/tabler/tabler-icons
+--------------------------------------------------------------------------
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

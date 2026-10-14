@@ -18,10 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
-use crate::domain::capture::PlaybackGain;
+use crate::domain::capture::{DeviceIdentity, PlaybackGain};
 use crate::domain::output::PersistentOutputChoice;
-use crate::domain::state::{AppliedSettings, DraftSettings};
 
+use super::profiles::SourceProfiles;
 use super::schema::{self, EncodeError, SchemaError};
 
 // ---------------------------------------------------------------------------
@@ -37,18 +37,24 @@ use super::schema::{self, EncodeError, SchemaError};
 /// `output` key decodes to [`PersistentOutputChoice::Auto`]. Downgrade limit:
 /// a document written with a manual choice carries that key and is refused by
 /// builds that predate it; by design there is no migration path.
+///
+/// Stream statistics are shown by default. `stats_hidden` is optional on disk;
+/// only `true` is encoded. Older strict readers refuse documents carrying it,
+/// without modifying the original file or attempting a downgrade migration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalPreferences {
     pub gain: PlaybackGain,
     pub fullscreen: bool,
     pub output: PersistentOutputChoice,
+    pub stats_hidden: bool,
 }
 
-/// The complete persisted document: last verified applied settings, if any,
-/// plus local preferences.
+/// The complete persisted document: all verified source profiles, the exact
+/// last successful source identity, and unchanged global preferences.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredDocument {
-    pub applied: Option<DraftSettings>,
+    pub profiles: SourceProfiles,
+    pub last_source: Option<DeviceIdentity>,
     pub preferences: LocalPreferences,
 }
 
@@ -81,7 +87,7 @@ pub enum SettingsLoadError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("settings file at {path} violates schema v1: {source}")]
+    #[error("settings file at {path} violates its versioned schema: {source}")]
     Schema {
         path: PathBuf,
         #[source]
@@ -332,10 +338,12 @@ impl SettingsStore {
         self.snapshot.as_ref()
     }
 
-    /// Persists verified applied settings plus preferences.
-    pub fn save_applied(
+    /// Persists the session's complete verified collection and global preferences.
+    /// The published snapshot changes only after the atomic rename commits.
+    pub fn save_profiles(
         &mut self,
-        applied: &AppliedSettings,
+        profiles: &SourceProfiles,
+        last_source: Option<&DeviceIdentity>,
         preferences: LocalPreferences,
     ) -> Result<WriteOutcome, SettingsWriteError> {
         if self.refused {
@@ -343,42 +351,35 @@ impl SettingsStore {
                 path: self.path.clone(),
             });
         }
-        let document = StoredDocument {
-            applied: Some(applied.settings().clone()),
+        let bytes =
+            schema::encode_profiles(profiles, last_source, &preferences).map_err(|error| {
+                match error {
+                    EncodeError::InvalidValue(source) => {
+                        SettingsWriteError::InvalidValue { source }
+                    }
+                    EncodeError::Serialize(source) => SettingsWriteError::Serialize { source },
+                }
+            })?;
+        let outcome = self.atomic_write(&bytes)?;
+        // The only collection copy supplies ownership to the committed snapshot;
+        // validation and failed pre-commit writes never clone the working state.
+        self.snapshot = Some(StoredDocument {
+            profiles: profiles.clone(),
+            last_source: last_source.cloned(),
             preferences,
-        };
-        self.commit(document)
+        });
+        Ok(outcome)
     }
 
-    /// Persists preferences only, preserving the published applied settings.
-    pub fn save_preferences(
-        &mut self,
-        preferences: LocalPreferences,
-    ) -> Result<WriteOutcome, SettingsWriteError> {
-        if self.refused {
-            return Err(SettingsWriteError::RefusedOriginal {
-                path: self.path.clone(),
-            });
-        }
-        let applied = self
-            .snapshot
-            .as_ref()
-            .and_then(|stored| stored.applied.clone());
-        self.commit(StoredDocument {
-            applied,
-            preferences,
-        })
-    }
-
-    /// Explicit, authorized replacement of the whole document: applied is
-    /// cleared and preferences are written. The only write allowed to clear
-    /// a refusal; refusal is cleared only after the write committed.
+    /// Explicit, authorized replacement: profiles and last_source are cleared,
+    /// preserving current global preferences. A refusal clears only after commit.
     pub fn reset(
         &mut self,
         preferences: LocalPreferences,
     ) -> Result<WriteOutcome, SettingsWriteError> {
         let outcome = self.commit(StoredDocument {
-            applied: None,
+            profiles: SourceProfiles::default(),
+            last_source: None,
             preferences,
         })?;
         self.refused = false;
