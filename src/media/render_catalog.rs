@@ -5,35 +5,31 @@
 //! `video/out/vo_gpu_next.c::map_scaler`, libplacebo
 //! cee9b076f2c63104ccfd497fa79c39a867293ec4 `src/filters.c` / `src/filters.h`.
 //! The captured fixture provenance records the binary identity separately.
-use super::filter_catalog::{self, FilterCapabilities, FilterCatalogError};
 use crate::domain::render::{
     DitherMode, RendererProperty, RendererSettings, ScalerChoice, ScalerKernel,
 };
 use std::{
     ffi::CStr,
     path::{Path, PathBuf},
-    process::Output,
+    process::{Command, Output},
 };
 use thiserror::Error;
 
-#[derive(Debug)]
-pub struct QualifiedTreatmentCapabilities {
-    pub filters: Result<FilterCapabilities, FilterCatalogError>,
-    pub renderer: Result<RendererCapabilities, RendererCatalogError>,
-}
-impl QualifiedTreatmentCapabilities {
-    pub fn query(prefix: &Path) -> Self {
-        Self {
-            filters: filter_catalog::query_qualified_capabilities(prefix),
-            renderer: query_qualified_capabilities(prefix),
-        }
-    }
-}
+const QUALIFIED_MPV_VERSION: &str = "v0.41.0";
+const QUALIFIED_FFMPEG_VERSION: &str = "8.1.2";
 
 #[derive(Debug, Error)]
 pub enum RendererCatalogError {
-    #[error("renderer qualification failed: {0}")]
-    Qualification(#[from] FilterCatalogError),
+    #[error("invalid qualified media prefix: {detail}")]
+    InvalidPrefix { detail: String },
+    #[error("malformed qualified version output: {reason}")]
+    MalformedVersion { reason: &'static str },
+    #[error("qualified {component} version mismatch: expected {expected}, got {actual}")]
+    QualificationMismatch {
+        component: &'static str,
+        expected: &'static str,
+        actual: String,
+    },
     #[error("renderer {argument} query could not execute: {source}")]
     QueryExecution {
         argument: &'static str,
@@ -124,16 +120,92 @@ fn run(
     executable: &Path,
     argument: &'static str,
 ) -> Result<String, RendererCatalogError> {
-    let output = filter_catalog::qualified_argument_command(prefix, executable, argument)
+    let output = qualified_argument_command(prefix, executable, argument)
         .output()
         .map_err(|source| RendererCatalogError::QueryExecution { argument, source })?;
     query_text(argument, output)
 }
+fn qualified_executable(prefix: &Path) -> Result<(PathBuf, PathBuf), RendererCatalogError> {
+    if !prefix.is_absolute() || !prefix.is_dir() {
+        return Err(RendererCatalogError::InvalidPrefix {
+            detail: "prefix must be an absolute existing directory".to_owned(),
+        });
+    }
+    let prefix = prefix
+        .canonicalize()
+        .map_err(|error| RendererCatalogError::InvalidPrefix {
+            detail: error.to_string(),
+        })?;
+    let executable = prefix.join("bin/mpv").canonicalize().map_err(|error| {
+        RendererCatalogError::InvalidPrefix {
+            detail: format!("bin/mpv: {error}"),
+        }
+    })?;
+    if !executable.starts_with(&prefix) || !executable.is_file() {
+        return Err(RendererCatalogError::InvalidPrefix {
+            detail: "bin/mpv must resolve to a file within the qualified prefix".to_owned(),
+        });
+    }
+    Ok((prefix, executable))
+}
+
+fn qualified_argument_command(prefix: &Path, executable: &Path, argument: &str) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .arg("--no-config")
+        .arg(argument)
+        .env_clear()
+        .env("LD_LIBRARY_PATH", prefix.join("lib"))
+        .env("LC_ALL", "C");
+    command
+}
+
+fn parse_versions(text: &str) -> Result<(), RendererCatalogError> {
+    let malformed = |reason| RendererCatalogError::MalformedVersion { reason };
+    let mut mpv = None;
+    let mut ffmpeg = None;
+    for line in text.lines() {
+        if line == "mpv" || line.starts_with("mpv ") {
+            if mpv.is_some() {
+                return Err(malformed("duplicate mpv version"));
+            }
+            mpv = line.split_ascii_whitespace().nth(1);
+            if mpv.is_none() {
+                return Err(malformed("missing mpv version token"));
+            }
+        } else if let Some(version) = line.strip_prefix("FFmpeg version:") {
+            if ffmpeg.is_some() {
+                return Err(malformed("duplicate FFmpeg version"));
+            }
+            let mut tokens = version.split_ascii_whitespace();
+            ffmpeg = tokens.next();
+            if ffmpeg.is_none() || tokens.next().is_some() {
+                return Err(malformed("invalid FFmpeg version token"));
+            }
+        }
+    }
+    let mpv = mpv.ok_or_else(|| malformed("missing mpv version"))?;
+    let ffmpeg = ffmpeg.ok_or_else(|| malformed("missing FFmpeg version"))?;
+    for (component, expected, actual) in [
+        ("mpv", QUALIFIED_MPV_VERSION, mpv),
+        ("FFmpeg", QUALIFIED_FFMPEG_VERSION, ffmpeg),
+    ] {
+        if actual != expected {
+            return Err(RendererCatalogError::QualificationMismatch {
+                component,
+                expected,
+                actual: actual.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn query_qualified_capabilities(
     prefix: &Path,
 ) -> Result<RendererCapabilities, RendererCatalogError> {
-    let (prefix, executable) = filter_catalog::qualified_executable(prefix)?;
-    filter_catalog::parse_versions(&run(&prefix, &executable, "--version")?)?;
+    let (prefix, executable) = qualified_executable(prefix)?;
+    parse_versions(&run(&prefix, &executable, "--version")?)?;
     let list = run(&prefix, &executable, "--list-options")?;
     let helps = [
         run(&prefix, &executable, "--scale=help")?,
@@ -550,14 +622,32 @@ mod tests {
             stdout,
             stderr: vec![],
         };
-        assert!(matches!(
-            query_text("--list-options", output(256, vec![])),
-            Err(RendererCatalogError::QueryFailed { .. })
-        ));
-        assert!(matches!(
-            query_text("--list-options", output(0, vec![255])),
-            Err(RendererCatalogError::InvalidEncoding { .. })
-        ));
+        for argument in [
+            "--version",
+            "--list-options",
+            "--scale=help",
+            "--cscale=help",
+            "--dscale=help",
+            "--dither=help",
+        ] {
+            for (raw_status, expected_status) in [(7 << 8, Some(7)), (9, None)] {
+                assert!(matches!(
+                    query_text(argument, output(raw_status, vec![])),
+                    Err(RendererCatalogError::QueryFailed { argument: actual, status, .. })
+                        if actual == argument && status == expected_status
+                ));
+            }
+            assert!(matches!(
+                query_text(argument, output(0, vec![255])),
+                Err(RendererCatalogError::InvalidEncoding { argument: actual }) if actual == argument
+            ));
+            let mut invalid_stderr = output(0, vec![]);
+            invalid_stderr.stderr = vec![255];
+            assert!(matches!(
+                query_text(argument, invalid_stderr),
+                Err(RendererCatalogError::InvalidEncoding { argument: actual }) if actual == argument
+            ));
+        }
     }
 }
 
@@ -565,12 +655,140 @@ mod tests {
 mod boundary_tests {
     use super::*;
     #[test]
+    fn version_query_requires_exact_unique_pinned_versions() {
+        const VERSION: &str = "mpv v0.41.0\nFFmpeg version: 8.1.2\n";
+        assert!(parse_versions(VERSION).is_ok());
+        for (from, to, component) in [
+            ("v0.41.0", "v0.41.01", "mpv"),
+            ("8.1.2", "8.1.20", "FFmpeg"),
+        ] {
+            assert!(matches!(parse_versions(&VERSION.replace(from, to)),
+                Err(RendererCatalogError::QualificationMismatch { component: actual, .. }) if actual == component));
+        }
+        for text in [
+            "",
+            "mpv v0.41.0\n",
+            "FFmpeg version: 8.1.2\n",
+            "mpv v0.41.0\nmpv v0.41.0\nFFmpeg version: 8.1.2\n",
+            "mpv v0.41.0\nFFmpeg version: 8.1.2\nFFmpeg version: 8.1.2\n",
+            "mpv\nFFmpeg version: 8.1.2\n",
+            "mpv v0.41.0\nFFmpeg version:\n",
+            "mpv v0.41.0\nFFmpeg version: 8.1.2 trailing\n",
+        ] {
+            assert!(matches!(
+                parse_versions(text),
+                Err(RendererCatalogError::MalformedVersion { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn qualified_command_keeps_fixed_arguments_and_only_qualified_environment() {
+        let prefix = Path::new("/qualified/prefix with spaces");
+        let executable = prefix.join("bin/mpv");
+        for argument in [
+            "--version",
+            "--list-options",
+            "--scale=help",
+            "--cscale=help",
+            "--dscale=help",
+            "--dither=help",
+        ] {
+            let command = qualified_argument_command(prefix, &executable, argument);
+            assert_eq!(command.get_program(), executable.as_os_str());
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                vec![
+                    std::ffi::OsStr::new("--no-config"),
+                    std::ffi::OsStr::new(argument)
+                ]
+            );
+            let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+            assert_eq!(environment.len(), 2);
+            assert_eq!(
+                environment[std::ffi::OsStr::new("LD_LIBRARY_PATH")],
+                Some(prefix.join("lib").as_os_str())
+            );
+            assert_eq!(
+                environment[std::ffi::OsStr::new("LC_ALL")],
+                Some(std::ffi::OsStr::new("C"))
+            );
+        }
+    }
+
+    #[test]
+    fn missing_prefix_and_unexecutable_queries_are_typed() {
+        assert!(matches!(
+            query_qualified_capabilities(Path::new("/furami-nonexistent-qualified-prefix")),
+            Err(RendererCatalogError::InvalidPrefix { .. })
+        ));
+        assert!(matches!(
+            run(
+                Path::new("/qualified/prefix"),
+                Path::new("/furami-nonexistent-mpv"),
+                "--version"
+            ),
+            Err(RendererCatalogError::QueryExecution {
+                argument: "--version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn canonical_executable_is_confined_and_prefix_is_canonical() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        struct OwnedDirectory(PathBuf);
+        impl Drop for OwnedDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "furami-renderer-catalog-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let owned = OwnedDirectory(path);
+        let prefix = owned.0.join("prefix");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let outside = owned.0.join("outside-mpv");
+        std::fs::write(&outside, b"never execute this outside-prefix file").unwrap();
+        let executable = prefix.join("bin/mpv");
+        symlink(&outside, &executable).unwrap();
+        assert!(matches!(
+            qualified_executable(&prefix),
+            Err(RendererCatalogError::InvalidPrefix { .. })
+        ));
+        std::fs::remove_file(&executable).unwrap();
+        let inside = prefix.join("bin/qualified-mpv");
+        std::fs::write(
+            &inside,
+            b"prefix confinement fixture, not a genuine catalog",
+        )
+        .unwrap();
+        symlink(&inside, &executable).unwrap();
+        let alias = owned.0.join("prefix-alias");
+        symlink(&prefix, &alias).unwrap();
+        assert_eq!(
+            qualified_executable(&alias).unwrap(),
+            (
+                prefix.canonicalize().unwrap(),
+                inside.canonicalize().unwrap()
+            )
+        );
+    }
+
+    #[test]
     fn invalid_prefix_is_refused_without_discovery() {
         assert!(matches!(
             query_qualified_capabilities(Path::new("relative")),
-            Err(RendererCatalogError::Qualification(
-                FilterCatalogError::InvalidPrefix { .. }
-            ))
+            Err(RendererCatalogError::InvalidPrefix { .. })
         ));
     }
     #[test]

@@ -3,6 +3,7 @@
 
 pub mod apply;
 pub(crate) mod control;
+pub(crate) mod diagnostic;
 pub(crate) mod gate;
 pub mod output;
 pub mod ports;

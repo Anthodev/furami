@@ -18,13 +18,15 @@ const EFFECTIVE_BUNDLE: &str = "effective";
 const HIGHRES_BUNDLE: &str = "highres";
 
 /// Expected exact facts shared by both bundles (same build-G stack).
-const STACK_SHA256: &str = "bd2e290c5c094eaf19536dc91251e4304dc6d46c546df640fa4ece96bcb03cee";
+pub(crate) const STACK_SHA256: &str =
+    "bd2e290c5c094eaf19536dc91251e4304dc6d46c546df640fa4ece96bcb03cee";
 const MPV_SHA256: &str = "d926eadbdfd76f3dc8cb773f9fb7e3a8ab0047ca4e7148807c9e33b67985f6f2";
 const FFMPEG_SHA256: &str = "1c38d09555005425ea30f80e03bfb45c4a65a3880013ed72d56658e2d416744e";
 const GPU_DEVICE_NAME: &str = "AMD Radeon RX 7900 XTX (RADV NAVI31)";
-const CAPTURE_SOURCE: &str = "alsa_input.usb-GENKI_ShadowCast_3_KT044001-02.analog-stereo";
+pub(crate) const CAPTURE_SOURCE: &str =
+    "alsa_input.usb-GENKI_ShadowCast_3_KT044001-02.analog-stereo";
 const K7_SINK: &str = "alsa_output.usb-Fosi_Audio_Fosi_Audio_K7-00.analog-stereo";
-const EFFECTIVE_SINK: &str = "easyeffects_sink";
+pub(crate) const EFFECTIVE_SINK: &str = "easyeffects_sink";
 
 fn sha256(data: &[u8]) -> String {
     // Compact FIPS 180-4 implementation; avoids a new dependency.
@@ -212,7 +214,7 @@ fn load_bundle(name: &str) -> ProbeCollection {
     }
 }
 
-fn capabilities(bundle: &str) -> ProbeCollection {
+pub(crate) fn capabilities(bundle: &str) -> ProbeCollection {
     let probes = load_bundle(bundle);
     Capabilities::from_probes(&probes).expect("recorded stack identity parses");
     probes

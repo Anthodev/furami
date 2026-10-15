@@ -227,11 +227,15 @@ impl PersistenceSession {
                 let (store, outcome) = SettingsStore::load(path);
                 session.load_status = match outcome {
                     LoadOutcome::Missing => "First-use session preferences (not restored); they save at safe application close.".into(),
-                    LoadOutcome::Loaded(document) => {
+                    LoadOutcome::Loaded { document, retired_filters_present } => {
                         session.preferences = document.preferences;
                         session.profiles = document.profiles;
                         session.last_source = document.last_source;
-                        "Saved local preferences restored.".into()
+                        if retired_filters_present {
+                            "Anciens filtres ignorés ; les autres réglages sont conservés. Les anciennes données de filtres seront définitivement retirées du fichier de réglages, sans supprimer ce fichier, lors de la prochaine sauvegarde autorisée. Après cette sauvegarde au format v3, les anciens builds refuseront le fichier et revenir à un ancien binaire ne restaurera pas les filtres. Avant cette sauvegarde, les octets du fichier restent inchangés.".into()
+                        } else {
+                            "Saved local preferences restored.".into()
+                        }
                     }
                     LoadOutcome::Refused(error) => format!("Settings file refused: {error}. Original preserved. ALL automatic saves are blocked; session preference changes will NOT survive relaunch until explicit reset. Current values are initial session values, not restored."),
                 };
@@ -262,13 +266,23 @@ impl PersistenceSession {
     pub fn set_stats_hidden_preference(&mut self, hidden: bool) {
         self.preferences.stats_hidden = hidden;
     }
+    /// Replaces the diagnostic-logging opt-in in place. Off is the default for
+    /// missing or strictly refused settings; the mutator only records the
+    /// session preference and never writes the file eagerly.
+    pub fn set_logging_enabled_preference(&mut self, enabled: bool) {
+        self.preferences.logging_enabled = enabled;
+    }
     pub fn saved_selection(&self) -> Option<DraftSettings> {
+        self.saved_selection_ref().cloned()
+    }
+    /// Lets diagnostics check its work budget before copying private settings.
+    pub(crate) fn saved_selection_ref(&self) -> Option<&DraftSettings> {
         let identity = self.last_source.as_ref()?;
         self.profiles
             .entries()
             .iter()
             .find(|profile| &profile.settings().video.identity == identity)
-            .map(|profile| profile.settings().clone())
+            .map(|profile| profile.settings())
     }
     pub fn source_profile(
         &self,
@@ -435,7 +449,6 @@ impl PersistenceSession {
                     && applied.settings().video.mode == submitted.settings.video.mode
                     && applied.settings().video.resolved_mode().is_some()
                     && applied.settings().audio == submitted.settings.audio
-                    && applied.settings().filters == submitted.settings.filters
                     && applied.settings().renderer == submitted.settings.renderer =>
             {
                 applied
@@ -660,7 +673,6 @@ mod tests {
     }
     fn selection(rate: u32) -> DraftSettings {
         DraftSettings {
-            filters: crate::domain::filters::FilterChain::default(),
             video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                 identity: DeviceIdentity::new(
                     0x1234,
@@ -706,7 +718,7 @@ mod tests {
         .unwrap()
     }
     /// Open aggregate keyed to the physical opening: the media owner returns it
-    /// only after nine native renderer readbacks plus its vf proof.
+    /// only after nine native renderer readbacks and matching playback.
     fn verify_open(model: &mut ProductModel, key: crate::domain::state::AttemptKey) {
         let request = model.opening_request().expect("opening request for proof");
         let treatment = crate::domain::state::TreatmentAttemptKey {
@@ -759,7 +771,7 @@ mod tests {
         preferences: LocalPreferences,
     }
     fn load_document(path: PathBuf) -> LoadedSelection {
-        let (_, LoadOutcome::Loaded(document)) = SettingsStore::load(path) else {
+        let (_, LoadOutcome::Loaded { document, .. }) = SettingsStore::load(path) else {
             panic!("document not loadable")
         };
         let applied = document.last_source.as_ref().and_then(|identity| {
@@ -891,108 +903,58 @@ mod tests {
         assert_eq!(chosen.draft, Some(explicit));
     }
     #[test]
-    fn confirmed_nonempty_treatments_save_complete_chain_for_both_receipt_variants() {
-        use crate::domain::filters::{
-            ColorLevels, EqParams, EqValues, Filter, FilterChain, FilterEntry, FormatParams,
-            Hqdn3dParams, Hqdn3dValues, SdrGamma, SdrMatrix,
-        };
+    fn confirmed_renderer_saves_complete_settings_for_both_receipt_variants() {
         use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
-        for live_filters in [false, true] {
-            for all_disabled in [false, true] {
-                let temp = Temp::new();
-                let mut session = PersistenceSession::load(Ok(temp.file()));
-                let mut submitted = selection(60000);
-                submitted.filters = FilterChain::new(vec![
-                    FilterEntry::new(
-                        "SDR\u{a0}matrix".into(),
-                        Filter::Format(FormatParams::new(
-                            SdrMatrix::Bt709,
-                            ColorLevels::Limited,
-                            SdrGamma::Bt1886,
-                        )),
-                        !all_disabled,
-                    ),
-                    FilterEntry::new(
-                        "inert\n\0label".into(),
-                        Filter::Eq(
-                            EqParams::new(EqValues {
-                                contrast: 1.0,
-                                brightness: 0.0,
-                                saturation: 1.0,
-                                gamma: 1.0,
-                                gamma_r: 1.0,
-                                gamma_g: 1.0,
-                                gamma_b: 1.0,
-                                gamma_weight: 1.0,
-                            })
-                            .unwrap(),
-                        ),
-                        false,
-                    ),
-                    FilterEntry::new(
-                        "denoise".into(),
-                        Filter::Hqdn3d(
-                            Hqdn3dParams::new(Hqdn3dValues {
-                                luma_spatial: 3.0,
-                                chroma_spatial: 0.0,
-                                luma_tmp: 6.0,
-                                chroma_tmp: 4.5,
-                            })
-                            .unwrap(),
-                        ),
-                        !all_disabled,
-                    ),
-                ])
-                .unwrap();
-                let VerifiedApplied::Open { key, applied } = event(submitted.clone()) else {
-                    panic!("Open fixture")
+        for live_renderer in [false, true] {
+            let temp = Temp::new();
+            let mut session = PersistenceSession::load(Ok(temp.file()));
+            let mut submitted = selection(60000);
+            submitted.renderer = reference_renderer();
+            let VerifiedApplied::Open { key, applied } = event(submitted.clone()) else {
+                panic!("Open fixture")
+            };
+            let revision = DraftRevision::new(1);
+            let (admission, receipt) = if live_renderer {
+                let key = TreatmentAttemptKey {
+                    apply: key.apply,
+                    attempt: key.attempt,
+                    pass: TreatmentPass::Candidate,
                 };
-                let revision = DraftRevision::new(1);
-                let (admission, receipt) = if live_filters {
-                    let filters = TreatmentAttemptKey {
-                        apply: key.apply,
-                        attempt: key.attempt,
-                        pass: TreatmentPass::Candidate,
-                    };
-                    (
-                        ApplyAdmission::Treatments {
-                            key: filters,
-                            revision,
-                        },
-                        VerifiedApplied::Treatments {
-                            key: filters,
-                            revision,
-                            applied,
-                        },
-                    )
-                } else {
-                    (
-                        ApplyAdmission::Open { apply: key.apply },
-                        VerifiedApplied::Open { key, applied },
-                    )
-                };
-                session.admit_user_apply(
-                    admission,
-                    Draft {
+                (
+                    ApplyAdmission::Treatments { key, revision },
+                    VerifiedApplied::Treatments {
+                        key,
                         revision,
-                        settings: submitted.clone(),
+                        applied,
                     },
-                    ProfileBinding::Serial,
-                );
-                session.observe_opening(key);
-                session.verified_applied(receipt.clone());
-                assert_eq!(load_document(temp.file()).applied, Some(submitted.clone()));
-                assert_eq!(session.authorized_apply(), None);
-                let bytes = fs::read(temp.file()).unwrap();
-                session.verified_applied(receipt);
-                assert_eq!(fs::read(temp.file()).unwrap(), bytes);
-            }
+                )
+            } else {
+                (
+                    ApplyAdmission::Open { apply: key.apply },
+                    VerifiedApplied::Open { key, applied },
+                )
+            };
+            session.admit_user_apply(
+                admission,
+                Draft {
+                    revision,
+                    settings: submitted.clone(),
+                },
+                ProfileBinding::Serial,
+            );
+            session.observe_opening(key);
+            session.verified_applied(receipt.clone());
+            assert_eq!(load_document(temp.file()).applied, Some(submitted.clone()));
+            assert_eq!(session.authorized_apply(), None);
+            let bytes = fs::read(temp.file()).unwrap();
+            session.verified_applied(receipt);
+            assert_eq!(fs::read(temp.file()).unwrap(), bytes);
         }
     }
 
     #[test]
-    fn immutable_filter_admission_cannot_authorize_an_open_receipt_and_cancel_consumes_permission()
-    {
+    fn immutable_renderer_admission_cannot_authorize_an_open_receipt_and_cancel_consumes_permission()
+     {
         use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
         let temp = Temp::new();
         let mut session = PersistenceSession::load(Ok(temp.file()));
@@ -1039,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn immutable_filter_receipts_require_exact_key_revision_and_complete_submission() {
+    fn immutable_renderer_receipts_require_exact_key_revision_and_complete_submission() {
         use crate::domain::state::{AttemptId, TreatmentAttemptKey, TreatmentPass};
         let VerifiedApplied::Open { key: open, applied } = event(selection(60000)) else {
             panic!("fixture")
@@ -1105,7 +1067,7 @@ mod tests {
         }
     }
     #[test]
-    fn exact_filter_receipt_saves_once_and_cancellation_revokes_it() {
+    fn exact_renderer_receipt_saves_once_and_cancellation_revokes_it() {
         use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
         let VerifiedApplied::Open { key: open, applied } = event(selection(60000)) else {
             panic!("fixture")
@@ -1214,6 +1176,63 @@ mod tests {
         assert_eq!(document.preferences, preferences(23));
     }
     #[test]
+    fn legacy_settings_load_without_writing_and_migrate_only_at_safe_close() {
+        for version in [1, 2, 3] {
+            for retired in [false, true] {
+                let temp = Temp::new();
+                let mut saved = selection(60000);
+                saved.renderer = reference_renderer();
+                let mut original = PersistenceSession::load(Ok(temp.file()));
+                let mut globals = preferences(29);
+                globals.stats_hidden = true;
+                globals.logging_enabled = true;
+                original.set_preferences(globals.clone());
+                user_apply(&mut original, saved.clone());
+                let mut wire: serde_json::Value =
+                    serde_json::from_slice(&fs::read(temp.file()).unwrap()).unwrap();
+                wire["schema_version"] = version.into();
+                if retired {
+                    wire["profiles"][0]["settings"]["filters"] =
+                        serde_json::json!({"invalid": true});
+                }
+                if version == 1 {
+                    let applied = wire["profiles"][0]["settings"].take();
+                    let object = wire.as_object_mut().unwrap();
+                    object.remove("profiles");
+                    object.remove("last_source");
+                    object.insert("applied".into(), applied);
+                }
+                let bytes = serde_json::to_vec(&wire).unwrap();
+                fs::write(temp.file(), &bytes).unwrap();
+                let mut loaded = PersistenceSession::load(Ok(temp.file()));
+                assert_eq!(fs::read(temp.file()).unwrap(), bytes);
+                if retired && version == 3 {
+                    assert!(loaded.refused());
+                    assert!(loaded.saved_selection().is_none());
+                    assert!(!loaded.preferences().logging_enabled);
+                    assert!(loaded.request_close());
+                    loaded.drained();
+                    assert!(!loaded.quit_allowed());
+                    assert_eq!(fs::read(temp.file()).unwrap(), bytes);
+                    continue;
+                }
+                assert_eq!(loaded.saved_selection(), Some(saved.clone()));
+                assert_eq!(loaded.preferences(), &globals);
+                assert!(loaded.request_close());
+                assert_eq!(fs::read(temp.file()).unwrap(), bytes);
+                loaded.drained();
+                assert!(loaded.quit_allowed());
+                let written: serde_json::Value =
+                    serde_json::from_slice(&fs::read(temp.file()).unwrap()).unwrap();
+                assert_eq!(written["schema_version"], 3);
+                assert!(written["profiles"][0]["settings"].get("filters").is_none());
+                let reloaded = PersistenceSession::load(Ok(temp.file()));
+                assert_eq!(reloaded.saved_selection(), Some(saved));
+                assert_eq!(reloaded.preferences(), &globals);
+            }
+        }
+    }
+    #[test]
     fn preference_only_close_without_capture_restores_latest_preferences_and_null_capture() {
         let temp = Temp::new();
         let mut session = PersistenceSession::load(Ok(temp.file()));
@@ -1278,6 +1297,63 @@ mod tests {
         assert_eq!(load_document(temp.file()).applied, None);
     }
     #[test]
+    fn logging_preference_is_off_by_default_and_safe_close_omits_the_key() {
+        let temp = Temp::new();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        assert!(!session.preferences().logging_enabled);
+        session.set_preferences(preferences(17));
+        assert!(session.request_close());
+        session.drained();
+        assert!(session.quit_allowed());
+        let bytes = fs::read(temp.file()).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("logging_enabled"),
+            "off must not be written: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let reloaded = PersistenceSession::load(Ok(temp.file()));
+        assert!(!reloaded.preferences().logging_enabled);
+    }
+    #[test]
+    fn logging_opt_in_defers_to_safe_close_and_survives_relaunch_without_capture() {
+        let temp = Temp::new();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        session.set_preferences(preferences(41));
+        session.set_logging_enabled_preference(true);
+        // The session mutator never writes eagerly; durability waits for close.
+        assert!(!temp.file().exists());
+        assert!(session.request_close());
+        session.drained();
+        assert!(session.quit_allowed());
+        let reloaded = PersistenceSession::load(Ok(temp.file()));
+        let mut expected = preferences(41);
+        expected.logging_enabled = true;
+        assert_eq!(reloaded.preferences(), &expected);
+        assert!(reloaded.saved_selection().is_none());
+    }
+    #[test]
+    fn refused_settings_start_off_and_reset_preserves_the_logging_opt_in() {
+        let temp = Temp::new();
+        fs::write(temp.file(), b"refused").unwrap();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        assert!(session.refused());
+        assert!(!session.preferences().logging_enabled);
+        session.set_preferences(preferences(12));
+        session.set_logging_enabled_preference(true);
+        session.request_reset();
+        let token = session.reset_token();
+        session.decide_reset(token, true);
+        let mut expected = preferences(12);
+        expected.logging_enabled = true;
+        assert_eq!(session.preferences(), &expected);
+        let document = load_document(temp.file());
+        assert_eq!(document.applied, None);
+        assert_eq!(document.preferences, expected);
+        session.request_close();
+        session.drained();
+        assert_eq!(load_document(temp.file()).applied, None);
+    }
+    #[test]
     fn failed_apply_save_retries_authorized_snapshot_with_latest_preferences_after_drain() {
         let temp = Temp::new();
         let blocked = temp.0.join("blocked");
@@ -1300,15 +1376,9 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_filter_save_faults_preserve_original_and_retry_frozen_applied_chain() {
+    fn confirmed_renderer_save_faults_preserve_original_and_retry_frozen_applied_settings() {
         use crate::{
-            domain::{
-                filters::{
-                    ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma,
-                    SdrMatrix,
-                },
-                state::{TreatmentAttemptKey, TreatmentPass},
-            },
+            domain::state::{TreatmentAttemptKey, TreatmentPass},
             settings::WriteFaultPoint,
         };
         for fault in [
@@ -1325,16 +1395,6 @@ mod tests {
             let old = fs::read(temp.file()).unwrap();
             session.store = Some(SettingsStore::with_injected_fault(temp.file(), fault));
             let mut submitted = selection(60000);
-            submitted.filters = FilterChain::new(vec![FilterEntry::new(
-                "frozen\n\0disabled".into(),
-                Filter::Format(FormatParams::new(
-                    SdrMatrix::Bt709,
-                    ColorLevels::Limited,
-                    SdrGamma::Bt1886,
-                )),
-                false,
-            )])
-            .unwrap();
             submitted.renderer = reference_renderer();
             let VerifiedApplied::Open { key: open, applied } = event(submitted.clone()) else {
                 panic!("fixture")
@@ -1393,32 +1453,17 @@ mod tests {
 
     #[test]
     fn observed_open_key_cannot_authorize_changed_or_dropped_full_submission() {
-        use crate::domain::{
-            filters::{
-                ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
-            },
-            render::{
-                DebandValues, DitherMode, RendererSettings, RendererValues, ScalerChoice,
-                ScalerKernel,
-            },
+        use crate::domain::render::{
+            DebandValues, DitherMode, RendererSettings, RendererValues, ScalerChoice, ScalerKernel,
         };
         let mut submitted = selection(60000);
-        submitted.filters = FilterChain::new(vec![FilterEntry::new(
-            "retained".into(),
-            Filter::Format(FormatParams::new(
-                SdrMatrix::Auto,
-                ColorLevels::Auto,
-                SdrGamma::Auto,
-            )),
-            false,
-        )])
-        .unwrap();
+        submitted.renderer = reference_renderer();
         for mismatch in 0..4 {
             let temp = Temp::new();
             let mut session = PersistenceSession::load(Ok(temp.file()));
             let mut wrong = submitted.clone();
             match mismatch {
-                0 => wrong.filters = FilterChain::default(),
+                0 => wrong.renderer = RendererSettings::default(),
                 1 => wrong.video.mode = selection(30000).video.mode,
                 2 => {
                     wrong.audio = AudioSelection::Enabled {
@@ -1811,7 +1856,7 @@ mod tests {
         migrated.drained();
         let written: serde_json::Value =
             serde_json::from_slice(&fs::read(temp.file()).unwrap()).unwrap();
-        assert_eq!(written["schema_version"], 2);
+        assert_eq!(written["schema_version"], 3);
         assert!(written.get("applied").is_none());
         assert_eq!(
             PersistenceSession::load(Ok(temp.file())).saved_selection(),

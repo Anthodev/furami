@@ -274,12 +274,37 @@ struct Desired {
     output: OutputPlan,
     serial: u64,
 }
+#[derive(Clone, Copy, Debug)]
+enum HelperKind {
+    PwLoopback,
+    PwMetadata,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum HelperObservation {
+    #[default]
+    NotObserved,
+    SpawnSucceeded,
+    SpawnFailed {
+        io_kind: std::io::ErrorKind,
+        os_code: Option<i32>,
+    },
+}
+
+/// Latest actual spawn outcome per helper, not a continuing health claim.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HelperObservations {
+    pub pw_loopback: HelperObservation,
+    pub pw_metadata: HelperObservation,
+}
+
 struct Shared {
     stop: Arc<AtomicBool>,
     owner_cancel: Arc<AtomicBool>,
     paused: AtomicBool,
     desired: Mutex<Desired>,
     event: Mutex<Option<LoopbackEvent>>,
+    helpers: Mutex<HelperObservations>,
 }
 impl Shared {
     fn cancelled(&self) -> bool {
@@ -329,6 +354,7 @@ impl LoopbackOwner {
                 serial: 1,
             }),
             event: Mutex::new(Some(LoopbackEvent::Opening)),
+            helpers: Mutex::new(HelperObservations::default()),
         });
         let state = Arc::clone(&shared);
         let worker = thread::Builder::new()
@@ -411,6 +437,10 @@ impl LoopbackOwner {
         Ok(())
     }
 
+    pub(crate) fn helper_observations(&self) -> HelperObservations {
+        *self.shared.helpers.lock()
+    }
+
     pub fn poll(&mut self) -> Option<LoopbackEvent> {
         if let Some(event) = self.shared.event.lock().take() {
             return Some(event);
@@ -457,6 +487,7 @@ impl LoopbackOwner {
                 serial: 1,
             }),
             event: Mutex::new(None),
+            helpers: Mutex::new(HelperObservations::default()),
         });
         let (release, barrier) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
@@ -568,7 +599,9 @@ fn child_command(helper: &Path, names: &Names, source_serial: u64) -> Result<Com
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        // The helper's raw native stderr has no reader; inheriting it would
+        // bypass the bounded diagnostics console. Discard it instead.
+        .stderr(Stdio::null());
     for key in REMOVED_ENV {
         command.env_remove(key);
     }
@@ -610,8 +643,23 @@ fn retain_blocked(shared: &Shared, stage: &'static str, diagnostic: String) -> !
 }
 
 impl OwnedChild {
-    fn spawn(command: &mut Command) -> Result<Self, AudioError> {
-        let child = command.spawn().map_err(|error| AudioError::Backend {
+    fn spawn(command: &mut Command, shared: &Shared, kind: HelperKind) -> Result<Self, AudioError> {
+        let spawned = command.spawn();
+        let observation = match &spawned {
+            Ok(_) => HelperObservation::SpawnSucceeded,
+            Err(error) => HelperObservation::SpawnFailed {
+                io_kind: error.kind(),
+                os_code: error.raw_os_error(),
+            },
+        };
+        {
+            let mut helpers = shared.helpers.lock();
+            match kind {
+                HelperKind::PwLoopback => helpers.pw_loopback = observation,
+                HelperKind::PwMetadata => helpers.pw_metadata = observation,
+            }
+        }
+        let child = spawned.map_err(|error| AudioError::Backend {
             operation: format!("spawn {}", command.get_program().to_string_lossy()),
             code: error.raw_os_error(),
             detail: error.to_string(),
@@ -1116,7 +1164,7 @@ fn write_owned_target(
     };
     pulse.check_lifetime()?;
     audio_child.alive()?;
-    let spawned = OwnedChild::spawn(&mut command);
+    let spawned = OwnedChild::spawn(&mut command, shared, HelperKind::PwMetadata);
     drop(guard); // Never retain Qt's intent mutex through child/PA waits.
     let mut writer = spawned?;
     // Command owns a duplicate of stderr's writer FD; close it after spawn so
@@ -1124,62 +1172,62 @@ fn write_owned_target(
     drop(command);
     let mut bytes = Vec::with_capacity(MAX_METADATA_STDERR);
     let mut truncated = false;
-    let result = (|| {
-        loop {
-            if !shared.current(desired) {
-                return Ok(false);
-            }
-            if Instant::now() >= deadline {
-                return Err(AudioError::Backend {
-                    operation: "owned pw-metadata deadline".into(),
-                    code: None,
-                    detail: format!(
-                        "stderr={:?}, truncated={truncated}",
-                        String::from_utf8_lossy(&bytes)
-                    ),
-                });
-            }
-            check_capture(pulse, names, audio_child, source, capture)?;
-            let fresh = fresh_stream(pulse, names, audio_child, false, playback)?;
-            if metadata_subject(&fresh)? != subject {
-                return Err(AudioError::Control(
-                    "owned native playback global ID changed during target write".into(),
-                ));
-            }
-            if !fresh_target(pulse, target)? {
-                return Ok(false);
-            }
-            drain_metadata_stderr(&mut stderr, &mut bytes, &mut truncated)?;
-            if let Some(status) = writer
-                .child
-                .try_wait()
-                .map_err(|error| AudioError::Control(format!("metadata child status: {error}")))?
-            {
-                writer.reaped = true;
-                drain_metadata_stderr(&mut stderr, &mut bytes, &mut truncated)?;
-                eprintln!(
-                    "LOOPBACK_METADATA_CONTROL_NOT_ROUTE_PROOF pid={} subject={subject} target_serial={} status={status} stderr={:?} truncated={truncated}",
-                    writer.pid(),
-                    target.object_serial,
-                    String::from_utf8_lossy(&bytes)
-                );
-                if !status.success() {
+    let result =
+        (|| {
+            loop {
+                if !shared.current(desired) {
+                    return Ok(false);
+                }
+                if Instant::now() >= deadline {
                     return Err(AudioError::Backend {
-                        operation: "owned pw-metadata completion".into(),
-                        code: status.code(),
+                        operation: "owned pw-metadata deadline".into(),
+                        code: None,
                         detail: format!(
-                            "status={status}; stderr={:?}; truncated={truncated}",
+                            "stderr={:?}, truncated={truncated}",
                             String::from_utf8_lossy(&bytes)
                         ),
                     });
                 }
-                // Exit zero/core.sync can coexist with asynchronous errors or
-                // absent metadata. The caller still awaits an ACTUAL PA peer.
-                return Ok(true);
+                check_capture(pulse, names, audio_child, source, capture)?;
+                let fresh = fresh_stream(pulse, names, audio_child, false, playback)?;
+                if metadata_subject(&fresh)? != subject {
+                    return Err(AudioError::Control(
+                        "owned native playback global ID changed during target write".into(),
+                    ));
+                }
+                if !fresh_target(pulse, target)? {
+                    return Ok(false);
+                }
+                drain_metadata_stderr(&mut stderr, &mut bytes, &mut truncated)?;
+                if let Some(status) = writer.child.try_wait().map_err(|error| {
+                    AudioError::Control(format!("metadata child status: {error}"))
+                })? {
+                    writer.reaped = true;
+                    drain_metadata_stderr(&mut stderr, &mut bytes, &mut truncated)?;
+                    tracing::info!(
+                        event_code = "audio_helper",
+                        kind = "PwMetadataExit",
+                        success = status.success(),
+                        os_code = status.code().unwrap_or(-1),
+                        truncated,
+                    );
+                    if !status.success() {
+                        return Err(AudioError::Backend {
+                            operation: "owned pw-metadata completion".into(),
+                            code: status.code(),
+                            detail: format!(
+                                "status={status}; stderr={:?}; truncated={truncated}",
+                                String::from_utf8_lossy(&bytes)
+                            ),
+                        });
+                    }
+                    // Exit zero/core.sync can coexist with asynchronous errors or
+                    // absent metadata. The caller still awaits an ACTUAL PA peer.
+                    return Ok(true);
+                }
+                thread::sleep(POLL);
             }
-            thread::sleep(POLL);
-        }
-    })();
+        })();
     // All cancel/error/timeout paths TERM/KILL/reap this exact short child.
     // Capture retirement cannot acknowledge while either child remains live.
     let cleanup = writer.retire(shared);
@@ -1223,11 +1271,11 @@ fn run(seed: Seed, names: Names, shared: &Shared) -> Result<(), AudioError> {
     if shared.cancelled() {
         return Ok(());
     }
-    let mut child = OwnedChild::spawn(&mut child_command(
-        Path::new(HELPER),
-        &names,
-        source.serial,
-    )?)?;
+    let mut child = OwnedChild::spawn(
+        &mut child_command(Path::new(HELPER), &names, source.serial)?,
+        shared,
+        HelperKind::PwLoopback,
+    )?;
     let mut result = run_child(&open, &names, shared, &mut pulse, &source, &mut child);
     if matches!(&result, Err(AudioError::RecordingLost { .. })) && !shared.cancelled() {
         // Helper teardown can arrive before Pulse's source-removal callback.
@@ -1686,6 +1734,7 @@ mod tests {
                     serial: 1,
                 }),
                 event: Mutex::new(None),
+                helpers: Mutex::new(HelperObservations::default()),
             }),
             worker: None,
             joined: false,
@@ -1764,6 +1813,41 @@ mod tests {
     }
 
     #[test]
+    fn helper_observations_record_only_actual_independent_spawn_outcomes() {
+        let owner = mailbox_owner();
+        assert_eq!(owner.helper_observations(), HelperObservations::default());
+        let mut missing = Command::new("/furami-nonexistent-helper-for-spawn-test");
+        assert!(OwnedChild::spawn(&mut missing, &owner.shared, HelperKind::PwMetadata).is_err());
+        let failed = owner.helper_observations();
+        assert_eq!(failed.pw_loopback, HelperObservation::NotObserved);
+        assert_eq!(
+            failed.pw_metadata,
+            HelperObservation::SpawnFailed {
+                io_kind: std::io::ErrorKind::NotFound,
+                os_code: Some(2),
+            }
+        );
+        let mut command = Command::new("/usr/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child =
+            OwnedChild::spawn(&mut command, &owner.shared, HelperKind::PwLoopback).unwrap();
+        assert_eq!(
+            owner.helper_observations().pw_loopback,
+            HelperObservation::SpawnSucceeded
+        );
+        assert_eq!(owner.helper_observations().pw_metadata, failed.pw_metadata);
+        child.retire(&owner.shared).unwrap();
+        assert_eq!(
+            owner.helper_observations().pw_loopback,
+            HelperObservation::SpawnSucceeded
+        );
+    }
+
+    #[test]
     fn owned_child_stop_reaps_the_actual_process() {
         let owner = mailbox_owner();
         let mut command = Command::new("/usr/bin/sleep");
@@ -1772,7 +1856,8 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = OwnedChild::spawn(&mut command).unwrap();
+        let mut child =
+            OwnedChild::spawn(&mut command, &owner.shared, HelperKind::PwLoopback).unwrap();
         child.retire(&owner.shared).unwrap();
         assert!(child.reaped);
         assert!(child.child.try_wait().unwrap().is_some());

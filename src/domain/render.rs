@@ -27,12 +27,37 @@
 //! native value); `scale` has no auto and always names a kernel. Deband parameters are
 //! validated even when `deband.enabled` is false, and a negative zero is normalized to `+0.0`.
 
-use std::fmt;
+use std::{fmt, marker::PhantomData};
 
-use serde::de::{self, Visitor};
+use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::filters::deserialize_object;
+/// Require an object before delegating named-field checks to Serde, whose
+/// derived struct deserializer would also accept positional sequences.
+fn deserialize_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct ObjectVisitor<T>(PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+        type Value = T;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<T, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            T::deserialize(de::value::MapAccessDeserializer::new(map))
+        }
+    }
+
+    deserializer.deserialize_map(ObjectVisitor(PhantomData))
+}
 
 // ---------------------------------------------------------------------------
 // Scaler kernels

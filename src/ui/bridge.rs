@@ -1,6 +1,7 @@
 //! Value-only CXX boundary. C++ retains every Qt object and notification target.
 
 use super::runtime::{self, RuntimeCoordinator};
+use crate::diagnostics::{diagnostics_native_event, diagnostics_qt_message};
 use crate::{
     app::{gate::GatePhase, ports::SubmitStatus},
     domain::state::AttemptId,
@@ -36,6 +37,8 @@ pub(crate) mod ffi {
     #[derive(Debug)]
     struct UiUpdate {
         ui_snapshot: String,
+        log_folder_request: u64,
+        log_folder_path: String,
         changed: bool,
         phase: GatePhase,
         generation: u64,
@@ -72,6 +75,7 @@ pub(crate) mod ffi {
         reset_token: u64,
         fullscreen: bool,
         stats_hidden: bool,
+        logging_enabled: bool,
         closing: bool,
         output_rows: String,
         output_catalog_revision: u64,
@@ -93,7 +97,37 @@ pub(crate) mod ffi {
     }
     extern "Rust" {
         type RuntimeCoordinator;
+        fn diagnostics_qt_message(severity: i32);
+        fn diagnostics_native_event(code: &str, severity: i32, fields_json: &str);
+        // Local exception: this declaration mirrors `host.h`, where the nine
+        // environment-bootstrap values cross the CXX boundary positionally in a
+        // single auditable call; bundling them would change the frozen native
+        // ABI and the existing ownership-bootstrap handoff.
+        #[allow(clippy::too_many_arguments, reason = "CXX positional boundary.")]
+        fn gate_native_environment(
+            gate: &mut RuntimeCoordinator,
+            qt_version: &str,
+            platform: &str,
+            x_vendor: &str,
+            x_release: u32,
+            x_protocol_major: u32,
+            x_protocol_minor: u32,
+            shape_major: u32,
+            shape_minor: u32,
+        ) -> UiUpdate;
         fn gate_refresh_catalogs(gate: &mut RuntimeCoordinator) -> UiUpdate;
+        fn gate_open_log_folder(gate: &mut RuntimeCoordinator) -> UiUpdate;
+        fn gate_claim_log_folder_dispatch(gate: &mut RuntimeCoordinator, request_id: u64) -> bool;
+        fn gate_log_folder_result(
+            gate: &mut RuntimeCoordinator,
+            request_id: u64,
+            accepted: bool,
+        ) -> UiUpdate;
+        fn gate_log_folder_finished(
+            gate: &mut RuntimeCoordinator,
+            request_id: u64,
+            failed: bool,
+        ) -> UiUpdate;
         fn gate_select_capture(
             gate: &mut RuntimeCoordinator,
             selection_revision: &str,
@@ -142,43 +176,6 @@ pub(crate) mod ffi {
             catalog_revision: &str,
             row_key: &str,
         ) -> UiUpdate;
-        fn gate_set_filter_enabled(
-            gate: &mut RuntimeCoordinator,
-            selection_revision: &str,
-            entry_key: &str,
-            enabled: bool,
-        ) -> UiUpdate;
-        fn gate_add_filter(
-            gate: &mut RuntimeCoordinator,
-            selection_revision: &str,
-            kind: &str,
-        ) -> UiUpdate;
-        fn gate_remove_filter(
-            gate: &mut RuntimeCoordinator,
-            selection_revision: &str,
-            entry_key: &str,
-        ) -> UiUpdate;
-        fn gate_set_filter_number(
-            gate: &mut RuntimeCoordinator,
-            revision: &str,
-            entry: &str,
-            parameter: &str,
-            value: f64,
-        ) -> UiUpdate;
-        fn gate_set_filter_choice(
-            gate: &mut RuntimeCoordinator,
-            revision: &str,
-            entry: &str,
-            parameter: &str,
-            value: &str,
-        ) -> UiUpdate;
-        fn gate_move_filter(
-            gate: &mut RuntimeCoordinator,
-            revision: &str,
-            entry: &str,
-            direction: &str,
-        ) -> UiUpdate;
-        fn gate_clear_filters(gate: &mut RuntimeCoordinator, revision: &str) -> UiUpdate;
         fn gate_set_scale(
             gate: &mut RuntimeCoordinator,
             selection_revision: &str,
@@ -236,6 +233,7 @@ pub(crate) mod ffi {
         ) -> UiUpdate;
         fn gate_set_fullscreen(gate: &mut RuntimeCoordinator, fullscreen: bool) -> UiUpdate;
         fn gate_set_stats_hidden(gate: &mut RuntimeCoordinator, hidden: bool) -> UiUpdate;
+        fn gate_set_logging_enabled(gate: &mut RuntimeCoordinator, enabled: bool) -> UiUpdate;
         fn gate_open(gate: &mut RuntimeCoordinator) -> UiUpdate;
         fn gate_restart(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
         fn gate_reconnect(gate: &mut RuntimeCoordinator, generation: u64) -> UiUpdate;
@@ -275,6 +273,8 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
     fn from(update: runtime::UiUpdate) -> Self {
         Self {
             ui_snapshot: update.ui_snapshot,
+            log_folder_request: update.log_folder_request,
+            log_folder_path: update.log_folder_path,
             changed: update.changed,
             phase: match update.phase {
                 GatePhase::Idle => ffi::GatePhase::Idle,
@@ -323,6 +323,7 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
             reset_token: update.reset_token,
             fullscreen: update.fullscreen,
             stats_hidden: update.stats_hidden,
+            logging_enabled: update.logging_enabled,
             closing: update.closing,
             output_rows: update.output_rows,
             output_catalog_revision: update.output_catalog_revision,
@@ -333,6 +334,30 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
             output_needs_action: update.output_needs_action,
         }
     }
+}
+#[allow(clippy::too_many_arguments)]
+fn gate_native_environment(
+    gate: &mut RuntimeCoordinator,
+    qt_version: &str,
+    platform: &str,
+    x_vendor: &str,
+    x_release: u32,
+    x_protocol_major: u32,
+    x_protocol_minor: u32,
+    shape_major: u32,
+    shape_minor: u32,
+) -> ffi::UiUpdate {
+    gate.native_environment(
+        qt_version,
+        platform,
+        x_vendor,
+        x_release,
+        x_protocol_major,
+        x_protocol_minor,
+        shape_major,
+        shape_minor,
+    )
+    .into()
 }
 fn gate_refresh_catalogs(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
     gate.refresh_catalogs().into()
@@ -407,60 +432,6 @@ fn gate_select_audio_input(
 ) -> ffi::UiUpdate {
     gate.select_audio_input(selection_revision, catalog_revision, row_key)
         .into()
-}
-fn gate_set_filter_enabled(
-    gate: &mut RuntimeCoordinator,
-    selection_revision: &str,
-    entry_key: &str,
-    enabled: bool,
-) -> ffi::UiUpdate {
-    gate.set_filter_enabled(selection_revision, entry_key, enabled)
-        .into()
-}
-fn gate_add_filter(
-    gate: &mut RuntimeCoordinator,
-    selection_revision: &str,
-    kind: &str,
-) -> ffi::UiUpdate {
-    gate.add_filter(selection_revision, kind).into()
-}
-fn gate_remove_filter(
-    gate: &mut RuntimeCoordinator,
-    selection_revision: &str,
-    entry_key: &str,
-) -> ffi::UiUpdate {
-    gate.remove_filter(selection_revision, entry_key).into()
-}
-fn gate_set_filter_number(
-    gate: &mut RuntimeCoordinator,
-    revision: &str,
-    entry: &str,
-    parameter: &str,
-    value: f64,
-) -> ffi::UiUpdate {
-    gate.set_filter_number(revision, entry, parameter, value)
-        .into()
-}
-fn gate_set_filter_choice(
-    gate: &mut RuntimeCoordinator,
-    revision: &str,
-    entry: &str,
-    parameter: &str,
-    value: &str,
-) -> ffi::UiUpdate {
-    gate.set_filter_choice(revision, entry, parameter, value)
-        .into()
-}
-fn gate_move_filter(
-    gate: &mut RuntimeCoordinator,
-    revision: &str,
-    entry: &str,
-    direction: &str,
-) -> ffi::UiUpdate {
-    gate.move_filter(revision, entry, direction).into()
-}
-fn gate_clear_filters(gate: &mut RuntimeCoordinator, revision: &str) -> ffi::UiUpdate {
-    gate.clear_filters(revision).into()
 }
 fn gate_set_scale(
     gate: &mut RuntimeCoordinator,
@@ -548,6 +519,29 @@ fn gate_set_fullscreen(gate: &mut RuntimeCoordinator, fullscreen: bool) -> ffi::
 }
 fn gate_set_stats_hidden(gate: &mut RuntimeCoordinator, hidden: bool) -> ffi::UiUpdate {
     gate.set_stats_hidden(hidden).into()
+}
+fn gate_set_logging_enabled(gate: &mut RuntimeCoordinator, enabled: bool) -> ffi::UiUpdate {
+    gate.set_logging_enabled(enabled).into()
+}
+fn gate_open_log_folder(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
+    gate.open_log_folder().into()
+}
+fn gate_claim_log_folder_dispatch(gate: &mut RuntimeCoordinator, request_id: u64) -> bool {
+    gate.claim_log_folder_dispatch(request_id)
+}
+fn gate_log_folder_result(
+    gate: &mut RuntimeCoordinator,
+    request_id: u64,
+    accepted: bool,
+) -> ffi::UiUpdate {
+    gate.log_folder_result(request_id, accepted).into()
+}
+fn gate_log_folder_finished(
+    gate: &mut RuntimeCoordinator,
+    request_id: u64,
+    failed: bool,
+) -> ffi::UiUpdate {
+    gate.log_folder_finished(request_id, failed).into()
 }
 fn gate_open(gate: &mut RuntimeCoordinator) -> ffi::UiUpdate {
     gate.open().into()

@@ -3,7 +3,6 @@
 use super::{catalog as capture_catalog, projection};
 use crate::domain::{
     capture::{CaptureModeRequest, FrameRate, FrameSize, InputFormatPolicy},
-    filters::{FilterChain, FilterEntry, FilterKind},
     render::{DitherMode, RendererSettings, ScalerChoice, ScalerKernel},
 };
 
@@ -38,8 +37,14 @@ use crate::{
 
 type Engine = ApplyCoordinator<CaptureValidator, GateRunner>;
 
+mod diagnostic;
+use diagnostic::{ProfileSeed, ReportCache};
+
 pub(crate) struct UiUpdate {
     pub ui_snapshot: String,
+    /// Prepared desktop dispatch; the native launcher must claim it once.
+    pub log_folder_request: u64,
+    pub log_folder_path: String,
     pub changed: bool,
     pub phase: GatePhase,
     pub generation: u64,
@@ -81,6 +86,7 @@ pub(crate) struct UiUpdate {
     pub reset_token: u64,
     pub fullscreen: bool,
     pub stats_hidden: bool,
+    pub logging_enabled: bool,
     pub closing: bool,
     /// Legacy audio output selector projection: JSON plain-text rows (the
     /// reserved `auto` row first), the observed catalog revision and selected
@@ -108,7 +114,6 @@ struct PartialDraft {
     rate: Option<FrameRate>,
     policy: InputFormatPolicy,
     audio: AudioSelection,
-    filters: FilterChain,
     renderer: RendererSettings,
 }
 impl Default for PartialDraft {
@@ -119,7 +124,6 @@ impl Default for PartialDraft {
             rate: None,
             policy: InputFormatPolicy::Auto,
             audio: AudioSelection::default(),
-            filters: FilterChain::default(),
             renderer: RendererSettings::default(),
         }
     }
@@ -131,7 +135,6 @@ impl PartialDraft {
             rate: Some(settings.video.mode.rate),
             policy: settings.video.mode.format_policy,
             audio: settings.audio.clone(),
-            filters: settings.filters.clone(),
             renderer: settings.renderer.clone(),
             ..Self::default()
         }
@@ -151,6 +154,7 @@ struct PendingSelection {
     binding: ProfileBinding,
     intent: capture_catalog::ModeIntent,
     origin: SelectionOrigin,
+    profile_seed: Option<ProfileSeed>,
 }
 struct ProductUi {
     catalog: capture_catalog::Model,
@@ -175,7 +179,6 @@ struct ProductUi {
     state_sequence: u64,
     state_identity: Option<StateIdentity>,
     state_initialized: bool,
-    filters: projection::Filters,
     renderer: projection::Renderer,
     snapshot: Option<projection::Snapshot>,
     error: Option<projection::IntentError>,
@@ -203,7 +206,6 @@ impl Default for ProductUi {
             state_sequence: 1,
             state_identity: None,
             state_initialized: false,
-            filters: projection::Filters::default(),
             renderer: projection::Renderer::default(),
             snapshot: None,
             error: None,
@@ -213,6 +215,9 @@ impl Default for ProductUi {
 }
 
 pub(crate) struct RuntimeCoordinator {
+    diagnostics: crate::diagnostics::DiagnosticsHandle,
+    report_cache: ReportCache,
+    next_log_folder_request: Option<crate::diagnostics::FolderRequestId>,
     engine: Option<Engine>,
     ui: ProductUi,
     sources: Vec<AudioSourceIdentity>,
@@ -223,6 +228,8 @@ pub(crate) struct RuntimeCoordinator {
         PlaybackGain,
         Option<PlaybackState>,
     )>,
+    last_logged_runtime: Option<RuntimeLogSnapshot>,
+    last_logged_settings: Option<SettingsLogSnapshot>,
     command_error: String,
     quit_empty: bool,
     persistence: PersistenceSession,
@@ -440,7 +447,6 @@ impl RuntimeCoordinator {
         Ok(Some(DraftSettings {
             video,
             audio: partial.audio.clone(),
-            filters: partial.filters.clone(),
             renderer: partial.renderer.clone(),
         }))
     }
@@ -524,7 +530,7 @@ impl RuntimeCoordinator {
             self.ui_reject(code, action, field, message);
             return self.poll();
         }
-        self.commit_selection(partial, action, field, None, None);
+        self.commit_selection(partial, action, field, None, None, None);
         self.poll()
     }
     pub(crate) fn refresh_catalogs(&mut self) -> UiUpdate {
@@ -568,15 +574,28 @@ impl RuntimeCoordinator {
             .persistence
             .source_profile(&physical.identity, serial_unique);
         let new_source = profile.is_none();
+        let binding = self
+            .persistence
+            .profile_binding(&physical.identity, serial_unique);
+        let profile_seed = profile.map(|loaded| {
+            ProfileSeed::new(
+                loaded,
+                binding,
+                crate::diagnostics::report::ProfileOrigin::SourceSelection,
+                self.diagnostics.report_byte_limit(),
+            )
+        });
         let mut partial = profile.map(PartialDraft::from_settings).unwrap_or_default();
         if let Some(audio) = &self.ui.cli_audio {
             partial.audio = audio.clone();
         }
         partial.source = Some(physical.clone());
-        let binding = self
-            .persistence
-            .profile_binding(&physical.identity, serial_unique);
-        self.begin_source_resolution(partial, binding, SelectionOrigin::User { new_source });
+        self.begin_source_resolution(
+            partial,
+            binding,
+            SelectionOrigin::User { new_source },
+            profile_seed,
+        );
         self.poll()
     }
     fn observe_profile_snapshot(&mut self) {
@@ -610,6 +629,7 @@ impl RuntimeCoordinator {
         mut partial: PartialDraft,
         binding: ProfileBinding,
         origin: SelectionOrigin,
+        profile_seed: Option<ProfileSeed>,
     ) {
         let physical = partial.source.as_ref().expect("resolved physical source");
         let prior = partial
@@ -633,7 +653,7 @@ impl RuntimeCoordinator {
                 partial.size = Some(mode.size);
                 partial.rate = Some(mode.rate);
                 partial.policy = mode.format_policy;
-                self.commit_source_selection(partial, binding, origin);
+                self.commit_source_selection(partial, binding, origin, profile_seed);
             }
             Ok(capture_catalog::ModeResolution::Pending(serial)) => {
                 self.ui.resolving = Some(PendingSelection {
@@ -644,6 +664,7 @@ impl RuntimeCoordinator {
                     binding,
                     intent,
                     origin,
+                    profile_seed,
                     domain_revision: self
                         .engine
                         .as_ref()
@@ -665,6 +686,7 @@ impl RuntimeCoordinator {
         mut partial: PartialDraft,
         binding: ProfileBinding,
         origin: SelectionOrigin,
+        profile_seed: Option<ProfileSeed>,
     ) {
         let audio_reason = if matches!(origin, SelectionOrigin::User { new_source: true })
             && self.ui.cli_audio.is_none()
@@ -684,6 +706,7 @@ impl RuntimeCoordinator {
             "source",
             audio_reason,
             Some((binding, origin)),
+            profile_seed,
         );
     }
     fn prepare_startup_adaptation(&mut self) {
@@ -745,6 +768,7 @@ impl RuntimeCoordinator {
                     partial,
                     binding,
                     SelectionOrigin::Startup { original },
+                    self.report_cache.provenance.selection_seed.clone(),
                 );
             }
             Err(reason) => {
@@ -812,6 +836,7 @@ impl RuntimeCoordinator {
             binding,
             intent,
             origin,
+            profile_seed,
             ..
         } = self
             .ui
@@ -835,7 +860,7 @@ impl RuntimeCoordinator {
                 partial.rate = Some(mode.rate);
                 partial.policy = mode.format_policy;
                 let newer_error = self.ui.error.take();
-                self.commit_source_selection(partial, binding, origin);
+                self.commit_source_selection(partial, binding, origin, profile_seed);
                 if self.ui.error.is_none() {
                     self.ui.error = newer_error;
                 }
@@ -971,319 +996,6 @@ impl RuntimeCoordinator {
                 Ok(())
             },
         )
-    }
-    pub(crate) fn set_filter_enabled(
-        &mut self,
-        revision: &str,
-        entry: &str,
-        enabled: bool,
-    ) -> UiUpdate {
-        self.edit_ui(revision, "setFilterEnabled", "filters", |draft, _| {
-            let prefix = format!("filter:{revision}:");
-            let index = entry
-                .strip_prefix(&prefix)
-                .and_then(capture_catalog::decimal)
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or((
-                    "stale_selection",
-                    "L'entrée de filtre ne correspond plus à cette sélection.".into(),
-                ))?;
-            draft
-                .filters
-                .set_enabled(index, enabled)
-                .map_err(|error| ("filter_error", error.to_string()))?;
-            Ok(())
-        })
-    }
-    pub(crate) fn remove_filter(&mut self, revision: &str, entry: &str) -> UiUpdate {
-        self.edit_ui(revision, "removeFilter", "filters", |draft, _| {
-            let prefix = format!("filter:{revision}:");
-            let index = entry
-                .strip_prefix(&prefix)
-                .and_then(capture_catalog::decimal)
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or((
-                    "stale_selection",
-                    "L'entrée de filtre ne correspond plus à cette sélection.".into(),
-                ))?;
-            draft
-                .filters
-                .remove(index)
-                .map_err(|error| ("filter_error", error.to_string()))?;
-            Ok(())
-        })
-    }
-
-    fn filter_entry_index(
-        revision: &str,
-        entry: &str,
-        len: usize,
-    ) -> Result<usize, (&'static str, String)> {
-        let index = entry
-            .strip_prefix("filter:")
-            .and_then(|key| key.split_once(':'))
-            .filter(|(entry_revision, _)| *entry_revision == revision)
-            .and_then(|(_, index)| capture_catalog::decimal(index))
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| {
-                (
-                    "stale_selection",
-                    "L'entrée de filtre ne correspond plus à cette sélection.".into(),
-                )
-            })?;
-        if index >= len {
-            return Err((
-                "filter_error",
-                crate::domain::filters::FilterValidationError::InvalidIndex { index, len }
-                    .to_string(),
-            ));
-        }
-        Ok(index)
-    }
-
-    pub(crate) fn set_filter_number(
-        &mut self,
-        revision: &str,
-        entry: &str,
-        parameter: &str,
-        value: f64,
-    ) -> UiUpdate {
-        use crate::domain::filters::{
-            EqParams, EqValues, Filter, Hqdn3dParams, Hqdn3dValues, UnsharpParams, UnsharpValues,
-        };
-        self.edit_ui(revision, "setFilterNumber", "filters", |draft, _| {
-            let index = Self::filter_entry_index(revision, entry, draft.filters.entries().len())?;
-            let unknown = || (
-                "invalid_value",
-                "Ce paramètre numérique n'appartient pas au filtre sélectionné.".into(),
-            );
-            let invalid = |error: crate::domain::filters::FilterValidationError| {
-                ("filter_error", error.to_string())
-            };
-            let filter = match draft.filters.entries()[index].filter() {
-                Filter::Eq(current) => {
-                    let mut values = EqValues {
-                        contrast: current.contrast(),
-                        brightness: current.brightness(),
-                        saturation: current.saturation(),
-                        gamma: current.gamma(),
-                        gamma_r: current.gamma_r(),
-                        gamma_g: current.gamma_g(),
-                        gamma_b: current.gamma_b(),
-                        gamma_weight: current.gamma_weight(),
-                    };
-                    match parameter {
-                        "contrast" => values.contrast = value,
-                        "brightness" => values.brightness = value,
-                        "saturation" => values.saturation = value,
-                        "gamma" => values.gamma = value,
-                        "gamma_r" => values.gamma_r = value,
-                        "gamma_g" => values.gamma_g = value,
-                        "gamma_b" => values.gamma_b = value,
-                        "gamma_weight" => values.gamma_weight = value,
-                        _ => return Err(unknown()),
-                    }
-                    Filter::Eq(EqParams::new(values).map_err(invalid)?)
-                }
-                Filter::Unsharp(current) => {
-                    let mut values = UnsharpValues {
-                        luma_msize_x: u32::from(current.luma_msize_x()),
-                        luma_msize_y: u32::from(current.luma_msize_y()),
-                        luma_amount: current.luma_amount(),
-                        chroma_msize_x: u32::from(current.chroma_msize_x()),
-                        chroma_msize_y: u32::from(current.chroma_msize_y()),
-                        chroma_amount: current.chroma_amount(),
-                        alpha_msize_x: u32::from(current.alpha_msize_x()),
-                        alpha_msize_y: u32::from(current.alpha_msize_y()),
-                        alpha_amount: current.alpha_amount(),
-                    };
-                    // Constructor inputs are u32, even though validated dimensions
-                    // are stored as u8. Reject before casting: never truncate a
-                    // fraction, saturate overflow, or wrap a negative number.
-                    let dimension = || -> Result<u32, (&'static str, String)> {
-                        if !value.is_finite()
-                            || value.fract() != 0.0
-                            || !(0.0..=f64::from(u32::MAX)).contains(&value)
-                        {
-                            return Err((
-                                "invalid_value",
-                                "Une dimension de matrice doit être un entier impair de 3 à 23 taps.".into(),
-                            ));
-                        }
-                        Ok(value as u32)
-                    };
-                    match parameter {
-                        "luma_msize_x" => values.luma_msize_x = dimension()?,
-                        "luma_msize_y" => values.luma_msize_y = dimension()?,
-                        "luma_amount" => values.luma_amount = value,
-                        "chroma_msize_x" => values.chroma_msize_x = dimension()?,
-                        "chroma_msize_y" => values.chroma_msize_y = dimension()?,
-                        "chroma_amount" => values.chroma_amount = value,
-                        "alpha_msize_x" => values.alpha_msize_x = dimension()?,
-                        "alpha_msize_y" => values.alpha_msize_y = dimension()?,
-                        "alpha_amount" => values.alpha_amount = value,
-                        _ => return Err(unknown()),
-                    }
-                    Filter::Unsharp(UnsharpParams::new(values).map_err(invalid)?)
-                }
-                Filter::Hqdn3d(current) => {
-                    let mut values = Hqdn3dValues {
-                        luma_spatial: current.luma_spatial(),
-                        chroma_spatial: current.chroma_spatial(),
-                        luma_tmp: current.luma_tmp(),
-                        chroma_tmp: current.chroma_tmp(),
-                    };
-                    match parameter {
-                        "luma_spatial" => values.luma_spatial = value,
-                        "chroma_spatial" => values.chroma_spatial = value,
-                        "luma_tmp" => values.luma_tmp = value,
-                        "chroma_tmp" => values.chroma_tmp = value,
-                        _ => return Err(unknown()),
-                    }
-                    Filter::Hqdn3d(Hqdn3dParams::new(values).map_err(invalid)?)
-                }
-                _ => return Err(unknown()),
-            };
-            draft.filters.set_filter(index, filter).map_err(invalid)
-        })
-    }
-
-    pub(crate) fn set_filter_choice(
-        &mut self,
-        revision: &str,
-        entry: &str,
-        parameter: &str,
-        value: &str,
-    ) -> UiUpdate {
-        use crate::domain::filters::{
-            BwdifMode, BwdifParams, ColorLevels, DeinterlaceSelection, FieldParity, Filter,
-            FormatParams, SdrGamma, SdrMatrix,
-        };
-        self.edit_ui(revision, "setFilterChoice", "filters", |draft, _| {
-            let index = Self::filter_entry_index(revision, entry, draft.filters.entries().len())?;
-            let unknown = || {
-                (
-                    "invalid_value",
-                    "Paramètre de choix ou valeur inconnu pour le filtre sélectionné.".into(),
-                )
-            };
-            let filter = match (draft.filters.entries()[index].filter(), parameter) {
-                (Filter::Format(current), "matrix") => Filter::Format(FormatParams::new(
-                    SdrMatrix::from_token(value).ok_or_else(unknown)?,
-                    current.levels(),
-                    current.gamma(),
-                )),
-                (Filter::Format(current), "levels") => Filter::Format(FormatParams::new(
-                    current.matrix(),
-                    ColorLevels::from_token(value).ok_or_else(unknown)?,
-                    current.gamma(),
-                )),
-                (Filter::Format(current), "gamma") => Filter::Format(FormatParams::new(
-                    current.matrix(),
-                    current.levels(),
-                    SdrGamma::from_token(value).ok_or_else(unknown)?,
-                )),
-                (Filter::Bwdif(current), "mode") => Filter::Bwdif(BwdifParams::new(
-                    BwdifMode::from_token(value).ok_or_else(unknown)?,
-                    current.parity(),
-                    current.deint(),
-                )),
-                (Filter::Bwdif(current), "parity") => Filter::Bwdif(BwdifParams::new(
-                    current.mode(),
-                    FieldParity::from_token(value).ok_or_else(unknown)?,
-                    current.deint(),
-                )),
-                (Filter::Bwdif(current), "deint") => Filter::Bwdif(BwdifParams::new(
-                    current.mode(),
-                    current.parity(),
-                    DeinterlaceSelection::from_token(value).ok_or_else(unknown)?,
-                )),
-                _ => return Err(unknown()),
-            };
-            draft
-                .filters
-                .set_filter(index, filter)
-                .map_err(|error| ("filter_error", error.to_string()))
-        })
-    }
-
-    pub(crate) fn move_filter(&mut self, revision: &str, entry: &str, direction: &str) -> UiUpdate {
-        self.edit_ui(revision, "moveFilter", "filters", |draft, _| {
-            let len = draft.filters.entries().len();
-            let index = Self::filter_entry_index(revision, entry, len)?;
-            let target = match direction {
-                "up" => index.saturating_sub(1),
-                "down" => (index + 1).min(len - 1),
-                _ => return Err(("invalid_value", "Direction de déplacement inconnue.".into())),
-            };
-            draft
-                .filters
-                .move_entry(index, target)
-                .map_err(|error| ("filter_error", error.to_string()))
-        })
-    }
-
-    pub(crate) fn clear_filters(&mut self, revision: &str) -> UiUpdate {
-        self.edit_ui(revision, "clearFilters", "filters", |draft, _| {
-            draft.filters = FilterChain::default();
-            Ok(())
-        })
-    }
-
-    pub(crate) fn add_filter(&mut self, revision: &str, kind: &str) -> UiUpdate {
-        let available = self
-            .ui
-            .filters
-            .kinds
-            .iter()
-            .any(|row| row.kind == kind && row.available);
-        self.edit_ui(revision, "addFilter", "filters", |draft, _| {
-            let kind = FilterKind::ALL
-                .into_iter()
-                .find(|value| value.as_str() == kind)
-                .ok_or(("invalid_value", "Type de filtre inconnu.".into()))?;
-            if !available {
-                return Err((
-                    "unavailable",
-                    "Ce filtre n'est pas disponible dans le registre qualifié.".into(),
-                ));
-            }
-            if draft
-                .filters
-                .entries()
-                .iter()
-                .any(|entry| entry.kind() == kind)
-            {
-                return Err((
-                    "filter_error",
-                    "Ce type de filtre est déjà présent ; ses entrées sont conservées.".into(),
-                ));
-            }
-            let mut counter = 1u64;
-            let label = loop {
-                let label = format!("{}-{counter}", kind.as_str());
-                if !draft
-                    .filters
-                    .entries()
-                    .iter()
-                    .any(|entry| entry.label() == label)
-                {
-                    break label;
-                }
-                counter = counter.checked_add(1).ok_or((
-                    "filter_error",
-                    "La séquence des libellés est épuisée.".into(),
-                ))?;
-            };
-            draft
-                .filters
-                .insert(
-                    draft.filters.entries().len(),
-                    FilterEntry::new(label, projection::default_filter(kind), true),
-                )
-                .map_err(|error| ("filter_error", error.to_string()))?;
-            Ok(())
-        })
     }
     fn edit_renderer(
         &mut self,
@@ -1471,6 +1183,7 @@ impl RuntimeCoordinator {
         field: &'static str,
         audio_reason: Option<String>,
         source_context: Option<(ProfileBinding, SelectionOrigin)>,
+        source_profile: Option<ProfileSeed>,
     ) {
         // Retain the final authoritative admission after resolving the input.
         if let Err((code, error)) = self.check_selection_ready() {
@@ -1562,6 +1275,9 @@ impl RuntimeCoordinator {
             ));
             self.fed_plan_revision = None;
         }
+        if source_context.is_some() {
+            self.report_cache.provenance.selection_seed = source_profile;
+        }
         self.ui.selected = partial.source;
         if let Some((binding, _)) = source_context {
             self.ui.selected_binding = Some((
@@ -1649,6 +1365,12 @@ impl RuntimeCoordinator {
         };
         match result {
             Ok(admission) => {
+                self.report_cache.provenance.admit(
+                    admission,
+                    &submitted,
+                    binding,
+                    self.diagnostics.report_byte_limit(),
+                );
                 self.ui.submitted = Some((admission.id(), self.ui.selected.clone()));
                 if self.ui.profile_audio
                     && matches!(admission, crate::domain::state::ApplyAdmission::Open { .. })
@@ -1798,7 +1520,6 @@ impl RuntimeCoordinator {
             audio_enabled: partial.audio.enabled(),
             audio_input_key: self.ui.catalog.input_key(&partial.audio),
             audio_input_label: self.audio_input_label(&partial.audio),
-            filters: partial.filters.clone(),
             renderer: partial.renderer.clone(),
         }
     }
@@ -1873,7 +1594,6 @@ impl RuntimeCoordinator {
             rate: Some(settings.video.mode.rate),
             policy: settings.video.mode.format_policy,
             audio: settings.audio.clone(),
-            filters: settings.filters.clone(),
             renderer: settings.renderer.clone(),
         };
         self.selection_projection(&partial, Some(settings))
@@ -1907,30 +1627,6 @@ impl RuntimeCoordinator {
         let last_valid = model
             .and_then(ProductModel::last_valid)
             .map(|applied| self.applied_projection(applied));
-        let mut filters = self.ui.filters.clone();
-        filters.entries = partial
-            .filters
-            .entries()
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                let available = filters
-                    .kinds
-                    .iter()
-                    .find(|kind| kind.kind == entry.kind().as_str());
-                projection::FilterEntryRow {
-                    key: format!("filter:{}:{index}", self.ui.public_revision),
-                    label: entry.label().into(),
-                    kind: entry.kind().as_str(),
-                    enabled: entry.enabled(),
-                    parameters: projection::Parameters::from(entry.filter()),
-                    available: available.is_some_and(|kind| kind.available),
-                    reason: available
-                        .map(|kind| kind.reason.clone())
-                        .unwrap_or_else(|| "Registre qualifié indisponible".into()),
-                }
-            })
-            .collect();
         let old_live = self.ui.snapshot.as_ref().map(|snapshot| &snapshot.live);
         let visible = applied.as_ref().or(last_valid.as_ref());
         let live = projection::Live {
@@ -2033,7 +1729,6 @@ impl RuntimeCoordinator {
             live,
             stream_stats: model.map(|model| self.stream_stats(stream_settings(model))),
             catalog: self.ui.catalog.projection.clone(),
-            filters,
             renderer: self.ui.renderer.clone(),
             output: projection::Output {
                 revision: output.catalog_revision.to_string(),
@@ -2077,17 +1772,66 @@ impl RuntimeCoordinator {
                 close_dialog: self.persistence.close_dialog().into(),
                 reset_token: self.persistence.reset_token().to_string(),
             },
+            diagnostics: self.diagnostics_projection(),
             intent_error: self.ui.error.clone(),
         }
     }
     pub(crate) fn new(
         prefix: String,
-        treatment_capabilities: crate::media::render_catalog::QualifiedTreatmentCapabilities,
+        treatment_capabilities: Result<
+            crate::media::render_catalog::RendererCapabilities,
+            crate::media::render_catalog::RendererCatalogError,
+        >,
         startup: StartupSelection,
         persistence: PersistenceSession,
         sources: Vec<AudioSourceIdentity>,
+        diagnostics: crate::diagnostics::DiagnosticsHandle,
+    ) -> Self {
+        Self::new_with_catalog(
+            prefix,
+            treatment_capabilities,
+            startup,
+            persistence,
+            sources,
+            diagnostics,
+            OutputCatalogWatch::start,
+        )
+    }
+    fn new_with_catalog(
+        prefix: String,
+        treatment_capabilities: Result<
+            crate::media::render_catalog::RendererCapabilities,
+            crate::media::render_catalog::RendererCatalogError,
+        >,
+        startup: StartupSelection,
+        persistence: PersistenceSession,
+        sources: Vec<AudioSourceIdentity>,
+        diagnostics: crate::diagnostics::DiagnosticsHandle,
+        start_catalog: impl FnOnce() -> Result<OutputCatalogWatch, crate::domain::capture::AudioError>,
     ) -> Self {
         let gain = persistence.preferences().gain;
+        let mut report_cache = ReportCache::default();
+        report_cache.environment.os = diagnostics.os_report();
+        report_cache.environment.log_location = diagnostics.health();
+        if startup.restore_profile {
+            report_cache.provenance.selection_seed = persistence
+                .saved_selection_ref()
+                .zip(startup.source_binding)
+                .map(|(loaded, binding)| {
+                    ProfileSeed::new(
+                        loaded,
+                        binding,
+                        crate::diagnostics::report::ProfileOrigin::Startup,
+                        diagnostics.report_byte_limit(),
+                    )
+                });
+        }
+        report_cache.environment.runtime_treatment_capabilities =
+            crate::diagnostics::report::Observation::Observed {
+                value: crate::diagnostics::report::RuntimeTreatmentCapabilities {
+                    renderer_available: treatment_capabilities.is_ok(),
+                },
+            };
         let output = OutputPolicy::new(persistence.preferences().output.clone());
         let selected_binding = startup
             .source_binding
@@ -2098,14 +1842,14 @@ impl RuntimeCoordinator {
                     .map(|settings| settings.video.identity.clone()),
             )
             .map(|(binding, identity)| (identity, binding));
-        let (catalog, catalog_start_failed) = match OutputCatalogWatch::start() {
+        let (catalog, catalog_start_failed) = match start_catalog() {
             Ok(watch) => (Some(watch), false),
-            Err(error) => {
-                tracing::warn!(error = %error, "output catalog watch unavailable");
+            Err(_) => {
+                tracing::warn!(event_code = "output_catalog_unavailable");
                 (None, true)
             }
         };
-        let (filters, renderer) = projection::treatments(&treatment_capabilities);
+        let renderer = projection::treatments(&treatment_capabilities);
         let runner = GateRunner::new(prefix, treatment_capabilities);
         let cli_audio = (startup.audio_policy == crate::app::settings::StartupAudioPolicy::Cli)
             .then(|| {
@@ -2136,6 +1880,9 @@ impl RuntimeCoordinator {
             ),
         };
         Self {
+            diagnostics,
+            report_cache,
+            next_log_folder_request: Some(crate::diagnostics::FolderRequestId(1)),
             engine,
             ui: ProductUi {
                 audio_policy: startup.audio_policy,
@@ -2145,7 +1892,6 @@ impl RuntimeCoordinator {
                     && startup.audio_policy != crate::app::settings::StartupAudioPolicy::Cli,
                 startup_adaptation: startup.adapt_video,
                 startup_pin: startup.topology_pin,
-                filters,
                 renderer,
                 bootstrap_runner,
                 partial,
@@ -2154,6 +1900,8 @@ impl RuntimeCoordinator {
             sources,
             dirty: true,
             last_state: None,
+            last_logged_runtime: None,
+            last_logged_settings: None,
             command_error: String::new(),
             quit_empty: false,
             auto_open: startup.auto_open,
@@ -2203,6 +1951,16 @@ impl RuntimeCoordinator {
             };
             match admission {
                 Ok(admission) => {
+                    self.report_cache.provenance.admit(
+                        admission,
+                        engine.model().draft(),
+                        self.ui
+                            .selected_binding
+                            .as_ref()
+                            .map(|(_, binding)| *binding)
+                            .unwrap_or(ProfileBinding::Topology),
+                        self.diagnostics.report_byte_limit(),
+                    );
                     let apply = admission.id();
                     self.startup_apply = Some(apply);
                     if let Err(error) = engine.require_startup_restore_audio(apply) {
@@ -2225,6 +1983,7 @@ impl RuntimeCoordinator {
         self.poll()
     }
     fn begin_shutdown(&mut self) {
+        self.report_cache.provenance.cancel();
         if self.ui.resolving.take().is_some() {
             self.ui_reject(
                 "closing",
@@ -2306,6 +2065,9 @@ impl RuntimeCoordinator {
         self.ui.resolving = None;
         self.ui.catalog.cancel_mode();
         self.persistence.request_reset();
+        if self.persistence.reset_token() != 0 {
+            self.report_cache.provenance.cancel();
+        }
         self.dirty = true;
         self.poll()
     }
@@ -2328,14 +2090,32 @@ impl RuntimeCoordinator {
         self.dirty = true;
         self.poll()
     }
+    pub(crate) fn set_logging_enabled(&mut self, enabled: bool) -> UiUpdate {
+        if !self.persistence.mutations_open() {
+            return self.poll();
+        }
+        if let Err(error) = self.diagnostics.set_logging_enabled(enabled) {
+            self.ui_reject(
+                "unavailable",
+                "setLoggingEnabled",
+                "loggingEnabled",
+                error.message_fr(),
+            );
+            return self.poll();
+        }
+        if self.persistence.preferences().logging_enabled != enabled {
+            self.persistence.set_logging_enabled_preference(enabled);
+            self.dirty = true;
+        }
+        self.poll()
+    }
     fn rejection(&mut self, error: impl std::fmt::Display) {
         self.command_error = error.to_string();
         self.dirty = true;
-        tracing::warn!(diagnostic = %serde_json::json!({"error": self.command_error}), "qualification_command_rejected");
+        tracing::warn!(event_code = "qualification_command_rejected");
     }
     fn qualification_rejection(&mut self, line: &str, error: impl std::fmt::Display) {
-        // Serialize before tracing or projecting: inert user labels can contain
-        // controls, but must never turn one rejected request into log lines.
+        // This escaped value is user-facing UI state, never a log payload.
         self.rejection(serde_json::json!({"input": line, "error": error.to_string()}));
     }
     /// Open is a plain draft apply. It must never silently reconnect a lost
@@ -2383,6 +2163,12 @@ impl RuntimeCoordinator {
             match result {
                 Err(error) => self.rejection(error),
                 Ok(apply) => {
+                    self.report_cache.provenance.admit(
+                        apply,
+                        &submitted,
+                        binding.expect("engine binding"),
+                        self.diagnostics.report_byte_limit(),
+                    );
                     if self.ui.profile_audio
                         && matches!(apply, crate::domain::state::ApplyAdmission::Open { .. })
                         && let Err(error) = engine.require_profile_restore_audio(apply.id())
@@ -2445,6 +2231,7 @@ impl RuntimeCoordinator {
                 if let Err(error) = result {
                     self.rejection(error);
                 } else {
+                    self.report_cache.provenance.cancel();
                     if let Some(apply) = self.persistence.authorized_apply() {
                         self.persistence.cancel_user_apply(apply);
                     }
@@ -2474,8 +2261,8 @@ impl RuntimeCoordinator {
                 self.rejection(CommandRejection::StaleState);
             } else {
                 match engine.reconnect(engine.model().state_identity()) {
-                    Ok(admission) => {
-                        tracing::info!(?admission, "ui_reconnect_admitted");
+                    Ok(_) => {
+                        tracing::info!(event_code = "reconnect_admitted");
                         self.command_error.clear();
                         self.dirty = true;
                     }
@@ -2902,7 +2689,10 @@ impl RuntimeCoordinator {
                 return self.poll();
             }
         }
-        tracing::info!(request = %serde_json::json!({"input": line}), "qualification_request_received");
+        tracing::info!(
+            event_code = "qualification_request_received",
+            kind = qualification_intent(line)
+        );
         match line.trim() {
             "settings" => {
                 self.dirty = true;
@@ -2946,7 +2736,10 @@ impl RuntimeCoordinator {
                 return self.poll();
             }
         };
-        tracing::info!(request = %serde_json::json!({"input": line, "verb": line.split_ascii_whitespace().next()}), "qualification_request_parsed");
+        tracing::info!(
+            event_code = "qualification_request_parsed",
+            kind = qualification_intent(line)
+        );
         if command == Command::Snapshot {
             self.dirty = true;
             return self.poll();
@@ -2987,13 +2780,6 @@ impl RuntimeCoordinator {
         };
         let result: Result<(), String> = (|| {
             match command {
-                Command::Filters(revision, filters) => {
-                    let mut settings = engine.model().draft().settings.clone();
-                    settings.filters = filters;
-                    engine
-                        .edit_draft(revision, settings)
-                        .map_err(|error| error.to_string())?;
-                }
                 Command::Renderer(revision, renderer) => {
                     // Editing stores the requested renderer only; nothing is
                     // applied until an explicit Apply/Open.
@@ -3066,6 +2852,12 @@ impl RuntimeCoordinator {
                     let apply = engine
                         .apply(state, revision)
                         .map_err(|error| error.to_string())?;
+                    self.report_cache.provenance.admit(
+                        apply,
+                        &submitted,
+                        binding.expect("engine binding"),
+                        self.diagnostics.report_byte_limit(),
+                    );
                     if self.ui.profile_audio
                         && matches!(apply, crate::domain::state::ApplyAdmission::Open { .. })
                     {
@@ -3087,8 +2879,8 @@ impl RuntimeCoordinator {
                 Command::Reconnect(expected) => {
                     let state =
                         Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
-                    let admission = engine.reconnect(state).map_err(|error| error.to_string())?;
-                    tracing::info!(?admission, "qualification_reconnect_admitted");
+                    engine.reconnect(state).map_err(|error| error.to_string())?;
+                    tracing::info!(event_code = "reconnect_admitted");
                 }
                 Command::Choose(expected, token) => {
                     let state =
@@ -3101,6 +2893,7 @@ impl RuntimeCoordinator {
                     let state =
                         Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
                     engine.close(state).map_err(|error| error.to_string())?;
+                    self.report_cache.provenance.cancel();
                     if let Some(apply) = self.persistence.authorized_apply() {
                         self.persistence.cancel_user_apply(apply);
                     }
@@ -3108,6 +2901,7 @@ impl RuntimeCoordinator {
                 Command::Quit(expected) => {
                     Self::checked_state(engine, expected).map_err(|error| error.to_string())?;
                     if self.persistence.request_close() {
+                        self.report_cache.provenance.cancel();
                         engine.quit();
                     }
                 }
@@ -3118,7 +2912,11 @@ impl RuntimeCoordinator {
                     let gain = PlaybackGain::new(percent, engine.gain().muted)
                         .map_err(|error| error.to_string())?;
                     let status = engine.set_gain(gain);
-                    tracing::info!(attempt_id = attempt.get(), ?status, "qualification_volume");
+                    tracing::info!(
+                        event_code = "qualification_volume",
+                        attempt_id = attempt.get(),
+                        accepted = status == SubmitStatus::Accepted
+                    );
                     if status != SubmitStatus::Accepted {
                         return Err(format!("volume submission {status:?}"));
                     }
@@ -3133,7 +2931,11 @@ impl RuntimeCoordinator {
                         ..engine.gain()
                     };
                     let status = engine.set_gain(gain);
-                    tracing::info!(attempt_id = attempt.get(), ?status, "qualification_mute");
+                    tracing::info!(
+                        event_code = "qualification_mute",
+                        attempt_id = attempt.get(),
+                        accepted = status == SubmitStatus::Accepted
+                    );
                     if status != SubmitStatus::Accepted {
                         return Err(format!("mute submission {status:?}"));
                     }
@@ -3164,7 +2966,49 @@ impl RuntimeCoordinator {
         }
         self.poll()
     }
+    pub(crate) fn open_log_folder(&mut self) -> UiUpdate {
+        let health = self.diagnostics.health();
+        if !self.persistence.mutations_open()
+            || !health.logging_enabled
+            || health.folder.state == crate::diagnostics::FolderState::Preparing
+        {
+            return self.poll();
+        }
+        if let Some(request) = self.next_log_folder_request {
+            self.next_log_folder_request = request.next();
+            self.diagnostics.prepare_log_folder(request);
+            tracing::info!(event_code = "log_folder_requested", request_id = request.0);
+        } else {
+            self.diagnostics.reject_folder_counter_exhausted();
+        }
+        self.poll()
+    }
+
+    pub(crate) fn claim_log_folder_dispatch(&mut self, request: u64) -> bool {
+        self.diagnostics
+            .claim_log_folder_dispatch(crate::diagnostics::FolderRequestId(request))
+    }
+
+    pub(crate) fn log_folder_result(&mut self, request: u64, accepted: bool) -> UiUpdate {
+        self.diagnostics
+            .acknowledge_log_folder(crate::diagnostics::FolderRequestId(request), accepted);
+        self.poll()
+    }
+
+    pub(crate) fn log_folder_finished(&mut self, request: u64, failed: bool) -> UiUpdate {
+        self.diagnostics
+            .finish_log_folder(crate::diagnostics::FolderRequestId(request), failed);
+        self.poll()
+    }
+
     pub(crate) fn poll(&mut self) -> UiUpdate {
+        let diagnostics_environment_changed = self.poll_diagnostic_environment();
+        self.dirty |= diagnostics_environment_changed;
+        let folder_dispatch = self
+            .diagnostics
+            .take_folder_result()
+            .and_then(|response| response.result.ok().map(|path| (response.request.0, path)));
+        self.dirty |= folder_dispatch.is_some();
         if self.ui.catalog.poll() {
             self.dirty = true;
             self.observe_profile_snapshot();
@@ -3175,6 +3019,7 @@ impl RuntimeCoordinator {
         if let Some(engine) = &mut self.engine {
             if let Some((key, _)) = engine.model().opening() {
                 self.persistence.observe_opening(key);
+                self.report_cache.provenance.observe_opening(key);
             }
             engine.poll();
             if let Some(apply) = self.persistence.authorized_apply()
@@ -3184,8 +3029,12 @@ impl RuntimeCoordinator {
             }
             if let Some((key, _)) = engine.model().opening() {
                 self.persistence.observe_opening(key);
+                self.report_cache.provenance.observe_opening(key);
             }
             if let Some(event) = engine.take_verified_applied() {
+                self.report_cache
+                    .provenance
+                    .verified(&event, self.diagnostics.report_byte_limit());
                 let apply = match &event {
                     VerifiedApplied::Open { key, .. } => key.apply,
                     VerifiedApplied::Treatments { key, .. } => key.apply,
@@ -3229,6 +3078,27 @@ impl RuntimeCoordinator {
                 self.persistence.startup_failed(reason);
                 self.dirty = true;
             }
+            if let Some(apply) = self.report_cache.provenance.pending_apply()
+                && !engine.has_user_apply_result_or_pending(apply)
+            {
+                self.report_cache.provenance.cancel();
+            }
+            let model = engine.model();
+            let active_key = model.active().map(|active| {
+                (
+                    active.attempt(),
+                    model
+                        .confirmed_treatments()
+                        .filter(|confirmed| confirmed.key().attempt == active.attempt())
+                        .map(|confirmed| confirmed.key()),
+                )
+            });
+            self.report_cache.provenance.synchronize(
+                model.active().map(|v| v.applied()),
+                model.last_valid(),
+                active_key,
+                self.diagnostics.report_byte_limit(),
+            );
         }
         self.sync_ui_tokens();
         let mut update = self.poll_media();
@@ -3271,6 +3141,11 @@ impl RuntimeCoordinator {
             // GUI never leaves the event loop.
             update.changed = true;
         }
+        if let Some((request, path)) = folder_dispatch {
+            update.log_folder_request = request;
+            update.log_folder_path = path;
+            update.changed = true;
+        }
         if update.changed {
             let projection = self.output_projection();
             let snapshot = self.product_snapshot(&update, &projection);
@@ -3300,13 +3175,42 @@ impl RuntimeCoordinator {
             update.reset_token = self.persistence.reset_token();
             update.fullscreen = self.persistence.preferences().fullscreen;
             update.stats_hidden = self.persistence.preferences().stats_hidden;
+            update.logging_enabled = self.persistence.preferences().logging_enabled;
             update.closing = !self.persistence.mutations_open();
         }
-        if update.changed {
-            tracing::info!(settings_status = %update.settings_status, settings_path = %update.settings_path,
-                settings_refused = update.settings_refused, startup_reason = %update.startup_reason,
-                close_dialog = %update.close_dialog, reset_token = update.reset_token,
-                fullscreen = update.fullscreen, selection = %update.saved_selection, quit = update.quit, "settings_runtime");
+        self.publish_diagnostics(
+            diagnostics_environment_changed,
+            update.phase,
+            update.generation,
+        );
+        // Publish the current immutable report before admitting its scalar events.
+        // GUI dirtiness includes diagnostics health; only product keys emit logs.
+        if let Some(engine) = &self.engine {
+            let snapshot = runtime_snapshot(engine);
+            if self.last_logged_runtime != Some(snapshot) {
+                self.last_logged_runtime = Some(snapshot);
+                log_snapshot(snapshot);
+            }
+        }
+        let settings = SettingsLogSnapshot {
+            refused: self.persistence.refused(),
+            reset_token: self.persistence.reset_token(),
+            fullscreen: self.persistence.preferences().fullscreen,
+            stats_hidden: self.persistence.preferences().stats_hidden,
+            closing: !self.persistence.mutations_open(),
+            quit: update.quit,
+        };
+        if self.last_logged_settings != Some(settings) {
+            self.last_logged_settings = Some(settings);
+            tracing::info!(
+                event_code = "settings_runtime",
+                settings_refused = settings.refused,
+                reset_token = settings.reset_token,
+                fullscreen = settings.fullscreen,
+                stats_hidden = settings.stats_hidden,
+                closing = settings.closing,
+                quit = settings.quit
+            );
         }
         update
     }
@@ -3315,6 +3219,8 @@ impl RuntimeCoordinator {
             let changed = std::mem::take(&mut self.dirty);
             return UiUpdate {
                 ui_snapshot: String::new(),
+                log_folder_request: 0,
+                log_folder_path: String::new(),
                 changed,
                 phase: if self.quit_empty {
                     GatePhase::QuitReady
@@ -3383,6 +3289,7 @@ impl RuntimeCoordinator {
                 reset_token: 0,
                 fullscreen: false,
                 stats_hidden: false,
+                logging_enabled: false,
                 closing: false,
                 output_rows: String::new(),
                 output_catalog_revision: 0,
@@ -3649,12 +3556,11 @@ impl RuntimeCoordinator {
             }
             context_diagnostic.push_str(INTERPOLATION_INACTIVE_TEXT);
         }
-        if changed {
-            log_snapshot(engine);
-        }
         let runner = engine.runner_mut();
         UiUpdate {
             ui_snapshot: String::new(),
+            log_folder_request: 0,
+            log_folder_path: String::new(),
             changed,
             phase,
             generation: native.attempt.map(AttemptId::get).unwrap_or(0),
@@ -3701,6 +3607,7 @@ impl RuntimeCoordinator {
             reset_token: 0,
             fullscreen: false,
             stats_hidden: false,
+            logging_enabled: false,
             closing: false,
             output_rows: String::new(),
             output_catalog_revision: 0,
@@ -3882,59 +3789,107 @@ fn candidate_entry(candidate: &RecoveryCandidate) -> String {
     )
 }
 
-fn runtime_snapshot(engine: &mut Engine) -> serde_json::Value {
-    let pending_key = engine.model().treating().map(|transition| transition.key());
-    // Admission can precede the owner's first Pending publication. A retained
-    // incumbent confirmation is not success for that newly admitted key.
-    let treatments = match (pending_key, engine.runner_mut().treatment_snapshot()) {
-        (Some(key), observed)
-            if observed.is_none_or(|observed| {
-                observed.key != key
-                    || matches!(
-                        observed.status,
-                        crate::media::controller::TreatmentStatus::Confirmed(_)
-                    )
-            }) =>
-        {
-            Some(serde_json::json!({
-                "key": key, "sequence": null, "status": "Pending",
-                "confirmation": null, "failure": null,
-            }))
-        }
-        (_, Some(treatments)) => {
-            let (status, confirmation, failure) = match &treatments.status {
-                crate::media::controller::TreatmentStatus::Pending => ("Pending", None, None),
-                crate::media::controller::TreatmentStatus::Confirmed(confirmation) => {
-                    ("Confirmed", Some(confirmation), None)
-                }
-                crate::media::controller::TreatmentStatus::Failed(failure) => {
-                    ("Failed", None, Some(failure))
-                }
-            };
-            Some(serde_json::json!({
-                "key": treatments.key, "sequence": treatments.sequence, "status": status,
-                "confirmation": confirmation, "failure": failure,
-            }))
-        }
-        _ => None,
-    };
-    let model = engine.model();
-    let identity = model.state_identity();
-    serde_json::json!({
-        "phase": model.phase(), "apply_id": identity.operation().map(|id| id.get()), "attempt_id": identity.attempt().map(AttemptId::get),
-        "treatment_pass": identity.treatment_pass(), "treatments": treatments,
-        "cleanup": match model.cleanup() { CleanupStatus::Complete => "Complete", CleanupStatus::Draining => "Draining", CleanupStatus::Blocked { .. } => "Blocked" },
-        "draft_revision": model.draft().revision.get(), "draft": model.draft().settings,
-        "last_valid": model.last_valid().map(|settings| settings.settings()),
-        "active_attempt": model.active().map(|active| active.attempt().get()), "active_settings": model.active().map(|active| active.applied().settings()),
-        "active_playback": model.active().map(|active| active.playback()),
-        "failures": model.failures(), "validation_rejection": model.validation_rejection().map(|rejection| serde_json::json!({"request": rejection.request, "failure": rejection.failure})),
-        "gain": engine.gain(), "can_apply": model.can_apply(), "can_restart": model.can_restart(), "can_reconnect": model.can_reconnect(), "shutdown_ready": model.shutdown_ready(),
-    })
+/// Product-authoritative qualification scalars. Zero represents an absent ID,
+/// exactly as checked_state does; no report/GUI snapshot is a command authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeLogSnapshot {
+    phase: &'static str,
+    apply_id: u64,
+    attempt_id: u64,
+    cleanup: &'static str,
+    draft_revision: u64,
+    pass: Option<crate::domain::state::TreatmentPass>,
+    gain: PlaybackGain,
+    can_apply: bool,
+    can_restart: bool,
+    can_reconnect: bool,
+    shutdown_ready: bool,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SettingsLogSnapshot {
+    refused: bool,
+    reset_token: u64,
+    fullscreen: bool,
+    stats_hidden: bool,
+    closing: bool,
+    quit: bool,
 }
 
-fn log_snapshot(engine: &mut Engine) {
-    tracing::info!(snapshot = %runtime_snapshot(engine), "apply_runtime");
+fn runtime_snapshot(engine: &Engine) -> RuntimeLogSnapshot {
+    let model = engine.model();
+    let identity = model.state_identity();
+    RuntimeLogSnapshot {
+        phase: phase_name(model.phase()),
+        apply_id: identity.operation().map(|id| id.get()).unwrap_or(0),
+        attempt_id: identity.attempt().map(AttemptId::get).unwrap_or(0),
+        cleanup: match model.cleanup() {
+            CleanupStatus::Complete => "Complete",
+            CleanupStatus::Draining => "Draining",
+            CleanupStatus::Blocked { .. } => "Blocked",
+        },
+        draft_revision: model.draft().revision.get(),
+        pass: identity.treatment_pass(),
+        gain: engine.gain(),
+        can_apply: model.can_apply(),
+        can_restart: model.can_restart(),
+        can_reconnect: model.can_reconnect(),
+        shutdown_ready: model.shutdown_ready(),
+    }
+}
+
+fn log_snapshot(snapshot: RuntimeLogSnapshot) {
+    let pass = match snapshot.pass {
+        Some(crate::domain::state::TreatmentPass::Candidate) => "Candidate",
+        Some(crate::domain::state::TreatmentPass::Restore) => "Restore",
+        Some(crate::domain::state::TreatmentPass::Open) => "Open",
+        None => "None",
+    };
+    tracing::info!(
+        event_code = "apply_runtime",
+        phase = snapshot.phase,
+        apply_id = snapshot.apply_id,
+        attempt_id = snapshot.attempt_id,
+        cleanup = snapshot.cleanup,
+        draft_revision = snapshot.draft_revision,
+        pass,
+        volume_percent = snapshot.gain.volume_percent,
+        muted = snapshot.gain.muted,
+        can_apply = snapshot.can_apply,
+        can_restart = snapshot.can_restart,
+        can_reconnect = snapshot.can_reconnect,
+        shutdown_ready = snapshot.shutdown_ready
+    );
+}
+
+fn qualification_intent(line: &str) -> &'static str {
+    match line.split_ascii_whitespace().next() {
+        Some("snapshot") => "Snapshot",
+        Some("draft-video") => "DraftVideo",
+        Some("draft-identity") => "DraftIdentity",
+        Some("draft-audio") => "DraftAudio",
+        Some("draft-source") => "DraftSource",
+        Some("draft-renderer") => "DraftRenderer",
+        Some("open") => "Open",
+        Some("apply") => "Apply",
+        Some("restart") => "Restart",
+        Some("reconnect") => "Reconnect",
+        Some("choose") => "Choose",
+        Some("volume") => "Volume",
+        Some("mute") => "Mute",
+        Some("pause") => "Pause",
+        Some("close") => "Close",
+        Some("quit") => "Quit",
+        Some("settings") => "Settings",
+        Some("application-close") => "ApplicationClose",
+        Some("save-retry") => "SaveRetry",
+        Some("close-without-save") => "CloseWithoutSave",
+        Some("settings-reset") => "SettingsReset",
+        Some("reset-cancel") => "ResetCancel",
+        Some("reset-confirm") => "ResetConfirm",
+        Some("preference-volume") => "PreferenceVolume",
+        Some("preference-mute") => "PreferenceMute",
+        _ => "Unknown",
+    }
 }
 
 #[cfg(test)]
@@ -3945,7 +3900,7 @@ mod tests {
         domain::{
             capture::{AudioEpoch, AudioError, CaptureMode, CapturedFourCc, FrameRate, FrameSize},
             failure::ApplyFailure,
-            state::{ProductPhase, ValidationRequest},
+            state::{ProductPhase, TreatmentPass, ValidationRequest},
         },
         media::controller::{
             BackendEvent, Generation, OwnerEndpoint, X11WindowId,
@@ -3954,14 +3909,12 @@ mod tests {
     };
     use std::sync::mpsc;
 
-    /// Legitimate cfg(test) fixture bundle: real captured filter inventory plus
-    /// the real captured renderer inventory (owner keeps the production query).
-    fn fixture_treatment_capabilities()
-    -> crate::media::render_catalog::QualifiedTreatmentCapabilities {
-        crate::media::render_catalog::QualifiedTreatmentCapabilities {
-            filters: Ok(crate::media::filter_catalog::fixture_capabilities()),
-            renderer: Ok(crate::media::render_catalog::fixture_capabilities()),
-        }
+    /// Captured renderer inventory; production retains the qualified query.
+    fn fixture_treatment_capabilities() -> Result<
+        crate::media::render_catalog::RendererCapabilities,
+        crate::media::render_catalog::RendererCatalogError,
+    > {
+        Ok(crate::media::render_catalog::fixture_capabilities())
     }
     fn settings() -> DraftSettings {
         let mode = CaptureMode {
@@ -3970,7 +3923,6 @@ mod tests {
             rate: FrameRate::new(60, 1).unwrap(),
         };
         DraftSettings {
-            filters: crate::domain::filters::FilterChain::default(),
             video: crate::domain::capture::VideoRequest::manual(
                 crate::domain::capture::ModeRequest {
                     identity: session_fixture(&["/dev/video0"], mode).devices()[0]
@@ -4051,6 +4003,9 @@ mod tests {
         );
         (
             RuntimeCoordinator {
+                diagnostics: crate::diagnostics::DiagnosticsHandle::for_test(),
+                report_cache: ReportCache::default(),
+                next_log_folder_request: Some(crate::diagnostics::FolderRequestId(1)),
                 engine: Some(engine),
                 sources: vec![
                     AudioSourceIdentity::new(
@@ -4061,6 +4016,8 @@ mod tests {
                 ],
                 dirty: true,
                 last_state: None,
+                last_logged_runtime: None,
+                last_logged_settings: None,
                 command_error: String::new(),
                 quit_empty: false,
                 persistence: {
@@ -4421,7 +4378,7 @@ mod tests {
             self.0.join("settings.json")
         }
         fn applied(&self) -> DraftSettings {
-            let (_, crate::settings::LoadOutcome::Loaded(document)) =
+            let (_, crate::settings::LoadOutcome::Loaded { document, .. }) =
                 crate::settings::SettingsStore::load(self.path())
             else {
                 panic!("runtime did not publish a valid settings document")
@@ -4465,54 +4422,12 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    fn treatment_chain(all_disabled: bool) -> crate::domain::filters::FilterChain {
-        use crate::domain::filters::*;
-        FilterChain::new(vec![
-            FilterEntry::new(
-                "SDR\u{a0}reference".into(),
-                Filter::Format(FormatParams::new(
-                    SdrMatrix::Bt709,
-                    ColorLevels::Limited,
-                    SdrGamma::Bt1886,
-                )),
-                !all_disabled,
-            ),
-            FilterEntry::new(
-                "disabled\n\0equalizer".into(),
-                Filter::Eq(
-                    EqParams::new(EqValues {
-                        contrast: 1.1,
-                        brightness: 0.05,
-                        saturation: 1.2,
-                        gamma: 1.0,
-                        gamma_r: 1.0,
-                        gamma_g: 1.0,
-                        gamma_b: 1.0,
-                        gamma_weight: 1.0,
-                    })
-                    .unwrap(),
-                ),
-                false,
-            ),
-            FilterEntry::new(
-                "denoise".into(),
-                Filter::Hqdn3d(
-                    Hqdn3dParams::new(Hqdn3dValues {
-                        luma_spatial: 3.0,
-                        chroma_spatial: 0.0,
-                        luma_tmp: 6.0,
-                        chroma_tmp: 4.5,
-                    })
-                    .unwrap(),
-                ),
-                !all_disabled,
-            ),
-        ])
-        .unwrap()
+    fn treatment_renderer(interpolation: bool) -> RendererSettings {
+        renderer_settings_with_interpolation(interpolation)
     }
-    fn edit_filters(
+    fn edit_renderer_settings(
         runtime: &mut RuntimeCoordinator,
-        chain: &crate::domain::filters::FilterChain,
+        renderer: &RendererSettings,
     ) -> UiUpdate {
         let revision = runtime
             .engine
@@ -4523,8 +4438,8 @@ mod tests {
             .revision
             .get();
         runtime.qualification_command(&format!(
-            "draft-filters {revision} {}",
-            serde_json::to_string(chain).unwrap(),
+            "draft-renderer {revision} {}",
+            serde_json::to_string(renderer).unwrap(),
         ))
     }
     fn begin_live_treatments(
@@ -4561,14 +4476,13 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
-            panic!("expected exactly one whole-chain treatment command: {command:?}")
+            panic!("expected exactly one renderer treatment command: {command:?}")
         };
         assert_eq!(key.pass, crate::domain::state::TreatmentPass::Candidate);
         assert_eq!(runtime.persistence.authorized_apply(), Some(key.apply));
         (id, key)
     }
-    /// Open aggregate keyed to the physical opening: the media owner returns it
-    /// only after nine native renderer readbacks plus its vf proof.
+    /// Open aggregate keyed to the physical opening after all renderer readbacks.
     fn verify_open(model: &mut ProductModel, key: crate::domain::state::AttemptKey) {
         use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
         let request = model.opening_request().expect("opening request for proof");
@@ -4584,24 +4498,16 @@ mod tests {
         );
         model.open_verified(key, confirmation);
     }
-    /// A live-origin confirmation binding the real submitted key to the
-    /// default renderer the draft carries; the vf graph is treated as
-    /// reconfigured, which is what a genuinely changed compiled chain proves.
+    /// Confirmation for the exact submitted renderer on the current live owner.
     fn treatment_confirmation(
         key: crate::domain::state::TreatmentAttemptKey,
+        renderer: RendererSettings,
     ) -> crate::domain::state::TreatmentConfirmation {
-        use crate::domain::state::{
-            FilterConfirmation, FilterTreatmentProof, RendererConfirmation, TreatmentConfirmation,
-        };
-        let filter = FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap();
-        let renderer =
-            RendererConfirmation::checked(key, crate::domain::render::RendererSettings::default());
+        use crate::domain::state::{RendererConfirmation, TreatmentConfirmation};
         TreatmentConfirmation::checked(
             key,
-            crate::domain::state::InitialPlayback::Live,
-            true,
-            FilterTreatmentProof::Reconfigured(filter),
-            renderer,
+            InitialPlayback::Live,
+            RendererConfirmation::checked(key, renderer),
         )
         .unwrap()
     }
@@ -4609,78 +4515,26 @@ mod tests {
         driver: &Driver,
         id: crate::media::controller::RequestId,
         key: crate::domain::state::TreatmentAttemptKey,
+        renderer: RendererSettings,
     ) {
         driver.send(BackendEvent::TreatmentResult {
             id: id.get(),
             key,
-            result: Ok(treatment_confirmation(key)),
-        });
-        driver.fence();
-    }
-    /// Confirms a candidate whose filter chain equals the incumbent's, exactly
-    /// as a real backend would: the vf graph is preserved on its committed
-    /// origin and the renderer proof carries the actually submitted renderer.
-    fn confirm_unchanged_filter_treatments(
-        runtime: &RuntimeCoordinator,
-        driver: &Driver,
-        id: crate::media::controller::RequestId,
-        key: crate::domain::state::TreatmentAttemptKey,
-        submitted_renderer: crate::domain::render::RendererSettings,
-    ) {
-        use crate::domain::state::{
-            FilterConfirmation, FilterEvidence, FilterTreatmentProof, RendererConfirmation,
-            TreatmentConfirmation,
-        };
-        let origin = runtime
-            .engine
-            .as_ref()
-            .expect("confirmed vf origin")
-            .model()
-            .confirmed_filter_origin()
-            .expect("an incumbent committed vf origin");
-        let confirmation = TreatmentConfirmation::checked(
-            key,
-            crate::domain::state::InitialPlayback::Live,
-            false,
-            FilterTreatmentProof::Preserved {
-                origin: FilterEvidence::Confirmed(
-                    FilterConfirmation::checked(origin, 0.0, 2.0, 32).unwrap(),
-                ),
-            },
-            RendererConfirmation::checked(key, submitted_renderer),
-        )
-        .expect("unchained-filter proof");
-        driver.send(BackendEvent::TreatmentResult {
-            id: id.get(),
-            key,
-            result: Ok(confirmation),
+            result: Ok(treatment_confirmation(key, renderer)),
         });
         driver.fence();
     }
     fn treatment_failure(
         key: crate::domain::state::TreatmentAttemptKey,
-        kind: crate::domain::failure::FilterErrorKind,
+        reason: crate::domain::failure::TreatmentConfirmationFailure,
         fresh: bool,
     ) -> Box<crate::domain::failure::TreatmentFailure> {
         use crate::domain::failure::{
-            FilterAttemptDiagnostics, FilterFailure, TreatmentErrorKind, TreatmentFailure,
-            TreatmentFailureDisposition,
+            TreatmentErrorKind, TreatmentFailure, TreatmentFailureDisposition,
         };
         Box::new(TreatmentFailure {
             key: Some(key),
-            kind: TreatmentErrorKind::Filter(FilterFailure {
-                kind,
-                attributed_ordinal: None,
-                requires_fresh_owner: fresh,
-                diagnostics: FilterAttemptDiagnostics {
-                    key: Some(key),
-                    entries: Vec::new(),
-                    records: Vec::new(),
-                    native_evidence_lost: false,
-                    truncated: false,
-                    dropped_context: 0,
-                },
-            }),
+            kind: TreatmentErrorKind::Unconfirmed { reason },
             disposition: if fresh {
                 TreatmentFailureDisposition::RestoreFreshOwner
             } else {
@@ -4690,18 +4544,19 @@ mod tests {
     }
 
     #[test]
-    fn qualifier_strict_filter_edit_preserves_invalid_draft_and_legacy_boundaries() {
+    fn qualifier_strict_renderer_edit_preserves_invalid_draft_and_legacy_boundaries() {
         let (mut runtime, drivers) = runtime();
-        let chain = treatment_chain(false);
-        let edited = edit_filters(&mut runtime, &chain);
+        let renderer = treatment_renderer(true);
+        let edited = edit_renderer_settings(&mut runtime, &renderer);
         assert!(!edited.failed);
         let frozen = runtime.engine.as_ref().unwrap().model().draft().clone();
-        assert_eq!(frozen.settings.filters, chain);
+        assert_eq!(frozen.settings.renderer, renderer);
         for invalid in [
-            r#"draft-filters 1 {"entries":null}"#,
-            r#"draft-filters 1 {"entries":[],"entries":[]}"#,
-            "draft-filters 0 {\"entries\":[]}",
-            "draft-filters 1 {\"entries\":[{\"label\":\"raw\ncontrol\"}]}",
+            r#"draft-renderer 1 {"scale":null}"#,
+            r#"draft-renderer 1 {"scale":"bilinear","scale":"bilinear"}"#,
+            "draft-renderer 0 {}",
+            "draft-renderer 1 {\"scale\":\"raw\ncontrol\"}",
+            "draft-filters 1 {\"entries\":[]}",
         ] {
             let update = runtime.qualification_command(invalid);
             assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &frozen);
@@ -4712,7 +4567,10 @@ mod tests {
             assert_eq!(diagnostic["input"], invalid);
             assert!(diagnostic["error"].is_string());
         }
-        let mut exact = format!("draft-filters 1 {}", serde_json::to_string(&chain).unwrap());
+        let mut exact = format!(
+            "draft-renderer 1 {}",
+            serde_json::to_string(&renderer).unwrap()
+        );
         exact.push_str(&" ".repeat(control::STRUCTURED_COMMAND_MAX_BYTES - exact.len()));
         runtime.qualification_command(&exact);
         assert!(runtime.command_error.is_empty());
@@ -4734,46 +4592,57 @@ mod tests {
     }
 
     #[test]
-    fn runtime_confirmed_open_and_live_filter_receipts_store_full_chains_not_newer_drafts() {
-        for all_disabled in [false, true] {
+    fn runtime_confirmed_open_and_live_renderer_receipts_store_frozen_values_not_newer_drafts() {
+        for interpolation in [false, true] {
             let store = WritableSettings::new();
             let (mut runtime, drivers) = runtime();
             store.bind(&mut runtime);
-            let chain = treatment_chain(all_disabled);
-            edit_filters(&mut runtime, &chain);
+            let renderer = treatment_renderer(interpolation);
+            edit_renderer_settings(&mut runtime, &renderer);
             let driver = start_live(&mut runtime, &drivers);
-            assert_eq!(store.applied().filters, chain);
+            assert_eq!(store.applied().renderer, renderer);
             assert_eq!(runtime.persistence.authorized_apply(), None);
-            let initial = runtime_snapshot(runtime.engine.as_mut().unwrap());
-            assert_eq!(initial["treatments"]["status"], "Confirmed");
-            assert_eq!(initial["treatments"]["key"]["pass"], "Open");
+            let engine = runtime.engine.as_ref().unwrap();
+            let initial = runtime_snapshot(engine);
+            let confirmed = engine.model().confirmed_treatments().unwrap();
+            assert_eq!(confirmed.key().pass, TreatmentPass::Open);
             assert_eq!(
-                initial["active_settings"]["filters"],
-                serde_json::json!(&chain)
+                engine
+                    .model()
+                    .active()
+                    .unwrap()
+                    .applied()
+                    .settings()
+                    .renderer,
+                renderer
             );
-            assert!(initial["treatment_pass"].is_null());
-            let candidate = treatment_chain(!all_disabled);
-            edit_filters(&mut runtime, &candidate);
+            assert!(initial.pass.is_none());
+            let candidate = treatment_renderer(!interpolation);
+            edit_renderer_settings(&mut runtime, &candidate);
             let (id, key) = begin_live_treatments(&mut runtime, &driver);
-            let pending = runtime_snapshot(runtime.engine.as_mut().unwrap());
-            assert_eq!(pending["phase"], "ApplyingTreatments");
-            assert_eq!(pending["treatment_pass"], "Candidate");
-            assert_eq!(pending["treatments"]["status"], "Pending");
-            assert_eq!(pending["treatments"]["key"], serde_json::json!(key));
+            let engine = runtime.engine.as_ref().unwrap();
+            let pending = runtime_snapshot(engine);
+            assert_eq!(pending.phase, "ApplyingTreatments");
+            assert_eq!(pending.pass, Some(TreatmentPass::Candidate));
+            assert_eq!(engine.model().treating().unwrap().key(), key);
             assert_eq!(
-                pending["active_settings"]["filters"],
-                serde_json::json!(&chain)
+                engine
+                    .model()
+                    .active()
+                    .unwrap()
+                    .applied()
+                    .settings()
+                    .renderer,
+                renderer
             );
-            edit_filters(
-                &mut runtime,
-                &crate::domain::filters::FilterChain::default(),
-            );
-            confirm_treatments(&driver, id, key);
+            let newer = treatment_renderer(interpolation);
+            edit_renderer_settings(&mut runtime, &newer);
+            confirm_treatments(&driver, id, key, candidate.clone());
             let confirmed = await_update(&mut runtime, |update| update.product_phase == "Active");
             assert!(!confirmed.failed);
             assert_eq!(confirmed.playback_status, "Live");
-            assert_eq!(store.applied().filters, candidate);
-            assert!(
+            assert_eq!(store.applied().renderer, candidate);
+            assert_eq!(
                 runtime
                     .engine
                     .as_ref()
@@ -4781,20 +4650,25 @@ mod tests {
                     .model()
                     .draft()
                     .settings
-                    .filters
-                    .entries()
-                    .is_empty()
+                    .renderer,
+                newer
             );
-            let snapshot = runtime_snapshot(runtime.engine.as_mut().unwrap());
-            assert_eq!(snapshot["treatments"]["status"], "Confirmed");
-            assert_eq!(snapshot["treatments"]["key"]["pass"], "Candidate");
+            let engine = runtime.engine.as_ref().unwrap();
+            let confirmed = engine.model().confirmed_treatments().unwrap();
+            assert_eq!(confirmed.key().pass, TreatmentPass::Candidate);
             assert_eq!(
-                snapshot["active_settings"]["filters"],
-                serde_json::json!(&candidate)
+                engine
+                    .model()
+                    .active()
+                    .unwrap()
+                    .applied()
+                    .settings()
+                    .renderer,
+                candidate
             );
             let bytes = std::fs::read(store.path()).unwrap();
             // Duplicate native outcomes do not regain consumed persistence permission.
-            confirm_treatments(&driver, id, key);
+            confirm_treatments(&driver, id, key, candidate.clone());
             runtime.poll();
             assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
             assert_eq!(runtime.persistence.authorized_apply(), None);
@@ -4816,7 +4690,8 @@ mod tests {
             store.bind(&mut runtime);
             let driver = start_live(&mut runtime, &drivers);
             let original = std::fs::read(store.path()).unwrap();
-            edit_filters(&mut runtime, &treatment_chain(false));
+            let candidate = treatment_renderer(true);
+            edit_renderer_settings(&mut runtime, &candidate);
             let (id, key) = begin_live_treatments(&mut runtime, &driver);
             let mut submitted = runtime.engine.as_ref().unwrap().model().draft().clone();
             let mut wrong = key;
@@ -4827,7 +4702,7 @@ mod tests {
                 2 => wrong.pass = TreatmentPass::Restore,
                 3 => revision = DraftRevision::new(revision.get() + 1),
                 4 => submitted.revision = DraftRevision::new(revision.get() + 1),
-                5 => submitted.settings.filters = crate::domain::filters::FilterChain::default(),
+                5 => submitted.settings.renderer = RendererSettings::default(),
                 _ => unreachable!(),
             }
             runtime.persistence.admit_user_apply(
@@ -4838,7 +4713,7 @@ mod tests {
                 submitted,
                 ProfileBinding::Serial,
             );
-            confirm_treatments(&driver, id, key);
+            confirm_treatments(&driver, id, key, candidate);
             await_update(&mut runtime, |update| update.product_phase == "Active");
             runtime.poll();
             assert_eq!(
@@ -4860,9 +4735,10 @@ mod tests {
             store.bind(&mut runtime);
             let driver = start_live(&mut runtime, &drivers);
             let original = std::fs::read(store.path()).unwrap();
-            edit_filters(&mut runtime, &treatment_chain(false));
+            let candidate = treatment_renderer(true);
+            edit_renderer_settings(&mut runtime, &candidate);
             let (id, key) = begin_live_treatments(&mut runtime, &driver);
-            confirm_treatments(&driver, id, key);
+            confirm_treatments(&driver, id, key, candidate);
             // Stop exactly between the real engine's commit and the runtime's
             // receipt consumer; this is not a fabricated persistence receipt.
             runtime.engine.as_mut().unwrap().poll();
@@ -4897,18 +4773,18 @@ mod tests {
     }
 
     #[test]
-    fn runtime_late_filter_fault_and_source_loss_revoke_unsaved_confirmed_candidate() {
-        use crate::domain::failure::{FilterConfirmationFailure, FilterErrorKind};
+    fn runtime_late_treatment_fault_and_source_loss_revoke_unsaved_confirmed_candidate() {
+        use crate::domain::failure::TreatmentConfirmationFailure;
         for source_loss in [false, true] {
             let store = WritableSettings::new();
             let (mut runtime, drivers) = runtime();
             store.bind(&mut runtime);
             let driver = start_live(&mut runtime, &drivers);
             let original = std::fs::read(store.path()).unwrap();
-            let chain = treatment_chain(false);
-            edit_filters(&mut runtime, &chain);
+            let renderer = treatment_renderer(true);
+            edit_renderer_settings(&mut runtime, &renderer);
             let (id, key) = begin_live_treatments(&mut runtime, &driver);
-            confirm_treatments(&driver, id, key);
+            confirm_treatments(&driver, id, key, renderer.clone());
             runtime.engine.as_mut().unwrap().poll();
             assert!(
                 runtime
@@ -4927,9 +4803,7 @@ mod tests {
                     key,
                     failure: treatment_failure(
                         key,
-                        FilterErrorKind::Unconfirmed {
-                            reason: FilterConfirmationFailure::EvidenceLost,
-                        },
+                        TreatmentConfirmationFailure::EvidenceLost,
                         true,
                     ),
                 });
@@ -4946,8 +4820,8 @@ mod tests {
                     .model()
                     .draft()
                     .settings
-                    .filters,
-                chain
+                    .renderer,
+                renderer
             );
             if revoked.release_native {
                 runtime.quit();
@@ -4964,23 +4838,17 @@ mod tests {
 
     #[test]
     fn runtime_one_live_restore_projects_typed_failure_and_never_saves_candidate_or_restore() {
-        use crate::domain::{
-            failure::{FilterConfirmationFailure, FilterErrorKind},
-            state::TreatmentPass,
-        };
+        use crate::domain::{failure::TreatmentConfirmationFailure, state::TreatmentPass};
         for restore_fails in [false, true] {
             let store = WritableSettings::new();
             let (mut runtime, drivers) = product_runtime();
             store.bind(&mut runtime);
-            seed_filter_editor(&mut runtime, treatment_chain(false));
+            let prior = RendererSettings::default();
             let driver = start_live(&mut runtime, &drivers);
             runtime.set_stats_hidden(true);
             let original = std::fs::read(store.path()).unwrap();
             let revision = runtime.ui.public_revision.to_string();
-            let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[0]
-                .key
-                .clone();
-            runtime.set_filter_choice(&revision, &entry, "matrix", "bt601");
+            runtime.set_interpolation(&revision, true);
             let candidate = runtime
                 .engine
                 .as_ref()
@@ -4988,9 +4856,9 @@ mod tests {
                 .model()
                 .draft()
                 .settings
-                .filters
+                .renderer
                 .clone();
-            let (id, key) = receive_filter_edit(&driver);
+            let (id, key) = receive_renderer_edit(&driver);
             let stale_close = format!(
                 "close ApplyingTreatments {} {} Complete",
                 key.apply.get(),
@@ -5001,9 +4869,7 @@ mod tests {
                 key,
                 result: Err(treatment_failure(
                     key,
-                    FilterErrorKind::Unconfirmed {
-                        reason: FilterConfirmationFailure::Deadline,
-                    },
+                    TreatmentConfirmationFailure::Deadline,
                     false,
                 )),
             });
@@ -5034,8 +4900,8 @@ mod tests {
                 panic!("the selected route must send one live restore command")
             };
             assert_eq!(restore.pass, TreatmentPass::Restore);
-            let snapshot = runtime_snapshot(runtime.engine.as_mut().unwrap());
-            assert_eq!(snapshot["treatment_pass"], "Restore");
+            let snapshot = runtime_snapshot(runtime.engine.as_ref().unwrap());
+            assert_eq!(snapshot.pass, Some(TreatmentPass::Restore));
             runtime.qualification_command(&stale_close);
             assert!(runtime.command_error.contains("stale"));
             assert_eq!(
@@ -5048,7 +4914,7 @@ mod tests {
                     key: restore,
                     result: Err(treatment_failure(
                         restore,
-                        FilterErrorKind::RuntimeGraph,
+                        TreatmentConfirmationFailure::BackendUnavailable,
                         true,
                     )),
                 });
@@ -5062,11 +4928,11 @@ mod tests {
                 assert!(failed.failed && failed.can_open && failed.can_restart);
                 assert_eq!(failed.playback_status, "Unavailable");
                 assert!(
-                    failed.diagnostic.contains("RuntimeGraph")
+                    failed.diagnostic.contains("BackendUnavailable")
                         && failed.diagnostic.contains("Deadline")
                 );
             } else {
-                confirm_treatments(&driver, restore_id, restore);
+                confirm_treatments(&driver, restore_id, restore, prior.clone());
                 let restored = await_update(&mut runtime, |update| {
                     update.product_phase == "ErrorWithActiveRestored"
                 });
@@ -5083,18 +4949,18 @@ mod tests {
                     .model()
                     .draft()
                     .settings
-                    .filters,
+                    .renderer,
                 candidate
             );
             let public = product_values(&mut runtime);
-            assert_eq!(public["selection"]["filters"], serde_json::json!(candidate));
+            assert_eq!(
+                public["selection"]["renderer"],
+                serde_json::json!(candidate)
+            );
             if restore_fails {
                 assert!(public["applied"].is_null());
             } else {
-                assert_eq!(
-                    public["applied"]["filters"],
-                    serde_json::json!(treatment_chain(false))
-                );
+                assert_eq!(public["applied"]["renderer"], serde_json::json!(prior));
             }
             assert!(
                 drivers.try_recv().is_err(),
@@ -5954,10 +5820,15 @@ mod tests {
             runner,
         );
         let mut runtime = RuntimeCoordinator {
+            diagnostics: crate::diagnostics::DiagnosticsHandle::for_test(),
+            report_cache: ReportCache::default(),
+            next_log_folder_request: Some(crate::diagnostics::FolderRequestId(1)),
             engine: Some(engine),
             sources: vec![source_a.clone(), source_b],
             dirty: true,
             last_state: None,
+            last_logged_runtime: None,
+            last_logged_settings: None,
             command_error: String::new(),
             quit_empty: false,
             persistence: {
@@ -6292,6 +6163,13 @@ mod tests {
         let path = temp.join("settings.json");
         let _ = std::fs::remove_file(&path);
         let persistence = PersistenceSession::load(Ok(path.clone()));
+        let writer =
+            crate::diagnostics::DiagnosticsRuntime::start(crate::diagnostics::DiagnosticsConfig {
+                logging_enabled: persistence.preferences().logging_enabled,
+                xdg_state_home: Some(temp.clone().into_os_string()),
+                home: None,
+                limits: Default::default(),
+            });
         let startup = StartupSelection {
             restore_profile: false,
             source_binding: None,
@@ -6309,14 +6187,22 @@ mod tests {
             startup,
             persistence,
             vec![],
+            writer.handle(),
         );
         let initial = runtime.poll();
         assert!(initial.can_set_gain && !initial.can_open && !initial.create_native);
         assert!(!initial.stats_hidden);
+        assert!(!initial.logging_enabled);
         assert!(runtime.ui.snapshot.as_ref().unwrap().stream_stats.is_none());
         let hidden = runtime.set_stats_hidden(true);
         assert!(hidden.changed && hidden.stats_hidden && !hidden.create_native);
         assert_eq!(hidden.context_diagnostic, initial.context_diagnostic);
+        let logging = runtime.set_logging_enabled(true);
+        assert!(logging.logging_enabled && !logging.create_native && !logging.release_native);
+        assert!(
+            !path.exists(),
+            "the preference switch does not eagerly save"
+        );
         assert_eq!(runtime.set_volume(27), SubmitStatus::Accepted);
         assert_eq!(runtime.set_muted(true), SubmitStatus::Accepted);
         let update = runtime.set_fullscreen(true);
@@ -6336,6 +6222,7 @@ mod tests {
         };
         assert!(final_update.quit);
         assert!(runtime.set_stats_hidden(false).stats_hidden);
+        assert!(runtime.set_logging_enabled(false).logging_enabled);
         let reloaded = PersistenceSession::load(Ok(path));
         assert_eq!(
             reloaded.preferences().gain,
@@ -6343,6 +6230,8 @@ mod tests {
         );
         assert!(reloaded.preferences().fullscreen && reloaded.saved_selection().is_none());
         assert!(reloaded.preferences().stats_hidden);
+        assert!(reloaded.preferences().logging_enabled);
+        finish_diagnostic_writer(&writer);
         std::fs::remove_dir_all(temp).unwrap();
     }
 
@@ -6376,22 +6265,18 @@ mod tests {
     #[test]
     fn startup_restore_opens_once_and_never_authorizes_applied_file_write() {
         use std::os::unix::fs::MetadataExt;
-        for chain in [
-            crate::domain::filters::FilterChain::default(),
-            treatment_chain(false),
-            treatment_chain(true),
-        ] {
+        for renderer in [RendererSettings::default(), treatment_renderer(true)] {
             let store = WritableSettings::new();
             let (mut prior, prior_drivers) = runtime();
             store.bind(&mut prior);
-            edit_filters(&mut prior, &chain);
+            edit_renderer_settings(&mut prior, &renderer);
             let prior_driver = start_live(&mut prior, &prior_drivers);
             cleanup(&mut prior);
             prior_driver.destroyed.recv().unwrap();
             let original = std::fs::read(store.path()).unwrap();
             let inode = std::fs::metadata(store.path()).unwrap().ino();
             let saved = store.applied();
-            assert_eq!(saved.filters, chain);
+            assert_eq!(saved.renderer, renderer);
 
             let (mut runtime, drivers) = runtime();
             runtime
@@ -6452,8 +6337,8 @@ mod tests {
                     .unwrap()
                     .applied()
                     .settings()
-                    .filters,
-                chain
+                    .renderer,
+                renderer
             );
             assert_eq!(std::fs::read(store.path()).unwrap(), original);
             assert_eq!(
@@ -6693,10 +6578,10 @@ mod tests {
             drivers.try_recv().is_err(),
             "a draft renderer edit never opens a backend owner"
         );
-        let snapshot = runtime_snapshot(runtime.engine.as_mut().unwrap());
-        assert_eq!(snapshot["draft"]["renderer"], serde_json::json!(&requested));
-        assert_eq!(snapshot["active_settings"], serde_json::Value::Null);
-        assert_eq!(snapshot["treatments"], serde_json::Value::Null);
+        let engine = runtime.engine.as_ref().unwrap();
+        assert_eq!(engine.model().draft().settings.renderer, requested);
+        assert!(engine.model().active().is_none());
+        assert!(engine.model().confirmed_treatments().is_none());
         // A stale revision is refused without moving the stored draft.
         let stale = runtime.qualification_command(&format!(
             "draft-renderer {before} {}",
@@ -6737,7 +6622,7 @@ mod tests {
             )),
         );
         let capabilities = fixture_treatment_capabilities();
-        (runtime.ui.filters, runtime.ui.renderer) = projection::treatments(&capabilities);
+        runtime.ui.renderer = projection::treatments(&capabilities);
         runtime.ui.catalog = capture_catalog::Model::fixture(
             session_fixture(&["/dev/video0"], settings().video.fixture_mode()),
             vec![crate::capture::audio::AudioSource {
@@ -6917,13 +6802,7 @@ mod tests {
         // The submitted prepared treatments are compiled from the accepted
         // candidate, so the proof carries that exact renderer without reading
         // controller-private payload internals.
-        confirm_unchanged_filter_treatments(
-            &runtime,
-            &driver,
-            id,
-            key,
-            requested.settings.renderer.clone(),
-        );
+        confirm_treatments(&driver, id, key, requested.settings.renderer.clone());
         await_update(&mut runtime, |update| update.product_phase == "Active");
         assert_eq!(store.applied().renderer, requested.settings.renderer);
         assert!(
@@ -6938,315 +6817,10 @@ mod tests {
         driver.destroyed.recv().unwrap();
     }
     #[test]
-    fn loaded_repeated_filters_preserve_order_labels_and_parameters_on_individual_toggle() {
-        use crate::domain::filters::{EqParams, EqValues, Filter};
-        let (mut runtime, drivers) = product_runtime();
-        let make = |brightness| {
-            Filter::Eq(
-                EqParams::new(EqValues {
-                    brightness,
-                    contrast: 1.25,
-                    saturation: 0.75,
-                    gamma: 1.4,
-                    gamma_r: 1.1,
-                    gamma_g: 0.9,
-                    gamma_b: 1.2,
-                    gamma_weight: 0.8,
-                })
-                .unwrap(),
-            )
-        };
-        let chain = FilterChain::new(vec![
-            FilterEntry::new("Loaded\nlabel".into(), make(0.2), true),
-            FilterEntry::new("Second repeated eq".into(), make(-0.1), false),
-        ])
-        .unwrap();
-        let engine = runtime.engine.as_mut().unwrap();
-        let mut draft = engine.model().draft().settings.clone();
-        draft.filters = chain.clone();
-        engine
-            .edit_draft(engine.model().draft().revision, draft)
-            .unwrap();
-        runtime.poll();
-        // The immediate toggle is a real transaction: the owner it starts must
-        // stay observable for the whole test instead of outliving its fixture.
-        let driver = start_live(&mut runtime, &drivers);
-        let revision = runtime.ui.public_revision.to_string();
-        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[1]
-            .key
-            .clone();
-        runtime.set_filter_enabled(&revision, &entry, true);
-        let requested = runtime
-            .engine
-            .as_ref()
-            .unwrap()
-            .model()
-            .draft()
-            .settings
-            .filters
-            .clone();
-        let entries = requested.entries();
-        assert_eq!(entries[0], chain.entries()[0]);
-        assert_eq!(entries[1].filter(), chain.entries()[1].filter());
-        assert_eq!(entries[1].label(), chain.entries()[1].label());
-        assert!(entries[1].enabled());
-        let (id, command) = driver
-            .submitted
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
-            panic!("a changed filter chain must use the treatment owner")
-        };
-        // Keys embed the admission revision: re-read the row key the same way
-        // the real UI does after the accepted transaction advanced it.
-        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[1]
-            .key
-            .clone();
-        runtime.set_filter_enabled(&runtime.ui.public_revision.to_string(), &entry, false);
-        assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .filters,
-            requested
-        );
-        runtime.add_filter(&runtime.ui.public_revision.to_string(), "eq");
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .filters,
-            requested
-        );
-        confirm_treatments(&driver, id, key);
-        await_update(&mut runtime, |update| update.product_phase == "Active");
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .active()
-                .unwrap()
-                .applied()
-                .settings()
-                .filters,
-            requested
-        );
-        cleanup(&mut runtime);
-        driver.destroyed.recv().unwrap();
-    }
-    #[test]
-    fn removing_a_filter_preserves_remaining_order_parameters_and_uses_real_transaction() {
-        use crate::domain::filters::{EqParams, EqValues, Filter};
-        let (mut runtime, drivers) = product_runtime();
-        let make = |brightness| {
-            Filter::Eq(
-                EqParams::new(EqValues {
-                    brightness,
-                    contrast: 1.25,
-                    saturation: 0.75,
-                    gamma: 1.4,
-                    gamma_r: 1.1,
-                    gamma_g: 0.9,
-                    gamma_b: 1.2,
-                    gamma_weight: 0.8,
-                })
-                .unwrap(),
-            )
-        };
-        let chain = FilterChain::new(vec![
-            FilterEntry::new("First eq".into(), make(0.3), true),
-            FilterEntry::new("Second eq".into(), make(-0.4), false),
-        ])
-        .unwrap();
-        let engine = runtime.engine.as_mut().unwrap();
-        let mut draft = engine.model().draft().settings.clone();
-        draft.filters = chain.clone();
-        engine
-            .edit_draft(engine.model().draft().revision, draft)
-            .unwrap();
-        runtime.poll();
-        // The removal is a real transaction: the owner it starts must stay
-        // observable for the whole test instead of outliving its fixture.
-        let driver = start_live(&mut runtime, &drivers);
-        let revision = runtime.ui.public_revision.to_string();
-        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[0]
-            .key
-            .clone();
-        runtime.remove_filter(&revision, &entry);
-        let requested = runtime
-            .engine
-            .as_ref()
-            .unwrap()
-            .model()
-            .draft()
-            .settings
-            .filters
-            .clone();
-        assert_eq!(requested.entries().len(), 1);
-        // The survivor keeps its position, label, enabled flag and exact parameters.
-        assert_eq!(requested.entries()[0], chain.entries()[1]);
-        let (id, command) = driver
-            .submitted
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
-            panic!("a changed filter chain must use the treatment owner")
-        };
-        // While the transaction is busy a further removal of the survivor is
-        // refused against the current revision without touching the draft.
-        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[0]
-            .key
-            .clone();
-        runtime.remove_filter(&runtime.ui.public_revision.to_string(), &entry);
-        assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .filters,
-            requested
-        );
-        confirm_treatments(&driver, id, key);
-        await_update(&mut runtime, |update| update.product_phase == "Active");
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .active()
-                .unwrap()
-                .applied()
-                .settings()
-                .filters,
-            requested
-        );
-        assert!(driver.submitted.try_recv().is_err());
-        cleanup(&mut runtime);
-        driver.destroyed.recv().unwrap();
-    }
-    #[test]
-    fn removing_the_last_filter_yields_empty_chain_and_stale_key_is_refused() {
-        use crate::domain::filters::{EqParams, EqValues, Filter};
-        let (mut runtime, drivers) = product_runtime();
-        let chain = FilterChain::new(vec![FilterEntry::new(
-            "Only eq".into(),
-            Filter::Eq(
-                EqParams::new(EqValues {
-                    contrast: 1.0,
-                    brightness: 0.5,
-                    saturation: 1.0,
-                    gamma: 1.0,
-                    gamma_r: 1.0,
-                    gamma_g: 1.0,
-                    gamma_b: 1.0,
-                    gamma_weight: 1.0,
-                })
-                .unwrap(),
-            ),
-            true,
-        )])
-        .unwrap();
-        let engine = runtime.engine.as_mut().unwrap();
-        let mut draft = engine.model().draft().settings.clone();
-        draft.filters = chain.clone();
-        engine
-            .edit_draft(engine.model().draft().revision, draft)
-            .unwrap();
-        runtime.poll();
-        let driver = start_live(&mut runtime, &drivers);
-        let revision = runtime.ui.public_revision.to_string();
-        // An index beyond the chain inside the current revision is refused by
-        // the domain before any mutation.
-        runtime.remove_filter(&revision, &format!("filter:{revision}:7"));
-        assert_eq!(runtime.ui.error.as_ref().unwrap().code, "filter_error");
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .filters,
-            chain
-        );
-        // Removing the only entry leaves a valid, empty chain.
-        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[0]
-            .key
-            .clone();
-        runtime.remove_filter(&revision, &entry);
-        let requested = runtime
-            .engine
-            .as_ref()
-            .unwrap()
-            .model()
-            .draft()
-            .settings
-            .filters
-            .clone();
-        assert!(requested.entries().is_empty());
-        let (id, command) = driver
-            .submitted
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
-            panic!("a changed filter chain must use the treatment owner")
-        };
-        // The accepted transaction advanced the revision, so the superseded
-        // key is refused as stale instead of removing the wrong entry.
-        runtime.remove_filter(&revision, &entry);
-        assert_eq!(runtime.ui.error.as_ref().unwrap().code, "stale_selection");
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .filters,
-            requested
-        );
-        confirm_treatments(&driver, id, key);
-        await_update(&mut runtime, |update| update.product_phase == "Active");
-        assert!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .active()
-                .unwrap()
-                .applied()
-                .settings()
-                .filters
-                .entries()
-                .is_empty()
-        );
-        cleanup(&mut runtime);
-        driver.destroyed.recv().unwrap();
-    }
-    #[test]
-    fn immediate_filter_confirmation_preserves_requested_chain_and_preferences() {
+    fn immediate_renderer_confirmation_preserves_requested_values_and_preferences() {
         let (mut runtime, drivers) = product_runtime();
         let driver = start_live(&mut runtime, &drivers);
-        runtime.add_filter(&runtime.ui.public_revision.to_string(), "eq");
+        runtime.set_interpolation(&runtime.ui.public_revision.to_string(), true);
         let requested = runtime.engine.as_ref().unwrap().model().draft().clone();
         let revision = runtime.ui.public_revision;
         let (id, command) = driver
@@ -7256,11 +6830,11 @@ mod tests {
         let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
             panic!("real immediate treatment admission required");
         };
-        runtime.set_interpolation(&revision.to_string(), true);
+        runtime.set_interpolation(&revision.to_string(), false);
         assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
         assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &requested);
         runtime.set_volume(21);
-        confirm_treatments(&driver, id, key);
+        confirm_treatments(&driver, id, key, requested.settings.renderer.clone());
         await_update(&mut runtime, |update| update.product_phase == "Active");
         assert_eq!(
             runtime
@@ -7272,8 +6846,8 @@ mod tests {
                 .unwrap()
                 .applied()
                 .settings()
-                .filters,
-            requested.settings.filters
+                .renderer,
+            requested.settings.renderer
         );
         assert_eq!(
             runtime
@@ -7283,8 +6857,8 @@ mod tests {
                 .model()
                 .draft()
                 .settings
-                .filters,
-            requested.settings.filters
+                .renderer,
+            requested.settings.renderer
         );
         assert_eq!(runtime.ui.public_revision, revision);
         assert_eq!(runtime.persistence.preferences().gain.volume_percent, 21);
@@ -7293,37 +6867,17 @@ mod tests {
         driver.destroyed.recv().unwrap();
     }
 
-    fn filter_editor_chain() -> FilterChain {
-        let mut entries = treatment_chain(false).entries().to_vec();
-        entries.push(FilterEntry::new(
-            "Unsharp dimensions".into(),
-            projection::default_filter(FilterKind::Unsharp),
-            true,
-        ));
-        entries.push(FilterEntry::new(
-            "Interlaced source".into(),
-            projection::default_filter(FilterKind::Bwdif),
-            true,
-        ));
-        entries.push(FilterEntry::new(
-            "Repeated disabled eq".into(),
-            entries[1].filter().clone(),
-            false,
-        ));
-        FilterChain::new(entries).unwrap()
-    }
-
-    fn seed_filter_editor(runtime: &mut RuntimeCoordinator, chain: FilterChain) {
+    fn seed_renderer(runtime: &mut RuntimeCoordinator, renderer: RendererSettings) {
         let engine = runtime.engine.as_mut().unwrap();
         let mut settings = engine.model().draft().settings.clone();
-        settings.filters = chain;
+        settings.renderer = renderer;
         engine
             .edit_draft(engine.model().draft().revision, settings)
             .unwrap();
         runtime.poll();
     }
 
-    fn receive_filter_edit(
+    fn receive_renderer_edit(
         driver: &Driver,
     ) -> (
         crate::media::controller::RequestId,
@@ -7334,446 +6888,28 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
-            panic!("filter editor must submit a real whole-chain treatment command: {command:?}");
+            panic!("renderer editor must submit a real treatment command: {command:?}");
         };
         (id, key)
     }
 
-    fn confirm_filter_edit(runtime: &mut RuntimeCoordinator, driver: &Driver) {
-        let (id, key) = receive_filter_edit(driver);
-        let model = runtime.engine.as_ref().unwrap().model();
-        let renderer = model.draft().settings.renderer.clone();
-        let capabilities = crate::media::filter_catalog::fixture_capabilities();
-        let unchanged = crate::media::filter_catalog::compile_chain(
-            &model.draft().settings.filters,
-            &capabilities,
-        )
-        .unwrap()
-            == crate::media::filter_catalog::compile_chain(
-                &model.active().unwrap().applied().settings().filters,
-                &capabilities,
-            )
-            .unwrap();
-        if unchanged {
-            confirm_unchanged_filter_treatments(runtime, driver, id, key, renderer);
-        } else {
-            driver.send(BackendEvent::TreatmentResult {
-                id: id.get(),
-                key,
-                result: Ok(
-                    crate::media::controller::test_support::treatment_confirmation(
-                        key,
-                        InitialPlayback::Live,
-                        renderer,
-                    ),
-                ),
-            });
-            driver.fence();
-        }
-        await_update(runtime, |update| update.product_phase == "Active");
-    }
-
-    #[test]
-    fn filter_parameter_controls_apply_every_domain_boundary_without_touching_siblings() {
-        let (mut runtime, drivers) = product_runtime();
-        seed_filter_editor(&mut runtime, filter_editor_chain());
-        let driver = start_live(&mut runtime, &drivers);
-        // The fixture opens a valid request without a persisted devnode. The
-        // first UI edit resolves the already-selected physical source, just
-        // as normal selection admission does; that is not a filter change.
-        let selected_node = runtime
-            .ui
-            .catalog
-            .source(runtime.ui.selected.as_ref().unwrap())
-            .unwrap()
-            .node
-            .devnode()
-            .to_owned();
-        let fields = runtime.ui.filters.kinds.clone();
-        for kind in fields {
-            let index = runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .filters
-                .entries()
-                .iter()
-                .position(|entry| entry.kind().as_str() == kind.kind)
-                .unwrap();
-            for field in kind.fields {
-                let values = if field.field_type == "choice" {
-                    field
-                        .choices
-                        .iter()
-                        .map(|choice| serde_json::json!(choice.key))
-                        .collect()
-                } else {
-                    vec![
-                        serde_json::json!(field.min.unwrap()),
-                        serde_json::json!(field.max.unwrap()),
-                    ]
-                };
-                for value in values {
-                    let before = runtime
-                        .engine
-                        .as_ref()
-                        .unwrap()
-                        .model()
-                        .draft()
-                        .settings
-                        .clone();
-                    let mut expected = before.clone();
-                    expected.video.selected_node = Some(selected_node.clone());
-                    let mut filter =
-                        serde_json::to_value(before.filters.entries()[index].filter()).unwrap();
-                    filter["parameters"][field.key] = if field.field_type == "integer" {
-                        serde_json::json!(value.as_f64().unwrap() as u32)
-                    } else {
-                        value.clone()
-                    };
-                    expected
-                        .filters
-                        .set_filter(index, serde_json::from_value(filter).unwrap())
-                        .unwrap();
-                    let revision = runtime.ui.public_revision;
-                    let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[index]
-                        .key
-                        .clone();
-                    if field.field_type == "choice" {
-                        runtime.set_filter_choice(
-                            &revision.to_string(),
-                            &entry,
-                            field.key,
-                            value.as_str().unwrap(),
-                        );
-                    } else {
-                        runtime.set_filter_number(
-                            &revision.to_string(),
-                            &entry,
-                            field.key,
-                            value.as_f64().unwrap(),
-                        );
-                    }
-                    assert!(runtime.ui.error.is_none(), "{}.{}", kind.kind, field.key);
-                    assert_eq!(
-                        runtime.engine.as_ref().unwrap().model().draft().settings,
-                        expected
-                    );
-                    if before != expected {
-                        confirm_filter_edit(&mut runtime, &driver);
-                    } else {
-                        assert_eq!(runtime.ui.public_revision, revision);
-                    }
-                    assert!(
-                        runtime
-                            .engine
-                            .as_ref()
-                            .unwrap()
-                            .model()
-                            .active()
-                            .unwrap()
-                            .applied()
-                            .settings()
-                            .same_request(&expected)
-                    );
-                    assert!(driver.submitted.try_recv().is_err());
-                }
-            }
-        }
-        // Edit the repeated disabled eq, not the first same-kind entry. A
-        // small nonzero value is not rounded to display-oriented precision.
-        let sibling = runtime
+    fn confirm_renderer_edit(runtime: &mut RuntimeCoordinator, driver: &Driver) {
+        let (id, key) = receive_renderer_edit(driver);
+        let renderer = runtime
             .engine
             .as_ref()
             .unwrap()
             .model()
             .draft()
             .settings
-            .filters
-            .entries()[1]
+            .renderer
             .clone();
-        let revision = runtime.ui.public_revision.to_string();
-        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[5]
-            .key
-            .clone();
-        runtime.set_filter_number(&revision, &entry, "brightness", 1e-7);
-        confirm_filter_edit(&mut runtime, &driver);
-        let crate::domain::filters::Filter::Eq(eq) = runtime
-            .engine
-            .as_ref()
-            .unwrap()
-            .model()
-            .active()
-            .unwrap()
-            .applied()
-            .settings()
-            .filters
-            .entries()[5]
-            .filter()
-        else {
-            panic!("disabled eq stays an eq")
-        };
-        assert_eq!(eq.brightness(), 1e-7);
-        assert!(
-            !runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .filters
-                .entries()[5]
-                .enabled()
-        );
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .filters
-                .entries()[1],
-            sibling
-        );
-        cleanup(&mut runtime);
-        driver.destroyed.recv().unwrap();
+        confirm_treatments(driver, id, key, renderer);
+        await_update(runtime, |update| update.product_phase == "Active");
     }
 
     #[test]
-    fn filter_editor_rejects_invalid_numeric_choice_and_identity_without_media_or_disk_changes() {
-        let (mut runtime, drivers) = product_runtime();
-        let store = WritableSettings::new();
-        store.bind(&mut runtime);
-        seed_filter_editor(&mut runtime, filter_editor_chain());
-        let driver = start_live(&mut runtime, &drivers);
-        let before = runtime.engine.as_ref().unwrap().model().draft().clone();
-        let bytes = std::fs::read(store.path()).unwrap();
-        let revision = runtime.ui.public_revision.to_string();
-        let rows = runtime
-            .ui
-            .snapshot
-            .as_ref()
-            .unwrap()
-            .filters
-            .entries
-            .clone();
-        for (index, parameter, value, code) in [
-            (1, "brightness", f64::NAN, "filter_error"),
-            (1, "brightness", f64::INFINITY, "filter_error"),
-            (1, "brightness", f64::NEG_INFINITY, "filter_error"),
-            (1, "brightness", 1.01, "filter_error"),
-            (1, "mode", 1.0, "invalid_value"),
-            (0, "matrix", 1.0, "invalid_value"),
-            (3, "luma_msize_x", 3.5, "invalid_value"),
-            (3, "luma_msize_x", -3.0, "invalid_value"),
-            (
-                3,
-                "luma_msize_x",
-                f64::from(u32::MAX) + 1.0,
-                "invalid_value",
-            ),
-            (3, "luma_msize_x", f64::NAN, "invalid_value"),
-            (3, "luma_msize_x", 4.0, "filter_error"),
-            (3, "luma_msize_x", 25.0, "filter_error"),
-        ] {
-            runtime.set_filter_number(&revision, &rows[index].key, parameter, value);
-            assert_eq!(runtime.ui.error.as_ref().unwrap().code, code);
-            assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &before);
-        }
-        for (index, parameter, token) in [
-            (0, "matrix", "BT709"),
-            (0, "levels", "invalid"),
-            (0, "gamma", "gamma2.2"),
-            (0, "mode", "send_frame"),
-            (1, "brightness", "0.2"),
-            (4, "mode", "bad"),
-            (4, "parity", "tff"),
-            (4, "deint", "invalid"),
-        ] {
-            runtime.set_filter_choice(&revision, &rows[index].key, parameter, token);
-            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "invalid_value");
-            assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &before);
-        }
-        runtime.move_filter(&revision, &rows[0].key, "sideways");
-        assert_eq!(runtime.ui.error.as_ref().unwrap().code, "invalid_value");
-        for entry in [
-            "eq",
-            "filter:0:1",
-            "filter:01:1",
-            "filter:1:-1",
-            "filter:1:1:2",
-        ] {
-            runtime.set_filter_number(&revision, entry, "brightness", 0.2);
-            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "stale_selection");
-        }
-        runtime.set_filter_number(
-            &revision,
-            &format!("filter:{revision}:99"),
-            "brightness",
-            0.2,
-        );
-        assert_eq!(runtime.ui.error.as_ref().unwrap().code, "filter_error");
-        assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &before);
-        assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
-        assert!(driver.submitted.try_recv().is_err());
-        assert!(drivers.try_recv().is_err());
-        cleanup(&mut runtime);
-        driver.destroyed.recv().unwrap();
-    }
-
-    #[test]
-    fn filter_moves_clear_and_readd_preserve_loaded_entries_and_guard_every_intent() {
-        let (mut runtime, drivers) = product_runtime();
-        let store = WritableSettings::new();
-        store.bind(&mut runtime);
-        let chain = filter_editor_chain();
-        seed_filter_editor(&mut runtime, chain.clone());
-        let driver = start_live(&mut runtime, &drivers);
-        let revision = runtime.ui.public_revision;
-        let rows = runtime
-            .ui
-            .snapshot
-            .as_ref()
-            .unwrap()
-            .filters
-            .entries
-            .clone();
-        let bytes = std::fs::read(store.path()).unwrap();
-        for (index, direction) in [(0, "up"), (rows.len() - 1, "down")] {
-            runtime.move_filter(&revision.to_string(), &rows[index].key, direction);
-            assert!(runtime.ui.error.is_none());
-            assert_eq!(runtime.ui.public_revision, revision);
-            assert_eq!(
-                runtime
-                    .engine
-                    .as_ref()
-                    .unwrap()
-                    .model()
-                    .draft()
-                    .settings
-                    .filters,
-                chain
-            );
-        }
-        assert!(driver.submitted.try_recv().is_err());
-        assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
-
-        let mut expected = chain;
-        for (index, direction, target) in [(2, "up", 1), (1, "down", 2), (5, "up", 4)] {
-            let old_revision = runtime.ui.public_revision.to_string();
-            let old_entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[index]
-                .key
-                .clone();
-            expected.move_entry(index, target).unwrap();
-            runtime.move_filter(&old_revision, &old_entry, direction);
-            assert_eq!(
-                runtime
-                    .engine
-                    .as_ref()
-                    .unwrap()
-                    .model()
-                    .draft()
-                    .settings
-                    .filters,
-                expected
-            );
-            let requested = runtime.engine.as_ref().unwrap().model().draft().clone();
-            let revision = runtime.ui.public_revision.to_string();
-            let rows = runtime
-                .ui
-                .snapshot
-                .as_ref()
-                .unwrap()
-                .filters
-                .entries
-                .clone();
-            runtime.set_filter_number(&revision, &rows[1].key, "brightness", 0.5);
-            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
-            runtime.set_filter_choice(&revision, &rows[0].key, "matrix", "auto");
-            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
-            runtime.move_filter(&revision, &rows[0].key, "down");
-            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
-            runtime.clear_filters(&revision);
-            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
-            runtime.set_filter_number(&old_revision, &old_entry, "brightness", 0.8);
-            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "stale_selection");
-            assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &requested);
-            confirm_filter_edit(&mut runtime, &driver);
-            let revision = runtime.ui.public_revision.to_string();
-            runtime.move_filter(&revision, &old_entry, "up");
-            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "stale_selection");
-            assert_eq!(
-                runtime
-                    .engine
-                    .as_ref()
-                    .unwrap()
-                    .model()
-                    .active()
-                    .unwrap()
-                    .applied()
-                    .settings()
-                    .filters,
-                expected
-            );
-            assert!(driver.submitted.try_recv().is_err());
-        }
-        let revision = runtime.ui.public_revision.to_string();
-        runtime.clear_filters(&revision);
-        assert!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .filters
-                .entries()
-                .is_empty()
-        );
-        confirm_filter_edit(&mut runtime, &driver);
-        assert!(store.applied().filters.entries().is_empty());
-        let revision = runtime.ui.public_revision;
-        let bytes = std::fs::read(store.path()).unwrap();
-        runtime.clear_filters(&revision.to_string());
-        assert!(runtime.ui.error.is_none());
-        assert_eq!(runtime.ui.public_revision, revision);
-        assert!(driver.submitted.try_recv().is_err());
-        assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
-        runtime.add_filter(&revision.to_string(), "eq");
-        confirm_filter_edit(&mut runtime, &driver);
-        let added = &runtime
-            .engine
-            .as_ref()
-            .unwrap()
-            .model()
-            .active()
-            .unwrap()
-            .applied()
-            .settings()
-            .filters;
-        assert_eq!(added.entries().len(), 1);
-        assert_eq!(
-            added.entries()[0].filter(),
-            &projection::default_filter(FilterKind::Eq)
-        );
-        assert!(added.entries()[0].enabled());
-        assert!(
-            drivers.try_recv().is_err(),
-            "no filter action reopens the owner"
-        );
-        cleanup(&mut runtime);
-        driver.destroyed.recv().unwrap();
-    }
-
-    #[test]
-    fn prevalidation_refusal_keeps_filter_parameter_request_and_saved_profile_untouched() {
+    fn prevalidation_refusal_keeps_renderer_request_and_saved_profile_untouched() {
         fn refuse(
             request: ValidationRequest,
         ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>) {
@@ -7784,7 +6920,7 @@ mod tests {
                 crate::domain::failure::Stage::Prevalidation,
                 crate::domain::failure::Cause::Generic,
                 request.settings.clone(),
-                "filter_editor_prevalidation",
+                "renderer_editor_prevalidation",
                 "controlled source refusal",
             );
             (request, Err(failure))
@@ -7792,16 +6928,12 @@ mod tests {
         let store = WritableSettings::new();
         let (mut runtime, drivers) = product_runtime_with_validator(refuse);
         store.bind(&mut runtime);
-        let mut saved = settings();
-        saved.filters = filter_editor_chain();
+        let saved = settings();
         remember_profile(&mut runtime.persistence, saved.clone());
-        seed_filter_editor(&mut runtime, saved.filters.clone());
+        seed_renderer(&mut runtime, saved.renderer.clone());
         let bytes = std::fs::read(store.path()).unwrap();
         let revision = runtime.ui.public_revision.to_string();
-        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[1]
-            .key
-            .clone();
-        runtime.set_filter_number(&revision, &entry, "brightness", 0.75);
+        runtime.set_interpolation(&revision, true);
         let requested = runtime
             .engine
             .as_ref()
@@ -7810,7 +6942,7 @@ mod tests {
             .draft()
             .settings
             .clone();
-        assert_ne!(requested.filters, saved.filters);
+        assert_ne!(requested.renderer, saved.renderer);
         // A prevalidation rejection with no incumbent returns to Stopped;
         // it is recorded separately from terminal owner/treatment failures.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -7824,7 +6956,7 @@ mod tests {
         {
             assert!(
                 std::time::Instant::now() < deadline,
-                "filter request was not validated"
+                "renderer request was not validated"
             );
             runtime.poll();
             std::thread::yield_now();
@@ -7836,21 +6968,21 @@ mod tests {
             .model()
             .validation_rejection()
             .unwrap();
-        assert_eq!(rejection.failure.operation, "filter_editor_prevalidation");
-        assert_eq!(rejection.request.settings.filters, requested.filters);
+        assert_eq!(rejection.failure.operation, "renderer_editor_prevalidation");
+        assert_eq!(rejection.request.settings.renderer, requested.renderer);
         runtime.dirty = true;
         let refused = runtime.poll();
         assert_eq!(refused.product_phase, "Stopped");
         assert!(!refused.failed && !refused.can_toggle_pause && refused.can_open);
         assert_eq!(refused.playback_status, "Unavailable");
-        assert!(refused.diagnostic.contains("filter_editor_prevalidation"));
+        assert!(refused.diagnostic.contains("renderer_editor_prevalidation"));
         assert_eq!(
             runtime.engine.as_ref().unwrap().model().draft().settings,
             requested
         );
         assert_eq!(
-            product_values(&mut runtime)["selection"]["filters"],
-            serde_json::json!(requested.filters)
+            product_values(&mut runtime)["selection"]["renderer"],
+            serde_json::json!(requested.renderer)
         );
         assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
         assert_eq!(store.applied(), saved);
@@ -7861,53 +6993,42 @@ mod tests {
     #[test]
     fn parameter_prevalidation_refusal_preserves_confirmed_incumbent_without_owner_work() {
         use crate::domain::failure::{
-            FailureCategory, FilterErrorKind, Stage, TreatmentErrorKind,
+            FailureCategory, RendererErrorKind, Stage, TreatmentErrorKind,
             TreatmentFailureDisposition, ValidationLayer,
         };
         let store = WritableSettings::new();
         let (mut runtime, drivers) = product_runtime();
         store.bind(&mut runtime);
-        seed_filter_editor(&mut runtime, filter_editor_chain());
         let driver = start_live(&mut runtime, &drivers);
         settle_committed_watch(&mut runtime);
         let model = runtime.engine.as_ref().unwrap().model();
         let incumbent = model.active().unwrap().clone();
         let last_valid = model.last_valid().unwrap().clone();
-        let mut expected_chain = model.draft().settings.filters.clone();
-        let mut edited = serde_json::to_value(expected_chain.entries()[1].filter()).unwrap();
-        edited["parameters"]["brightness"] = serde_json::json!(0.75);
-        expected_chain
-            .set_filter(1, serde_json::from_value(edited).unwrap())
-            .unwrap();
+        let expected_renderer = treatment_renderer(true);
         let bytes = std::fs::read(store.path()).unwrap();
         let revision = runtime.ui.public_revision.to_string();
-        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[1]
-            .key
-            .clone();
         // Replace only the preparation/admission port. As in the existing
         // unavailable-pause-port probe, the actual confirmed owner remains
         // alive in `original` and is restored before observation or cleanup.
         let refused_port = GateRunner::with_spawner(
-            crate::media::render_catalog::QualifiedTreatmentCapabilities {
-                filters: Err(
-                    crate::media::filter_catalog::FilterCatalogError::InvalidPrefix {
-                        detail: "controlled filter catalog prevalidation refusal".into(),
-                    },
-                ),
-                renderer: Ok(crate::media::render_catalog::fixture_capabilities()),
-            },
+            Err(
+                crate::media::render_catalog::RendererCatalogError::Malformed {
+                    property: Some(crate::domain::render::RendererProperty::Scale),
+                    reason: "controlled renderer catalog prevalidation refusal",
+                },
+            ),
             |_, _| panic!("prevalidation cannot create a replacement owner"),
         );
         let original =
             std::mem::replace(runtime.engine.as_mut().unwrap().runner_mut(), refused_port);
-        runtime.set_filter_number(&revision, &entry, "brightness", 0.75);
+        runtime.set_interpolation(&revision, true);
         *runtime.engine.as_mut().unwrap().runner_mut() = original;
         runtime.dirty = true;
         let refused = runtime.poll();
         let model = runtime.engine.as_ref().unwrap().model();
         assert_eq!(model.active(), Some(&incumbent));
         assert_eq!(model.last_valid(), Some(&last_valid));
-        assert_eq!(model.draft().settings.filters, expected_chain);
+        assert_eq!(model.draft().settings.renderer, expected_renderer);
         assert_eq!(
             model.draft().settings.video.mode,
             incumbent.applied().settings().video.mode
@@ -7916,14 +7037,10 @@ mod tests {
             model.draft().settings.audio,
             incumbent.applied().settings().audio
         );
-        assert_eq!(
-            model.draft().settings.renderer,
-            incumbent.applied().settings().renderer
-        );
         let failure = model.failures().unwrap().candidate.as_ref().unwrap();
         assert_eq!(
             failure.category,
-            FailureCategory::Validation(ValidationLayer::Filters)
+            FailureCategory::Validation(ValidationLayer::Renderer)
         );
         assert_eq!(failure.stage, Stage::Prevalidation);
         let treatment = failure.treatment.as_ref().unwrap();
@@ -7931,26 +7048,30 @@ mod tests {
             treatment.disposition,
             TreatmentFailureDisposition::Untouched
         );
-        let TreatmentErrorKind::Filter(filter) = &treatment.kind else {
-            panic!("filter prevalidation must preserve its typed cause");
+        let TreatmentErrorKind::Renderer(renderer) = &treatment.kind else {
+            panic!("renderer prevalidation must preserve its typed cause");
         };
-        assert_eq!(filter.kind, FilterErrorKind::CatalogUnavailable);
+        assert_eq!(renderer.kind, RendererErrorKind::CatalogUnavailable);
+        assert_eq!(
+            renderer.property,
+            crate::domain::render::RendererProperty::Scale
+        );
         assert_eq!(refused.product_phase, "ErrorWithActiveRestored");
         assert!(refused.failed && refused.can_toggle_pause);
         assert_eq!(refused.playback_status, "Live");
         assert!(
             refused
                 .diagnostic
-                .contains("controlled filter catalog prevalidation refusal")
+                .contains("controlled renderer catalog prevalidation refusal")
         );
         let public = product_values(&mut runtime);
         assert_eq!(
-            public["selection"]["filters"],
-            serde_json::json!(expected_chain)
+            public["selection"]["renderer"],
+            serde_json::json!(expected_renderer)
         );
         assert_eq!(
-            public["applied"]["filters"],
-            serde_json::json!(incumbent.applied().settings().filters)
+            public["applied"]["renderer"],
+            serde_json::json!(incumbent.applied().settings().renderer)
         );
         assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
         assert_eq!(runtime.persistence.authorized_apply(), None);
@@ -7968,17 +7089,17 @@ mod tests {
     }
 
     #[test]
-    fn verified_filter_edits_order_and_clear_reload_only_the_selected_source_profile() {
+    fn verified_renderer_edits_reload_only_the_selected_source_profile() {
         let store = WritableSettings::new();
         let mut a = profile_fixture_settings(1);
-        a.filters = filter_editor_chain();
         let b = profile_fixture_settings(2);
         let globals = crate::settings::LocalPreferences {
             gain: PlaybackGain::new(17, true).unwrap(),
             fullscreen: true,
             stats_hidden: true,
+            logging_enabled: false,
             output: PersistentOutputChoice::Manual(
-                SinkIdentity::new("filter-profile-output".into(), Vec::new()).unwrap(),
+                SinkIdentity::new("renderer-profile-output".into(), Vec::new()).unwrap(),
             ),
         };
         let mut session = PersistenceSession::load(Ok(store.path()));
@@ -7991,26 +7112,18 @@ mod tests {
         for action in 0..4 {
             let bytes = std::fs::read(store.path()).unwrap();
             let revision = runtime.ui.public_revision.to_string();
-            let rows = runtime
-                .ui
-                .snapshot
-                .as_ref()
-                .unwrap()
-                .filters
-                .entries
-                .clone();
             match action {
                 0 => {
-                    runtime.set_filter_number(&revision, &rows[1].key, "brightness", 1e-7);
+                    runtime.set_scale_antiring(&revision, 0.75);
                 }
                 1 => {
-                    runtime.set_filter_choice(&revision, &rows[0].key, "matrix", "rgb");
+                    runtime.set_dither(&revision, "ordered");
                 }
                 2 => {
-                    runtime.move_filter(&revision, &rows[2].key, "up");
+                    runtime.set_deband_enabled(&revision, true);
                 }
                 3 => {
-                    runtime.clear_filters(&revision);
+                    runtime.set_interpolation(&revision, false);
                 }
                 _ => unreachable!(),
             }
@@ -8024,14 +7137,14 @@ mod tests {
                 .clone();
             assert_eq!(candidate.video.mode, a.video.mode);
             assert_eq!(candidate.audio, a.audio);
-            assert_eq!(candidate.renderer, a.renderer);
+            assert_ne!(candidate.renderer, a.renderer);
             assert_eq!(
                 std::fs::read(store.path()).unwrap(),
                 bytes,
                 "pending is never saved"
             );
-            confirm_filter_edit(&mut runtime, &driver);
-            a.filters = candidate.filters;
+            confirm_renderer_edit(&mut runtime, &driver);
+            a.renderer = candidate.renderer;
             let reloaded = PersistenceSession::load(Ok(store.path()));
             assert!(
                 reloaded
@@ -8043,11 +7156,11 @@ mod tests {
             assert_eq!(reloaded.preferences(), &globals);
             assert!(store.applied().same_request(&a));
         }
-        assert!(a.filters.entries().is_empty());
+        assert!(!a.renderer.values().interpolation);
         cleanup(&mut runtime);
         driver.destroyed.recv().unwrap();
 
-        // A new real runtime must seed and open the verified empty A chain,
+        // A new runtime opens the verified A renderer,
         // then independently restore B without inheriting any A editor state.
         let (mut relaunched, drivers) = profiles_runtime(&store);
         let update = choose_profile_source(&mut relaunched, 0);
@@ -8102,7 +7215,7 @@ mod tests {
             bootstrap_audio: Default::default(),
         });
         let driver = start_live(&mut runtime, &drivers);
-        runtime.add_filter(&runtime.ui.public_revision.to_string(), "eq");
+        runtime.set_interpolation(&runtime.ui.public_revision.to_string(), true);
         let (id, command) = driver
             .submitted
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -8111,7 +7224,7 @@ mod tests {
             panic!("real treatment admission required")
         };
         runtime.set_volume(29);
-        confirm_treatments(&driver, id, key);
+        confirm_treatments(&driver, id, key, treatment_renderer(true));
         await_update(&mut runtime, |update| update.product_phase == "Active");
         assert!(runtime.ui.snapshot.as_ref().unwrap().settings.refused);
         assert_eq!(std::fs::read(store.path()).unwrap(), original);
@@ -8612,6 +7725,7 @@ mod tests {
             binding: ProfileBinding::Serial,
             intent: capture_catalog::ModeIntent::RestoreProfile,
             origin: SelectionOrigin::User { new_source: false },
+            profile_seed: None,
         });
         physical
     }
@@ -8992,7 +8106,6 @@ mod tests {
                 AudioSourceIdentity::new(format!("saved-audio-{index}"), Vec::new()).unwrap(),
             ),
         };
-        value.filters = treatment_chain(index == 2);
         value.renderer = renderer_settings_with_interpolation(index == 1);
         value
     }
@@ -9089,17 +8202,35 @@ mod tests {
     }
     static PROFILE_VALIDATION_PROBE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     fn profiles_runtime(store: &WritableSettings) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+        profiles_runtime_with_spawn_failure(store, None)
+    }
+    fn profiles_runtime_with_spawn_failure(
+        store: &WritableSettings,
+        fail_spawn: Option<u64>,
+    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+        profiles_runtime_with_validation(store, fail_spawn, validate_profile_fixture_probe)
+    }
+    fn profiles_runtime_with_validation(
+        store: &WritableSettings,
+        fail_spawn: Option<u64>,
+        validate: fn(
+            ValidationRequest,
+        ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
+    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
         let (mut runtime, _) = product_runtime();
         let (tx, rx) = mpsc::channel();
         let runner = GateRunner::with_spawner(
             fixture_treatment_capabilities(),
             move |generation, config| {
-                let requested = config
-                    .video
-                    .validate_snapshot(&profiles_capture_fixture())
-                    .unwrap()
-                    .requested()
-                    .clone();
+                if fail_spawn == Some(generation.get()) {
+                    return Err(crate::media::controller::MediaError::new(
+                        "fixture_spawn",
+                        "profile candidate owner spawn refused",
+                    ));
+                }
+                // CaptureValidator already produced this exact physical proof;
+                // do not re-resolve it against an older fixture after relocation.
+                let requested = config.video.requested();
                 let (driver, backend) = Driver::pair(Config::default());
                 let backend = backend.with_open_treatments(config.treatment_key, config.treatments);
                 tx.send(driver).unwrap();
@@ -9112,7 +8243,7 @@ mod tests {
             settings(),
             runtime.persistence.preferences().gain,
             CaptureValidator::with_runner_and_snapshot(
-                validate_profile_fixture_probe,
+                validate,
                 profiles_capture_fixture(),
                 profile_audio_sources(),
             ),
@@ -9154,6 +8285,60 @@ mod tests {
             &runtime.ui.catalog.revision.to_string(),
             &key,
         )
+    }
+    /// Exercise the production startup composition/baseline capture, replacing
+    /// only concrete I/O adapters before the first admission.
+    fn startup_profiles_runtime(
+        store: &WritableSettings,
+        startup: StartupSelection,
+    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+        startup_profiles_runtime_with_validation(store, startup, validate_profile_fixture_probe)
+    }
+    fn startup_profiles_runtime_with_validation(
+        store: &WritableSettings,
+        startup: StartupSelection,
+        validate: fn(
+            ValidationRequest,
+        ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
+    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+        startup_profiles_runtime_with_adapters(store, startup, None, validate)
+    }
+    fn startup_profiles_runtime_with_adapters(
+        store: &WritableSettings,
+        startup: StartupSelection,
+        fail_spawn: Option<u64>,
+        validate: fn(
+            ValidationRequest,
+        ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
+    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+        let submitted = startup.draft.clone().expect("complete startup fixture");
+        let mut persistence = PersistenceSession::load(Ok(store.path()));
+        persistence.prepare_startup(&startup);
+        let mut runtime = RuntimeCoordinator::new_with_catalog(
+            String::new(),
+            fixture_treatment_capabilities(),
+            startup,
+            persistence,
+            profile_audio_sources()
+                .into_iter()
+                .map(|source| source.identity)
+                .collect(),
+            crate::diagnostics::DiagnosticsHandle::for_test(),
+            || {
+                Err(AudioError::Control(
+                    "fixture has no Pulse catalog connection".into(),
+                ))
+            },
+        );
+        let (mut adapters, drivers) = profiles_runtime_with_validation(store, fail_spawn, validate);
+        let mut engine = adapters.engine.take().unwrap();
+        engine
+            .edit_draft(engine.model().draft().revision, submitted)
+            .unwrap();
+        runtime.engine = Some(engine);
+        runtime.ui.catalog = std::mem::take(&mut adapters.ui.catalog);
+        runtime.ui.catalog.hold_mode_requests_fixture();
+        (runtime, drivers)
     }
     fn complete_profile_source(
         runtime: &mut RuntimeCoordinator,
@@ -9231,7 +8416,7 @@ mod tests {
         driver.send(BackendEvent::PlaybackRestart);
         driver.confirm_open_treatments();
         driver.fence();
-        await_update(runtime, |update| update.product_phase == "Active");
+        await_update(runtime, |update| update.can_toggle_pause);
         driver
     }
 
@@ -9245,6 +8430,7 @@ mod tests {
             gain: PlaybackGain::new(0, true).unwrap(),
             fullscreen: true,
             stats_hidden: true,
+            logging_enabled: false,
             output: PersistentOutputChoice::Manual(
                 SinkIdentity::new("global-output".into(), Vec::new()).unwrap(),
             ),
@@ -9254,16 +8440,28 @@ mod tests {
         remember_profile(&mut session, b.clone());
         let (mut runtime, drivers) = profiles_runtime(&store);
         let mut incumbent = None;
+        let mut prior_profile = None;
         for (index, expected) in [(0, &a), (1, &b), (0, &a)] {
             let revision = runtime.ui.public_revision;
+            let validation = PROFILE_VALIDATION_PROBE.lock();
             let update = choose_profile_source(&mut runtime, index);
             let submitted = &runtime.engine.as_ref().unwrap().model().draft().settings;
             assert!(submitted.same_request(expected));
             assert_eq!(runtime.ui.public_revision, revision + 1);
             assert!(runtime.persistence.authorized_apply().is_some());
+            assert_eq!(
+                runtime.report_cache.provenance.pending_apply(),
+                runtime.persistence.authorized_apply()
+            );
+            assert_eq!(
+                runtime.diagnostics_report().session.applied_profile,
+                prior_profile,
+                "a selected/pending source cannot replace actual incumbent provenance"
+            );
             assert_eq!(runtime.persistence.preferences(), &globals);
             assert_eq!(runtime.output.choice(), &globals.output);
             assert_eq!(runtime.engine.as_ref().unwrap().gain(), globals.gain);
+            drop(validation);
             incumbent = Some(complete_profile_source(
                 &mut runtime,
                 &drivers,
@@ -9272,19 +8470,42 @@ mod tests {
             ));
             assert!(store.applied().same_request(expected));
             assert_eq!(runtime.persistence.preferences(), &globals);
+            let profile = runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .unwrap();
+            assert_eq!(
+                profile.origin,
+                crate::diagnostics::report::ProfileOrigin::SourceSelection
+            );
+            assert_eq!(
+                profile.binding_kind,
+                crate::diagnostics::report::ProfileBindingKind::Serial
+            );
+            assert!(profile.matches_loaded_settings);
+            assert!(runtime.report_cache.provenance.pending_apply().is_none());
+            prior_profile = Some(profile);
         }
         // Hold C's validator before admitting its request. Acquiring this
         // after dispatch races the worker and can accidentally open C.
         let validation_probe = PROFILE_VALIDATION_PROBE.lock();
         let c_update = choose_profile_source(&mut runtime, 2);
         assert!(!c_update.create_native && !c_update.release_native);
+        assert_eq!(
+            runtime.diagnostics_report().session.applied_profile,
+            prior_profile
+        );
+        assert_eq!(
+            runtime.report_cache.provenance.pending_apply(),
+            runtime.persistence.authorized_apply()
+        );
         let selected_c = &runtime.engine.as_ref().unwrap().model().draft().settings;
         assert_eq!(
             selected_c.video.identity,
             profile_fixture_settings(3).video.identity
         );
         assert_eq!(selected_c.video.mode.format_policy, InputFormatPolicy::Auto);
-        assert!(selected_c.filters.entries().is_empty());
         assert_eq!(selected_c.renderer, RendererSettings::default());
         assert_eq!(
             selected_c.audio,
@@ -9304,6 +8525,14 @@ mod tests {
         // Consume the close call's one-shot native-release instruction too:
         // dropping it can strand the GUI side at the acknowledged barrier.
         let closing = runtime.request_application_close();
+        assert!(runtime.report_cache.provenance.pending_apply().is_none());
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
         if closing.release_native {
             incumbent.take().unwrap().destroyed.recv().unwrap();
             let released = runtime.native_released(AttemptId::new(closing.generation).unwrap());
@@ -9619,14 +8848,12 @@ mod tests {
         let opening = choose_profile_source(&mut runtime, 0);
         let submitted = &runtime.engine.as_ref().unwrap().model().draft().settings;
         assert_eq!(submitted.video.mode.format_policy, InputFormatPolicy::Auto);
-        assert_eq!(submitted.filters, old.filters);
         assert_eq!(submitted.renderer, old.renderer);
         assert_eq!(submitted.audio, old.audio);
         assert_eq!(std::fs::read(store.path()).unwrap(), before);
         let driver = complete_profile_source(&mut runtime, &drivers, opening, None);
         let saved = store.applied();
         assert_eq!(saved.video.mode.format_policy, InputFormatPolicy::Auto);
-        assert_eq!(saved.filters, old.filters);
         assert_eq!(saved.renderer, old.renderer);
         assert_eq!(saved.audio, old.audio);
         cleanup(&mut runtime);
@@ -9644,7 +8871,7 @@ mod tests {
         remember_profile(&mut session, known.clone());
         let before = std::fs::read(store.path()).unwrap();
         let (mut runtime, drivers) = profiles_runtime(&store);
-        let update = choose_profile_source(&mut runtime, 0);
+        choose_profile_source(&mut runtime, 0);
         // Spec: session-only FourCC resolution is cleared before re-admission;
         // only the requested policy is authoritative.
         let mut seeded = known.clone();
@@ -9663,7 +8890,7 @@ mod tests {
         // The refused candidate stays editable: an explicit audio repair is the
         // only authority that revokes the restored-audio intent.
         let revision = runtime.ui.public_revision.to_string();
-        runtime.set_audio_enabled(&revision, false);
+        let update = runtime.set_audio_enabled(&revision, false);
         assert!(runtime.ui.error.is_none());
         assert!(
             !runtime
@@ -9862,5 +9089,2225 @@ mod tests {
         drop(validation_guard);
         cleanup(&mut runtime);
         assert!(drivers.try_recv().is_err());
+    }
+
+    #[test]
+    fn diagnostics_backend_is_unavailable_until_current_owner_observes_and_clears_on_retirement() {
+        use crate::{
+            diagnostics::report::Observation,
+            media::controller::{BackendObservation, BackendUnavailable, RuntimeMediaObservation},
+        };
+        let (mut runtime, drivers) = runtime();
+        assert!(matches!(
+            runtime
+                .diagnostics_report()
+                .environment
+                .runtime_media
+                .backend,
+            Observation::Unavailable { .. }
+        ));
+        let driver = start_live(&mut runtime, &drivers);
+        let mut observed = RuntimeMediaObservation {
+            generation: 1,
+            observation_epoch: 1,
+            client_api: 0x0002_0005,
+            libmpv_version: "mpv 0.41.0".into(),
+            backend: BackendObservation::Observed {
+                video_output: "observed-vo".into(),
+                gpu_context: "observed-context".into(),
+            },
+            helpers: Default::default(),
+        };
+        driver.send(BackendEvent::Diagnostics(Box::new(observed.clone())));
+        driver.fence();
+        runtime.poll();
+        assert!(
+            matches!(runtime.diagnostics_report().environment.runtime_media.backend, Observation::Observed { value } if value.video_output == "observed-vo")
+        );
+        observed.generation = 2;
+        observed.backend = BackendObservation::Observed {
+            video_output: "stale-vo".into(),
+            gpu_context: "stale-context".into(),
+        };
+        driver.send(BackendEvent::Diagnostics(Box::new(observed.clone())));
+        driver.fence();
+        runtime.poll();
+        assert!(
+            !serde_json::to_string(&runtime.diagnostics_report())
+                .unwrap()
+                .contains("stale-vo")
+        );
+        observed.generation = 1;
+        observed.observation_epoch = 2;
+        observed.backend = BackendObservation::Unavailable(BackendUnavailable::Invalidated);
+        driver.send(BackendEvent::Diagnostics(Box::new(observed)));
+        driver.fence();
+        runtime.poll();
+        assert!(matches!(
+            runtime
+                .diagnostics_report()
+                .environment
+                .runtime_media
+                .backend,
+            Observation::Unavailable { .. }
+        ));
+        cleanup(&mut runtime);
+        let final_report = runtime.diagnostics_report();
+        assert!(matches!(
+            final_report.environment.runtime_media.backend,
+            Observation::Unavailable { .. }
+        ));
+        assert!(matches!(
+            final_report.session.applied_capture,
+            Observation::Unavailable { .. }
+        ));
+        assert!(matches!(
+            final_report.session.treatments.active_renderer,
+            Observation::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn startup_profile_provenance_uses_original_store_before_cli_override_or_mode_adaptation() {
+        use crate::{
+            app::settings::StartupAudioPolicy,
+            diagnostics::report::{ProfileBindingKind, ProfileOrigin},
+        };
+        for adapt in [false, true] {
+            for cli_override in [false, true] {
+                let store = WritableSettings::new();
+                let mut loaded = profile_fixture_settings(1);
+                if adapt {
+                    loaded.video.mode.size = FrameSize::new(640, 480).unwrap();
+                    loaded.video.mode.rate = FrameRate::new(120, 1).unwrap();
+                }
+                let mut persistence = PersistenceSession::load(Ok(store.path()));
+                remember_profile(&mut persistence, loaded.clone());
+                let mut submitted = loaded;
+                if cli_override {
+                    submitted.audio = AudioSelection::Disabled { retained: None };
+                }
+                let startup = StartupSelection {
+                    draft: Some(submitted),
+                    auto_open: !adapt,
+                    adapt_video: adapt,
+                    restore_profile: true,
+                    source_binding: Some(ProfileBinding::Serial),
+                    topology_pin: None,
+                    reason: String::new(),
+                    audio_policy: if cli_override {
+                        StartupAudioPolicy::Cli
+                    } else {
+                        StartupAudioPolicy::Explicit
+                    },
+                    bootstrap_audio: AudioSelection::default(),
+                };
+                let (mut runtime, drivers) = startup_profiles_runtime(&store, startup);
+                assert!(
+                    runtime
+                        .diagnostics_report()
+                        .session
+                        .applied_profile
+                        .is_none()
+                );
+                let opening = runtime.ui_ready();
+                assert!(
+                    runtime.ui.resolving.is_none(),
+                    "fixture has exact native descriptors for the resolved startup mode"
+                );
+                runtime.ui.catalog.worker.take();
+                assert!(
+                    runtime
+                        .diagnostics_report()
+                        .session
+                        .applied_profile
+                        .is_none(),
+                    "startup selection/admission is not applied provenance"
+                );
+                assert_eq!(
+                    runtime.report_cache.provenance.pending_apply(),
+                    runtime.startup_apply
+                );
+                assert!(runtime.report_cache.provenance.pending_apply().is_some());
+                let driver = complete_profile_source(&mut runtime, &drivers, opening, None);
+                let profile = runtime
+                    .diagnostics_report()
+                    .session
+                    .applied_profile
+                    .unwrap();
+                assert_eq!(profile.origin, ProfileOrigin::Startup);
+                assert_eq!(profile.binding_kind, ProfileBindingKind::Serial);
+                assert_eq!(profile.matches_loaded_settings, !adapt && !cli_override);
+                assert!(runtime.report_cache.provenance.pending_apply().is_none());
+                assert_eq!(
+                    runtime
+                        .engine
+                        .as_ref()
+                        .unwrap()
+                        .model()
+                        .active()
+                        .unwrap()
+                        .applied()
+                        .settings()
+                        .audio
+                        .source()
+                        .is_none(),
+                    cli_override
+                );
+                cleanup(&mut runtime);
+                assert!(
+                    runtime
+                        .diagnostics_report()
+                        .session
+                        .applied_profile
+                        .is_none()
+                );
+                driver.destroyed.recv().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn source_profile_report_promotes_only_after_real_verified_selection_and_clears_active_on_close()
+     {
+        use crate::diagnostics::report::ProfileOrigin;
+        let store = WritableSettings::new();
+        let loaded = profile_fixture_settings(1);
+        let mut persistence = PersistenceSession::load(Ok(store.path()));
+        remember_profile(&mut persistence, loaded);
+        let (mut runtime, drivers) = profiles_runtime(&store);
+        let update = choose_profile_source(&mut runtime, 0);
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+        let _driver = complete_profile_source(&mut runtime, &drivers, update, None);
+        let profile = runtime
+            .diagnostics_report()
+            .session
+            .applied_profile
+            .unwrap();
+        assert_eq!(profile.origin, ProfileOrigin::SourceSelection);
+        cleanup(&mut runtime);
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scalar_logs_feed_qualification_without_private_input_or_health_feedback() {
+        use crate::diagnostics::{
+            DiagnosticsConfig, DiagnosticsRuntime, EventLevel, LogLimits, SafeField,
+        };
+        let directory = WritableSettings::new();
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: true,
+            xdg_state_home: Some(directory.0.clone().into_os_string()),
+            home: None,
+            limits: LogLimits::default(),
+        });
+        let handle = writer.handle();
+        let dispatch = handle.test_dispatch();
+        let (mut runtime, _) = runtime();
+        runtime.diagnostics = handle.clone();
+        runtime.last_logged_runtime = None;
+        runtime.last_logged_settings = None;
+        tracing::dispatcher::with_default(&dispatch, || {
+            runtime.qualification_command("PRIVATE_ASCII_COMMAND private://path SERIAL_PRIVATE");
+            handle.reject_folder_counter_exhausted();
+            runtime.poll();
+            writer.begin_shutdown();
+            // A genuinely dropped event changes diagnostic counters. It must
+            // not cause either runtime emitter to submit another event.
+            handle.event(
+                EventLevel::Info,
+                "apply_runtime",
+                &[SafeField::u64("apply_id", 99)],
+            );
+            let dropped = handle.health().dropped_events;
+            for _ in 0..10 {
+                runtime.poll();
+            }
+            assert_eq!(handle.health().dropped_events, dropped);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !writer.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "diagnostic worker did not drain"
+            );
+            std::thread::yield_now();
+        }
+        writer.finish_shutdown(std::time::Duration::from_millis(250));
+        let text = std::fs::read_to_string(directory.0.join("furami/logs/furami.log")).unwrap();
+        assert!(!text.contains("PRIVATE_ASCII_COMMAND"));
+        assert!(!text.contains("SERIAL_PRIVATE"));
+        assert!(!text.contains("private://path"));
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|value: &serde_json::Value| value.get("event_code").is_some())
+            .collect();
+        let snapshots: Vec<_> = events
+            .iter()
+            .filter(|event| event["event_code"] == "apply_runtime")
+            .collect();
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "health-only polls cannot emit product snapshots"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event_code"] == "settings_runtime")
+                .count(),
+            1
+        );
+        assert!(events.iter().any(
+            |event| event["event_code"] == "qualification_request_received"
+                && event["fields"]["kind"] == "Unknown"
+        ));
+        let fields = &snapshots[0]["fields"];
+        let command = format!(
+            "open {} {} {} {} {}",
+            fields["phase"].as_str().unwrap(),
+            fields["apply_id"].as_u64().unwrap(),
+            fields["attempt_id"].as_u64().unwrap(),
+            fields["cleanup"].as_str().unwrap(),
+            fields["draft_revision"].as_u64().unwrap()
+        );
+        let Command::Apply(expected, revision) = control::parse(&command).unwrap() else {
+            panic!("the scalar contract must feed the unchanged qualification grammar");
+        };
+        let engine = runtime.engine.as_ref().unwrap();
+        assert!(RuntimeCoordinator::checked_state(engine, expected).is_ok());
+        assert_eq!(revision, engine.model().draft().revision);
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn oversize_report_health_does_not_create_a_publication_feedback_loop() {
+        use crate::diagnostics::{DiagnosticsConfig, DiagnosticsRuntime, LogLimits};
+        let (mut runtime, _) = runtime();
+        runtime.engine = None;
+        runtime.ui.partial = Some(PartialDraft::default());
+        runtime.poll();
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: true,
+            xdg_state_home: None,
+            home: None,
+            limits: LogLimits {
+                report_bytes: 256,
+                ..LogLimits::default()
+            },
+        });
+        let handle = writer.handle();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(
+            handle.os_report(),
+            crate::diagnostics::report::Observation::Unavailable {
+                reason: crate::diagnostics::report::UnavailableReason::NotObserved
+            }
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker OS observation did not complete"
+            );
+            std::thread::yield_now();
+        }
+        runtime.diagnostics = handle.clone();
+        runtime.poll();
+        let revision = runtime.diagnostics_report().revision;
+        let oversized = handle.health().oversized_reports;
+        assert!(oversized > 0);
+        for _ in 0..10 {
+            runtime.poll();
+        }
+        assert_eq!(runtime.diagnostics_report().revision, revision);
+        assert_eq!(handle.health().oversized_reports, oversized);
+        assert!(
+            runtime
+                .diagnostics_report()
+                .environment
+                .log_location
+                .has_problem()
+        );
+        // An independently changed folder failure is not suppressed by the
+        // post-publication baseline, even when the next report is oversized too.
+        handle.prepare_log_folder(crate::diagnostics::FolderRequestId(1));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.health().folder.state != crate::diagnostics::FolderState::Failed {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder response did not complete"
+            );
+            std::thread::yield_now();
+        }
+        runtime.poll();
+        assert!(runtime.diagnostics_report().revision > revision);
+        writer.begin_shutdown();
+        writer.finish_shutdown(std::time::Duration::from_millis(250));
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn native_environment_enriches_engine_free_reports_once_without_xwayland_inference() {
+        use crate::diagnostics::report::{Observation, UnavailableReason};
+        let (mut runtime, _) = runtime();
+        runtime.engine = None;
+        runtime.ui.partial = Some(PartialDraft::default());
+        runtime.poll();
+        let before = runtime.diagnostics_report().revision;
+        runtime.native_environment(
+            "6.11.2",
+            "xcb",
+            &"vendor".repeat(100),
+            12401000,
+            11,
+            0,
+            1,
+            1,
+        );
+        let enriched = runtime.diagnostics_report();
+        assert!(enriched.revision > before);
+        assert!(
+            matches!(enriched.environment.native.qt_runtime_version, Observation::Observed { value } if value == "6.11.2")
+        );
+        assert!(
+            matches!(enriched.environment.native.x_server, Observation::Observed { value } if value.vendor.len() == 256 && value.protocol_major == 11 && value.shape_major == 1)
+        );
+        assert!(matches!(
+            enriched.environment.native.xwayland_version,
+            Observation::Unavailable {
+                reason: UnavailableReason::NotExposed
+            }
+        ));
+        runtime.native_environment(
+            "6.11.2",
+            "xcb",
+            &"vendor".repeat(100),
+            12401000,
+            11,
+            0,
+            1,
+            1,
+        );
+        assert_eq!(runtime.diagnostics_report().revision, enriched.revision);
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn profile_origin_survives_hot_edit_but_match_changes_only_after_matching_confirmation() {
+        use crate::diagnostics::report::ProfileOrigin;
+        let store = WritableSettings::new();
+        let mut loaded = profile_fixture_settings(1);
+        loaded.renderer = RendererSettings::default();
+        let mut persistence = PersistenceSession::load(Ok(store.path()));
+        remember_profile(&mut persistence, loaded);
+        let (mut runtime, drivers) = profiles_runtime(&store);
+        let opening = choose_profile_source(&mut runtime, 0);
+        let driver = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let opening_profile = runtime
+            .diagnostics_report()
+            .session
+            .applied_profile
+            .unwrap();
+        assert!(opening_profile.matches_loaded_settings);
+        edit_renderer_settings(&mut runtime, &treatment_renderer(true));
+        let (id, key) = begin_live_treatments(&mut runtime, &driver);
+        assert_eq!(
+            runtime.report_cache.provenance.pending_apply(),
+            Some(key.apply)
+        );
+        assert_eq!(
+            runtime.diagnostics_report().session.applied_profile,
+            Some(opening_profile)
+        );
+        confirm_treatments(&driver, id, key, treatment_renderer(true));
+        await_update(&mut runtime, |update| update.product_phase == "Active");
+        let edited = runtime
+            .diagnostics_report()
+            .session
+            .applied_profile
+            .unwrap();
+        assert_eq!(edited.origin, ProfileOrigin::SourceSelection);
+        assert!(!edited.matches_loaded_settings);
+        assert!(runtime.report_cache.provenance.pending_apply().is_none());
+        cleanup(&mut runtime);
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn independent_folder_failure_during_report_publication_is_not_absorbed_as_oversize_feedback() {
+        use crate::diagnostics::{
+            DiagnosticsConfig, DiagnosticsRuntime, FolderRequestId, FolderState, LogLimits,
+        };
+        let (mut runtime, _) = runtime();
+        runtime.engine = None;
+        runtime.ui.partial = Some(PartialDraft::default());
+        runtime.poll();
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: true,
+            xdg_state_home: None,
+            home: None,
+            limits: LogLimits {
+                report_bytes: 256,
+                ..LogLimits::default()
+            },
+        });
+        let handle = writer.handle();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(
+            handle.os_report(),
+            crate::diagnostics::report::Observation::Unavailable {
+                reason: crate::diagnostics::report::UnavailableReason::NotObserved
+            }
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker OS observation did not complete"
+            );
+            std::thread::yield_now();
+        }
+        runtime.diagnostics = handle.clone();
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        runtime.report_cache.publication_pause = Some((reached_tx, resume_rx));
+        std::thread::scope(|scope| {
+            let handle = handle.clone();
+            scope.spawn(move || {
+                reached_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("pre-health sampled before publication pause");
+                handle.prepare_log_folder(FolderRequestId(1));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while handle.health().folder.state != FolderState::Failed {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = resume_tx.send(());
+                        panic!("worker folder failure did not complete");
+                    }
+                    std::thread::yield_now();
+                }
+                resume_tx.send(()).expect("resume exact paused publication");
+            });
+            runtime.poll();
+        });
+        let first = runtime.diagnostics_report();
+        assert_ne!(
+            first.environment.log_location.folder.state,
+            FolderState::Failed,
+            "the just-encoded report predates the forced independent failure"
+        );
+        let first_revision = first.revision;
+        runtime.poll();
+        let recorded = runtime.diagnostics_report();
+        assert!(
+            recorded.revision > first_revision,
+            "independent health arriving during publication must retain its pending checkpoint"
+        );
+        assert_eq!(
+            recorded.environment.log_location.folder.state,
+            FolderState::Failed
+        );
+        let oversized = handle.health().oversized_reports;
+        for _ in 0..10 {
+            runtime.poll();
+        }
+        assert_eq!(runtime.diagnostics_report().revision, recorded.revision);
+        assert_eq!(
+            handle.health().oversized_reports,
+            oversized,
+            "own oversize accounting must stabilize after recording the independent failure"
+        );
+        writer.begin_shutdown();
+        writer.finish_shutdown(std::time::Duration::from_millis(250));
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn disabled_logging_keeps_current_reports_and_functional_errors_without_diagnostic_hold() {
+        use crate::diagnostics::{
+            DiagnosticsConfig, DiagnosticsRuntime, LogLimits,
+            report::{Observation, UnavailableReason},
+        };
+        let directory = WritableSettings::new();
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: false,
+            xdg_state_home: Some(directory.0.clone().into_os_string()),
+            home: None,
+            limits: LogLimits {
+                report_bytes: 256,
+                ..LogLimits::default()
+            },
+        });
+        let handle = writer.handle();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(
+            handle.os_report(),
+            Observation::Unavailable {
+                reason: UnavailableReason::NotObserved
+            }
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "OS observation did not finish"
+            );
+            std::thread::yield_now();
+        }
+        let (mut runtime, drivers) = runtime();
+        runtime.diagnostics = handle.clone();
+        let initial = runtime.poll();
+        let before = runtime.diagnostics_report();
+        assert!(!initial.logging_enabled);
+        let edited = runtime.qualification_command("draft-video 0 YUYV 1920x1080 30/1");
+        assert!(!edited.create_native && !edited.release_native);
+        let next_folder_request = runtime.next_log_folder_request;
+        assert_eq!(runtime.open_log_folder().log_folder_request, 0);
+        assert_eq!(runtime.next_log_folder_request, next_folder_request);
+        let current = runtime.diagnostics_report();
+        assert!(current.revision > before.revision);
+        assert_ne!(
+            current.session.selected_capture,
+            before.session.selected_capture
+        );
+        let rejected = runtime.qualification_command("not-a-functional-command");
+        assert!(!rejected.context_diagnostic.is_empty());
+        let diagnostics = &runtime.ui.snapshot.as_ref().unwrap().diagnostics;
+        assert_eq!(diagnostics.status, "Disabled");
+        assert!(!diagnostics.has_problem);
+        assert!(diagnostics.message.is_empty());
+        let revision = runtime.diagnostics_report().revision;
+        for _ in 0..10 {
+            runtime.poll();
+        }
+        assert_eq!(runtime.diagnostics_report().revision, revision);
+        assert_eq!(handle.health().oversized_reports, 0);
+        assert_eq!(handle.health().dropped_events, 0);
+        assert!(drivers.try_recv().is_err(), "reports cannot open media");
+        cleanup(&mut runtime);
+        finish_diagnostic_writer(&writer);
+        assert!(!directory.0.join("furami").exists());
+    }
+
+    #[test]
+    fn refused_logging_enable_preserves_preference_and_uses_the_intent_error_lane() {
+        use crate::diagnostics::{DiagnosticsConfig, DiagnosticsRuntime, LogLimits};
+        let directory = WritableSettings::new();
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: false,
+            xdg_state_home: Some(directory.0.clone().into_os_string()),
+            home: None,
+            limits: LogLimits::default(),
+        });
+        finish_diagnostic_writer(&writer);
+        let (mut runtime, drivers) = runtime();
+        runtime.diagnostics = writer.handle();
+        let rejected = runtime.set_logging_enabled(true);
+        assert!(!rejected.logging_enabled);
+        assert!(!rejected.create_native && !rejected.release_native);
+        assert!(!runtime.persistence.preferences().logging_enabled);
+        assert!(!runtime.diagnostics.health().logging_enabled);
+        let error = runtime
+            .ui
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .intent_error
+            .as_ref()
+            .unwrap();
+        assert_eq!(error.code, "unavailable");
+        assert_eq!(error.action, "setLoggingEnabled");
+        assert_eq!(error.field, "loggingEnabled");
+        assert_eq!(
+            runtime.ui.snapshot.as_ref().unwrap().diagnostics.status,
+            "Disabled"
+        );
+        assert!(drivers.try_recv().is_err());
+        cleanup(&mut runtime);
+        assert!(!directory.0.join("furami").exists());
+    }
+
+    #[test]
+    fn pending_folder_dispatch_is_cancelled_by_reentrant_off_on_before_native_claim() {
+        use crate::diagnostics::{
+            DiagnosticsConfig, DiagnosticsRuntime, FolderRequestId, FolderState, LogLimits,
+        };
+        let directory = WritableSettings::new();
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: true,
+            xdg_state_home: Some(directory.0.clone().into_os_string()),
+            home: None,
+            limits: LogLimits::default(),
+        });
+        let (mut runtime, _) = runtime();
+        runtime.engine = None;
+        runtime.diagnostics = writer.handle();
+        runtime.persistence.set_logging_enabled_preference(true);
+        let first = runtime.open_log_folder();
+        let prepared = if first.log_folder_request != 0 {
+            first
+        } else {
+            await_update(&mut runtime, |update| update.log_folder_request != 0)
+        };
+        let old_request = prepared.log_folder_request;
+        // The outer native applyUpdate already owns this edge. A synchronous
+        // stateChanged handler can change the mode before it reaches dispatch.
+        runtime.set_logging_enabled(false);
+        runtime.set_logging_enabled(true);
+        assert!(!runtime.claim_log_folder_dispatch(old_request));
+        runtime.log_folder_result(old_request, false);
+        assert_eq!(runtime.diagnostics.health().folder.state, FolderState::Idle);
+        let retry = runtime.open_log_folder();
+        let fresh = if retry.log_folder_request != 0 {
+            retry
+        } else {
+            await_update(&mut runtime, |update| update.log_folder_request != 0)
+        };
+        assert!(fresh.log_folder_request > old_request);
+        let revision = runtime.diagnostics_report().revision;
+        assert!(runtime.claim_log_folder_dispatch(fresh.log_folder_request));
+        assert!(!runtime.claim_log_folder_dispatch(fresh.log_folder_request));
+        assert_eq!(runtime.diagnostics_report().revision, revision);
+        runtime.log_folder_result(old_request, false);
+        runtime.log_folder_result(fresh.log_folder_request, true);
+        assert_eq!(
+            runtime.diagnostics.health().folder.request,
+            Some(FolderRequestId(fresh.log_folder_request))
+        );
+        assert_eq!(
+            runtime.diagnostics.health().folder.state,
+            FolderState::OpenRequested
+        );
+        cleanup(&mut runtime);
+        finish_diagnostic_writer(&writer);
+    }
+
+    #[test]
+    fn folder_dispatch_is_once_and_acknowledgements_are_correlated_while_idle() {
+        use crate::diagnostics::{DiagnosticsConfig, DiagnosticsRuntime, FolderState, LogLimits};
+        let directory = WritableSettings::new();
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: true,
+            xdg_state_home: Some(directory.0.clone().into_os_string()),
+            home: None,
+            limits: LogLimits::default(),
+        });
+        let (mut runtime, _) = runtime();
+        runtime.engine = None;
+        runtime.diagnostics = writer.handle();
+        runtime.poll();
+        let mut update = runtime.open_log_folder();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while update.log_folder_request == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder preparation did not complete"
+            );
+            std::thread::yield_now();
+            update = runtime.poll();
+        }
+        assert!(update.changed);
+        assert_eq!(update.log_folder_request, 1);
+        assert_eq!(
+            update.log_folder_path,
+            directory.0.join("furami/logs").to_str().unwrap()
+        );
+        assert_eq!(
+            runtime.poll().log_folder_request,
+            0,
+            "dispatch is consumed exactly once"
+        );
+        assert!(runtime.claim_log_folder_dispatch(update.log_folder_request));
+        assert!(!runtime.claim_log_folder_dispatch(update.log_folder_request));
+        runtime.log_folder_result(2, true);
+        assert_eq!(
+            runtime.diagnostics.health().folder.state,
+            FolderState::Preparing
+        );
+        let rejected = runtime.log_folder_result(1, false);
+        assert!(rejected.changed);
+        let snapshot: serde_json::Value = serde_json::from_str(&rejected.ui_snapshot).unwrap();
+        assert_eq!(snapshot["diagnostics"]["folderState"], "Failed");
+        assert_eq!(snapshot["diagnostics"]["hasProblem"], true);
+        runtime.log_folder_result(1, true);
+        assert_eq!(
+            runtime.diagnostics.health().folder.state,
+            FolderState::Failed
+        );
+        let mut retry = runtime.open_log_folder();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while retry.log_folder_request == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retry preparation did not complete"
+            );
+            std::thread::yield_now();
+            retry = runtime.poll();
+        }
+        assert_eq!(retry.log_folder_request, 2);
+        assert!(runtime.claim_log_folder_dispatch(retry.log_folder_request));
+        writer.begin_shutdown();
+        runtime
+            .diagnostics
+            .event(crate::diagnostics::EventLevel::Info, "apply_runtime", &[]);
+        let dropped = runtime.diagnostics.health().dropped_events;
+        assert!(dropped > 0);
+        let accepted = runtime.log_folder_result(2, true);
+        assert!(accepted.changed);
+        let snapshot: serde_json::Value = serde_json::from_str(&accepted.ui_snapshot).unwrap();
+        assert_eq!(snapshot["diagnostics"]["folderState"], "OpenRequested");
+        assert_eq!(
+            snapshot["diagnostics"]["hasProblem"], true,
+            "action success cannot repair diagnostic loss"
+        );
+        assert_eq!(
+            snapshot["diagnostics"]["droppedEvents"],
+            dropped.to_string()
+        );
+        runtime.log_folder_result(2, false);
+        assert_eq!(
+            runtime.diagnostics.health().folder.state,
+            FolderState::OpenRequested
+        );
+        let terminated = runtime.log_folder_finished(2, true);
+        assert!(terminated.changed);
+        assert!(!terminated.create_native && !terminated.release_native);
+        let snapshot: serde_json::Value = serde_json::from_str(&terminated.ui_snapshot).unwrap();
+        assert_eq!(snapshot["diagnostics"]["folderState"], "Failed");
+        assert_eq!(snapshot["diagnostics"]["hasProblem"], true);
+        assert_eq!(
+            runtime
+                .diagnostics_report()
+                .environment
+                .log_location
+                .folder
+                .error
+                .unwrap()
+                .code,
+            crate::diagnostics::DiagnosticsCode::LauncherFailed
+        );
+        runtime.next_log_folder_request = Some(crate::diagnostics::FolderRequestId(u64::MAX));
+        runtime.open_log_folder();
+        assert_eq!(
+            runtime.diagnostics.health().folder.request,
+            Some(crate::diagnostics::FolderRequestId(u64::MAX))
+        );
+        assert_eq!(
+            runtime.next_log_folder_request, None,
+            "the native request counter never wraps through zero"
+        );
+        runtime.open_log_folder();
+        assert_eq!(
+            runtime.diagnostics.health().folder.error.unwrap().code,
+            crate::diagnostics::DiagnosticsCode::CounterExhausted
+        );
+        writer.begin_shutdown();
+        writer.finish_shutdown(std::time::Duration::from_millis(250));
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn folder_terminal_failure_refreshes_visible_diagnostics_and_report_without_capture() {
+        use crate::diagnostics::{
+            DiagnosticsCode, DiagnosticsConfig, DiagnosticsOperation, DiagnosticsRuntime,
+            FolderState, LogLimits,
+        };
+        let directory = WritableSettings::new();
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: true,
+            xdg_state_home: Some(directory.0.clone().into_os_string()),
+            home: None,
+            limits: LogLimits::default(),
+        });
+        let (mut runtime, _) = runtime();
+        runtime.engine = None;
+        runtime.diagnostics = writer.handle();
+        runtime.persistence.set_logging_enabled_preference(true);
+        let first = runtime.open_log_folder();
+        let prepared = if first.log_folder_request != 0 {
+            first
+        } else {
+            await_update(&mut runtime, |update| update.log_folder_request != 0)
+        };
+        let request = prepared.log_folder_request;
+        assert!(runtime.claim_log_folder_dispatch(request));
+        let accepted = runtime.log_folder_result(request, true);
+        assert!(!accepted.create_native && !accepted.release_native);
+        assert_eq!(
+            runtime.diagnostics.health().folder.state,
+            FolderState::OpenRequested
+        );
+        let accepted_revision = runtime.diagnostics_report().revision;
+        let failed = runtime.log_folder_finished(request, true);
+        assert!(failed.changed);
+        assert!(!failed.create_native && !failed.release_native);
+        assert_eq!(failed.log_folder_request, 0);
+        let snapshot: serde_json::Value = serde_json::from_str(&failed.ui_snapshot).unwrap();
+        assert_eq!(snapshot["diagnostics"]["folderState"], "Failed");
+        assert_eq!(snapshot["diagnostics"]["hasProblem"], true);
+        assert!(
+            !snapshot["diagnostics"]["message"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(snapshot["intentError"].is_null());
+        let report = runtime.diagnostics_report();
+        assert!(report.revision > accepted_revision);
+        assert_eq!(
+            report.environment.log_location.folder.state,
+            FolderState::Failed
+        );
+        let error = report.environment.log_location.folder.error.unwrap();
+        assert_eq!(error.operation, DiagnosticsOperation::OpenFolder);
+        assert_eq!(error.code, DiagnosticsCode::LauncherFailed);
+        assert_eq!(error.io_kind, None);
+        assert_eq!(error.os_code, None);
+        runtime.log_folder_finished(request, false);
+        runtime.log_folder_result(request, true);
+        assert_eq!(
+            runtime
+                .diagnostics_report()
+                .environment
+                .log_location
+                .folder
+                .error,
+            Some(error)
+        );
+        cleanup(&mut runtime);
+        finish_diagnostic_writer(&writer);
+    }
+
+    #[test]
+    fn folder_zero_exit_keeps_open_requested_and_cannot_be_reversed_by_duplicate_failure() {
+        use crate::diagnostics::{DiagnosticsConfig, DiagnosticsRuntime, FolderState, LogLimits};
+        let directory = WritableSettings::new();
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: true,
+            xdg_state_home: Some(directory.0.clone().into_os_string()),
+            home: None,
+            limits: LogLimits::default(),
+        });
+        let (mut runtime, _) = runtime();
+        runtime.engine = None;
+        runtime.diagnostics = writer.handle();
+        runtime.persistence.set_logging_enabled_preference(true);
+        let first = runtime.open_log_folder();
+        let prepared = if first.log_folder_request != 0 {
+            first
+        } else {
+            await_update(&mut runtime, |update| update.log_folder_request != 0)
+        };
+        let request = prepared.log_folder_request;
+        assert!(runtime.claim_log_folder_dispatch(request));
+        runtime.log_folder_result(request, true);
+        runtime.log_folder_finished(request, false);
+        runtime.log_folder_finished(request, true);
+        let projection = &runtime.ui.snapshot.as_ref().unwrap().diagnostics;
+        assert_eq!(projection.folder_state, "OpenRequested");
+        assert!(!projection.has_problem);
+        assert!(projection.message.is_empty());
+        let report = runtime.diagnostics_report();
+        assert_eq!(
+            report.environment.log_location.folder.state,
+            FolderState::OpenRequested
+        );
+        assert_eq!(report.environment.log_location.folder.error, None);
+        cleanup(&mut runtime);
+        finish_diagnostic_writer(&writer);
+    }
+
+    #[test]
+    fn folder_failure_is_visible_without_engine_and_never_becomes_capture_intent_error() {
+        use crate::diagnostics::{DiagnosticsConfig, DiagnosticsRuntime, LogLimits};
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: true,
+            xdg_state_home: None,
+            home: None,
+            limits: LogLimits::default(),
+        });
+        let (mut runtime, _) = runtime();
+        runtime.engine = None;
+        runtime.diagnostics = writer.handle();
+        runtime.poll();
+        let mut update = runtime.open_log_folder();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !update.ui_snapshot.is_empty() {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&update.ui_snapshot).unwrap();
+                if snapshot["diagnostics"]["folderState"] == "Failed" {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder failure was not delivered in a UI update"
+            );
+            std::thread::yield_now();
+            update = runtime.poll();
+        }
+        assert!(update.changed);
+        assert_eq!(update.log_folder_request, 0);
+        let snapshot: serde_json::Value = serde_json::from_str(&update.ui_snapshot).unwrap();
+        assert_eq!(snapshot["diagnostics"]["folderState"], "Failed");
+        assert_eq!(snapshot["diagnostics"]["status"], "Unavailable");
+        assert!(snapshot["intentError"].is_null());
+        let underlying = runtime.diagnostics.health();
+        let disabled = runtime.set_logging_enabled(false);
+        assert!(!disabled.logging_enabled && !disabled.create_native && !disabled.release_native);
+        let projection = &runtime.ui.snapshot.as_ref().unwrap().diagnostics;
+        assert_eq!(projection.status, "Disabled");
+        assert!(!projection.has_problem);
+        assert!(projection.message.is_empty());
+        assert_eq!(
+            runtime.diagnostics.health().last_error,
+            underlying.last_error
+        );
+        assert_eq!(
+            runtime.diagnostics.health().dropped_events,
+            underlying.dropped_events
+        );
+        let enabled = runtime.set_logging_enabled(true);
+        assert!(enabled.logging_enabled && !enabled.create_native && !enabled.release_native);
+        let projection = &runtime.ui.snapshot.as_ref().unwrap().diagnostics;
+        assert_eq!(projection.status, "Unavailable");
+        assert!(projection.has_problem);
+        assert_eq!(
+            runtime.diagnostics.health().last_error,
+            underlying.last_error
+        );
+        let revision = runtime.diagnostics_report().revision;
+        runtime.set_logging_enabled(true);
+        assert_eq!(runtime.diagnostics_report().revision, revision);
+        writer.begin_shutdown();
+        writer.finish_shutdown(std::time::Duration::from_millis(250));
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn prepared_folder_and_real_owner_release_share_one_complete_update() {
+        use crate::diagnostics::{
+            DiagnosticsConfig, DiagnosticsRuntime, FolderRequestId, LogLimits,
+        };
+        let (mut runtime, drivers) = runtime();
+        let _driver = start_live(&mut runtime, &drivers);
+        let attempt = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .active()
+            .unwrap()
+            .attempt();
+        let directory = WritableSettings::new();
+        let writer = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: true,
+            xdg_state_home: Some(directory.0.clone().into_os_string()),
+            home: None,
+            limits: LogLimits::default(),
+        });
+        let handle = writer.handle();
+        handle.prepare_log_folder(FolderRequestId(u64::MAX));
+        // Drain the actual worker before the lifecycle transition without
+        // polling the UI or consuming its prepared response.
+        writer.begin_shutdown();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !writer.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder worker did not drain"
+            );
+            std::thread::yield_now();
+        }
+        writer.finish_shutdown(std::time::Duration::from_millis(250));
+        runtime.diagnostics = handle;
+        // Use the real surface-loss/owner-ACK barrier, keeping its native
+        // release edge pending until the same poll takes the folder response.
+        runtime
+            .engine
+            .as_mut()
+            .unwrap()
+            .runner_mut()
+            .surface_lost(attempt);
+        assert!(runtime.wait_for_owner_ack(attempt).is_empty());
+        let update = runtime.poll();
+        assert!(update.changed);
+        assert!(
+            update.release_native,
+            "the actual owner acknowledgement must retain native retirement"
+        );
+        assert_eq!(update.generation, attempt.get());
+        assert_eq!(update.log_folder_request, u64::MAX);
+        assert_eq!(
+            update.log_folder_path,
+            directory.0.join("furami/logs").to_str().unwrap()
+        );
+        let repeated = runtime.poll();
+        assert!(
+            !repeated.release_native,
+            "native retirement is a one-shot edge"
+        );
+        assert_eq!(
+            repeated.log_folder_request, 0,
+            "folder dispatch is a separate one-shot edge"
+        );
+        runtime.native_released(attempt);
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn deferred_loaded_source_cancel_does_not_promote_or_rebase_live_profile_on_stale_mode_reply() {
+        let store = WritableSettings::new();
+        let (mut runtime, drivers) = product_runtime();
+        store.bind(&mut runtime);
+        remember_profile(&mut runtime.persistence, settings());
+        let opening = choose_profile_source(&mut runtime, 0);
+        let driver = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let active = runtime
+            .diagnostics_report()
+            .session
+            .applied_profile
+            .unwrap();
+        let active_attempt = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .active()
+            .unwrap()
+            .attempt();
+        runtime.ui.catalog = capture_catalog::Model::fixture(
+            crate::capture::linux::session_range_fixture(
+                &["/dev/video0"],
+                settings().video.fixture_mode(),
+            ),
+            Vec::new(),
+        );
+        runtime.ui.catalog.hold_mode_requests_fixture();
+        let pending = choose_profile_source(&mut runtime, 0);
+        assert!(!pending.create_native && !pending.release_native);
+        let resolving = runtime
+            .ui
+            .resolving
+            .as_ref()
+            .expect("real select_capture must wait for exact ranged-mode reply");
+        let reply = capture_catalog::ModeReply {
+            serial: resolving.serial,
+            revision: resolving.catalog_revision,
+            physical: resolving.partial.source.clone().unwrap(),
+            result: Ok(settings().video.mode),
+        };
+        assert!(
+            runtime.report_cache.provenance.pending_apply().is_none(),
+            "a mode query is not an admitted apply"
+        );
+        assert_eq!(
+            runtime.diagnostics_report().session.applied_profile,
+            Some(active)
+        );
+        runtime.request_reset();
+        assert!(runtime.ui.resolving.is_none());
+        assert_eq!(
+            runtime.diagnostics_report().session.applied_profile,
+            Some(active)
+        );
+        runtime.ui.catalog.complete_mode_fixture(reply);
+        runtime.poll();
+        assert_eq!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .active()
+                .unwrap()
+                .attempt(),
+            active_attempt
+        );
+        assert_eq!(
+            runtime.diagnostics_report().session.applied_profile,
+            Some(active)
+        );
+        assert!(runtime.report_cache.provenance.pending_apply().is_none());
+        assert!(
+            drivers.try_recv().is_err(),
+            "cancelled source resolution cannot open a replacement owner"
+        );
+        let token = runtime.persistence.reset_token();
+        assert_ne!(token, 0);
+        runtime.decide_reset(token, false);
+        runtime.ui.catalog.worker.take();
+        cleanup(&mut runtime);
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn failed_b_candidate_restores_verified_a_profile_without_using_b_selection_origin() {
+        use crate::diagnostics::report::{Observation, ProfileOrigin};
+        let store = WritableSettings::new();
+        let a = profile_fixture_settings(1);
+        let b = profile_fixture_settings(2);
+        let mut persistence = PersistenceSession::load(Ok(store.path()));
+        remember_profile(&mut persistence, b.clone());
+        remember_profile(&mut persistence, a.clone());
+        let startup = StartupSelection {
+            draft: Some(a.clone()),
+            auto_open: true,
+            adapt_video: false,
+            restore_profile: true,
+            source_binding: Some(ProfileBinding::Serial),
+            topology_pin: None,
+            reason: String::new(),
+            audio_policy: crate::app::settings::StartupAudioPolicy::Explicit,
+            bootstrap_audio: AudioSelection::default(),
+        };
+        let (mut runtime, drivers) = startup_profiles_runtime(&store, startup);
+        let opening = runtime.ui_ready();
+        runtime.ui.catalog.worker.take();
+        let first = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let profile_a = runtime
+            .diagnostics_report()
+            .session
+            .applied_profile
+            .unwrap();
+        assert_eq!(
+            profile_a.origin,
+            ProfileOrigin::Startup,
+            "A must be distinguishable from B's SourceSelection origin"
+        );
+        let validation = PROFILE_VALIDATION_PROBE.lock();
+        let pending_b = choose_profile_source(&mut runtime, 1);
+        assert!(!pending_b.release_native && !pending_b.create_native);
+        assert_eq!(
+            runtime.diagnostics_report().session.applied_profile,
+            Some(profile_a)
+        );
+        assert_eq!(
+            runtime.report_cache.provenance.pending_apply(),
+            runtime.persistence.authorized_apply()
+        );
+        assert!(runtime.report_cache.provenance.pending_apply().is_some());
+        drop(validation);
+        let retired = await_update(&mut runtime, |update| update.release_native);
+        first.destroyed.recv().unwrap();
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+        let released = runtime.native_released(AttemptId::new(retired.generation).unwrap());
+        let candidate_opening = if released.create_native {
+            released
+        } else {
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        let second = drivers.recv().unwrap();
+        runtime.surface_ready(SurfaceToken {
+            generation: Generation::new(candidate_opening.generation).unwrap(),
+            xid: X11WindowId::new(72).unwrap(),
+        });
+        second.initialized.recv().unwrap();
+        let _load = second.submitted.recv().unwrap();
+        second.send(BackendEvent::EndFile {
+            reason: 4,
+            error: -17,
+        });
+        let retired = await_update(&mut runtime, |update| update.release_native);
+        second.destroyed.recv().unwrap();
+        let released = runtime.native_released(AttemptId::new(retired.generation).unwrap());
+        let restore_opening = if released.create_native {
+            released
+        } else {
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        let restored = complete_profile_source(&mut runtime, &drivers, restore_opening, None);
+        let report = runtime.diagnostics_report();
+        assert_eq!(report.session.phase, "ErrorWithActiveRestored");
+        assert_eq!(report.session.applied_profile, Some(profile_a));
+        assert!(runtime.report_cache.provenance.pending_apply().is_none());
+        assert!(
+            matches!(report.session.selected_capture, Observation::Observed { value } if value.requested.width == b.video.mode.size.width())
+        );
+        assert!(
+            matches!(report.session.applied_capture, Observation::Observed { value } if value.requested.width == a.video.mode.size.width())
+        );
+        let candidate = report.session.failures.candidate.unwrap();
+        assert_eq!(
+            candidate.requested.requested.width,
+            b.video.mode.size.width()
+        );
+        assert_eq!(candidate.phase_at_failure, "OpeningCandidate");
+        assert!(report.session.failures.restore.is_none());
+        assert!(
+            store.applied().same_request(&a),
+            "failed B cannot replace the last verified saved profile"
+        );
+        cleanup(&mut runtime);
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+        restored.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn saving_a_new_source_never_creates_loaded_profile_origin_on_identical_reopen() {
+        let store = WritableSettings::new();
+        let (mut runtime, drivers) = profiles_runtime(&store);
+        let opening = choose_profile_source(&mut runtime, 1);
+        let first = complete_profile_source(&mut runtime, &drivers, opening, None);
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+        assert!(
+            runtime
+                .persistence
+                .source_profile(
+                    &runtime
+                        .engine
+                        .as_ref()
+                        .unwrap()
+                        .model()
+                        .active()
+                        .unwrap()
+                        .applied()
+                        .settings()
+                        .video
+                        .identity,
+                    true
+                )
+                .is_some(),
+            "the verified new source was saved"
+        );
+        let attempt = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .active()
+            .unwrap()
+            .attempt();
+        let closing = runtime.close(attempt.get());
+        let retired = if closing.release_native {
+            closing
+        } else {
+            await_update(&mut runtime, |update| update.release_native)
+        };
+        first.destroyed.recv().unwrap();
+        runtime.native_released(AttemptId::new(retired.generation).unwrap());
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+        let opening = runtime.open();
+        let second = complete_profile_source(&mut runtime, &drivers, opening, None);
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none(),
+            "save/reopen is not source_profile loading"
+        );
+        assert!(runtime.report_cache.provenance.pending_apply().is_none());
+        cleanup(&mut runtime);
+        second.destroyed.recv().unwrap();
+    }
+
+    fn diagnostic_writer(
+        store: &WritableSettings,
+        report_bytes: usize,
+    ) -> crate::diagnostics::DiagnosticsRuntime {
+        crate::diagnostics::DiagnosticsRuntime::start(crate::diagnostics::DiagnosticsConfig {
+            logging_enabled: true,
+            xdg_state_home: Some(store.0.clone().into_os_string()),
+            home: None,
+            limits: crate::diagnostics::LogLimits {
+                report_bytes,
+                ..crate::diagnostics::LogLimits::default()
+            },
+        })
+    }
+
+    fn finish_diagnostic_writer(writer: &crate::diagnostics::DiagnosticsRuntime) {
+        writer.begin_shutdown();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !writer.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "isolated diagnostic worker did not drain"
+            );
+            std::thread::yield_now();
+        }
+        writer.finish_shutdown(std::time::Duration::from_millis(250));
+    }
+
+    fn diagnostic_records(store: &WritableSettings) -> Vec<serde_json::Value> {
+        let mut records = Vec::new();
+        for archive in (0..5).rev() {
+            let path = store.0.join("furami/logs").join(if archive == 0 {
+                "furami.log".into()
+            } else {
+                format!("furami.{archive}.log")
+            });
+            if path.exists() {
+                records.extend(
+                    std::fs::read_to_string(path)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap()),
+                );
+            }
+        }
+        records
+    }
+
+    #[test]
+    fn diagnostics_report_uses_effective_limits_after_invalid_configuration() {
+        let store = WritableSettings::new();
+        let (mut runtime, drivers) = runtime();
+        let driver = start_live(&mut runtime, &drivers);
+        let writer = diagnostic_writer(&store, 128);
+        runtime.diagnostics = writer.handle();
+        assert_eq!(
+            runtime.diagnostics.report_byte_limit(),
+            crate::diagnostics::LogLimits::default().report_bytes,
+            "reports use the writer's effective configuration, not rejected limits",
+        );
+        assert!(!runtime.diagnostics_report().session.projection_oversized);
+        finish_diagnostic_writer(&writer);
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn oversized_imported_audio_refuses_before_materialization_and_preserves_actual_failure_skeleton()
+     {
+        use crate::diagnostics::report::Observation;
+        let store = WritableSettings::new();
+        let (mut runtime, drivers) = runtime_fixture(validate, Some(2), None);
+        let engine = runtime.engine.as_mut().unwrap();
+        let mut imported = engine.model().draft().settings.clone();
+        imported.audio = AudioSelection::Disabled {
+            retained: Some(
+                AudioSourceIdentity::new("private-oversized-audio".repeat(8_192), Vec::new())
+                    .unwrap(),
+            ),
+        };
+        engine
+            .edit_draft(engine.model().draft().revision, imported)
+            .unwrap();
+        let first = start_live(&mut runtime, &drivers);
+        let expected = snapshot_expected(&runtime);
+        let retiring = runtime.qualification_command(&format!(
+            "restart {:?} {} {} Complete",
+            expected.phase, expected.apply, expected.attempt,
+        ));
+        let retired = if retiring.release_native {
+            retiring
+        } else {
+            await_update(&mut runtime, |update| update.release_native)
+        };
+        first.destroyed.recv().unwrap();
+        let released = runtime.native_released(AttemptId::new(retired.generation).unwrap());
+        let opening = if released.create_native {
+            released
+        } else {
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        let restored = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let prior = runtime.diagnostics_report();
+        assert!(prior.session.failures.candidate.is_some());
+        let writer = diagnostic_writer(&store, 8_192);
+        runtime.diagnostics = writer.handle();
+        runtime.poll();
+        let report = runtime.diagnostics_report();
+        assert!(report.session.projection_oversized);
+        assert_eq!(report.session.identity, prior.session.identity);
+        assert_eq!(
+            report.session.selected_capture,
+            prior.session.selected_capture
+        );
+        assert_eq!(
+            report.session.applied_capture,
+            prior.session.applied_capture
+        );
+        assert_eq!(report.session.failures, prior.session.failures);
+        // Wait on observed worker facts, not a guessed scheduling delay.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(
+            runtime.diagnostics.os_report(),
+            Observation::Unavailable {
+                reason: crate::diagnostics::report::UnavailableReason::NotObserved
+            }
+        ) || runtime.diagnostics.health().sink_status
+            == crate::diagnostics::SinkStatus::Starting
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "isolated worker did not publish its startup facts"
+            );
+            std::thread::yield_now();
+        }
+        runtime.poll();
+        let settled = runtime.diagnostics_report().revision;
+        for _ in 0..10 {
+            runtime.poll();
+        }
+        assert_eq!(runtime.diagnostics_report().revision, settled);
+        finish_diagnostic_writer(&writer);
+        let records = diagnostic_records(&store);
+        let checkpoint = records
+            .iter()
+            .rev()
+            .find(|record| record["record_type"] == "report")
+            .unwrap();
+        assert_eq!(checkpoint["report"]["incomplete"], true);
+        assert_eq!(
+            checkpoint["report"]["failures"]["candidate"]["phase_at_failure"],
+            "OpeningCandidate"
+        );
+        assert_eq!(
+            checkpoint["report"]["selected_capture"],
+            serde_json::to_value(&report.session.selected_capture).unwrap()
+        );
+        assert_eq!(
+            checkpoint["report"]["applied_capture"],
+            serde_json::to_value(&report.session.applied_capture).unwrap()
+        );
+        assert!(!checkpoint.to_string().contains("private-oversized-audio"));
+        cleanup(&mut runtime);
+        restored.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn oversized_loaded_audio_is_unknown_after_real_receipt_then_bounded_source_replacement_recovers()
+     {
+        use crate::diagnostics::report::ProfileOrigin;
+        let store = WritableSettings::new();
+        let mut loaded = profile_fixture_settings(1);
+        loaded.audio = AudioSelection::Disabled {
+            retained: Some(
+                AudioSourceIdentity::new("private-oversized-audio".repeat(8_192), Vec::new())
+                    .unwrap(),
+            ),
+        };
+        let mut persistence = PersistenceSession::load(Ok(store.path()));
+        remember_profile(&mut persistence, loaded);
+        remember_profile(&mut persistence, profile_fixture_settings(2));
+        let (mut runtime, drivers) = profiles_runtime(&store);
+        let writer = diagnostic_writer(
+            &store,
+            crate::diagnostics::LogLimits::default().report_bytes,
+        );
+        runtime.diagnostics = writer.handle();
+        let opening = choose_profile_source(&mut runtime, 0);
+        assert!(
+            !runtime.diagnostics_report().session.projection_oversized,
+            "unverified pending data is not active provenance"
+        );
+        let first = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let unknown = runtime.diagnostics_report();
+        assert!(
+            unknown.session.projection_oversized,
+            "an uncomparable loaded baseline cannot publish false/null as complete provenance"
+        );
+        let emergency = serde_json::to_value(unknown.emergency()).unwrap();
+        assert_eq!(emergency["incomplete"], true);
+        assert!(emergency.get("applied_profile").is_none());
+        assert!(!emergency.to_string().contains("private-oversized-audio"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(
+            runtime.diagnostics.os_report(),
+            crate::diagnostics::report::Observation::Unavailable {
+                reason: crate::diagnostics::report::UnavailableReason::NotObserved
+            }
+        ) || runtime.diagnostics.health().sink_status
+            == crate::diagnostics::SinkStatus::Starting
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "isolated worker startup facts did not settle"
+            );
+            std::thread::yield_now();
+        }
+        runtime.poll();
+        let revision = runtime.diagnostics_report().revision;
+        for _ in 0..10 {
+            runtime.poll();
+        }
+        assert_eq!(runtime.diagnostics_report().revision, revision);
+        let opening = choose_profile_source(&mut runtime, 1);
+        let second = complete_profile_source(&mut runtime, &drivers, opening, Some(first));
+        let bounded = runtime.diagnostics_report();
+        assert!(!bounded.session.projection_oversized);
+        let applied = bounded.session.applied_profile.unwrap();
+        assert_eq!(applied.origin, ProfileOrigin::SourceSelection);
+        assert!(applied.matches_loaded_settings);
+        assert!(
+            serde_json::to_value(&bounded).unwrap()["environment"]["build_inventory"].is_object()
+        );
+        finish_diagnostic_writer(&writer);
+        let records = diagnostic_records(&store);
+        assert!(
+            records
+                .iter()
+                .any(|record| record["record_type"] == "report"
+                    && record["report"]["incomplete"] == true)
+        );
+        let final_checkpoint = records
+            .iter()
+            .rev()
+            .find(|record| record["record_type"] == "report")
+            .unwrap();
+        assert_eq!(
+            final_checkpoint["report"]["session"]["applied_profile"]["matches_loaded_settings"],
+            true
+        );
+        assert!(
+            final_checkpoint["report"]["environment"]["build_inventory"]["reference_snapshot"]
+                .is_object()
+        );
+        assert!(
+            final_checkpoint["report"].get("incomplete").is_none(),
+            "a later bounded exact receipt restores a complete checkpoint"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.to_string().contains("private-oversized-audio"))
+        );
+        cleanup(&mut runtime);
+        assert!(!runtime.diagnostics_report().session.projection_oversized);
+        second.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn startup_oversized_private_audio_baseline_uses_emergency_but_actual_close_clears_unknown() {
+        let store = WritableSettings::new();
+        let mut loaded = profile_fixture_settings(1);
+        loaded.audio = AudioSelection::Disabled {
+            retained: Some(
+                AudioSourceIdentity::new(
+                    "saved-audio-1".into(),
+                    vec![("private-property".into(), "private-value".repeat(16_384))],
+                )
+                .unwrap(),
+            ),
+        };
+        let mut persistence = PersistenceSession::load(Ok(store.path()));
+        remember_profile(&mut persistence, loaded.clone());
+        let startup = StartupSelection {
+            draft: Some(loaded),
+            auto_open: true,
+            adapt_video: false,
+            restore_profile: true,
+            source_binding: Some(ProfileBinding::Serial),
+            topology_pin: None,
+            reason: String::new(),
+            audio_policy: crate::app::settings::StartupAudioPolicy::Explicit,
+            bootstrap_audio: AudioSelection::default(),
+        };
+        let (mut runtime, drivers) = startup_profiles_runtime(&store, startup);
+        let opening = runtime.ui_ready();
+        runtime.ui.catalog.worker.take();
+        let driver = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let report = runtime.diagnostics_report();
+        assert!(report.session.projection_oversized);
+        assert!(
+            !serde_json::to_string(&report.emergency())
+                .unwrap()
+                .contains("private-value")
+        );
+        let attempt = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .active()
+            .unwrap()
+            .attempt();
+        let closing = runtime.close(attempt.get());
+        let retired = if closing.release_native {
+            closing
+        } else {
+            await_update(&mut runtime, |update| update.release_native)
+        };
+        driver.destroyed.recv().unwrap();
+        runtime.native_released(AttemptId::new(retired.generation).unwrap());
+        let closed = runtime.diagnostics_report();
+        assert!(
+            !closed.session.projection_oversized,
+            "unknown last-valid metadata cannot force emergency after actual owner close"
+        );
+        assert!(closed.session.applied_profile.is_none());
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn runtime_renderer_report_keeps_all_native_values_and_reference_inventory() {
+        let renderer = treatment_renderer(true);
+        let (mut runtime, drivers) = runtime();
+        let engine = runtime.engine.as_mut().unwrap();
+        let mut edited = engine.model().draft().settings.clone();
+        edited.renderer = renderer.clone();
+        engine
+            .edit_draft(engine.model().draft().revision, edited)
+            .unwrap();
+        let driver = start_live(&mut runtime, &drivers);
+        let report = runtime.diagnostics_report();
+        assert!(!report.session.projection_oversized);
+        let json = serde_json::to_value(report).unwrap();
+        for value in [
+            &json["session"]["treatments"]["requested_renderer"],
+            &json["session"]["treatments"]["active_renderer"]["value"],
+        ] {
+            assert_eq!(value.as_object().unwrap().len(), 9);
+            assert_eq!(value["interpolation"], true);
+            assert_eq!(
+                *value,
+                serde_json::to_value(crate::diagnostics::report::RendererReport::from(&renderer))
+                    .unwrap()
+            );
+        }
+        assert!(json["environment"]["build_inventory"]["reference_snapshot"].is_object());
+        assert!(
+            json["session"]["treatments"]
+                .get("active_filters")
+                .is_none()
+        );
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn diagnostic_media_cache_uses_bounded_public_facts_not_raw_observation_suffixes() {
+        use crate::media::controller::{BackendObservation, RuntimeMediaObservation};
+        let (mut runtime, drivers) = runtime();
+        let driver = start_live(&mut runtime, &drivers);
+        let mut observed = RuntimeMediaObservation {
+            generation: 1,
+            observation_epoch: 1,
+            client_api: 0x0002_0005,
+            libmpv_version: format!("{}private-first", "v".repeat(128)).into(),
+            backend: BackendObservation::Observed {
+                video_output: format!("{}private-first", "o".repeat(128)).into(),
+                gpu_context: format!("{}private-first", "c".repeat(128)).into(),
+            },
+            helpers: Default::default(),
+        };
+        driver.send(BackendEvent::Diagnostics(Box::new(observed.clone())));
+        driver.fence();
+        runtime.poll();
+        let first = runtime.diagnostics_report();
+        observed.libmpv_version = format!(
+            "{}{}",
+            "v".repeat(128),
+            "private-huge-suffix".repeat(16_384)
+        )
+        .into();
+        observed.backend = BackendObservation::Observed {
+            video_output: format!(
+                "{}{}",
+                "o".repeat(128),
+                "private-huge-suffix".repeat(16_384)
+            )
+            .into(),
+            gpu_context: format!(
+                "{}{}",
+                "c".repeat(128),
+                "private-huge-suffix".repeat(16_384)
+            )
+            .into(),
+        };
+        driver.send(BackendEvent::Diagnostics(Box::new(observed.clone())));
+        driver.fence();
+        runtime.poll();
+        assert_eq!(
+            runtime.diagnostics_report().revision,
+            first.revision,
+            "changes outside bounded public facts do not rebuild or publish"
+        );
+        observed.backend = BackendObservation::Observed {
+            video_output: "different-vo".into(),
+            gpu_context: "different-context".into(),
+        };
+        driver.send(BackendEvent::Diagnostics(Box::new(observed)));
+        driver.fence();
+        runtime.poll();
+        let changed = runtime.diagnostics_report();
+        assert!(changed.revision > first.revision);
+        assert!(
+            !serde_json::to_string(&changed)
+                .unwrap()
+                .contains("private-huge-suffix")
+        );
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn source_profile_with_excessive_stable_property_count_is_unknown_not_a_complete_false_claim() {
+        let store = WritableSettings::new();
+        let mut loaded = profile_fixture_settings(1);
+        loaded.audio = AudioSelection::Disabled {
+            retained: Some(
+                AudioSourceIdentity::new(
+                    "saved-audio-1".into(),
+                    (0..4_096)
+                        .map(|index| (format!("private-key-{index}"), "v".into()))
+                        .collect(),
+                )
+                .unwrap(),
+            ),
+        };
+        let mut persistence = PersistenceSession::load(Ok(store.path()));
+        remember_profile(&mut persistence, loaded);
+        let (mut runtime, drivers) = profiles_runtime(&store);
+        let opening = choose_profile_source(&mut runtime, 0);
+        let driver = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let report = runtime.diagnostics_report();
+        assert!(report.session.projection_oversized);
+        let emergency = serde_json::to_value(report.emergency()).unwrap();
+        assert_eq!(emergency["incomplete"], true);
+        assert!(emergency.get("applied_profile").is_none());
+        assert!(!emergency.to_string().contains("private-key"));
+        cleanup(&mut runtime);
+        assert!(!runtime.diagnostics_report().session.projection_oversized);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn failed_candidate_and_restore_keep_both_frozen_lanes_then_real_reconnect_reattaches_only_verified_a_origin()
+     {
+        use crate::diagnostics::report::{Observation, ProfileOrigin};
+        let store = WritableSettings::new();
+        let a = profile_fixture_settings(1);
+        let b = profile_fixture_settings(2);
+        let mut persistence = PersistenceSession::load(Ok(store.path()));
+        remember_profile(&mut persistence, b.clone());
+        remember_profile(&mut persistence, a.clone());
+        let startup = StartupSelection {
+            draft: Some(a.clone()),
+            auto_open: true,
+            adapt_video: false,
+            restore_profile: true,
+            source_binding: Some(ProfileBinding::Serial),
+            topology_pin: None,
+            reason: String::new(),
+            audio_policy: crate::app::settings::StartupAudioPolicy::Explicit,
+            bootstrap_audio: AudioSelection::default(),
+        };
+        let (mut runtime, drivers) = startup_profiles_runtime_with_adapters(
+            &store,
+            startup,
+            Some(3),
+            validate_profile_fixture_probe,
+        );
+        let opening = runtime.ui_ready();
+        runtime.ui.catalog.worker.take();
+        let first = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let profile_a = runtime
+            .diagnostics_report()
+            .session
+            .applied_profile
+            .unwrap();
+        assert_eq!(
+            profile_a.origin,
+            ProfileOrigin::Startup,
+            "B's SourceSelection metadata must not satisfy A's restoration assertion"
+        );
+        let switching = choose_profile_source(&mut runtime, 1);
+        let retired = if switching.release_native {
+            switching
+        } else {
+            await_update(&mut runtime, |update| update.release_native)
+        };
+        first.destroyed.recv().unwrap();
+        let released = runtime.native_released(AttemptId::new(retired.generation).unwrap());
+        let opening_b = if released.create_native {
+            released
+        } else {
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        let second = drivers.recv().unwrap();
+        runtime.surface_ready(SurfaceToken {
+            generation: Generation::new(opening_b.generation).unwrap(),
+            xid: X11WindowId::new(72).unwrap(),
+        });
+        second.initialized.recv().unwrap();
+        let _load = second.submitted.recv().unwrap();
+        second.send(BackendEvent::EndFile {
+            reason: 4,
+            error: -17,
+        });
+        let retired = await_update(&mut runtime, |update| update.release_native);
+        second.destroyed.recv().unwrap();
+        let failed = runtime.native_released(AttemptId::new(retired.generation).unwrap());
+        if failed.product_phase != "ErrorWithoutActive" {
+            await_update(&mut runtime, |update| {
+                update.product_phase == "ErrorWithoutActive"
+            });
+        }
+        let report = runtime.diagnostics_report();
+        assert!(report.session.applied_profile.is_none());
+        assert!(matches!(
+            report.session.applied_capture,
+            Observation::Unavailable { .. }
+        ));
+        let candidate = report.session.failures.candidate.as_ref().unwrap();
+        let restore = report.session.failures.restore.as_ref().unwrap();
+        assert_eq!(
+            candidate.requested.requested.width,
+            b.video.mode.size.width()
+        );
+        assert_eq!(candidate.phase_at_failure, "OpeningCandidate");
+        assert_eq!(restore.requested.requested.width, a.video.mode.size.width());
+        assert_eq!(restore.phase_at_failure, "OpeningRestore");
+        assert!(
+            candidate.evidence.is_none() && restore.evidence.is_none(),
+            "mpv -17 is not OS errno evidence"
+        );
+        assert!(runtime.report_cache.provenance.pending_apply().is_none());
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().model().cleanup(),
+            &CleanupStatus::Complete
+        );
+        let expected = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .state_identity()
+            .attempt()
+            .map(AttemptId::get)
+            .unwrap_or(0);
+        let opening = runtime.reconnect(expected);
+        let recovered = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let report = runtime.diagnostics_report();
+        assert_eq!(report.session.phase, "Active");
+        assert_eq!(report.session.applied_profile, Some(profile_a));
+        assert!(
+            matches!(report.session.selected_capture, Observation::Observed { value } if value.requested.width == b.video.mode.size.width())
+        );
+        assert!(
+            matches!(report.session.applied_capture, Observation::Observed { value } if value.requested.width == a.video.mode.size.width())
+        );
+        assert!(
+            store.applied().same_request(&a),
+            "recovery does not save the unverified B draft"
+        );
+        cleanup(&mut runtime);
+        recovered.destroyed.recv().unwrap();
+    }
+
+    fn relocated_profile_snapshot() -> crate::capture::linux::CaptureSnapshot {
+        use crate::domain::capture::{DeviceIdentity, UsbTopology};
+        let original = profile_fixture_settings(1);
+        let identity = DeviceIdentity::new(
+            original.video.identity.vendor_id(),
+            original.video.identity.product_id(),
+            UsbTopology::new(
+                "pci-relocated-profile".into(),
+                vec![std::num::NonZeroU8::new(7).unwrap()],
+            )
+            .unwrap(),
+            original.video.identity.serial().map(str::to_owned),
+        )
+        .unwrap();
+        crate::capture::linux::physical_fixture(&[(
+            identity,
+            "/dev/profile-a-relocated",
+            "/sys/usb/relocated-a",
+            "/sys/nodes/relocated-a",
+            original.video.fixture_mode(),
+        )])
+    }
+
+    fn validate_relocated_profile_fixture(
+        request: ValidationRequest,
+    ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>) {
+        let _guard = PROFILE_VALIDATION_PROBE.lock();
+        let result = crate::capture::apply::fixture_request_prepared(
+            &request,
+            &relocated_profile_snapshot(),
+            request.watch,
+        );
+        (request, result)
+    }
+
+    #[test]
+    fn real_startup_serial_relocation_and_same_route_recovery_preserve_loaded_profile_origin() {
+        use crate::diagnostics::report::{Observation, ProfileBindingKind, ProfileOrigin};
+        let store = WritableSettings::new();
+        let a = profile_fixture_settings(1);
+        let mut persistence = PersistenceSession::load(Ok(store.path()));
+        remember_profile(&mut persistence, a.clone());
+        let startup = StartupSelection {
+            draft: Some(a.clone()),
+            auto_open: true,
+            adapt_video: false,
+            restore_profile: true,
+            source_binding: Some(ProfileBinding::Serial),
+            topology_pin: None,
+            reason: String::new(),
+            audio_policy: crate::app::settings::StartupAudioPolicy::Explicit,
+            bootstrap_audio: AudioSelection::default(),
+        };
+        let (mut runtime, drivers) = startup_profiles_runtime_with_validation(
+            &store,
+            startup,
+            validate_relocated_profile_fixture,
+        );
+        let opening = runtime.ui_ready();
+        runtime.ui.catalog.worker.take();
+        let first = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let applied_profile = runtime
+            .diagnostics_report()
+            .session
+            .applied_profile
+            .unwrap();
+        assert_eq!(applied_profile.binding_kind, ProfileBindingKind::Serial);
+        assert_eq!(applied_profile.origin, ProfileOrigin::Startup);
+        let first_active = runtime.engine.as_ref().unwrap().model().active().unwrap();
+        let first_attempt = first_active.attempt();
+        let first_pin = first_active
+            .applied()
+            .physical_node()
+            .map(|(node, usb)| (node.to_path_buf(), usb.to_path_buf()))
+            .unwrap();
+        assert_eq!(
+            first_active.applied().settings().video.identity,
+            *relocated_profile_snapshot().devices()[0].identity(),
+            "startup must resolve the saved serial before freezing its physical route"
+        );
+        assert_ne!(
+            first_active.applied().settings().video.identity.topology(),
+            a.video.identity.topology()
+        );
+        first.send(BackendEvent::EndFile {
+            reason: 0,
+            error: 0,
+        });
+        first.fence();
+        let retired = await_update(&mut runtime, |update| update.release_native);
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+        first.destroyed.recv().unwrap();
+        let released = runtime.native_released(AttemptId::new(retired.generation).unwrap());
+        let opening = if released.create_native {
+            released
+        } else {
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        let recovered = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let active = runtime.engine.as_ref().unwrap().model().active().unwrap();
+        assert_ne!(active.attempt(), first_attempt);
+        assert_eq!(
+            active.applied().physical_node(),
+            Some((first_pin.0.as_path(), first_pin.1.as_path())),
+            "recovery must retain the exact route verified at startup"
+        );
+        assert_eq!(
+            active.applied().settings().video.identity,
+            *relocated_profile_snapshot().devices()[0].identity(),
+            "recovery must validate the same relocated physical identity"
+        );
+        assert_ne!(
+            active.applied().settings().video.identity.topology(),
+            a.video.identity.topology()
+        );
+        assert_eq!(
+            active.applied().settings().video.identity.serial(),
+            a.video.identity.serial()
+        );
+        let report = runtime.diagnostics_report();
+        assert!(!report.session.projection_oversized);
+        assert_eq!(report.session.applied_profile, Some(applied_profile));
+        assert!(
+            matches!(report.session.applied_capture, Observation::Observed { ref value } if value.requested.rate_numerator == 60000 && value.requested.rate_denominator == 1001)
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("pci-relocated-profile")
+        );
+        assert!(
+            store.applied().same_request(&a),
+            "automatic recovery cannot rewrite the user-loaded profile origin"
+        );
+        cleanup(&mut runtime);
+        recovered.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn verified_profile_free_c_replaces_loaded_a_origin_and_reconnect_does_not_invent_a_saved_origin()
+     {
+        use crate::diagnostics::report::{Observation, ProfileOrigin};
+        let store = WritableSettings::new();
+        let a = profile_fixture_settings(1);
+        let c = profile_fixture_settings(3);
+        let mut persistence = PersistenceSession::load(Ok(store.path()));
+        remember_profile(&mut persistence, a.clone());
+        // A real retained CLI-off selection keeps C disabled instead of
+        // requiring an unrelated Pulse recording fixture for this provenance test.
+        let startup = StartupSelection {
+            draft: Some(a.clone()),
+            auto_open: true,
+            adapt_video: false,
+            restore_profile: true,
+            source_binding: Some(ProfileBinding::Serial),
+            topology_pin: None,
+            reason: String::new(),
+            audio_policy: crate::app::settings::StartupAudioPolicy::Cli,
+            bootstrap_audio: AudioSelection::default(),
+        };
+        let (mut runtime, drivers) = startup_profiles_runtime(&store, startup);
+        let opening = runtime.ui_ready();
+        runtime.ui.catalog.worker.take();
+        let first = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let profile_a = runtime
+            .diagnostics_report()
+            .session
+            .applied_profile
+            .unwrap();
+        assert_eq!(profile_a.origin, ProfileOrigin::Startup);
+        assert!(
+            runtime
+                .persistence
+                .source_profile(&c.video.identity, true)
+                .is_none()
+        );
+        let validation = PROFILE_VALIDATION_PROBE.lock();
+        let pending = choose_profile_source(&mut runtime, 2);
+        assert!(!pending.release_native && !pending.create_native);
+        assert_eq!(
+            runtime.diagnostics_report().session.applied_profile,
+            Some(profile_a),
+            "pending profile-free C cannot revoke verified A metadata"
+        );
+        assert!(runtime.report_cache.provenance.pending_apply().is_some());
+        drop(validation);
+        let second = complete_profile_source(&mut runtime, &drivers, pending, Some(first));
+        let report = runtime.diagnostics_report();
+        assert_eq!(report.session.phase, "Active");
+        assert!(
+            report.session.applied_profile.is_none(),
+            "C's exact verified receipt replaces A's loaded origin with known absence"
+        );
+        assert!(runtime.report_cache.provenance.pending_apply().is_none());
+        assert_eq!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .active()
+                .unwrap()
+                .applied()
+                .settings()
+                .video
+                .identity,
+            c.video.identity
+        );
+        assert!(
+            runtime
+                .persistence
+                .source_profile(&c.video.identity, true)
+                .is_some(),
+            "C was actually saved, but saving is not loading a profile"
+        );
+        let attempt = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .active()
+            .unwrap()
+            .attempt();
+        let closing = runtime.close(attempt.get());
+        let retired = if closing.release_native {
+            closing
+        } else {
+            await_update(&mut runtime, |update| update.release_native)
+        };
+        second.destroyed.recv().unwrap();
+        runtime.native_released(AttemptId::new(retired.generation).unwrap());
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+        let expected = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .state_identity()
+            .attempt()
+            .map(AttemptId::get)
+            .unwrap_or(0);
+        let opening = runtime.reconnect(expected);
+        let reconnected = complete_profile_source(&mut runtime, &drivers, opening, None);
+        let report = runtime.diagnostics_report();
+        assert_eq!(report.session.phase, "Active");
+        assert!(
+            report.session.applied_profile.is_none(),
+            "C reconnect must not resurrect A or manufacture SourceSelection origin from C's new save"
+        );
+        assert!(!report.session.projection_oversized);
+        assert!(
+            matches!(report.session.applied_capture, Observation::Observed { value } if value.requested.width == c.video.mode.size.width() && value.requested.rate_numerator == c.video.mode.rate.numerator())
+        );
+        cleanup(&mut runtime);
+        assert!(
+            runtime
+                .diagnostics_report()
+                .session
+                .applied_profile
+                .is_none()
+        );
+        reconnected.destroyed.recv().unwrap();
     }
 }

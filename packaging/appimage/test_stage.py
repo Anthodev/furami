@@ -414,5 +414,97 @@ class StageIntegrityTests(unittest.TestCase):
             self.assertEqual(owner["origin"], "signed-ubuntu-snapshot-deb")
             self.assertEqual(owner["deb_sha256"], "a" * 64)
 
+    def test_media_program_seed_copies_exact_provider_bytes_and_ownership(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix = root / "prefix"
+            (prefix / "bin").mkdir(parents=True)
+            program = prefix / "bin/mpv"
+            program.write_bytes(b"\x7fELF provider mpv program")
+            unshipped = prefix / "bin/ffmpeg"
+            unshipped.write_bytes(b"provider program not in the AppDir contract")
+            manifest = {"bin/mpv": {"type": "file", "sha256": stage.digest(program)},
+                        "bin/ffmpeg": {"type": "file", "sha256": stage.digest(unshipped)}}
+            appdir = root / "AppDir"
+            appdir.mkdir()
+            owners = {}
+            stage.stage_media_programs(prefix, manifest, appdir, owners)
+            self.assertEqual(sorted(owners), ["usr/bin/mpv"])
+            self.assertEqual(owners["usr/bin/mpv"],
+                             {"owner": "media", "source": "bin/mpv",
+                              "source_sha256": stage.digest(program)})
+            self.assertEqual((appdir / "usr/bin/mpv").read_bytes(), program.read_bytes())
+            self.assertFalse((appdir / "usr/bin/ffmpeg").exists())
+            self.assertFalse((appdir / "bin/ffmpeg").exists())
+
+    def test_media_program_seed_refuses_unrecorded_or_absent_provider_program(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix = root / "prefix"
+            prefix.mkdir()
+            appdir = root / "AppDir"
+            appdir.mkdir()
+            with self.assertRaisesRegex(ValueError, "prefix artifact unrecorded: bin/mpv"):
+                stage.stage_media_programs(prefix, {}, appdir, {})
+            with self.assertRaisesRegex(ValueError, "missing component: .*bin/mpv"):
+                stage.stage_media_programs(
+                    prefix, {"bin/mpv": {"type": "file", "sha256": "0" * 64}}, appdir, {})
+
+    def test_stage_libraries_discovers_provider_closure_recursively_from_program_seed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix = root / "prefix"
+            (prefix / "bin").mkdir(parents=True)
+            (prefix / "lib").mkdir()
+            program = prefix / "bin/mpv"
+            program.write_bytes(b"\x7fELF program\x00/out/prefix/lib\x00tail")
+            libraries = {}
+            for name in ("libmpv.so.2", "libavcodec.so.61", "libavutil.so.59"):
+                libraries[name] = prefix / "lib" / name
+                libraries[name].write_bytes(("shared library " + name).encode() + b"\x00")
+            manifest = {"bin/mpv": {"type": "file", "sha256": stage.digest(program)}}
+            for name, path in libraries.items():
+                manifest["lib/" + name] = {"type": "file", "sha256": stage.digest(path)}
+            needed = {"mpv": ["libmpv.so.2"], "libmpv.so.2": ["libavcodec.so.61"],
+                      "libavcodec.so.61": ["libavutil.so.59"], "libavutil.so.59": []}
+
+            def provider_metadata(target):
+                target = Path(target)
+                if target.name not in needed or not target.is_file():
+                    return None
+                bytes_ = target.read_bytes()
+                paths = [("RUNPATH", token.decode()) for token in
+                         (b"/out/prefix/lib", b"$ORIGIN/../lib") if token + b"\x00" in bytes_]
+                return {"needed": needed[target.name], "paths": paths, "soname": None}
+
+            appdir = root / "AppDir"
+            appdir.mkdir()
+            owners = {}
+            stage.stage_media_programs(prefix, manifest, appdir, owners)
+            self.assertEqual(sorted(owners), ["usr/bin/mpv"])
+            with patch.object(stage, "elf_metadata", provider_metadata):
+                loader = stage.stage_libraries(prefix, manifest, appdir, owners, {})
+            self.assertEqual(loader["host_exclusions"], {})
+            self.assertEqual(sorted(owners), ["usr/bin/mpv", "usr/lib/libavcodec.so.61",
+                                              "usr/lib/libavutil.so.59", "usr/lib/libmpv.so.2"])
+            for name, path in libraries.items():
+                staged = appdir / "usr/lib" / name
+                self.assertEqual(staged.read_bytes(), path.read_bytes())
+                self.assertEqual(owners["usr/lib/" + name]["source"], "lib/" + name)
+                self.assertEqual(owners["usr/lib/" + name]["source_sha256"], stage.digest(path))
+                self.assertIn("usr/lib/" + name, loader["elf"])
+            relocation = loader["transformations"][0]
+            self.assertEqual([entry["path"] for entry in loader["transformations"]], ["usr/bin/mpv"])
+            self.assertEqual(relocation["before"], "/out/prefix/lib")
+            self.assertEqual(relocation["after"], "$ORIGIN/../lib")
+            self.assertEqual(relocation["before_sha256"], owners["usr/bin/mpv"]["source_sha256"])
+            self.assertEqual(relocation["after_sha256"], stage.digest(appdir / "usr/bin/mpv"))
+            self.assertNotEqual(relocation["before_sha256"], relocation["after_sha256"])
+            relocated = (appdir / "usr/bin/mpv").read_bytes()
+            self.assertNotIn(b"/out/prefix/lib\x00", relocated)
+            self.assertIn(b"$ORIGIN/../lib\x00", relocated)
+            self.assertEqual(len(relocated), len(program.read_bytes()))
+
+
 if __name__ == "__main__":
     unittest.main()

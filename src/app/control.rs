@@ -5,15 +5,13 @@ use crate::domain::{
         CandidateId, CaptureModeRequest, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize,
         InputFormatPolicy, ObservationEpoch, SelectionToken, UsbTopology, WatchId, WatchStamp,
     },
-    filters::FilterChain,
     render::RendererSettings,
     state::{AttemptId, DraftRevision, ProductPhase, TreatmentPass},
 };
 use std::num::NonZeroU8;
 
 pub(crate) const LEGACY_COMMAND_MAX_BYTES: usize = 256;
-/// Shared cap for the structured-JSON draft commands (`draft-filters`,
-/// `draft-renderer`). Both decode the untouched remainder as strict JSON.
+/// Cap for `draft-renderer`, which decodes the untouched remainder as strict JSON.
 pub(crate) const STRUCTURED_COMMAND_MAX_BYTES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,7 +35,6 @@ pub(crate) enum Command {
     Identity(DraftRevision, DeviceIdentity),
     Audio(DraftRevision, bool),
     Source(DraftRevision, String),
-    Filters(DraftRevision, FilterChain),
     Renderer(DraftRevision, RendererSettings),
     Apply(ExpectedState, DraftRevision),
     Restart(ExpectedState),
@@ -129,43 +126,17 @@ fn hex(value: Option<&str>) -> Result<u16, &'static str> {
         .ok_or("four hexadecimal VID/PID digits required")
 }
 
-/// Inspect only the ASCII verb token; JSON labels are not legacy grammar.
-/// The structured-JSON draft commands carry an untouched JSON remainder and
-/// are decoded before the legacy 256-byte lexical gate.
+/// Inspect only the ASCII verb token; decode the untouched renderer JSON
+/// remainder before the legacy 256-byte lexical gate.
 pub(crate) fn is_structured_json_command(line: &str) -> bool {
-    matches!(
-        line.split_ascii_whitespace().next(),
-        Some("draft-filters" | "draft-renderer")
-    )
+    matches!(line.split_ascii_whitespace().next(), Some("draft-renderer"))
 }
 
 fn parse_structured_json(line: &str) -> Result<Command, &'static str> {
     match line.split_ascii_whitespace().next() {
-        Some("draft-filters") => parse_filters(line),
         Some("draft-renderer") => parse_renderer(line),
         _ => Err("unknown qualification command"),
     }
-}
-
-fn parse_filters(line: &str) -> Result<Command, &'static str> {
-    if line.len() > STRUCTURED_COMMAND_MAX_BYTES {
-        return Err("qualification filter command exceeds 65536 bytes");
-    }
-    let syntax = "draft-filters requires revision and strict FilterChain JSON";
-    let (_, remainder) = line
-        .trim_start_matches(|value: char| value.is_ascii_whitespace())
-        .split_once(|value: char| value.is_ascii_whitespace())
-        .ok_or(syntax)?;
-    let (revision, json) = remainder
-        .trim_start_matches(|value: char| value.is_ascii_whitespace())
-        .split_once(|value: char| value.is_ascii_whitespace())
-        .ok_or(syntax)?;
-    let revision = DraftRevision::new(unsigned(Some(revision))?);
-    // Deserialize the untouched remainder directly: no tokenization, lossy
-    // normalization or Value buffering that could collapse duplicate keys.
-    let chain = serde_json::from_str::<FilterChain>(json)
-        .map_err(|_| "draft-filters requires strict FilterChain JSON")?;
-    Ok(Command::Filters(revision, chain))
 }
 
 fn parse_renderer(line: &str) -> Result<Command, &'static str> {
@@ -336,206 +307,16 @@ pub(crate) fn parse(line: &str) -> Result<Command, &'static str> {
 mod tests {
     use super::*;
 
-    fn filter_chain(label: &str) -> FilterChain {
-        use crate::domain::filters::{
-            ColorLevels, Filter, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
-        };
-        FilterChain::new(vec![FilterEntry::new(
-            label.to_owned(),
-            Filter::Format(FormatParams::new(
-                SdrMatrix::Bt709,
-                ColorLevels::Limited,
-                SdrGamma::Bt1886,
-            )),
-            true,
-        )])
-        .unwrap()
-    }
-
-    fn filter_line(revision: u64, chain: &FilterChain) -> String {
-        format!(
-            "draft-filters {revision} {}",
-            serde_json::to_string(chain).unwrap()
-        )
-    }
-
     #[test]
-    fn filters_preserve_literal_unicode_whitespace_before_legacy_checks() {
-        let label = format!("SDR\u{a0}{}", "x".repeat(300));
-        let chain = filter_chain(&label);
-        let line = filter_line(7, &chain);
-        assert!(line.len() > LEGACY_COMMAND_MAX_BYTES);
-        assert!(line.contains('\u{a0}'));
-        assert_eq!(
-            parse(&line),
-            Ok(Command::Filters(DraftRevision::new(7), chain))
-        );
-    }
-
-    #[test]
-    fn filters_decode_escaped_controls_as_inert_label_text() {
-        let chain = filter_chain("line\nnul\0tab\tquote\" slash\\ vf=set;quit");
-        let line = filter_line(0, &chain);
-        assert!(line.contains(r"\n"));
-        assert!(line.contains(r"\u0000"));
-        assert!(!line.contains('\n'));
-        assert!(!line.contains('\0'));
-        assert_eq!(
-            parse(&line),
-            Ok(Command::Filters(DraftRevision::new(0), chain))
-        );
-    }
-
-    #[test]
-    fn filters_preserve_order_and_disabled_entries_including_all_disabled() {
-        use crate::domain::filters::FilterEntry;
-        let filter = filter_chain("").entries()[0].filter().clone();
-        for enabled in [[true, false, true], [false, false, false]] {
-            let chain = FilterChain::new(
-                ["first", "middle", "last"]
-                    .into_iter()
-                    .zip(enabled)
-                    .map(|(label, enabled)| {
-                        FilterEntry::new(label.to_owned(), filter.clone(), enabled)
-                    })
-                    .collect(),
-            )
-            .unwrap();
-            assert_eq!(
-                parse(&filter_line(3, &chain)),
-                Ok(Command::Filters(DraftRevision::new(3), chain))
-            );
-        }
-        assert_eq!(
-            parse(&filter_line(3, &FilterChain::default())),
-            Ok(Command::Filters(
-                DraftRevision::new(3),
-                FilterChain::default()
-            ))
-        );
-    }
-
-    #[test]
-    fn filters_require_exact_verb_ascii_revision_and_separator() {
-        let chain = FilterChain::default();
-        let json = serde_json::to_string(&chain).unwrap();
-        assert_eq!(
-            parse(&format!("\t draft-filters\t18446744073709551615\t {json} ")),
-            Ok(Command::Filters(DraftRevision::new(u64::MAX), chain))
-        );
-        for prefix in [
+    fn retired_filter_command_is_not_recognized() {
+        for line in [
             "draft-filters",
-            "draft-filtersx 0 ",
-            "draft-filters-json 0 ",
-            "draft-filters\u{a0}0 ",
-            "draft-filters 0\u{a0}",
-            "draft-filters -1 ",
-            "draft-filters +1 ",
-            "draft-filters 18446744073709551616 ",
-            "draft-filters 0",
+            "draft-filters 0 {}",
+            " draft-filters\t0 null",
         ] {
-            assert!(parse(&format!("{prefix}{json}")).is_err(), "{prefix:?}");
+            assert!(!is_structured_json_command(line));
+            assert_eq!(parse(line), Err("unknown qualification command"));
         }
-        assert!(parse("draft-filters").is_err());
-        assert!(parse("draft-filters 0").is_err());
-        assert!(!is_structured_json_command("draft-filtersx 0 {}"));
-        assert!(!is_structured_json_command("draft-filters\u{a0}0 {}"));
-        assert!(is_structured_json_command("\t draft-filters\t0 {}"));
-    }
-
-    #[test]
-    fn filters_reject_unescaped_controls_and_malformed_json() {
-        let line = filter_line(2, &filter_chain("safe"));
-        for control in ['\0', '\t', '\r', '\n', '\u{1f}'] {
-            let invalid = line.replacen(
-                r#""label":"safe""#,
-                &format!("\"label\":\"bad{control}label\""),
-                1,
-            );
-            assert!(parse(&invalid).is_err(), "{control:?}");
-        }
-        for json in [
-            "null",
-            "[]",
-            "{}",
-            r#"{"entries":null}"#,
-            r#"{"entries":[]} trailing"#,
-            r#"{"entries":[],"unknown":0}"#,
-            r#"{"entries":["#,
-            r#"{"entries":[{"label":"x","enabled":true,"filter":"vf=set"}]}"#,
-        ] {
-            assert!(parse(&format!("draft-filters 2 {json}")).is_err(), "{json}");
-        }
-    }
-
-    #[test]
-    fn filters_reject_raw_duplicate_fields_without_collapsing_them() {
-        let line = filter_line(2, &filter_chain("safe"));
-        let mut duplicates = vec![
-            "draft-filters 2 {\"entries\":[],\"entries\":[]}".to_owned(),
-            line.replacen(r#""label":"safe""#, r#""label":"first","label":"safe""#, 1),
-            line.replacen(r#""enabled":true"#, r#""enabled":false,"enabled":true"#, 1),
-            line.replacen(
-                r#""kind":"format""#,
-                r#""kind":"format","kind":"format""#,
-                1,
-            ),
-        ];
-        for fields in [
-            r#""matrix":"invalid","matrix":"bt709""#,
-            r#""matrix":"bt709","matrix":"invalid""#,
-            r#""matrix":"bt709","matrix":"bt709""#,
-        ] {
-            duplicates.push(line.replacen(r#""matrix":"bt709""#, fields, 1));
-        }
-        for duplicate in duplicates {
-            assert!(parse(&duplicate).is_err(), "{duplicate}");
-        }
-    }
-
-    #[test]
-    fn filters_reject_duplicate_labels_and_invalid_domain_parameters() {
-        let chain = filter_chain("safe");
-        let entry = serde_json::to_string(&chain.entries()[0]).unwrap();
-        let duplicate_labels = format!("draft-filters 2 {{\"entries\":[{entry},{entry}]}}");
-        assert!(parse(&duplicate_labels).is_err());
-        let invalid =
-            filter_line(2, &chain).replacen(r#""matrix":"bt709""#, r#""matrix":"not-a-matrix""#, 1);
-        assert!(parse(&invalid).is_err());
-    }
-
-    #[test]
-    fn filters_accept_exact_byte_cap_and_reject_one_more_byte() {
-        let fixed_bytes = filter_line(4, &filter_chain("")).len();
-        let label = "x".repeat(STRUCTURED_COMMAND_MAX_BYTES - fixed_bytes);
-        let chain = filter_chain(&label);
-        let exact = filter_line(4, &chain);
-        assert_eq!(exact.len(), STRUCTURED_COMMAND_MAX_BYTES);
-        assert_eq!(
-            parse(&exact),
-            Ok(Command::Filters(DraftRevision::new(4), chain))
-        );
-        let oversize = filter_line(4, &filter_chain(&(label + "x")));
-        assert_eq!(oversize.len(), STRUCTURED_COMMAND_MAX_BYTES + 1);
-        assert_eq!(
-            parse(&oversize),
-            Err("qualification filter command exceeds 65536 bytes")
-        );
-    }
-
-    #[test]
-    fn filter_command_cap_counts_utf8_bytes_not_label_characters() {
-        let fixed_bytes = filter_line(4, &filter_chain("")).len();
-        let label = format!(
-            "\u{a0}{}",
-            "x".repeat(STRUCTURED_COMMAND_MAX_BYTES - fixed_bytes - 2)
-        );
-        let exact = filter_line(4, &filter_chain(&label));
-        assert_eq!(exact.len(), STRUCTURED_COMMAND_MAX_BYTES);
-        assert!(parse(&exact).is_ok());
-        let oversize = filter_line(4, &filter_chain(&(label + "x")));
-        assert_eq!(oversize.len(), STRUCTURED_COMMAND_MAX_BYTES + 1);
-        assert!(parse(&oversize).is_err());
     }
 
     #[test]
@@ -826,8 +607,8 @@ mod tests {
                 "{prefix:?}"
             );
         }
-        // The structured predicate recognizes both JSON verbs and only exact verbs.
-        assert!(is_structured_json_command("\t draft-filters\t0 {}"));
+        // Only the surviving exact JSON verb gets structured-command handling.
+        assert!(!is_structured_json_command("\t draft-filters\t0 {}"));
         assert!(is_structured_json_command("\t draft-renderer\t0 {}"));
         assert!(!is_structured_json_command("draft-filtersx 0 {}"));
         assert!(!is_structured_json_command("draft-renderers 0 {}"));

@@ -1,7 +1,7 @@
 //! Responsibility: Versioned local storage, portable import/export.
 //! Allowed dependencies: `domain`, serialization and FS.
 //!
-//! Writes use schema v2; strict v1 documents migrate in memory only. A refused
+//! Writes use schema v3; strict v1/v2 documents migrate in memory only. A refused
 //! original blocks every automatic save until an explicit reset replaces it.
 //! Session preferences stay local until an authorized persistence event.
 

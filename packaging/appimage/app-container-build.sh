@@ -121,12 +121,12 @@ for argument in "$@"; do
   esac
 done
 if (( final )); then
-  args=(-fuse-ld=lld '-Wl,-rpath,$ORIGIN/../lib' -Wl,-Map,/build/evidence/furami.link.map "$@")
+  args=('-Wl,-rpath,$ORIGIN/../lib' -Wl,-Map,/build/evidence/furami.link.map "$@" -fuse-ld=bfd)
   printf -v line '%q ' cc "${args[@]}"
   printf '%s\n' "$line" > /build/evidence/furami-link-args.txt
   exec cc "${args[@]}"
 fi
-exec cc -fuse-ld=lld "$@"
+exec cc "$@" -fuse-ld=bfd
 EOF
 chmod +x /build/wrappers/cxx /build/wrappers/linker
 # QMAKE remains the actual frozen tool. Only rcc gets a read-only build-container
@@ -154,7 +154,7 @@ export CARGO_BUILD_JOBS="${FURAMI_BUILD_JOBS:-2}"
 export CXX=/build/wrappers/cxx
 export CFLAGS='-O2 -ffile-prefix-map=/workspace=/usr/src/furami -ffile-prefix-map=/build=/usr/src/furami-build'
 export CXXFLAGS="$CFLAGS"
-export RUSTFLAGS='-C linker=/build/wrappers/linker --remap-path-prefix=/workspace=/usr/src/furami --remap-path-prefix=/build=/usr/src/furami-build'
+export RUSTFLAGS='-C linker-features=-lld -C linker=/build/wrappers/linker --remap-path-prefix=/workspace=/usr/src/furami --remap-path-prefix=/build=/usr/src/furami-build'
 export SOURCE_DATE_EPOCH
 
 cargo metadata --offline --locked --format-version=1 --filter-platform x86_64-unknown-linux-gnu > /build/evidence/cargo-metadata.json

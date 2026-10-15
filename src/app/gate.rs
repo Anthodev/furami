@@ -241,7 +241,6 @@ mod tests {
             Stage::Unknown,
             Cause::Generic,
             DraftSettings {
-                filters: crate::domain::filters::FilterChain::default(),
                 video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                     identity,
                     mode: CaptureMode {

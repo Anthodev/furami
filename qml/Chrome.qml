@@ -81,6 +81,7 @@ QtObject {
         && !Projection.view.closing
         && Projection.view.intentError === null
         && !Projection.view.output.needsAction
+        && !Projection.view.diagnostics.hasProblem
 
     // A product state that must reach the user on its own, without pointer
     // activity. Entering one reveals the chrome; snapshot updates that keep the
@@ -91,6 +92,8 @@ QtObject {
             return ""
         if (v.intentError)
             return "intent-error"
+        if (v.diagnostics.hasProblem)
+            return "diagnostics-error"
         if (v.productPhase === "Disconnected")
             return "disconnected"
         if (v.recovery.stage.length > 0)

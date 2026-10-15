@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import dev.antho.furami
 
-// Themed checkbox used for the category toggles (filter entries, audio,
+// Themed checkbox used for the category toggles (audio,
 // deband, interpolation). A disabled control is the genuine off switch; the
 // checked state only enables the staged domain value.
 CheckBox {

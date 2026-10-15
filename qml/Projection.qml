@@ -134,38 +134,6 @@ QtObject {
             && projection.u32(value.numerator, minimum)
             && projection.u32(value.denominator, 1)
     }
-    function filterFieldTypes(kind) {
-        switch (kind) {
-        case "format":
-            return {matrix: "choice", levels: "choice", gamma: "choice"}
-        case "eq":
-            return {contrast: "number", brightness: "number", saturation: "number",
-                gamma: "number", gamma_r: "number", gamma_g: "number",
-                gamma_b: "number", gamma_weight: "number"}
-        case "unsharp":
-            return {luma_msize_x: "integer", luma_msize_y: "integer", luma_amount: "number",
-                chroma_msize_x: "integer", chroma_msize_y: "integer", chroma_amount: "number",
-                alpha_msize_x: "integer", alpha_msize_y: "integer", alpha_amount: "number"}
-        case "hqdn3d":
-            return {luma_spatial: "number", chroma_spatial: "number",
-                luma_tmp: "number", chroma_tmp: "number"}
-        case "bwdif":
-            return {mode: "choice", parity: "choice", deint: "choice"}
-        }
-        return null
-    }
-    function filterParametersValid(kind, value) {
-        const types = projection.filterFieldTypes(kind)
-        if (types === null || projection.record(value) === null)
-            return false
-        const keys = Object.keys(types)
-        return Object.keys(value).length === keys.length && keys.every(function(key) {
-            if (types[key] === "choice")
-                return typeof value[key] === "string"
-            return typeof value[key] === "number" && isFinite(value[key])
-                && (types[key] !== "integer" || Math.floor(value[key]) === value[key])
-        })
-    }
     function rendererSettingsValid(value) {
         return projection.strings(value, ["scale", "cscale", "dscale", "dither"])
             && projection.numbers(value, ["scale_antiring"])
@@ -185,14 +153,6 @@ QtObject {
             && (value.rate === null || (projection.rationalValid(value.rate, 1)
                 && projection.strings(value.rate, ["text"])))
             && (value.formatPolicy === "auto" || value.formatPolicy === "manual")
-            && projection.record(value.filters) !== null
-            && Array.isArray(value.filters.entries)
-            && value.filters.entries.every(function(entry) {
-                return projection.strings(entry, ["label"])
-                    && projection.flags(entry, ["enabled"])
-                    && projection.strings(entry.filter, ["kind"])
-                    && projection.filterParametersValid(entry.filter.kind, entry.filter.parameters)
-            })
             && projection.rendererSettingsValid(value.renderer)
     }
 
@@ -208,6 +168,22 @@ QtObject {
             && projection.sizeValid(value.size)
             && projection.rationalValid(value.rate, 1)
             && projection.strings(value.rate, ["text"])
+    }
+    // Diagnostics health (FUR-023), an additive schema-2 block: the three
+    // counters reuse the same u64 decimal-string contract as every identity,
+    // while `status` and `folderState` are closed producer vocabularies.
+    function diagnosticsValid(value) {
+        if (!projection.strings(value, ["status", "path", "message", "folderState"])
+                || !projection.flags(value, ["hasProblem"])
+                || !projection.u64(value.droppedEvents)
+                || !projection.u64(value.oversizedRecords)
+                || !projection.u64(value.oversizedReports))
+            return false
+        if (["Starting", "Healthy", "Degraded", "Unavailable", "Stopped", "Disabled"]
+                .indexOf(value.status) < 0)
+            return false
+        return ["Idle", "Preparing", "OpenRequested", "Failed"]
+            .indexOf(value.folderState) >= 0
     }
     function choiceValid(value) {
         return projection.strings(value, ["key", "label", "reason"])
@@ -258,37 +234,6 @@ QtObject {
             return "catalog.intervalRanges"
         return ""
     }
-    function filterFieldsValid(kind, fields) {
-        const types = projection.filterFieldTypes(kind)
-        if (types === null || !Array.isArray(fields)
-                || fields.length !== Object.keys(types).length)
-            return false
-        return fields.every(function(row, index) {
-            if (!projection.strings(row, ["key", "label", "type", "notice"])
-                    || !Object.prototype.hasOwnProperty.call(types, row.key)
-                    || types[row.key] !== row.type
-                    || fields.some(function(other, otherIndex) {
-                        return otherIndex < index && other.key === row.key
-                    })
-                    || !Array.isArray(row.choices)
-                    || !row.choices.every(projection.choiceValid))
-                return false
-            if (row.type === "choice") {
-                return row.min === null && row.max === null && row.step === null
-                    && row.choices.length > 0 && row.choices.every(function(choice, choiceIndex) {
-                        return !row.choices.some(function(other, otherIndex) {
-                            return otherIndex < choiceIndex && other.key === choice.key
-                        })
-                    })
-            }
-            return row.choices.length === 0 && projection.numbers(row, ["min", "max"])
-                && row.min <= row.max
-                && (row.type === "number" ? row.step === null
-                    : Math.floor(row.min) === row.min && Math.floor(row.max) === row.max
-                        && typeof row.step === "number" && isFinite(row.step)
-                        && row.step > 0 && Math.floor(row.step) === row.step)
-        })
-    }
     function rendererFieldValid(row) {
         if (!projection.strings(row, ["key", "label", "type", "notice"])
                 || !Array.isArray(row.choices) || !row.choices.every(projection.choiceValid))
@@ -330,19 +275,6 @@ QtObject {
         const catalogFailure = projection.catalogError(s.catalog)
         if (catalogFailure !== "")
             return catalogFailure
-        const f = s.filters
-        if (!projection.strings(f, ["error"]) || !projection.flags(f, ["available"])
-                || !Array.isArray(f.kinds) || !f.kinds.every(function(row) {
-                    return projection.strings(row, ["kind", "label", "reason"])
-                        && projection.flags(row, ["available"])
-                        && projection.filterParametersValid(row.kind, row.defaultParameters)
-                        && projection.filterFieldsValid(row.kind, row.fields)
-                }) || !Array.isArray(f.entries) || !f.entries.every(function(row) {
-                    return projection.strings(row, ["key", "label", "kind", "reason"])
-                        && projection.flags(row, ["enabled", "available"])
-                        && projection.filterParametersValid(row.kind, row.parameters)
-                }))
-            return "filters"
         const r = s.renderer
         if (!projection.strings(r, ["error", "notice"]) || !projection.flags(r, ["available"])
                 || !Array.isArray(r.fields) || !r.fields.every(projection.rendererFieldValid))
@@ -378,11 +310,13 @@ QtObject {
                 || !projection.u64(settings.resetToken)
                 || ["", "save", "warning"].indexOf(settings.closeDialog) < 0)
             return "settings"
+        if (!projection.diagnosticsValid(s.diagnostics))
+            return "diagnostics"
         if (s.intentError !== null) {
             if (!projection.strings(s.intentError, ["code", "action", "field", "message"])
                     || ["stale_selection", "stale_catalog", "invalid_value",
                         "unavailable", "busy", "closing", "capture_error", "audio_error",
-                        "filter_error", "renderer_error"].indexOf(s.intentError.code) < 0)
+                        "renderer_error"].indexOf(s.intentError.code) < 0)
                 return "intentError"
         }
         return ""
@@ -420,7 +354,6 @@ QtObject {
         audioEnabled: false,
         audioInputKey: "",
         audioInputLabel: "",
-        filters: { entries: [] },
         renderer: {}
     })
 
@@ -441,7 +374,6 @@ QtObject {
             audioEnabled: projection.flag(s.audioEnabled),
             audioInputKey: projection.text(s.audioInputKey),
             audioInputLabel: projection.text(s.audioInputLabel),
-            filters: projection.record(s.filters) || { entries: [] },
             renderer: projection.record(s.renderer) || {}
         }
     }
@@ -595,16 +527,6 @@ QtObject {
         }
     }
 
-    function filtersView(value) {
-        const f = projection.record(value)
-        if (!f) return projection.emptyView.filters
-        return {
-            available: projection.flag(f.available),
-            error: projection.text(f.error),
-            kinds: projection.list(f.kinds),
-            entries: projection.list(f.entries)
-        }
-    }
 
     function rendererView(value) {
         const r = projection.record(value)
@@ -654,6 +576,24 @@ QtObject {
         }
     }
 
+    // Diagnostics health for the Options folder action and the always-visible
+    // plain-text error. `path`/`message` are untrusted text rendered only
+    // through BrumeLabel; the counters stay decimal strings end to end.
+    function diagnosticsView(value) {
+        const d = projection.record(value)
+        if (!d) return projection.emptyView.diagnostics
+        return {
+            status: projection.text(d.status),
+            path: projection.text(d.path),
+            message: projection.text(d.message),
+            hasProblem: projection.flag(d.hasProblem),
+            droppedEvents: projection.text(d.droppedEvents),
+            oversizedRecords: projection.text(d.oversizedRecords),
+            oversizedReports: projection.text(d.oversizedReports),
+            folderState: projection.text(d.folderState)
+        }
+    }
+
     readonly property var emptyView: ({
         schema: 0,
         stateToken: "",
@@ -684,7 +624,6 @@ QtObject {
             audioInputRows: [], selectedAudioInputKey: "",
             capabilityStatus: "unknown", capabilityReason: ""
         },
-        filters: { available: false, error: "", kinds: [], entries: [] },
         renderer: { available: false, error: "", fields: [], notice: "" },
         output: {
             revision: "", rows: [], selectedKey: "", selectedLabel: "",
@@ -694,6 +633,11 @@ QtObject {
         settings: {
             status: "", path: "", refused: false, startupReason: "",
             closeDialog: "", resetToken: ""
+        },
+        diagnostics: {
+            status: "Starting", path: "", message: "", hasProblem: false,
+            droppedEvents: "0", oversizedRecords: "0", oversizedReports: "0",
+            folderState: "Idle"
         },
         intentError: null
     })
@@ -722,11 +666,11 @@ QtObject {
             streamStats: projection.streamStatsView(s.streamStats),
             live: projection.liveView(s.live),
             catalog: projection.catalogView(s.catalog),
-            filters: projection.filtersView(s.filters),
             renderer: projection.rendererView(s.renderer),
             output: projection.outputView(s.output),
             recovery: projection.recoveryView(s.recovery),
             settings: projection.settingsView(s.settings),
+            diagnostics: projection.diagnosticsView(s.diagnostics),
             intentError: projection.record(s.intentError)
         }
     }

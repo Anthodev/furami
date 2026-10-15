@@ -41,12 +41,19 @@ use super::schema::{self, EncodeError, SchemaError};
 /// Stream statistics are shown by default. `stats_hidden` is optional on disk;
 /// only `true` is encoded. Older strict readers refuse documents carrying it,
 /// without modifying the original file or attempting a downgrade migration.
+///
+/// Diagnostic logging is off by default for every document, fresh or existing,
+/// and is enabled only by an explicit opt-in. `logging_enabled` is optional on
+/// disk and follows the same convention: absent and explicit `false` both mean
+/// off, only `true` is encoded, and older strict readers refuse a document
+/// carrying it. A strictly refused document never yields a best-effort `true`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalPreferences {
     pub gain: PlaybackGain,
     pub fullscreen: bool,
     pub output: PersistentOutputChoice,
     pub stats_hidden: bool,
+    pub logging_enabled: bool,
 }
 
 /// The complete persisted document: all verified source profiles, the exact
@@ -67,7 +74,11 @@ pub struct StoredDocument {
 #[derive(Debug)]
 pub enum LoadOutcome {
     Missing,
-    Loaded(Box<StoredDocument>),
+    Loaded {
+        document: Box<StoredDocument>,
+        /// Legacy-only loading notice; never part of the persisted document.
+        retired_filters_present: bool,
+    },
     Refused(SettingsLoadError),
 }
 
@@ -290,14 +301,20 @@ impl SettingsStore {
                 )
             }
             Ok(bytes) => match schema::decode(&bytes) {
-                Ok(document) => (
+                Ok(schema::DecodedDocument {
+                    document,
+                    retired_filters_present,
+                }) => (
                     Self {
                         path,
                         refused: false,
                         snapshot: Some(document.clone()),
                         injected_fault: None,
                     },
-                    LoadOutcome::Loaded(Box::new(document)),
+                    LoadOutcome::Loaded {
+                        document: Box::new(document),
+                        retired_filters_present,
+                    },
                 ),
                 Err(schema_error) => {
                     let error = load_error(path.clone(), schema_error);

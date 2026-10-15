@@ -8,14 +8,24 @@ pub struct NativeLaunchError {
     pub diagnostic: String,
 }
 
+// Local exception: the Qt launch bootstrap keeps its eight values positional in
+// one call, preserving the existing ownership handoff into RuntimeCoordinator.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Qt/CXX positional boundary; one bootstrap call."
+)]
 pub fn run_application(
     media_prefix: &str,
-    treatment_capabilities: crate::media::render_catalog::QualifiedTreatmentCapabilities,
+    treatment_capabilities: Result<
+        crate::media::render_catalog::RendererCapabilities,
+        crate::media::render_catalog::RendererCatalogError,
+    >,
     display: &str,
     startup: crate::app::settings::StartupSelection,
     persistence: crate::app::settings::PersistenceSession,
     sources: Vec<crate::domain::capture::AudioSourceIdentity>,
     qualification_stdin: bool,
+    diagnostics: crate::diagnostics::DiagnosticsHandle,
 ) -> Result<(), NativeLaunchError> {
     let gate = Box::new(crate::ui::runtime::RuntimeCoordinator::new(
         media_prefix.to_owned(),
@@ -23,6 +33,7 @@ pub fn run_application(
         startup,
         persistence,
         sources,
+        diagnostics,
     ));
     let result = crate::ui::bridge::ffi::run_qt_application(gate, display, qualification_stdin);
     if result.exit_code == 0 {

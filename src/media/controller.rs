@@ -8,12 +8,11 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, Thread},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use super::{
-    filter_catalog::CompiledFilterChain,
-    session::{ObservedFacts, RequestedFacts, SessionError, SessionFacts},
+use super::session::{
+    ObservedFacts, RequestedFacts, SessionError, SessionFacts, Verification, VerificationStatus,
 };
 use crate::app::ports::OpenReadiness;
 #[cfg(test)]
@@ -25,17 +24,15 @@ use crate::domain::capture::{
 };
 use crate::domain::{
     failure::TreatmentFailure,
-    filters::FilterChain,
     output::OutputPlan,
     state::{
         InitialPlayback, PauseRequestId, TreatmentAttemptKey, TreatmentConfirmation, TreatmentPass,
     },
 };
 
-/// Both preparations are frozen before any native owner work is admitted.
+/// Renderer preparation is frozen before any native owner work is admitted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedTreatments {
-    pub(super) filters: CompiledFilterChain,
     pub(super) renderer: super::render_catalog::CompiledRendererSettings,
 }
 #[derive(Clone, Debug)]
@@ -47,7 +44,6 @@ pub struct SessionConfig {
     pub playback: InitialPlayback,
     pub watch: WatchStamp,
     pub selected_route: Option<SelectedRouteAuthorization>,
-    pub filters: FilterChain,
     pub treatments: PreparedTreatments,
     pub treatment_key: TreatmentAttemptKey,
 }
@@ -163,6 +159,38 @@ pub(crate) struct Snapshot {
     /// Independently retained revocation of the applied treatment. A newer
     /// unsuccessful operation must not hide this bounded health event.
     pub treatment_fault: Option<TreatmentSnapshot>,
+    pub diagnostics: Option<RuntimeMediaObservation>,
+}
+
+/// Cold owner facts only; neither backend configuration requests nor readiness.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RuntimeMediaObservation {
+    pub generation: u64,
+    pub observation_epoch: u64,
+    pub client_api: u64,
+    pub libmpv_version: Arc<str>,
+    pub backend: BackendObservation,
+    pub helpers: super::loopback::HelperObservations,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum BackendObservation {
+    Unavailable(BackendUnavailable),
+    Observed {
+        video_output: Arc<str>,
+        gpu_context: Arc<str>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackendUnavailable {
+    NotObserved,
+    Invalidated,
+    NotConfigured,
+    PropertyUnavailable,
+    InvalidPayload,
+    SubmissionRejected,
+    EpochExhausted,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -305,6 +333,9 @@ pub(crate) enum BackendEvent {
         failure: Box<TreatmentFailure>,
     },
     FileLoaded,
+    /// The production adapter's initial restart also requires fresh, exact
+    /// decoded-frame VO configuration for this owner/load with force-window=no.
+    /// It is not a presentation or continuous-video-health acknowledgment.
     PlaybackRestart,
     VideoReconfig,
     CommandReply {
@@ -325,6 +356,7 @@ pub(crate) enum BackendEvent {
         facts: ObservedFacts,
     },
     AudioAvailability(AudioAvailability),
+    Diagnostics(Box<RuntimeMediaObservation>),
     AudioDetached {
         epoch: AudioEpoch,
         outcome: Result<(), AudioError>,
@@ -338,7 +370,6 @@ pub(crate) trait OwnerBackend {
     /// property read is allowed once external audio can be opening or active.
     fn refresh_pause(&mut self) -> Result<Option<bool>, MediaError>;
     fn refresh_observed(&mut self, started: bool) -> Result<Option<ObservedFacts>, MediaError>;
-    fn diagnostic(&self) -> Option<String>;
     fn audio_status(&self) -> AudioAvailability {
         AudioAvailability::Disabled
     }
@@ -378,7 +409,6 @@ impl OwnerEndpoint {
     ) -> Result<Self, MediaError> {
         let requested = config.video.requested();
         let settings = crate::domain::state::DraftSettings {
-            filters: config.filters.clone(),
             video: config.video.video_request().clone(),
             audio: config.audio.clone(),
             renderer: config.treatments.renderer.requested().clone(),
@@ -417,7 +447,7 @@ impl OwnerEndpoint {
                     return stop.outcome();
                 }
                 let requested = input.requested().clone();
-                tracing::info!(generation = generation.get(), requested = %requested, "capture_requested");
+                log_capture_requested(generation, &requested);
                 run_backend(
                     super::ffi::MpvBackend::new(
                         prefix,
@@ -467,7 +497,7 @@ impl OwnerEndpoint {
                     return stop.outcome();
                 }
                 let requested = input.requested().clone();
-                tracing::info!(generation = generation.get(), requested = %requested, "capture_requested");
+                log_capture_requested(generation, &requested);
                 run_backend(
                     factory(input),
                     surface,
@@ -596,6 +626,7 @@ impl OwnerEndpoint {
                     audio_epoch: None,
                     treatments: None,
                     treatment_fault: None,
+                    diagnostics: None,
                 };
                 let outcome = task(
                     &surface_rx,
@@ -889,8 +920,8 @@ fn run_backend<B: OwnerBackend>(
         publish(latest, snapshot);
     }
     tracing::info!(
+        event_code = "owner_destroy_begin",
         generation = snapshot.generation.get(),
-        "owner_destroy_begin"
     );
     if let Err(error) = backend.shutdown() {
         stop.request(Some(error.clone()));
@@ -900,9 +931,12 @@ fn run_backend<B: OwnerBackend>(
             outcome = Err(error);
         }
     }
+    if snapshot.diagnostics.take().is_some() {
+        publish(latest, snapshot);
+    }
     tracing::info!(
+        event_code = "owner_destroy_complete",
         generation = snapshot.generation.get(),
-        "owner_destroy_complete"
     );
     outcome
 }
@@ -954,6 +988,7 @@ fn run_owner<B: OwnerBackend>(
     publish(latest, snapshot);
     let id = RequestId::next(&mut last_request)?;
     backend.submit(id, BackendCommand::LoadInput)?;
+    let mut readiness_started = Some(Instant::now());
     let mut pending = Some((id, InFlight::LoadInput));
     loop {
         if stop.is_set() {
@@ -1151,6 +1186,12 @@ fn run_owner<B: OwnerBackend>(
                     snapshot.audio = status;
                     publish(latest, snapshot);
                 }
+                BackendEvent::Diagnostics(observation) => {
+                    if observation.generation == snapshot.generation.get() {
+                        snapshot.diagnostics = Some(*observation);
+                        publish(latest, snapshot);
+                    }
+                }
                 BackendEvent::AudioDetached { epoch, outcome } => {
                     snapshot.audio_detached = Some((epoch, outcome));
                     publish(latest, snapshot);
@@ -1165,10 +1206,7 @@ fn run_owner<B: OwnerBackend>(
                         if error < 0 {
                             return Err(MediaError::new(
                                 "command_reply",
-                                format!(
-                                    "mpv async command failed: {error}; {}",
-                                    backend.diagnostic().unwrap_or_default()
-                                ),
+                                format!("mpv async command failed: {error}"),
                             ));
                         }
                         if let InFlight::SetPaused { request, paused } = kind
@@ -1195,18 +1233,15 @@ fn run_owner<B: OwnerBackend>(
                 BackendEvent::EndFile { reason, error } => {
                     snapshot.stream_ended = Some((reason, error));
                     tracing::info!(
+                        event_code = "mpv_end_file",
                         generation = snapshot.generation.get(),
-                        reason,
-                        error,
-                        "mpv_end_file"
+                        reason = end_file_reason(reason),
+                        mpv_error = error,
                     );
                     if error < 0 || reason == 4 {
                         return Err(MediaError::new(
                             "playback",
-                            format!(
-                                "mpv END_FILE reason={reason} error={error}; {}",
-                                backend.diagnostic().unwrap_or_default()
-                            ),
+                            format!("mpv END_FILE reason={reason} error={error}"),
                         ));
                     }
                     publish(latest, snapshot);
@@ -1225,12 +1260,21 @@ fn run_owner<B: OwnerBackend>(
                 }
             }
         }
+        let previous_readiness = snapshot.readiness;
+        if readiness_started.is_some() {
+            check_startup_readiness(
+                snapshot,
+                drained,
+                stop,
+                &mut readiness_started,
+                requested,
+                Instant::now(),
+            )?;
+        } else if drained {
+            update_readiness(snapshot);
+        }
         if stop.is_set() {
             return stop.outcome();
-        }
-        let previous_readiness = snapshot.readiness;
-        if drained {
-            update_readiness(snapshot);
         }
         if snapshot.readiness != previous_readiness {
             publish(latest, snapshot);
@@ -1239,6 +1283,49 @@ fn run_owner<B: OwnerBackend>(
         // stream must not turn deadline observation into an owner busy loop.
         thread::park_timeout(Duration::from_millis(10));
     }
+}
+
+const OPEN_READINESS_DEADLINE: Duration = Duration::from_secs(10);
+
+/// This bounds initial readiness observation, not blocking native calls or
+/// destruction. Once accepted, readiness never arms this owner's budget again.
+fn check_startup_readiness(
+    snapshot: &mut Snapshot,
+    drained: bool,
+    stop: &StopFlag,
+    started: &mut Option<Instant>,
+    requested: Option<&RequestedFacts>,
+    now: Instant,
+) -> Result<(), MediaError> {
+    if stop.is_set() {
+        return stop.outcome();
+    }
+    // A terminal already observed by this batch owns the outcome. Negative
+    // native terminals return before this boundary; ordinary EOF remains ended.
+    if snapshot.stream_ended.is_none()
+        && started.is_some_and(|accepted| {
+            now.saturating_duration_since(accepted) >= OPEN_READINESS_DEADLINE
+        })
+    {
+        let diagnostic = "native playback readiness was not established within 10 seconds";
+        let mut error = MediaError::new("startup_readiness_timeout", diagnostic);
+        // Preserve the explicit operation through run_backend's generic wrapper.
+        error.session = requested.map(|requested| {
+            Box::new(SessionError::backend(
+                requested.clone(),
+                diagnostic.into(),
+                None,
+            ))
+        });
+        return Err(error);
+    }
+    if drained {
+        update_readiness(snapshot);
+    }
+    if snapshot.readiness.is_some() {
+        *started = None;
+    }
+    Ok(())
 }
 
 /// Reserve both cookies atomically. Output work advances the counter beyond the
@@ -1368,10 +1455,10 @@ fn record_pause(
                 ));
             }
             tracing::info!(
+                event_code = "mpv_pause_observed",
                 generation = snapshot.generation.get(),
-                request = request.get(),
+                request_id = request.get(),
                 paused = observation.paused,
-                "mpv_pause_observed"
             );
         }
         None => {
@@ -1396,9 +1483,7 @@ fn apply_observed(
         if let Some(requested) = requested {
             let facts = SessionFacts::verify(requested.clone(), observed)
                 .map_err(MediaError::from_session)?;
-            tracing::info!(generation = snapshot.generation.get(),
-                facts = %serde_json::to_string(&facts).map_err(|error| MediaError::new("capture_metadata", error.to_string()))?,
-                "capture_observed");
+            log_capture_observed(snapshot.generation, &facts);
             snapshot.session = Some(facts);
         }
         snapshot.playback_started |= started;
@@ -1427,6 +1512,67 @@ fn update_readiness(snapshot: &mut Snapshot) {
             _ => None,
         }
     };
+}
+
+/// Bounded scalar projections for the private capture/owner diagnostics. No
+/// path, URL or raw option text reaches the logging layer.
+fn log_capture_requested(generation: Generation, requested: &RequestedFacts) {
+    let identity = &requested.identity;
+    let mode = &requested.mode;
+    tracing::info!(
+        event_code = "capture_requested",
+        generation = generation.get(),
+        vendor_id = identity.vendor_id() as u64,
+        product_id = identity.product_id() as u64,
+        width = mode.size.width() as u64,
+        height = mode.size.height() as u64,
+        fourcc = mode.captured_fourcc.kernel_value() as u64,
+        rate_numerator = mode.rate.numerator() as u64,
+        rate_denominator = mode.rate.denominator() as u64,
+    );
+}
+
+fn log_capture_observed(generation: Generation, facts: &SessionFacts) {
+    let mode = &facts.requested.mode;
+    tracing::info!(
+        event_code = "capture_observed",
+        generation = generation.get(),
+        width = mode.size.width() as u64,
+        height = mode.size.height() as u64,
+        fourcc = mode.captured_fourcc.kernel_value() as u64,
+        rate_numerator = mode.rate.numerator() as u64,
+        rate_denominator = mode.rate.denominator() as u64,
+        status = verification_token(&facts.verification),
+    );
+}
+
+fn verification_token(verification: &Verification) -> &'static str {
+    use VerificationStatus::{Approximate, Configured, ObservedCompatible};
+    let statuses = [
+        verification.captured_fourcc,
+        verification.decoded_size,
+        verification.nominal_rate,
+    ];
+    if statuses.contains(&Configured) {
+        "Configured"
+    } else if statuses.contains(&Approximate) {
+        "Approximate"
+    } else if statuses.contains(&ObservedCompatible) {
+        "ObservedCompatible"
+    } else {
+        "Unverified"
+    }
+}
+
+fn end_file_reason(reason: i32) -> &'static str {
+    match reason {
+        0 => "Eof",
+        2 => "Stop",
+        3 => "Quit",
+        4 => "Error",
+        5 => "Redirect",
+        _ => "Unknown",
+    }
 }
 
 #[cfg(test)]
@@ -1537,6 +1683,25 @@ pub(crate) mod test_support {
             self.events.send(Input::Fence(tx)).unwrap();
             rx.recv().unwrap();
         }
+        /// Exercise the production batch-boundary timer with explicit monotonic
+        /// time. Callers stage the resulting error through a real owner's stop
+        /// and destruction path; this does not simulate ten wall-clock seconds.
+        pub(crate) fn expired_initial_readiness(
+            mut snapshot: Snapshot,
+            requested: &RequestedFacts,
+        ) -> MediaError {
+            let accepted = Instant::now();
+            check_startup_readiness(
+                &mut snapshot,
+                false,
+                &StopFlag::new(),
+                &mut Some(accepted),
+                Some(requested),
+                accepted + OPEN_READINESS_DEADLINE,
+            )
+            .unwrap_err()
+        }
+
         /// Script a successful backend boundary only for the real submitted Open
         /// cookie/key. Production and observer tests never use this test driver.
         pub(crate) fn confirm_open_treatments(&self) -> TreatmentConfirmation {
@@ -1569,15 +1734,9 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn prepared_treatments(
-        chain: &FilterChain,
         renderer: &crate::domain::render::RendererSettings,
     ) -> PreparedTreatments {
         PreparedTreatments {
-            filters: super::super::filter_catalog::compile_chain(
-                chain,
-                &super::super::filter_catalog::fixture_capabilities(),
-            )
-            .unwrap(),
             renderer: super::super::render_catalog::compile_renderer(
                 renderer,
                 &super::super::render_catalog::fixture_capabilities(),
@@ -1591,33 +1750,9 @@ pub(crate) mod test_support {
         playback: InitialPlayback,
         renderer: crate::domain::render::RendererSettings,
     ) -> TreatmentConfirmation {
-        use crate::domain::state::{
-            FilterConfirmation, FilterEvidence, FilterTreatmentProof, RendererConfirmation,
-        };
-        let filters = match playback {
-            InitialPlayback::Live => FilterTreatmentProof::Reconfigured(
-                FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap(),
-            ),
-            InitialPlayback::Paused if key.pass == TreatmentPass::Open => {
-                FilterTreatmentProof::PreparedPaused { key }
-            }
-            InitialPlayback::Paused => FilterTreatmentProof::Preserved {
-                origin: FilterEvidence::PreparedPaused {
-                    key: TreatmentAttemptKey {
-                        pass: TreatmentPass::Open,
-                        ..key
-                    },
-                },
-            },
-        };
-        TreatmentConfirmation::checked(
-            key,
-            playback,
-            playback == InitialPlayback::Live,
-            filters,
-            RendererConfirmation::checked(key, renderer),
-        )
-        .unwrap()
+        use crate::domain::state::RendererConfirmation;
+        TreatmentConfirmation::checked(key, playback, RendererConfirmation::checked(key, renderer))
+            .unwrap()
     }
 
     impl FakeBackend {
@@ -1702,10 +1837,6 @@ pub(crate) mod test_support {
         ) -> Result<Option<ObservedFacts>, MediaError> {
             Ok(Some(self.observed.clone()))
         }
-        fn diagnostic(&self) -> Option<String> {
-            None
-        }
-
         fn shutdown(&mut self) -> Result<(), MediaError> {
             let _ = self.shutdown_started.send(());
             if self.config.hold_shutdown {
@@ -1767,6 +1898,54 @@ mod tests {
         owner.take_stopped().unwrap().unwrap()
     }
 
+    #[test]
+    fn diagnostics_follow_owner_snapshot_without_changing_readiness() {
+        let (mut owner, driver) = start(Config::default());
+        load(&driver);
+        driver.fence();
+        let before = owner.take_snapshot().unwrap();
+        let observation = RuntimeMediaObservation {
+            generation: generation().get(),
+            observation_epoch: 7,
+            client_api: 0x0002_0005,
+            libmpv_version: "mpv v0.41.0".into(),
+            backend: BackendObservation::Observed {
+                video_output: "gpu-next".into(),
+                gpu_context: "x11vk".into(),
+            },
+            helpers: super::super::loopback::HelperObservations::default(),
+        };
+        driver.send(BackendEvent::Diagnostics(Box::new(observation.clone())));
+        driver.fence();
+        let after = owner.take_snapshot().unwrap();
+        assert_eq!(after.diagnostics, Some(observation.clone()));
+        assert_eq!(after.readiness, before.readiness);
+        assert_eq!(after.initialized, before.initialized);
+        assert_eq!(after.file_loaded, before.file_loaded);
+        assert_eq!(after.playback_started, before.playback_started);
+        assert_eq!(after.failure, before.failure);
+        let mut stale = observation.clone();
+        stale.generation += 1;
+        driver.send(BackendEvent::Diagnostics(Box::new(stale)));
+        driver.fence();
+        assert!(owner.take_snapshot().is_none());
+        let mut helpers_changed = observation;
+        helpers_changed.helpers.pw_loopback =
+            super::super::loopback::HelperObservation::SpawnSucceeded;
+        helpers_changed.helpers.pw_metadata =
+            super::super::loopback::HelperObservation::SpawnFailed {
+                io_kind: std::io::ErrorKind::PermissionDenied,
+                os_code: Some(13),
+            };
+        driver.send(BackendEvent::Diagnostics(Box::new(helpers_changed.clone())));
+        driver.fence();
+        let after_helpers = owner.take_snapshot().unwrap();
+        assert_eq!(after_helpers.diagnostics, Some(helpers_changed));
+        assert_eq!(after_helpers.readiness, before.readiness);
+        stop(&mut owner, &driver);
+        assert!(owner.take_snapshot().unwrap().diagnostics.is_none());
+    }
+
     fn treatment_key(apply: u64, pass: TreatmentPass) -> TreatmentAttemptKey {
         TreatmentAttemptKey {
             apply: crate::domain::state::ApplyId::new(apply).unwrap(),
@@ -1778,31 +1957,22 @@ mod tests {
         PlaybackIntent::ApplyTreatments {
             key,
             treatments: Box::new(test_support::prepared_treatments(
-                &FilterChain::default(),
                 &crate::domain::render::RendererSettings::default(),
             )),
         }
     }
     fn treatment_failure(
         key: TreatmentAttemptKey,
-        kind: crate::domain::failure::FilterErrorKind,
+        kind: crate::domain::failure::RendererErrorKind,
     ) -> Box<TreatmentFailure> {
-        let filter = crate::domain::failure::FilterFailure {
+        let renderer = crate::domain::failure::RendererFailure {
+            property: crate::domain::render::RendererProperty::Scale,
+            diagnostic: format!("{kind:?}"),
             kind,
-            attributed_ordinal: None,
-            requires_fresh_owner: false,
-            diagnostics: crate::domain::failure::FilterAttemptDiagnostics {
-                key: Some(key),
-                entries: vec![],
-                records: vec![],
-                native_evidence_lost: false,
-                truncated: false,
-                dropped_context: 0,
-            },
         };
         Box::new(TreatmentFailure {
             key: Some(key),
-            kind: crate::domain::failure::TreatmentErrorKind::Filter(filter),
+            kind: crate::domain::failure::TreatmentErrorKind::Renderer(renderer),
             disposition: crate::domain::failure::TreatmentFailureDisposition::RestoreSameOwner,
         })
     }
@@ -1865,7 +2035,7 @@ mod tests {
             key,
             result: Err(treatment_failure(
                 key,
-                crate::domain::failure::FilterErrorKind::CommandRejected { mpv_error: -12 },
+                crate::domain::failure::RendererErrorKind::Rejected { mpv_error: -12 },
             )),
         });
         let (_, command) = driver
@@ -1893,7 +2063,10 @@ mod tests {
         });
         driver.send(BackendEvent::TreatmentFault {
             key,
-            failure: treatment_failure(key, crate::domain::failure::FilterErrorKind::RuntimeGraph),
+            failure: treatment_failure(
+                key,
+                crate::domain::failure::RendererErrorKind::ReadbackMismatch,
+            ),
         });
         driver.fence();
         let treatments = owner.take_snapshot().unwrap().treatments.unwrap();
@@ -1951,7 +2124,7 @@ mod tests {
             );
             let mut rejected = treatment_failure(
                 candidate,
-                crate::domain::failure::FilterErrorKind::CommandRejected { mpv_error: -5 },
+                crate::domain::failure::RendererErrorKind::Rejected { mpv_error: -5 },
             );
             rejected.disposition = crate::domain::failure::TreatmentFailureDisposition::Untouched;
             driver.send(BackendEvent::TreatmentResult {
@@ -1961,7 +2134,7 @@ mod tests {
             });
             let fault = treatment_failure(
                 confirmed,
-                crate::domain::failure::FilterErrorKind::RuntimeGraph,
+                crate::domain::failure::RendererErrorKind::IncumbentMismatch,
             );
             if same_drain {
                 driver.send(BackendEvent::TreatmentFault {
@@ -2013,7 +2186,7 @@ mod tests {
                 key: confirmed,
                 failure: treatment_failure(
                     confirmed,
-                    crate::domain::failure::FilterErrorKind::RuntimeGraph,
+                    crate::domain::failure::RendererErrorKind::IncumbentMismatch,
                 ),
             });
             driver.fence();
@@ -3000,6 +3173,7 @@ mod recovery_readiness_tests {
             audio_epoch: None,
             treatments: None,
             treatment_fault: None,
+            diagnostics: None,
         }
     }
 
@@ -3045,5 +3219,337 @@ mod recovery_readiness_tests {
         snapshot.failure = Some(MediaError::new("capture_metadata", "contradictory format"));
         update_readiness(&mut snapshot);
         assert_eq!(snapshot.readiness, None);
+    }
+
+    #[test]
+    fn startup_readiness_expires_at_exact_budget_with_honest_structured_error() {
+        use crate::domain::failure::{Cause, Stage};
+        let accepted = Instant::now();
+        for (elapsed, expired) in [
+            (OPEN_READINESS_DEADLINE - Duration::from_nanos(1), false),
+            (OPEN_READINESS_DEADLINE, true),
+            (OPEN_READINESS_DEADLINE + Duration::from_nanos(1), true),
+        ] {
+            let mut snapshot = paused_snapshot();
+            let requested = snapshot.session.as_ref().unwrap().requested.clone();
+            let mut started = Some(accepted);
+            let result = check_startup_readiness(
+                &mut snapshot,
+                true,
+                &StopFlag::new(),
+                &mut started,
+                Some(&requested),
+                accepted + elapsed,
+            );
+            assert_eq!(result.is_err(), expired);
+            assert_eq!(started, Some(accepted));
+            assert!(snapshot.readiness.is_none());
+            assert!(snapshot.treatments.is_none() && snapshot.treatment_fault.is_none());
+            if let Err(error) = result {
+                assert_eq!(error.code, "startup_readiness_timeout");
+                assert_eq!(
+                    error.diagnostic,
+                    "native playback readiness was not established within 10 seconds"
+                );
+                let session = error.session.unwrap();
+                assert_eq!(session.requested, requested);
+                assert_eq!(
+                    (session.stage, session.cause),
+                    (Stage::Unknown, Cause::Generic)
+                );
+                assert_eq!(session.diagnostic, error.diagnostic);
+                assert!(session.evidence.is_none() && session.source.is_none());
+            }
+        }
+        let mut snapshot = paused_snapshot();
+        let error = check_startup_readiness(
+            &mut snapshot,
+            true,
+            &StopFlag::new(),
+            &mut Some(accepted),
+            None,
+            accepted + OPEN_READINESS_DEADLINE,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "startup_readiness_timeout");
+        assert!(error.session.is_none());
+    }
+
+    fn live_snapshot() -> Snapshot {
+        let mut snapshot = paused_snapshot();
+        snapshot.load_complete = true;
+        snapshot.playback = InitialPlayback::Live;
+        snapshot.playback_started = true;
+        snapshot.pause.as_mut().unwrap().paused = false;
+        snapshot
+    }
+
+    #[test]
+    fn silent_missing_facts_and_nonclean_flood_cannot_escape_initial_budget() {
+        let accepted = Instant::now();
+        for missing in 0..6 {
+            let mut snapshot = live_snapshot();
+            match missing {
+                0 => snapshot.load_complete = false,
+                1 => snapshot.file_loaded = false,
+                2 => snapshot.session = None,
+                3 => snapshot.pause = None,
+                4 => snapshot.playback_started = false,
+                5 => {}
+                _ => unreachable!(),
+            }
+            let drained = missing != 5;
+            let mut started = Some(accepted);
+            for elapsed in [0, 1000, 9900, 9999] {
+                check_startup_readiness(
+                    &mut snapshot,
+                    drained,
+                    &StopFlag::new(),
+                    &mut started,
+                    None,
+                    accepted + Duration::from_millis(elapsed),
+                )
+                .unwrap();
+                assert!(snapshot.readiness.is_none());
+                assert_eq!(started, Some(accepted));
+            }
+            let error = check_startup_readiness(
+                &mut snapshot,
+                drained,
+                &StopFlag::new(),
+                &mut started,
+                None,
+                accepted + OPEN_READINESS_DEADLINE,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "startup_readiness_timeout");
+        }
+    }
+
+    #[test]
+    fn pre_readiness_metadata_pause_and_diagnostic_activity_never_resets_budget() {
+        let accepted = Instant::now();
+        let mut snapshot = live_snapshot();
+        snapshot.playback_started = false;
+        let mut started = Some(accepted);
+        for epoch in 1..=10 {
+            snapshot.pause.as_mut().unwrap().paused = epoch % 2 == 0;
+            snapshot.load_complete = epoch % 3 != 0;
+            snapshot.diagnostics = Some(RuntimeMediaObservation {
+                generation: snapshot.generation.get() + epoch % 2,
+                observation_epoch: epoch,
+                client_api: 0x0002_0005,
+                libmpv_version: "mpv v0.41.0".into(),
+                backend: BackendObservation::Unavailable(BackendUnavailable::NotConfigured),
+                helpers: Default::default(),
+            });
+            let result = check_startup_readiness(
+                &mut snapshot,
+                epoch % 2 == 0,
+                &StopFlag::new(),
+                &mut started,
+                None,
+                accepted + Duration::from_secs(epoch),
+            );
+            assert_eq!(result.is_err(), epoch == 10);
+            assert_eq!(started, Some(accepted));
+            assert!(snapshot.readiness.is_none());
+        }
+    }
+
+    #[test]
+    fn timely_live_and_paused_preparation_disarm_forever_despite_later_pause_work() {
+        let accepted = Instant::now();
+        let mut paused = paused_snapshot();
+        paused.load_complete = true;
+        for (mut snapshot, expected) in [
+            (live_snapshot(), OpenReadiness::Live),
+            (paused, OpenReadiness::PausedPrepared),
+        ] {
+            let mut started = Some(accepted);
+            check_startup_readiness(
+                &mut snapshot,
+                true,
+                &StopFlag::new(),
+                &mut started,
+                None,
+                accepted + OPEN_READINESS_DEADLINE - Duration::from_nanos(1),
+            )
+            .unwrap();
+            assert_eq!(snapshot.readiness, Some(expected));
+            assert_eq!(started, None);
+            if expected == OpenReadiness::PausedPrepared {
+                assert!(!snapshot.playback_started);
+            }
+            snapshot.pause = None;
+            for drained in [false, true, false] {
+                check_startup_readiness(
+                    &mut snapshot,
+                    drained,
+                    &StopFlag::new(),
+                    &mut started,
+                    None,
+                    accepted + Duration::from_secs(60),
+                )
+                .unwrap();
+                assert_eq!(started, None);
+            }
+            assert!(snapshot.readiness.is_none());
+        }
+    }
+
+    #[test]
+    fn first_readiness_at_or_after_deadline_cannot_disarm_expired_budget() {
+        let accepted = Instant::now();
+        for elapsed in [
+            OPEN_READINESS_DEADLINE,
+            OPEN_READINESS_DEADLINE + Duration::from_nanos(1),
+        ] {
+            for readiness in [OpenReadiness::Live, OpenReadiness::PausedPrepared] {
+                let mut snapshot = live_snapshot();
+                snapshot.readiness = Some(readiness);
+                let mut started = Some(accepted);
+                let error = check_startup_readiness(
+                    &mut snapshot,
+                    true,
+                    &StopFlag::new(),
+                    &mut started,
+                    None,
+                    accepted + elapsed,
+                )
+                .unwrap_err();
+                assert_eq!(error.code, "startup_readiness_timeout");
+                assert_eq!(started, Some(accepted));
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_and_observed_terminal_keep_priority_over_startup_expiry() {
+        let accepted = Instant::now();
+        for reason in [
+            None,
+            Some(MediaError::new("surface_lost", "surface was lost")),
+        ] {
+            let stop = StopFlag::new();
+            stop.request(reason.clone());
+            let mut snapshot = live_snapshot();
+            let result = check_startup_readiness(
+                &mut snapshot,
+                true,
+                &stop,
+                &mut Some(accepted),
+                None,
+                accepted + OPEN_READINESS_DEADLINE,
+            );
+            assert_eq!(result, reason.map_or(Ok(()), Err));
+            assert!(snapshot.readiness.is_none());
+        }
+        let mut snapshot = live_snapshot();
+        snapshot.stream_ended = Some((0, 0));
+        check_startup_readiness(
+            &mut snapshot,
+            true,
+            &StopFlag::new(),
+            &mut Some(accepted),
+            None,
+            accepted + OPEN_READINESS_DEADLINE,
+        )
+        .unwrap();
+        assert_eq!(snapshot.stream_ended, Some((0, 0)));
+        assert!(snapshot.readiness.is_none());
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_emission_tests {
+    use super::*;
+    use crate::domain::capture::{CaptureMode, CapturedFourCc, FrameRate, FrameSize};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    /// Records exactly the fields an emitter hands to the tracing boundary, so
+    /// a re-introduced private value fails without relying on the sink layer.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+
+    struct Recorded<'a>(&'a mut Vec<(String, String)>);
+    impl Visit for Recorded<'_> {
+        fn record_debug(&mut self, field: &Field, _: &dyn std::fmt::Debug) {
+            self.0.push((
+                field.name().to_string(),
+                format!("<debug:{}>", field.name()),
+            ));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_f64(&mut self, field: &Field, value: f64) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+    }
+    impl<S: tracing::Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            let mut fields = Vec::new();
+            event.record(&mut Recorded(&mut fields));
+            self.0.lock().extend(fields);
+        }
+    }
+
+    #[test]
+    fn capture_emissions_publish_only_bounded_scalars_never_the_device_node() {
+        let mode = CaptureMode {
+            captured_fourcc: CapturedFourCc::from_bytes(*b"NV12"),
+            size: FrameSize::new(2560, 1440).unwrap(),
+            rate: FrameRate::new(60, 1).unwrap(),
+        };
+        let catalog = crate::capture::linux::session_fixture(&["/dev/video7"], mode);
+        let selection =
+            CaptureSelection::from_snapshot(&catalog, std::path::Path::new("/dev/video7"), mode)
+                .unwrap();
+        let input = selection.validate_snapshot(&catalog).unwrap();
+        let requested = input.requested().clone();
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            log_capture_requested(Generation::new(4).unwrap(), &requested);
+        });
+        let fields = capture.0.lock().clone();
+        // The exact device node and any raw Debug/Display value must never cross
+        // the emitter boundary; only bounded scalars remain.
+        assert!(fields.iter().all(|(_, value)| !value.contains("/dev/")));
+        assert!(
+            fields
+                .iter()
+                .all(|(_, value)| !value.starts_with("<debug:"))
+        );
+        assert!(fields.iter().all(|(name, _)| !matches!(
+            name.as_str(),
+            "node" | "path" | "requested" | "serial" | "topology"
+        )));
+        assert!(
+            fields
+                .iter()
+                .any(|(name, value)| name == "event_code" && value == "capture_requested")
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|(name, value)| name == "width" && value == "2560")
+        );
+        assert!(fields.iter().any(|(name, _)| name == "fourcc"));
+        assert!(fields.iter().any(|(name, _)| name == "generation"));
     }
 }

@@ -1192,6 +1192,18 @@ impl Model {
     pub(super) fn complete_mode_fixture(&mut self, reply: ModeReply) {
         self.mode_reply = Some(reply);
     }
+    /// Keep real mode-admission/slot semantics without starting discovery or I/O.
+    #[cfg(test)]
+    pub(super) fn hold_mode_requests_fixture(&mut self) {
+        assert!(self.worker.is_none());
+        self.worker = Some(Worker {
+            shared: Arc::new(Shared {
+                slots: Mutex::new(Slots::default()),
+                ready: Condvar::new(),
+            }),
+            handle: None,
+        });
+    }
 }
 fn rational(value: FrameInterval) -> Rational {
     Rational {

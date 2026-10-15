@@ -1,8 +1,8 @@
 //! Responsibility: Strict versioned DTOs, validated conversion, atomic document codecs.
 //! Allowed dependencies: domain and settings value types, serde serialization only.
 //!
-//! Version 1 migrates in memory through the same validated settings payload;
-//! version 2 is the only write format. Neither decoder accepts partial recovery.
+//! Versions 1 and 2 migrate only in memory; version 3 is the only write format.
+//! Every decoder rejects partial recovery.
 
 use std::fmt;
 use std::num::NonZeroU8;
@@ -19,13 +19,12 @@ use crate::domain::capture::{
     CapturedFourCc, DeviceIdentity, FrameRate, FrameSize, InputFormatPolicy, PlaybackGain,
     UsbTopology, VideoRequest,
 };
-use crate::domain::filters::FilterChain;
 use crate::domain::output::{PersistentOutputChoice, SinkIdentity};
 use crate::domain::render::RendererSettings;
 use crate::domain::state::DraftSettings;
 
-/// On-disk schema version written by this module; v1 is also read.
-pub(crate) const SCHEMA_VERSION: u64 = 2;
+/// On-disk write format; legacy versions 1 and 2 remain readable.
+pub(crate) const SCHEMA_VERSION: u64 = 3;
 
 /// Value-level rejection of a structurally valid document, on decode or on
 /// encode before any bytes are written.
@@ -153,22 +152,41 @@ macro_rules! object_dto {
 
 #[derive(Debug)]
 struct DocumentV1 {
-    applied: Option<AppliedV1>,
+    applied: Option<Applied<1>>,
     preferences: PreferencesV1,
 }
 
+/// The collection shape is shared, but its version controls the settings
+/// reader: only versions 1 and 2 may consume the retired member.
 #[derive(Debug)]
-struct DocumentV2 {
-    profiles: Vec<ProfileV2>,
+struct ProfileDocument<const VERSION: u64> {
+    profiles: Vec<Profile<VERSION>>,
     last_source: Option<DeviceIdentityV1>,
     preferences: PreferencesV1,
 }
 
-object_dto! {
-    #[derive(Debug)]
-    struct ProfileV2 {
-        binding: BindingV2,
-        settings: AppliedV1,
+#[derive(Debug)]
+struct Profile<const VERSION: u64> {
+    binding: BindingV2,
+    settings: Applied<VERSION>,
+}
+
+impl<'de, const VERSION: u64> Deserialize<'de> for Profile<VERSION> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields<const VERSION: u64> {
+            binding: BindingV2,
+            settings: Applied<VERSION>,
+        }
+        let fields: Fields<VERSION> = deserialize_object(deserializer)?;
+        Ok(Self {
+            binding: fields.binding,
+            settings: fields.settings,
+        })
     }
 }
 
@@ -179,19 +197,15 @@ enum BindingV2 {
     Topology,
 }
 
-/// The applied section. `video` and `audio` stay mandatory; `filters` and
-/// `renderer` are absent-by-default for backward compatibility with documents
-/// written before those settings existed. A present `filters`/`renderer` is
-/// decoded straight into the validated domain value (never through an
-/// intermediate `Value`), so an explicit `null` is a schema violation rather
-/// than the default. The custom deserializer below replaces the `object_dto!`
-/// derive for exactly that reason.
+/// Only legacy readers recognize `filters`; its presence is carried separately
+/// and its value is skipped without retaining an obsolete domain model.
+/// Renderer remains absent-by-default, while explicit null is always refused.
 #[derive(Debug)]
-struct AppliedV1 {
+struct Applied<const VERSION: u64> {
     video: VideoV1,
     audio: AudioV1,
-    filters: FilterChain,
     renderer: RendererSettings,
+    retired_filters_present: bool,
 }
 
 /// The applied video request. `identity` and `mode` stay mandatory; the optional
@@ -284,6 +298,7 @@ struct PreferencesV1 {
     /// An explicit `null` is a schema violation, not `Auto`.
     output: Option<OutputV1>,
     stats_hidden: bool,
+    logging_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -305,8 +320,10 @@ object_dto! {
 // ---------------------------------------------------------------------------
 
 const DOCUMENT_V1_FIELDS: &[&str] = &["schema_version", "applied", "preferences"];
-const DOCUMENT_V2_FIELDS: &[&str] = &["schema_version", "profiles", "last_source", "preferences"];
-const APPLIED_FIELDS: &[&str] = &["video", "audio", "filters", "renderer"];
+const PROFILE_DOCUMENT_FIELDS: &[&str] =
+    &["schema_version", "profiles", "last_source", "preferences"];
+const APPLIED_FIELDS: &[&str] = &["video", "audio", "renderer"];
+const LEGACY_APPLIED_FIELDS: &[&str] = &["video", "audio", "renderer", "filters"];
 const IDENTITY_FIELDS: &[&str] = &["vendor_id", "product_id", "topology", "serial"];
 const VIDEO_FIELDS: &[&str] = &["identity", "mode", "format_policy"];
 const AUDIO_FIELDS: &[&str] = &["kind", "source", "retained"];
@@ -316,32 +333,26 @@ const PREFS_FIELDS: &[&str] = &[
     "fullscreen",
     "output",
     "stats_hidden",
+    "logging_enabled",
 ];
 const OUTPUT_FIELDS: &[&str] = &["kind", "sink"];
 
-impl<'de> Deserialize<'de> for AppliedV1 {
+impl<'de, const VERSION: u64> Deserialize<'de> for Applied<VERSION> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Not the `object_dto!` derive: `filters` is absent-by-default for
-        // backward compatibility, which a fully strict field set cannot
-        // express. A present `filters` decodes straight into the validated
-        // `FilterChain` (never through `serde_json::Value`, which would
-        // collapse duplicate object keys); an explicit `null` is refused.
-        deserializer.deserialize_struct("AppliedV1", APPLIED_FIELDS, AppliedVisitor)
+        deserializer.deserialize_map(AppliedVisitor::<VERSION>)
     }
 }
 
-struct AppliedVisitor;
+struct AppliedVisitor<const VERSION: u64>;
 
-impl<'de> Visitor<'de> for AppliedVisitor {
-    type Value = AppliedV1;
+impl<'de, const VERSION: u64> Visitor<'de> for AppliedVisitor<VERSION> {
+    type Value = Applied<VERSION>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(
-            "an applied settings object with video, audio and optional filters and renderer",
-        )
+        formatter.write_str("an applied settings object with video, audio and optional renderer")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -350,8 +361,8 @@ impl<'de> Visitor<'de> for AppliedVisitor {
     {
         let mut video: Option<VideoV1> = None;
         let mut audio: Option<AudioV1> = None;
-        let mut filters: Option<FilterChain> = None;
         let mut renderer: Option<RendererSettings> = None;
+        let mut retired_filters_present = false;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -367,33 +378,35 @@ impl<'de> Visitor<'de> for AppliedVisitor {
                     }
                     audio = Some(map.next_value()?);
                 }
-                "filters" => {
-                    if filters.is_some() {
-                        return Err(de::Error::duplicate_field("filters"));
-                    }
-                    // Present field decodes the validated chain directly. An
-                    // explicit null is refused here (map-only), so only the
-                    // absent key defaults to the empty chain.
-                    filters = Some(map.next_value::<FilterChain>()?);
-                }
                 "renderer" => {
                     if renderer.is_some() {
                         return Err(de::Error::duplicate_field("renderer"));
                     }
-                    // Present field decodes the validated renderer directly;
-                    // an explicit null is refused (map-only), so only the
-                    // absent key defaults to the baseline.
                     renderer = Some(map.next_value::<RendererSettings>()?);
                 }
-                other => return Err(de::Error::unknown_field(other, APPLIED_FIELDS)),
+                "filters" if VERSION == 1 || VERSION == 2 => {
+                    if retired_filters_present {
+                        return Err(de::Error::duplicate_field("filters"));
+                    }
+                    map.next_value::<IgnoredAny>()?;
+                    retired_filters_present = true;
+                }
+                other => {
+                    let fields = if VERSION == 1 || VERSION == 2 {
+                        LEGACY_APPLIED_FIELDS
+                    } else {
+                        APPLIED_FIELDS
+                    };
+                    return Err(de::Error::unknown_field(other, fields));
+                }
             }
         }
 
-        Ok(AppliedV1 {
+        Ok(Applied {
             video: video.ok_or_else(|| de::Error::missing_field("video"))?,
             audio: audio.ok_or_else(|| de::Error::missing_field("audio"))?,
-            filters: filters.unwrap_or_default(),
             renderer: renderer.unwrap_or_default(),
+            retired_filters_present,
         })
     }
 }
@@ -417,7 +430,7 @@ impl<'de> Visitor<'de> for PreferencesVisitor {
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(
-            "a preferences object with volume_percent, muted, fullscreen and optional output and stats_hidden",
+            "a preferences object with volume_percent, muted, fullscreen and optional output, stats_hidden and logging_enabled",
         )
     }
 
@@ -430,6 +443,7 @@ impl<'de> Visitor<'de> for PreferencesVisitor {
         let mut fullscreen: Option<bool> = None;
         let mut output: Option<Option<OutputV1>> = None;
         let mut stats_hidden: Option<bool> = None;
+        let mut logging_enabled: Option<bool> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -466,6 +480,12 @@ impl<'de> Visitor<'de> for PreferencesVisitor {
                     }
                     stats_hidden = Some(map.next_value::<bool>()?);
                 }
+                "logging_enabled" => {
+                    if logging_enabled.is_some() {
+                        return Err(de::Error::duplicate_field("logging_enabled"));
+                    }
+                    logging_enabled = Some(map.next_value::<bool>()?);
+                }
                 other => return Err(de::Error::unknown_field(other, PREFS_FIELDS)),
             }
         }
@@ -477,6 +497,7 @@ impl<'de> Visitor<'de> for PreferencesVisitor {
             fullscreen: fullscreen.ok_or_else(|| de::Error::missing_field("fullscreen"))?,
             output: output.flatten(),
             stats_hidden: stats_hidden.unwrap_or(false),
+            logging_enabled: logging_enabled.unwrap_or(false),
         })
     }
 }
@@ -664,7 +685,7 @@ impl<'de> Visitor<'de> for DocumentVisitor {
         A: MapAccess<'de>,
     {
         let mut schema_version: Option<u64> = None;
-        let mut applied: Option<Option<AppliedV1>> = None;
+        let mut applied: Option<Option<Applied<1>>> = None;
         let mut preferences: Option<PreferencesV1> = None;
 
         while let Some(key) = map.next_key::<String>()? {
@@ -714,22 +735,29 @@ impl<'de> Visitor<'de> for DocumentVisitor {
     }
 }
 
-impl<'de> Deserialize<'de> for DocumentV2 {
+impl<'de, const VERSION: u64> Deserialize<'de> for ProfileDocument<VERSION> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_struct("DocumentV2", DOCUMENT_V2_FIELDS, DocumentV2Visitor)
+        deserializer.deserialize_struct(
+            "ProfileDocument",
+            PROFILE_DOCUMENT_FIELDS,
+            ProfileDocumentVisitor::<VERSION>,
+        )
     }
 }
 
-struct DocumentV2Visitor;
+struct ProfileDocumentVisitor<const VERSION: u64>;
 
-impl<'de> Visitor<'de> for DocumentV2Visitor {
-    type Value = DocumentV2;
+impl<'de, const VERSION: u64> Visitor<'de> for ProfileDocumentVisitor<VERSION> {
+    type Value = ProfileDocument<VERSION>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a version 2 source profile document object")
+        write!(
+            formatter,
+            "a version {VERSION} source profile document object"
+        )
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -737,7 +765,7 @@ impl<'de> Visitor<'de> for DocumentV2Visitor {
         A: MapAccess<'de>,
     {
         let mut schema_version: Option<u64> = None;
-        let mut profiles: Option<Vec<ProfileV2>> = None;
+        let mut profiles: Option<Vec<Profile<VERSION>>> = None;
         let mut last_source: Option<Option<DeviceIdentityV1>> = None;
         let mut preferences: Option<PreferencesV1> = None;
         while let Some(key) = map.next_key::<String>()? {
@@ -766,17 +794,16 @@ impl<'de> Visitor<'de> for DocumentV2Visitor {
                     }
                     preferences = Some(map.next_value()?);
                 }
-                other => return Err(de::Error::unknown_field(other, DOCUMENT_V2_FIELDS)),
+                other => return Err(de::Error::unknown_field(other, PROFILE_DOCUMENT_FIELDS)),
             }
         }
         let version = schema_version.ok_or_else(|| de::Error::missing_field("schema_version"))?;
-        if version != SCHEMA_VERSION {
-            return Err(de::Error::invalid_value(
-                de::Unexpected::Unsigned(version),
-                &"schema_version 2",
-            ));
+        if version != VERSION {
+            return Err(de::Error::custom(format_args!(
+                "expected schema_version {VERSION}, got {version}"
+            )));
         }
-        Ok(DocumentV2 {
+        Ok(ProfileDocument {
             profiles: profiles.ok_or_else(|| de::Error::missing_field("profiles"))?,
             last_source: last_source.ok_or_else(|| de::Error::missing_field("last_source"))?,
             preferences: preferences.ok_or_else(|| de::Error::missing_field("preferences"))?,
@@ -940,7 +967,7 @@ impl<'de> Visitor<'de> for AudioVisitor {
 /// 1. syntax only (JSON well-formedness);
 /// 2. version discriminator, tolerant of unknown keys;
 /// 3. strict version-specific shape, then validated domain conversion.
-pub(crate) fn decode(bytes: &[u8]) -> Result<StoredDocument, SchemaError> {
+pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedDocument, SchemaError> {
     serde_json::from_slice::<IgnoredAny>(bytes).map_err(SchemaError::MalformedJson)?;
 
     let probe = serde_json::from_slice::<VersionProbe>(bytes).map_err(SchemaError::Schema)?;
@@ -948,15 +975,37 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<StoredDocument, SchemaError> {
         1 => {
             let document =
                 serde_json::from_slice::<DocumentV1>(bytes).map_err(SchemaError::Schema)?;
-            stored_from_v1(document).map_err(SchemaError::InvalidValue)
+            let retired_filters_present = document
+                .applied
+                .as_ref()
+                .is_some_and(|applied| applied.retired_filters_present);
+            Ok(DecodedDocument {
+                document: stored_from_v1(document)?,
+                retired_filters_present,
+            })
         }
-        SCHEMA_VERSION => {
-            let document =
-                serde_json::from_slice::<DocumentV2>(bytes).map_err(SchemaError::Schema)?;
-            stored_from_v2(document).map_err(SchemaError::InvalidValue)
-        }
+        2 => decode_profiles::<2>(bytes),
+        3 => decode_profiles::<3>(bytes),
         version => Err(SchemaError::UnsupportedVersion(version)),
     }
+}
+
+pub(crate) struct DecodedDocument {
+    pub document: StoredDocument,
+    pub retired_filters_present: bool,
+}
+
+fn decode_profiles<const VERSION: u64>(bytes: &[u8]) -> Result<DecodedDocument, SchemaError> {
+    let document =
+        serde_json::from_slice::<ProfileDocument<VERSION>>(bytes).map_err(SchemaError::Schema)?;
+    let retired_filters_present = document
+        .profiles
+        .iter()
+        .any(|profile| profile.settings.retired_filters_present);
+    Ok(DecodedDocument {
+        document: stored_from_profiles(document)?,
+        retired_filters_present,
+    })
 }
 
 fn stored_from_v1(document: DocumentV1) -> Result<StoredDocument, SettingsValidationError> {
@@ -983,7 +1032,9 @@ fn stored_from_v1(document: DocumentV1) -> Result<StoredDocument, SettingsValida
     })
 }
 
-fn stored_from_v2(document: DocumentV2) -> Result<StoredDocument, SettingsValidationError> {
+fn stored_from_profiles<const VERSION: u64>(
+    document: ProfileDocument<VERSION>,
+) -> Result<StoredDocument, SettingsValidationError> {
     let entries = document
         .profiles
         .into_iter()
@@ -1056,6 +1107,8 @@ struct PreferencesWrite<'a> {
     output: Option<OutputWrite<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stats_hidden: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logging_enabled: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1075,9 +1128,6 @@ struct SinkWrite<'a> {
 struct AppliedWrite<'a> {
     video: VideoWrite<'a>,
     audio: AudioWrite<'a>,
-    /// Borrowed, validated chain; a nonempty all-disabled chain is preserved.
-    #[serde(skip_serializing_if = "chain_is_empty")]
-    filters: &'a FilterChain,
     /// Borrowed, validated renderer; every non-baseline value is written in full.
     #[serde(skip_serializing_if = "renderer_is_baseline")]
     renderer: &'a RendererSettings,
@@ -1144,12 +1194,6 @@ where
     sequence.end()
 }
 
-/// `skip_serializing_if` predicate for the applied filter section: only a chain
-/// with no entries is omitted.
-fn chain_is_empty(chain: &FilterChain) -> bool {
-    chain.entries().is_empty()
-}
-
 /// `skip_serializing_if` predicate for the applied renderer section: only the
 /// exact behaviour-preserving baseline is omitted.
 fn renderer_is_baseline(renderer: &RendererSettings) -> bool {
@@ -1203,14 +1247,14 @@ fn applied_to_dto(applied: &DraftSettings) -> AppliedWrite<'_> {
     AppliedWrite {
         video: video_to_dto(&applied.video),
         audio: audio_to_dto(&applied.audio),
-        filters: &applied.filters,
         renderer: &applied.renderer,
     }
 }
 
-fn applied_from_dto(applied: AppliedV1) -> Result<DraftSettings, SettingsValidationError> {
+fn applied_from_dto<const VERSION: u64>(
+    applied: Applied<VERSION>,
+) -> Result<DraftSettings, SettingsValidationError> {
     Ok(DraftSettings {
-        filters: applied.filters,
         video: video_from_dto(applied.video)?,
         audio: audio_from_dto(applied.audio)?,
         renderer: applied.renderer,
@@ -1371,6 +1415,7 @@ fn preferences_to_dto(
         fullscreen: preferences.fullscreen,
         output,
         stats_hidden: preferences.stats_hidden.then_some(true),
+        logging_enabled: preferences.logging_enabled.then_some(true),
     })
 }
 
@@ -1393,5 +1438,6 @@ fn preferences_from_dto(
         fullscreen: preferences.fullscreen,
         output,
         stats_hidden: preferences.stats_hidden,
+        logging_enabled: preferences.logging_enabled,
     })
 }

@@ -190,19 +190,35 @@ def retained_direct_objects(linker_map, app_lock, apt_closure):
             known[path] = (object_sha, package)
 
     matched = {}
+    in_sections = False
+    pending_section = None
     for line in linker_map.splitlines():
-        # Archive members (including libgcc.a(foo.o)) are not direct .o inputs.
-        match = re.search(r"\s(/[^():\s]+\.o):\(([^)]*)\)", line)
-        if not match:
+        if line == "Linker script and memory map":
+            in_sections = True
             continue
-        map_path, section = match.groups()
+        if line == "Cross Reference Table":
+            break
+        if not in_sections:
+            continue  # In particular, never count discarded input sections.
+        # GNU BFD wraps long input-section names onto the preceding line.
+        section_only = re.fullmatch(r"\s+(\.\S+)\s*", line)
+        if section_only:
+            pending_section = section_only[1]
+            continue
+        match = re.fullmatch(
+            r"\s+(?:(\.\S+)\s+)?0x[0-9a-fA-F]+\s+"
+            r"0x([0-9a-fA-F]+)\s+(/[^()\s]+\.o)\s*", line)
+        section = (match[1] or pending_section) if match else None
+        pending_section = None
+        # LOAD lines and archive members (libgcc.a(foo.o)) are not sections.
+        if not match or section is None:
+            continue
+        size, map_path = int(match[2], 16), match[3]
         if map_path.startswith("/build/target/"):
             continue  # Furami/CXX-Qt output, not distribution CRT.
         path = posixpath.normpath(map_path)
         if path not in known:
             raise ValueError(f"unattributed linker object {map_path}")
-        parts = line.split()
-        size = int(parts[2], 16)
         if path not in matched:
             object_sha, package = known[path]
             matched[path] = {"path": path, "map_path": map_path, "sha256": object_sha,

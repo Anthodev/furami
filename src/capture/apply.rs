@@ -23,7 +23,7 @@ use crate::{
             RecoveryWatchTarget, SelectedRouteAuthorization, VideoPresence, WatchStamp,
         },
         failure::{ApplyFailure, Cause, FailureCategory, Stage, ValidationLayer},
-        state::{DraftSettings, ValidationKey, ValidationRequest},
+        state::{AttemptPurpose, DraftSettings, ValidationKey, ValidationRequest},
     },
 };
 
@@ -719,24 +719,34 @@ impl CaptureValidator {
                             });
                             // Exact prevalidation-pass evidence lives with the
                             // capture adapter; runtime only consumes the port.
-                            let payload = match &outcome.2 {
-                                ValidationOutcome::Prepared(_) => serde_json::json!({
-                                    "request": outcome.0, "stamp": outcome.1,
-                                    "status": "Validated", "failure": null,
-                                }),
-                                ValidationOutcome::SelectionRequired(candidates) => serde_json::json!({
-                                    "request": outcome.0, "stamp": outcome.1,
-                                    "status": "SelectionRequired", "candidates": candidates,
-                                }),
-                                ValidationOutcome::Failed(failure) => serde_json::json!({
-                                    "request": outcome.0, "stamp": outcome.1,
-                                    "status": "Failed", "failure": failure,
-                                }),
-                            };
-                            tracing::info!(
-                                apply_validation = %payload,
-                                "apply_validation"
-                            );
+                            // Diagnostics publish only bounded scalar projections.
+                            let key = &outcome.0.key;
+                            let revision = outcome.0.revision.get();
+                            match &outcome.2 {
+                                ValidationOutcome::Prepared(_) => tracing::info!(
+                                    event_code = "apply_validation",
+                                    apply_id = key.apply.get(),
+                                    purpose = purpose_token(key.purpose),
+                                    draft_revision = revision,
+                                    status = "Validated",
+                                ),
+                                ValidationOutcome::SelectionRequired(_) => tracing::info!(
+                                    event_code = "apply_validation",
+                                    apply_id = key.apply.get(),
+                                    purpose = purpose_token(key.purpose),
+                                    draft_revision = revision,
+                                    status = "SelectionRequired",
+                                ),
+                                ValidationOutcome::Failed(failure) => tracing::info!(
+                                    event_code = "apply_validation",
+                                    apply_id = key.apply.get(),
+                                    purpose = purpose_token(key.purpose),
+                                    draft_revision = revision,
+                                    status = "Failed",
+                                    stage = stage_token(failure.stage),
+                                    cause = cause_token(failure.cause),
+                                ),
+                            }
                             if outcome_tx.send(outcome).is_err() {
                                 break;
                             }
@@ -930,6 +940,39 @@ impl Drop for CaptureValidator {
     }
 }
 
+/// Finite diagnostic token vocabularies. Only these fixed identifiers reach
+/// the bounded logging layer, never raw settings, paths or error prose.
+fn purpose_token(purpose: AttemptPurpose) -> &'static str {
+    match purpose {
+        AttemptPurpose::Candidate => "Candidate",
+        AttemptPurpose::Restore => "Restore",
+        AttemptPurpose::Reconnect => "Reconnect",
+        AttemptPurpose::Resume => "Resume",
+        AttemptPurpose::Recovery => "Recovery",
+    }
+}
+
+fn stage_token(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Prevalidation => "Prevalidation",
+        Stage::InputConstruction => "InputConstruction",
+        Stage::Open => "Open",
+        Stage::Negotiation => "Negotiation",
+        Stage::StreamStart => "StreamStart",
+        Stage::Verification => "Verification",
+        Stage::Unknown => "Unknown",
+    }
+}
+
+fn cause_token(cause: Cause) -> &'static str {
+    match cause {
+        Cause::RequestedModeRefused => "RequestedModeRefused",
+        Cause::Busy => "Busy",
+        Cause::Permission => "Permission",
+        Cause::Generic => "Generic",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,7 +1007,6 @@ mod tests {
         audio: AudioSelection,
     ) -> DraftSettings {
         DraftSettings {
-            filters: crate::domain::filters::FilterChain::default(),
             video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                 identity: video_identity,
                 mode,
