@@ -146,6 +146,10 @@ public:
     Q_INVOKABLE void setFilterEnabled(const QString &selectionRevision, const QString &entryKey, bool enabled);
     Q_INVOKABLE void addFilter(const QString &selectionRevision, const QString &kind);
     Q_INVOKABLE void removeFilter(const QString &selectionRevision, const QString &entryKey);
+    Q_INVOKABLE void setFilterNumber(const QString &revision, const QString &entry, const QString &parameter, double value);
+    Q_INVOKABLE void setFilterChoice(const QString &revision, const QString &entry, const QString &parameter, const QString &value);
+    Q_INVOKABLE void moveFilter(const QString &revision, const QString &entry, const QString &direction);
+    Q_INVOKABLE void clearFilters(const QString &revision);
     Q_INVOKABLE void setScale(const QString &selectionRevision, const QString &kernel);
     Q_INVOKABLE void setCscale(const QString &selectionRevision, const QString &kernel);
     Q_INVOKABLE void setDscale(const QString &selectionRevision, const QString &kernel);

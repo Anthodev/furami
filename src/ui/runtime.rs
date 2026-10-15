@@ -1013,6 +1013,223 @@ impl RuntimeCoordinator {
             Ok(())
         })
     }
+
+    fn filter_entry_index(
+        revision: &str,
+        entry: &str,
+        len: usize,
+    ) -> Result<usize, (&'static str, String)> {
+        let index = entry
+            .strip_prefix("filter:")
+            .and_then(|key| key.split_once(':'))
+            .filter(|(entry_revision, _)| *entry_revision == revision)
+            .and_then(|(_, index)| capture_catalog::decimal(index))
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                (
+                    "stale_selection",
+                    "L'entrée de filtre ne correspond plus à cette sélection.".into(),
+                )
+            })?;
+        if index >= len {
+            return Err((
+                "filter_error",
+                crate::domain::filters::FilterValidationError::InvalidIndex { index, len }
+                    .to_string(),
+            ));
+        }
+        Ok(index)
+    }
+
+    pub(crate) fn set_filter_number(
+        &mut self,
+        revision: &str,
+        entry: &str,
+        parameter: &str,
+        value: f64,
+    ) -> UiUpdate {
+        use crate::domain::filters::{
+            EqParams, EqValues, Filter, Hqdn3dParams, Hqdn3dValues, UnsharpParams, UnsharpValues,
+        };
+        self.edit_ui(revision, "setFilterNumber", "filters", |draft, _| {
+            let index = Self::filter_entry_index(revision, entry, draft.filters.entries().len())?;
+            let unknown = || (
+                "invalid_value",
+                "Ce paramètre numérique n'appartient pas au filtre sélectionné.".into(),
+            );
+            let invalid = |error: crate::domain::filters::FilterValidationError| {
+                ("filter_error", error.to_string())
+            };
+            let filter = match draft.filters.entries()[index].filter() {
+                Filter::Eq(current) => {
+                    let mut values = EqValues {
+                        contrast: current.contrast(),
+                        brightness: current.brightness(),
+                        saturation: current.saturation(),
+                        gamma: current.gamma(),
+                        gamma_r: current.gamma_r(),
+                        gamma_g: current.gamma_g(),
+                        gamma_b: current.gamma_b(),
+                        gamma_weight: current.gamma_weight(),
+                    };
+                    match parameter {
+                        "contrast" => values.contrast = value,
+                        "brightness" => values.brightness = value,
+                        "saturation" => values.saturation = value,
+                        "gamma" => values.gamma = value,
+                        "gamma_r" => values.gamma_r = value,
+                        "gamma_g" => values.gamma_g = value,
+                        "gamma_b" => values.gamma_b = value,
+                        "gamma_weight" => values.gamma_weight = value,
+                        _ => return Err(unknown()),
+                    }
+                    Filter::Eq(EqParams::new(values).map_err(invalid)?)
+                }
+                Filter::Unsharp(current) => {
+                    let mut values = UnsharpValues {
+                        luma_msize_x: u32::from(current.luma_msize_x()),
+                        luma_msize_y: u32::from(current.luma_msize_y()),
+                        luma_amount: current.luma_amount(),
+                        chroma_msize_x: u32::from(current.chroma_msize_x()),
+                        chroma_msize_y: u32::from(current.chroma_msize_y()),
+                        chroma_amount: current.chroma_amount(),
+                        alpha_msize_x: u32::from(current.alpha_msize_x()),
+                        alpha_msize_y: u32::from(current.alpha_msize_y()),
+                        alpha_amount: current.alpha_amount(),
+                    };
+                    // Constructor inputs are u32, even though validated dimensions
+                    // are stored as u8. Reject before casting: never truncate a
+                    // fraction, saturate overflow, or wrap a negative number.
+                    let dimension = || -> Result<u32, (&'static str, String)> {
+                        if !value.is_finite()
+                            || value.fract() != 0.0
+                            || !(0.0..=f64::from(u32::MAX)).contains(&value)
+                        {
+                            return Err((
+                                "invalid_value",
+                                "Une dimension de matrice doit être un entier impair de 3 à 23 taps.".into(),
+                            ));
+                        }
+                        Ok(value as u32)
+                    };
+                    match parameter {
+                        "luma_msize_x" => values.luma_msize_x = dimension()?,
+                        "luma_msize_y" => values.luma_msize_y = dimension()?,
+                        "luma_amount" => values.luma_amount = value,
+                        "chroma_msize_x" => values.chroma_msize_x = dimension()?,
+                        "chroma_msize_y" => values.chroma_msize_y = dimension()?,
+                        "chroma_amount" => values.chroma_amount = value,
+                        "alpha_msize_x" => values.alpha_msize_x = dimension()?,
+                        "alpha_msize_y" => values.alpha_msize_y = dimension()?,
+                        "alpha_amount" => values.alpha_amount = value,
+                        _ => return Err(unknown()),
+                    }
+                    Filter::Unsharp(UnsharpParams::new(values).map_err(invalid)?)
+                }
+                Filter::Hqdn3d(current) => {
+                    let mut values = Hqdn3dValues {
+                        luma_spatial: current.luma_spatial(),
+                        chroma_spatial: current.chroma_spatial(),
+                        luma_tmp: current.luma_tmp(),
+                        chroma_tmp: current.chroma_tmp(),
+                    };
+                    match parameter {
+                        "luma_spatial" => values.luma_spatial = value,
+                        "chroma_spatial" => values.chroma_spatial = value,
+                        "luma_tmp" => values.luma_tmp = value,
+                        "chroma_tmp" => values.chroma_tmp = value,
+                        _ => return Err(unknown()),
+                    }
+                    Filter::Hqdn3d(Hqdn3dParams::new(values).map_err(invalid)?)
+                }
+                _ => return Err(unknown()),
+            };
+            draft.filters.set_filter(index, filter).map_err(invalid)
+        })
+    }
+
+    pub(crate) fn set_filter_choice(
+        &mut self,
+        revision: &str,
+        entry: &str,
+        parameter: &str,
+        value: &str,
+    ) -> UiUpdate {
+        use crate::domain::filters::{
+            BwdifMode, BwdifParams, ColorLevels, DeinterlaceSelection, FieldParity, Filter,
+            FormatParams, SdrGamma, SdrMatrix,
+        };
+        self.edit_ui(revision, "setFilterChoice", "filters", |draft, _| {
+            let index = Self::filter_entry_index(revision, entry, draft.filters.entries().len())?;
+            let unknown = || {
+                (
+                    "invalid_value",
+                    "Paramètre de choix ou valeur inconnu pour le filtre sélectionné.".into(),
+                )
+            };
+            let filter = match (draft.filters.entries()[index].filter(), parameter) {
+                (Filter::Format(current), "matrix") => Filter::Format(FormatParams::new(
+                    SdrMatrix::from_token(value).ok_or_else(unknown)?,
+                    current.levels(),
+                    current.gamma(),
+                )),
+                (Filter::Format(current), "levels") => Filter::Format(FormatParams::new(
+                    current.matrix(),
+                    ColorLevels::from_token(value).ok_or_else(unknown)?,
+                    current.gamma(),
+                )),
+                (Filter::Format(current), "gamma") => Filter::Format(FormatParams::new(
+                    current.matrix(),
+                    current.levels(),
+                    SdrGamma::from_token(value).ok_or_else(unknown)?,
+                )),
+                (Filter::Bwdif(current), "mode") => Filter::Bwdif(BwdifParams::new(
+                    BwdifMode::from_token(value).ok_or_else(unknown)?,
+                    current.parity(),
+                    current.deint(),
+                )),
+                (Filter::Bwdif(current), "parity") => Filter::Bwdif(BwdifParams::new(
+                    current.mode(),
+                    FieldParity::from_token(value).ok_or_else(unknown)?,
+                    current.deint(),
+                )),
+                (Filter::Bwdif(current), "deint") => Filter::Bwdif(BwdifParams::new(
+                    current.mode(),
+                    current.parity(),
+                    DeinterlaceSelection::from_token(value).ok_or_else(unknown)?,
+                )),
+                _ => return Err(unknown()),
+            };
+            draft
+                .filters
+                .set_filter(index, filter)
+                .map_err(|error| ("filter_error", error.to_string()))
+        })
+    }
+
+    pub(crate) fn move_filter(&mut self, revision: &str, entry: &str, direction: &str) -> UiUpdate {
+        self.edit_ui(revision, "moveFilter", "filters", |draft, _| {
+            let len = draft.filters.entries().len();
+            let index = Self::filter_entry_index(revision, entry, len)?;
+            let target = match direction {
+                "up" => index.saturating_sub(1),
+                "down" => (index + 1).min(len - 1),
+                _ => return Err(("invalid_value", "Direction de déplacement inconnue.".into())),
+            };
+            draft
+                .filters
+                .move_entry(index, target)
+                .map_err(|error| ("filter_error", error.to_string()))
+        })
+    }
+
+    pub(crate) fn clear_filters(&mut self, revision: &str) -> UiUpdate {
+        self.edit_ui(revision, "clearFilters", "filters", |draft, _| {
+            draft.filters = FilterChain::default();
+            Ok(())
+        })
+    }
+
     pub(crate) fn add_filter(&mut self, revision: &str, kind: &str) -> UiUpdate {
         let available = self
             .ui
@@ -4753,14 +4970,27 @@ mod tests {
         };
         for restore_fails in [false, true] {
             let store = WritableSettings::new();
-            let (mut runtime, drivers) = runtime();
+            let (mut runtime, drivers) = product_runtime();
             store.bind(&mut runtime);
+            seed_filter_editor(&mut runtime, treatment_chain(false));
             let driver = start_live(&mut runtime, &drivers);
             runtime.set_stats_hidden(true);
             let original = std::fs::read(store.path()).unwrap();
-            let candidate = treatment_chain(false);
-            edit_filters(&mut runtime, &candidate);
-            let (id, key) = begin_live_treatments(&mut runtime, &driver);
+            let revision = runtime.ui.public_revision.to_string();
+            let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[0]
+                .key
+                .clone();
+            runtime.set_filter_choice(&revision, &entry, "matrix", "bt601");
+            let candidate = runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .draft()
+                .settings
+                .filters
+                .clone();
+            let (id, key) = receive_filter_edit(&driver);
             let stale_close = format!(
                 "close ApplyingTreatments {} {} Complete",
                 key.apply.get(),
@@ -4856,6 +5086,16 @@ mod tests {
                     .filters,
                 candidate
             );
+            let public = product_values(&mut runtime);
+            assert_eq!(public["selection"]["filters"], serde_json::json!(candidate));
+            if restore_fails {
+                assert!(public["applied"].is_null());
+            } else {
+                assert_eq!(
+                    public["applied"]["filters"],
+                    serde_json::json!(treatment_chain(false))
+                );
+            }
             assert!(
                 drivers.try_recv().is_err(),
                 "a live restore failure cannot start a second route"
@@ -7052,6 +7292,797 @@ mod tests {
         cleanup(&mut runtime);
         driver.destroyed.recv().unwrap();
     }
+
+    fn filter_editor_chain() -> FilterChain {
+        let mut entries = treatment_chain(false).entries().to_vec();
+        entries.push(FilterEntry::new(
+            "Unsharp dimensions".into(),
+            projection::default_filter(FilterKind::Unsharp),
+            true,
+        ));
+        entries.push(FilterEntry::new(
+            "Interlaced source".into(),
+            projection::default_filter(FilterKind::Bwdif),
+            true,
+        ));
+        entries.push(FilterEntry::new(
+            "Repeated disabled eq".into(),
+            entries[1].filter().clone(),
+            false,
+        ));
+        FilterChain::new(entries).unwrap()
+    }
+
+    fn seed_filter_editor(runtime: &mut RuntimeCoordinator, chain: FilterChain) {
+        let engine = runtime.engine.as_mut().unwrap();
+        let mut settings = engine.model().draft().settings.clone();
+        settings.filters = chain;
+        engine
+            .edit_draft(engine.model().draft().revision, settings)
+            .unwrap();
+        runtime.poll();
+    }
+
+    fn receive_filter_edit(
+        driver: &Driver,
+    ) -> (
+        crate::media::controller::RequestId,
+        crate::domain::state::TreatmentAttemptKey,
+    ) {
+        let (id, command) = driver
+            .submitted
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
+            panic!("filter editor must submit a real whole-chain treatment command: {command:?}");
+        };
+        (id, key)
+    }
+
+    fn confirm_filter_edit(runtime: &mut RuntimeCoordinator, driver: &Driver) {
+        let (id, key) = receive_filter_edit(driver);
+        let model = runtime.engine.as_ref().unwrap().model();
+        let renderer = model.draft().settings.renderer.clone();
+        let capabilities = crate::media::filter_catalog::fixture_capabilities();
+        let unchanged = crate::media::filter_catalog::compile_chain(
+            &model.draft().settings.filters,
+            &capabilities,
+        )
+        .unwrap()
+            == crate::media::filter_catalog::compile_chain(
+                &model.active().unwrap().applied().settings().filters,
+                &capabilities,
+            )
+            .unwrap();
+        if unchanged {
+            confirm_unchanged_filter_treatments(runtime, driver, id, key, renderer);
+        } else {
+            driver.send(BackendEvent::TreatmentResult {
+                id: id.get(),
+                key,
+                result: Ok(
+                    crate::media::controller::test_support::treatment_confirmation(
+                        key,
+                        InitialPlayback::Live,
+                        renderer,
+                    ),
+                ),
+            });
+            driver.fence();
+        }
+        await_update(runtime, |update| update.product_phase == "Active");
+    }
+
+    #[test]
+    fn filter_parameter_controls_apply_every_domain_boundary_without_touching_siblings() {
+        let (mut runtime, drivers) = product_runtime();
+        seed_filter_editor(&mut runtime, filter_editor_chain());
+        let driver = start_live(&mut runtime, &drivers);
+        // The fixture opens a valid request without a persisted devnode. The
+        // first UI edit resolves the already-selected physical source, just
+        // as normal selection admission does; that is not a filter change.
+        let selected_node = runtime
+            .ui
+            .catalog
+            .source(runtime.ui.selected.as_ref().unwrap())
+            .unwrap()
+            .node
+            .devnode()
+            .to_owned();
+        let fields = runtime.ui.filters.kinds.clone();
+        for kind in fields {
+            let index = runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .draft()
+                .settings
+                .filters
+                .entries()
+                .iter()
+                .position(|entry| entry.kind().as_str() == kind.kind)
+                .unwrap();
+            for field in kind.fields {
+                let values = if field.field_type == "choice" {
+                    field
+                        .choices
+                        .iter()
+                        .map(|choice| serde_json::json!(choice.key))
+                        .collect()
+                } else {
+                    vec![
+                        serde_json::json!(field.min.unwrap()),
+                        serde_json::json!(field.max.unwrap()),
+                    ]
+                };
+                for value in values {
+                    let before = runtime
+                        .engine
+                        .as_ref()
+                        .unwrap()
+                        .model()
+                        .draft()
+                        .settings
+                        .clone();
+                    let mut expected = before.clone();
+                    expected.video.selected_node = Some(selected_node.clone());
+                    let mut filter =
+                        serde_json::to_value(before.filters.entries()[index].filter()).unwrap();
+                    filter["parameters"][field.key] = if field.field_type == "integer" {
+                        serde_json::json!(value.as_f64().unwrap() as u32)
+                    } else {
+                        value.clone()
+                    };
+                    expected
+                        .filters
+                        .set_filter(index, serde_json::from_value(filter).unwrap())
+                        .unwrap();
+                    let revision = runtime.ui.public_revision;
+                    let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[index]
+                        .key
+                        .clone();
+                    if field.field_type == "choice" {
+                        runtime.set_filter_choice(
+                            &revision.to_string(),
+                            &entry,
+                            field.key,
+                            value.as_str().unwrap(),
+                        );
+                    } else {
+                        runtime.set_filter_number(
+                            &revision.to_string(),
+                            &entry,
+                            field.key,
+                            value.as_f64().unwrap(),
+                        );
+                    }
+                    assert!(runtime.ui.error.is_none(), "{}.{}", kind.kind, field.key);
+                    assert_eq!(
+                        runtime.engine.as_ref().unwrap().model().draft().settings,
+                        expected
+                    );
+                    if before != expected {
+                        confirm_filter_edit(&mut runtime, &driver);
+                    } else {
+                        assert_eq!(runtime.ui.public_revision, revision);
+                    }
+                    assert!(
+                        runtime
+                            .engine
+                            .as_ref()
+                            .unwrap()
+                            .model()
+                            .active()
+                            .unwrap()
+                            .applied()
+                            .settings()
+                            .same_request(&expected)
+                    );
+                    assert!(driver.submitted.try_recv().is_err());
+                }
+            }
+        }
+        // Edit the repeated disabled eq, not the first same-kind entry. A
+        // small nonzero value is not rounded to display-oriented precision.
+        let sibling = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .draft()
+            .settings
+            .filters
+            .entries()[1]
+            .clone();
+        let revision = runtime.ui.public_revision.to_string();
+        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[5]
+            .key
+            .clone();
+        runtime.set_filter_number(&revision, &entry, "brightness", 1e-7);
+        confirm_filter_edit(&mut runtime, &driver);
+        let crate::domain::filters::Filter::Eq(eq) = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .active()
+            .unwrap()
+            .applied()
+            .settings()
+            .filters
+            .entries()[5]
+            .filter()
+        else {
+            panic!("disabled eq stays an eq")
+        };
+        assert_eq!(eq.brightness(), 1e-7);
+        assert!(
+            !runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .draft()
+                .settings
+                .filters
+                .entries()[5]
+                .enabled()
+        );
+        assert_eq!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .draft()
+                .settings
+                .filters
+                .entries()[1],
+            sibling
+        );
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn filter_editor_rejects_invalid_numeric_choice_and_identity_without_media_or_disk_changes() {
+        let (mut runtime, drivers) = product_runtime();
+        let store = WritableSettings::new();
+        store.bind(&mut runtime);
+        seed_filter_editor(&mut runtime, filter_editor_chain());
+        let driver = start_live(&mut runtime, &drivers);
+        let before = runtime.engine.as_ref().unwrap().model().draft().clone();
+        let bytes = std::fs::read(store.path()).unwrap();
+        let revision = runtime.ui.public_revision.to_string();
+        let rows = runtime
+            .ui
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .filters
+            .entries
+            .clone();
+        for (index, parameter, value, code) in [
+            (1, "brightness", f64::NAN, "filter_error"),
+            (1, "brightness", f64::INFINITY, "filter_error"),
+            (1, "brightness", f64::NEG_INFINITY, "filter_error"),
+            (1, "brightness", 1.01, "filter_error"),
+            (1, "mode", 1.0, "invalid_value"),
+            (0, "matrix", 1.0, "invalid_value"),
+            (3, "luma_msize_x", 3.5, "invalid_value"),
+            (3, "luma_msize_x", -3.0, "invalid_value"),
+            (
+                3,
+                "luma_msize_x",
+                f64::from(u32::MAX) + 1.0,
+                "invalid_value",
+            ),
+            (3, "luma_msize_x", f64::NAN, "invalid_value"),
+            (3, "luma_msize_x", 4.0, "filter_error"),
+            (3, "luma_msize_x", 25.0, "filter_error"),
+        ] {
+            runtime.set_filter_number(&revision, &rows[index].key, parameter, value);
+            assert_eq!(runtime.ui.error.as_ref().unwrap().code, code);
+            assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &before);
+        }
+        for (index, parameter, token) in [
+            (0, "matrix", "BT709"),
+            (0, "levels", "invalid"),
+            (0, "gamma", "gamma2.2"),
+            (0, "mode", "send_frame"),
+            (1, "brightness", "0.2"),
+            (4, "mode", "bad"),
+            (4, "parity", "tff"),
+            (4, "deint", "invalid"),
+        ] {
+            runtime.set_filter_choice(&revision, &rows[index].key, parameter, token);
+            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "invalid_value");
+            assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &before);
+        }
+        runtime.move_filter(&revision, &rows[0].key, "sideways");
+        assert_eq!(runtime.ui.error.as_ref().unwrap().code, "invalid_value");
+        for entry in [
+            "eq",
+            "filter:0:1",
+            "filter:01:1",
+            "filter:1:-1",
+            "filter:1:1:2",
+        ] {
+            runtime.set_filter_number(&revision, entry, "brightness", 0.2);
+            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "stale_selection");
+        }
+        runtime.set_filter_number(
+            &revision,
+            &format!("filter:{revision}:99"),
+            "brightness",
+            0.2,
+        );
+        assert_eq!(runtime.ui.error.as_ref().unwrap().code, "filter_error");
+        assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &before);
+        assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
+        assert!(driver.submitted.try_recv().is_err());
+        assert!(drivers.try_recv().is_err());
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn filter_moves_clear_and_readd_preserve_loaded_entries_and_guard_every_intent() {
+        let (mut runtime, drivers) = product_runtime();
+        let store = WritableSettings::new();
+        store.bind(&mut runtime);
+        let chain = filter_editor_chain();
+        seed_filter_editor(&mut runtime, chain.clone());
+        let driver = start_live(&mut runtime, &drivers);
+        let revision = runtime.ui.public_revision;
+        let rows = runtime
+            .ui
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .filters
+            .entries
+            .clone();
+        let bytes = std::fs::read(store.path()).unwrap();
+        for (index, direction) in [(0, "up"), (rows.len() - 1, "down")] {
+            runtime.move_filter(&revision.to_string(), &rows[index].key, direction);
+            assert!(runtime.ui.error.is_none());
+            assert_eq!(runtime.ui.public_revision, revision);
+            assert_eq!(
+                runtime
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .model()
+                    .draft()
+                    .settings
+                    .filters,
+                chain
+            );
+        }
+        assert!(driver.submitted.try_recv().is_err());
+        assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
+
+        let mut expected = chain;
+        for (index, direction, target) in [(2, "up", 1), (1, "down", 2), (5, "up", 4)] {
+            let old_revision = runtime.ui.public_revision.to_string();
+            let old_entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[index]
+                .key
+                .clone();
+            expected.move_entry(index, target).unwrap();
+            runtime.move_filter(&old_revision, &old_entry, direction);
+            assert_eq!(
+                runtime
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .model()
+                    .draft()
+                    .settings
+                    .filters,
+                expected
+            );
+            let requested = runtime.engine.as_ref().unwrap().model().draft().clone();
+            let revision = runtime.ui.public_revision.to_string();
+            let rows = runtime
+                .ui
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .filters
+                .entries
+                .clone();
+            runtime.set_filter_number(&revision, &rows[1].key, "brightness", 0.5);
+            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
+            runtime.set_filter_choice(&revision, &rows[0].key, "matrix", "auto");
+            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
+            runtime.move_filter(&revision, &rows[0].key, "down");
+            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
+            runtime.clear_filters(&revision);
+            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
+            runtime.set_filter_number(&old_revision, &old_entry, "brightness", 0.8);
+            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "stale_selection");
+            assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &requested);
+            confirm_filter_edit(&mut runtime, &driver);
+            let revision = runtime.ui.public_revision.to_string();
+            runtime.move_filter(&revision, &old_entry, "up");
+            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "stale_selection");
+            assert_eq!(
+                runtime
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .model()
+                    .active()
+                    .unwrap()
+                    .applied()
+                    .settings()
+                    .filters,
+                expected
+            );
+            assert!(driver.submitted.try_recv().is_err());
+        }
+        let revision = runtime.ui.public_revision.to_string();
+        runtime.clear_filters(&revision);
+        assert!(
+            runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .draft()
+                .settings
+                .filters
+                .entries()
+                .is_empty()
+        );
+        confirm_filter_edit(&mut runtime, &driver);
+        assert!(store.applied().filters.entries().is_empty());
+        let revision = runtime.ui.public_revision;
+        let bytes = std::fs::read(store.path()).unwrap();
+        runtime.clear_filters(&revision.to_string());
+        assert!(runtime.ui.error.is_none());
+        assert_eq!(runtime.ui.public_revision, revision);
+        assert!(driver.submitted.try_recv().is_err());
+        assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
+        runtime.add_filter(&revision.to_string(), "eq");
+        confirm_filter_edit(&mut runtime, &driver);
+        let added = &runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .active()
+            .unwrap()
+            .applied()
+            .settings()
+            .filters;
+        assert_eq!(added.entries().len(), 1);
+        assert_eq!(
+            added.entries()[0].filter(),
+            &projection::default_filter(FilterKind::Eq)
+        );
+        assert!(added.entries()[0].enabled());
+        assert!(
+            drivers.try_recv().is_err(),
+            "no filter action reopens the owner"
+        );
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn prevalidation_refusal_keeps_filter_parameter_request_and_saved_profile_untouched() {
+        fn refuse(
+            request: ValidationRequest,
+        ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>) {
+            let failure = ApplyFailure::new(
+                crate::domain::failure::FailureCategory::Validation(
+                    crate::domain::failure::ValidationLayer::Discovery,
+                ),
+                crate::domain::failure::Stage::Prevalidation,
+                crate::domain::failure::Cause::Generic,
+                request.settings.clone(),
+                "filter_editor_prevalidation",
+                "controlled source refusal",
+            );
+            (request, Err(failure))
+        }
+        let store = WritableSettings::new();
+        let (mut runtime, drivers) = product_runtime_with_validator(refuse);
+        store.bind(&mut runtime);
+        let mut saved = settings();
+        saved.filters = filter_editor_chain();
+        remember_profile(&mut runtime.persistence, saved.clone());
+        seed_filter_editor(&mut runtime, saved.filters.clone());
+        let bytes = std::fs::read(store.path()).unwrap();
+        let revision = runtime.ui.public_revision.to_string();
+        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[1]
+            .key
+            .clone();
+        runtime.set_filter_number(&revision, &entry, "brightness", 0.75);
+        let requested = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .draft()
+            .settings
+            .clone();
+        assert_ne!(requested.filters, saved.filters);
+        // A prevalidation rejection with no incumbent returns to Stopped;
+        // it is recorded separately from terminal owner/treatment failures.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .validation_rejection()
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "filter request was not validated"
+            );
+            runtime.poll();
+            std::thread::yield_now();
+        }
+        let rejection = runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .model()
+            .validation_rejection()
+            .unwrap();
+        assert_eq!(rejection.failure.operation, "filter_editor_prevalidation");
+        assert_eq!(rejection.request.settings.filters, requested.filters);
+        runtime.dirty = true;
+        let refused = runtime.poll();
+        assert_eq!(refused.product_phase, "Stopped");
+        assert!(!refused.failed && !refused.can_toggle_pause && refused.can_open);
+        assert_eq!(refused.playback_status, "Unavailable");
+        assert!(refused.diagnostic.contains("filter_editor_prevalidation"));
+        assert_eq!(
+            runtime.engine.as_ref().unwrap().model().draft().settings,
+            requested
+        );
+        assert_eq!(
+            product_values(&mut runtime)["selection"]["filters"],
+            serde_json::json!(requested.filters)
+        );
+        assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
+        assert_eq!(store.applied(), saved);
+        assert!(drivers.try_recv().is_err());
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn parameter_prevalidation_refusal_preserves_confirmed_incumbent_without_owner_work() {
+        use crate::domain::failure::{
+            FailureCategory, FilterErrorKind, Stage, TreatmentErrorKind,
+            TreatmentFailureDisposition, ValidationLayer,
+        };
+        let store = WritableSettings::new();
+        let (mut runtime, drivers) = product_runtime();
+        store.bind(&mut runtime);
+        seed_filter_editor(&mut runtime, filter_editor_chain());
+        let driver = start_live(&mut runtime, &drivers);
+        settle_committed_watch(&mut runtime);
+        let model = runtime.engine.as_ref().unwrap().model();
+        let incumbent = model.active().unwrap().clone();
+        let last_valid = model.last_valid().unwrap().clone();
+        let mut expected_chain = model.draft().settings.filters.clone();
+        let mut edited = serde_json::to_value(expected_chain.entries()[1].filter()).unwrap();
+        edited["parameters"]["brightness"] = serde_json::json!(0.75);
+        expected_chain
+            .set_filter(1, serde_json::from_value(edited).unwrap())
+            .unwrap();
+        let bytes = std::fs::read(store.path()).unwrap();
+        let revision = runtime.ui.public_revision.to_string();
+        let entry = runtime.ui.snapshot.as_ref().unwrap().filters.entries[1]
+            .key
+            .clone();
+        // Replace only the preparation/admission port. As in the existing
+        // unavailable-pause-port probe, the actual confirmed owner remains
+        // alive in `original` and is restored before observation or cleanup.
+        let refused_port = GateRunner::with_spawner(
+            crate::media::render_catalog::QualifiedTreatmentCapabilities {
+                filters: Err(
+                    crate::media::filter_catalog::FilterCatalogError::InvalidPrefix {
+                        detail: "controlled filter catalog prevalidation refusal".into(),
+                    },
+                ),
+                renderer: Ok(crate::media::render_catalog::fixture_capabilities()),
+            },
+            |_, _| panic!("prevalidation cannot create a replacement owner"),
+        );
+        let original =
+            std::mem::replace(runtime.engine.as_mut().unwrap().runner_mut(), refused_port);
+        runtime.set_filter_number(&revision, &entry, "brightness", 0.75);
+        *runtime.engine.as_mut().unwrap().runner_mut() = original;
+        runtime.dirty = true;
+        let refused = runtime.poll();
+        let model = runtime.engine.as_ref().unwrap().model();
+        assert_eq!(model.active(), Some(&incumbent));
+        assert_eq!(model.last_valid(), Some(&last_valid));
+        assert_eq!(model.draft().settings.filters, expected_chain);
+        assert_eq!(
+            model.draft().settings.video.mode,
+            incumbent.applied().settings().video.mode
+        );
+        assert_eq!(
+            model.draft().settings.audio,
+            incumbent.applied().settings().audio
+        );
+        assert_eq!(
+            model.draft().settings.renderer,
+            incumbent.applied().settings().renderer
+        );
+        let failure = model.failures().unwrap().candidate.as_ref().unwrap();
+        assert_eq!(
+            failure.category,
+            FailureCategory::Validation(ValidationLayer::Filters)
+        );
+        assert_eq!(failure.stage, Stage::Prevalidation);
+        let treatment = failure.treatment.as_ref().unwrap();
+        assert_eq!(
+            treatment.disposition,
+            TreatmentFailureDisposition::Untouched
+        );
+        let TreatmentErrorKind::Filter(filter) = &treatment.kind else {
+            panic!("filter prevalidation must preserve its typed cause");
+        };
+        assert_eq!(filter.kind, FilterErrorKind::CatalogUnavailable);
+        assert_eq!(refused.product_phase, "ErrorWithActiveRestored");
+        assert!(refused.failed && refused.can_toggle_pause);
+        assert_eq!(refused.playback_status, "Live");
+        assert!(
+            refused
+                .diagnostic
+                .contains("controlled filter catalog prevalidation refusal")
+        );
+        let public = product_values(&mut runtime);
+        assert_eq!(
+            public["selection"]["filters"],
+            serde_json::json!(expected_chain)
+        );
+        assert_eq!(
+            public["applied"]["filters"],
+            serde_json::json!(incumbent.applied().settings().filters)
+        );
+        assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
+        assert_eq!(runtime.persistence.authorized_apply(), None);
+        assert!(
+            driver.submitted.try_recv().is_err(),
+            "refusal cannot submit or restore treatments"
+        );
+        assert!(
+            driver.destroyed.try_recv().is_err(),
+            "incumbent owner stays alive"
+        );
+        assert!(drivers.try_recv().is_err(), "refusal cannot reopen capture");
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn verified_filter_edits_order_and_clear_reload_only_the_selected_source_profile() {
+        let store = WritableSettings::new();
+        let mut a = profile_fixture_settings(1);
+        a.filters = filter_editor_chain();
+        let b = profile_fixture_settings(2);
+        let globals = crate::settings::LocalPreferences {
+            gain: PlaybackGain::new(17, true).unwrap(),
+            fullscreen: true,
+            stats_hidden: true,
+            output: PersistentOutputChoice::Manual(
+                SinkIdentity::new("filter-profile-output".into(), Vec::new()).unwrap(),
+            ),
+        };
+        let mut session = PersistenceSession::load(Ok(store.path()));
+        session.set_preferences(globals.clone());
+        remember_profile(&mut session, a.clone());
+        remember_profile(&mut session, b.clone());
+        let (mut runtime, drivers) = profiles_runtime(&store);
+        let update = choose_profile_source(&mut runtime, 0);
+        let driver = complete_profile_source(&mut runtime, &drivers, update, None);
+        for action in 0..4 {
+            let bytes = std::fs::read(store.path()).unwrap();
+            let revision = runtime.ui.public_revision.to_string();
+            let rows = runtime
+                .ui
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .filters
+                .entries
+                .clone();
+            match action {
+                0 => {
+                    runtime.set_filter_number(&revision, &rows[1].key, "brightness", 1e-7);
+                }
+                1 => {
+                    runtime.set_filter_choice(&revision, &rows[0].key, "matrix", "rgb");
+                }
+                2 => {
+                    runtime.move_filter(&revision, &rows[2].key, "up");
+                }
+                3 => {
+                    runtime.clear_filters(&revision);
+                }
+                _ => unreachable!(),
+            }
+            let candidate = runtime
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .draft()
+                .settings
+                .clone();
+            assert_eq!(candidate.video.mode, a.video.mode);
+            assert_eq!(candidate.audio, a.audio);
+            assert_eq!(candidate.renderer, a.renderer);
+            assert_eq!(
+                std::fs::read(store.path()).unwrap(),
+                bytes,
+                "pending is never saved"
+            );
+            confirm_filter_edit(&mut runtime, &driver);
+            a.filters = candidate.filters;
+            let reloaded = PersistenceSession::load(Ok(store.path()));
+            assert!(
+                reloaded
+                    .source_profile(&a.video.identity, true)
+                    .unwrap()
+                    .same_request(&a)
+            );
+            assert_eq!(reloaded.source_profile(&b.video.identity, true), Some(&b));
+            assert_eq!(reloaded.preferences(), &globals);
+            assert!(store.applied().same_request(&a));
+        }
+        assert!(a.filters.entries().is_empty());
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+
+        // A new real runtime must seed and open the verified empty A chain,
+        // then independently restore B without inheriting any A editor state.
+        let (mut relaunched, drivers) = profiles_runtime(&store);
+        let update = choose_profile_source(&mut relaunched, 0);
+        let first = complete_profile_source(&mut relaunched, &drivers, update, None);
+        assert!(
+            relaunched
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .active()
+                .unwrap()
+                .applied()
+                .settings()
+                .same_request(&a)
+        );
+        let update = choose_profile_source(&mut relaunched, 1);
+        let second = complete_profile_source(&mut relaunched, &drivers, update, Some(first));
+        assert!(
+            relaunched
+                .engine
+                .as_ref()
+                .unwrap()
+                .model()
+                .active()
+                .unwrap()
+                .applied()
+                .settings()
+                .same_request(&b)
+        );
+        assert_eq!(relaunched.persistence.preferences(), &globals);
+        cleanup(&mut relaunched);
+        second.destroyed.recv().unwrap();
+    }
+
     #[test]
     fn refused_original_remains_refused_after_real_product_apply_and_preference_changes() {
         let store = WritableSettings::new();
@@ -8242,7 +9273,11 @@ mod tests {
             assert!(store.applied().same_request(expected));
             assert_eq!(runtime.persistence.preferences(), &globals);
         }
+        // Hold C's validator before admitting its request. Acquiring this
+        // after dispatch races the worker and can accidentally open C.
+        let validation_probe = PROFILE_VALIDATION_PROBE.lock();
         let c_update = choose_profile_source(&mut runtime, 2);
+        assert!(!c_update.create_native && !c_update.release_native);
         let selected_c = &runtime.engine.as_ref().unwrap().model().draft().settings;
         assert_eq!(
             selected_c.video.identity,
@@ -8264,17 +9299,28 @@ mod tests {
                 .source_profile(&selected_c.video.identity, true)
                 .is_none()
         );
-        // C stays an admitted candidate: the probe holds its validation until
-        // shutdown, so no owner opens and no profile can be written. Release
-        // the probe only after the close has cancelled the pending validation.
-        let validation_probe = PROFILE_VALIDATION_PROBE.lock();
-        runtime.request_application_close();
-        if c_update.release_native {
+        // C stays an admitted candidate while the real incumbent remains
+        // alive. Closing cancels C before its blocked validator can return.
+        // Consume the close call's one-shot native-release instruction too:
+        // dropping it can strand the GUI side at the acknowledged barrier.
+        let closing = runtime.request_application_close();
+        if closing.release_native {
             incumbent.take().unwrap().destroyed.recv().unwrap();
-            runtime.native_released(AttemptId::new(c_update.generation).unwrap());
+            let released = runtime.native_released(AttemptId::new(closing.generation).unwrap());
+            assert!(
+                !released.create_native,
+                "cancelled C must not create a native host"
+            );
         }
         drop(validation_probe);
         cleanup(&mut runtime);
+        if let Some(incumbent) = incumbent {
+            incumbent.destroyed.recv().unwrap();
+        }
+        assert!(
+            drivers.try_recv().is_err(),
+            "cancelled C must not open an owner"
+        );
         let restored = PersistenceSession::load(Ok(store.path()));
         assert_eq!(restored.source_profile(&a.video.identity, true), Some(&a));
         assert_eq!(restored.source_profile(&b.video.identity, true), Some(&b));

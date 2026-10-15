@@ -203,7 +203,9 @@ fn odd_matrix_size(
     parameter: &'static str,
     value: u32,
 ) -> Result<u8, FilterValidationError> {
-    if !(3..=23).contains(&value) || value.is_multiple_of(2) {
+    if !(UnsharpParams::MATRIX_MIN..=UnsharpParams::MATRIX_MAX).contains(&value)
+        || value.is_multiple_of(UnsharpParams::MATRIX_STEP)
+    {
         return Err(FilterValidationError::InvalidMatrixSize {
             filter,
             parameter,
@@ -278,6 +280,30 @@ pub struct Hqdn3dValues {
 // Format
 // ---------------------------------------------------------------------------
 
+macro_rules! parameter_tokens {
+    ($name:ident { $( $variant:ident => $token:literal ),+ $(,)? }) => {
+        impl $name {
+            /// Every supported value, in presentation order.
+            pub const ALL: &[Self] = &[ $( Self::$variant ),+ ];
+
+            /// Exact domain/storage token, not a backend-specific spelling.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $token, )+
+                }
+            }
+
+            /// Parse only an exact domain/storage token.
+            pub fn from_token(token: &str) -> Option<Self> {
+                match token {
+                    $( $token => Some(Self::$variant), )+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
 /// SDR color matrix (mpv `format=colormatrix`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum SdrMatrix {
@@ -298,6 +324,14 @@ pub enum SdrMatrix {
     Rgb,
 }
 
+parameter_tokens!(SdrMatrix {
+    Auto => "auto",
+    Bt601 => "bt601",
+    Bt709 => "bt709",
+    Smpte240m => "smpte240m",
+    Rgb => "rgb",
+});
+
 /// Color levels / range (mpv `format=colorlevels`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum ColorLevels {
@@ -311,6 +345,12 @@ pub enum ColorLevels {
     #[serde(rename = "full")]
     Full,
 }
+
+parameter_tokens!(ColorLevels {
+    Auto => "auto",
+    Limited => "limited",
+    Full => "full",
+});
 
 /// SDR transfer gamma (mpv `format=gamma`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -346,6 +386,19 @@ pub enum SdrGamma {
     #[serde(rename = "gamma28")]
     Gamma28,
 }
+
+parameter_tokens!(SdrGamma {
+    Auto => "auto",
+    Bt1886 => "bt1886",
+    Srgb => "srgb",
+    Linear => "linear",
+    Gamma18 => "gamma18",
+    Gamma20 => "gamma20",
+    Gamma22 => "gamma22",
+    Gamma24 => "gamma24",
+    Gamma26 => "gamma26",
+    Gamma28 => "gamma28",
+});
 
 /// Validated SDR `format` parameters: matrix, levels and gamma only (no primaries, no
 /// pixel-format/scale controls).
@@ -402,18 +455,77 @@ pub struct EqParams {
 }
 
 impl EqParams {
+    /// Inclusive dimensionless contrast bounds.
+    pub const CONTRAST_BOUNDS: (f64, f64) = (-1000.0, 1000.0);
+    /// Inclusive dimensionless brightness bounds.
+    pub const BRIGHTNESS_BOUNDS: (f64, f64) = (-1.0, 1.0);
+    /// Inclusive dimensionless saturation bounds.
+    pub const SATURATION_BOUNDS: (f64, f64) = (0.0, 3.0);
+    /// Inclusive bounds shared by all four gamma controls.
+    pub const GAMMA_BOUNDS: (f64, f64) = (0.1, 10.0);
+    /// Inclusive dimensionless gamma-weight bounds.
+    pub const GAMMA_WEIGHT_BOUNDS: (f64, f64) = (0.0, 1.0);
+
     /// Validate and build `eq` parameters. Rejects non-finite and out-of-interval values.
     pub fn new(values: EqValues) -> Result<Self, FilterValidationError> {
         let kind = FilterKind::Eq;
         Ok(Self {
-            contrast: bounded(kind, "contrast", values.contrast, -1000.0, 1000.0)?,
-            brightness: bounded(kind, "brightness", values.brightness, -1.0, 1.0)?,
-            saturation: bounded(kind, "saturation", values.saturation, 0.0, 3.0)?,
-            gamma: bounded(kind, "gamma", values.gamma, 0.1, 10.0)?,
-            gamma_r: bounded(kind, "gamma_r", values.gamma_r, 0.1, 10.0)?,
-            gamma_g: bounded(kind, "gamma_g", values.gamma_g, 0.1, 10.0)?,
-            gamma_b: bounded(kind, "gamma_b", values.gamma_b, 0.1, 10.0)?,
-            gamma_weight: bounded(kind, "gamma_weight", values.gamma_weight, 0.0, 1.0)?,
+            contrast: bounded(
+                kind,
+                "contrast",
+                values.contrast,
+                Self::CONTRAST_BOUNDS.0,
+                Self::CONTRAST_BOUNDS.1,
+            )?,
+            brightness: bounded(
+                kind,
+                "brightness",
+                values.brightness,
+                Self::BRIGHTNESS_BOUNDS.0,
+                Self::BRIGHTNESS_BOUNDS.1,
+            )?,
+            saturation: bounded(
+                kind,
+                "saturation",
+                values.saturation,
+                Self::SATURATION_BOUNDS.0,
+                Self::SATURATION_BOUNDS.1,
+            )?,
+            gamma: bounded(
+                kind,
+                "gamma",
+                values.gamma,
+                Self::GAMMA_BOUNDS.0,
+                Self::GAMMA_BOUNDS.1,
+            )?,
+            gamma_r: bounded(
+                kind,
+                "gamma_r",
+                values.gamma_r,
+                Self::GAMMA_BOUNDS.0,
+                Self::GAMMA_BOUNDS.1,
+            )?,
+            gamma_g: bounded(
+                kind,
+                "gamma_g",
+                values.gamma_g,
+                Self::GAMMA_BOUNDS.0,
+                Self::GAMMA_BOUNDS.1,
+            )?,
+            gamma_b: bounded(
+                kind,
+                "gamma_b",
+                values.gamma_b,
+                Self::GAMMA_BOUNDS.0,
+                Self::GAMMA_BOUNDS.1,
+            )?,
+            gamma_weight: bounded(
+                kind,
+                "gamma_weight",
+                values.gamma_weight,
+                Self::GAMMA_WEIGHT_BOUNDS.0,
+                Self::GAMMA_WEIGHT_BOUNDS.1,
+            )?,
         })
     }
 
@@ -481,19 +593,46 @@ pub struct UnsharpParams {
 }
 
 impl UnsharpParams {
+    /// Smallest valid matrix dimension, in taps.
+    pub const MATRIX_MIN: u32 = 3;
+    /// Largest valid matrix dimension, in taps.
+    pub const MATRIX_MAX: u32 = 23;
+    /// Difference between consecutive valid odd matrix dimensions.
+    pub const MATRIX_STEP: u32 = 2;
+    /// Inclusive dimensionless strength bounds for all planes.
+    pub const AMOUNT_BOUNDS: (f64, f64) = (-2.0, 5.0);
+
     /// Validate and build `unsharp` parameters.
     pub fn new(values: UnsharpValues) -> Result<Self, FilterValidationError> {
         let kind = FilterKind::Unsharp;
         Ok(Self {
             luma_msize_x: odd_matrix_size(kind, "luma_msize_x", values.luma_msize_x)?,
             luma_msize_y: odd_matrix_size(kind, "luma_msize_y", values.luma_msize_y)?,
-            luma_amount: bounded(kind, "luma_amount", values.luma_amount, -2.0, 5.0)?,
+            luma_amount: bounded(
+                kind,
+                "luma_amount",
+                values.luma_amount,
+                Self::AMOUNT_BOUNDS.0,
+                Self::AMOUNT_BOUNDS.1,
+            )?,
             chroma_msize_x: odd_matrix_size(kind, "chroma_msize_x", values.chroma_msize_x)?,
             chroma_msize_y: odd_matrix_size(kind, "chroma_msize_y", values.chroma_msize_y)?,
-            chroma_amount: bounded(kind, "chroma_amount", values.chroma_amount, -2.0, 5.0)?,
+            chroma_amount: bounded(
+                kind,
+                "chroma_amount",
+                values.chroma_amount,
+                Self::AMOUNT_BOUNDS.0,
+                Self::AMOUNT_BOUNDS.1,
+            )?,
             alpha_msize_x: odd_matrix_size(kind, "alpha_msize_x", values.alpha_msize_x)?,
             alpha_msize_y: odd_matrix_size(kind, "alpha_msize_y", values.alpha_msize_y)?,
-            alpha_amount: bounded(kind, "alpha_amount", values.alpha_amount, -2.0, 5.0)?,
+            alpha_amount: bounded(
+                kind,
+                "alpha_amount",
+                values.alpha_amount,
+                Self::AMOUNT_BOUNDS.0,
+                Self::AMOUNT_BOUNDS.1,
+            )?,
         })
     }
 
@@ -566,15 +705,42 @@ pub struct Hqdn3dParams {
 }
 
 impl Hqdn3dParams {
+    /// Inclusive dimensionless strength bounds, including the relational zero sentinel.
+    pub const STRENGTH_BOUNDS: (f64, f64) = (0.0, 252.0);
+
     /// Validate and build `hqdn3d` parameters. Rejects non-finite and out-of-`[0, 252]`
     /// values.
     pub fn new(values: Hqdn3dValues) -> Result<Self, FilterValidationError> {
         let kind = FilterKind::Hqdn3d;
         Ok(Self {
-            luma_spatial: bounded(kind, "luma_spatial", values.luma_spatial, 0.0, 252.0)?,
-            chroma_spatial: bounded(kind, "chroma_spatial", values.chroma_spatial, 0.0, 252.0)?,
-            luma_tmp: bounded(kind, "luma_tmp", values.luma_tmp, 0.0, 252.0)?,
-            chroma_tmp: bounded(kind, "chroma_tmp", values.chroma_tmp, 0.0, 252.0)?,
+            luma_spatial: bounded(
+                kind,
+                "luma_spatial",
+                values.luma_spatial,
+                Self::STRENGTH_BOUNDS.0,
+                Self::STRENGTH_BOUNDS.1,
+            )?,
+            chroma_spatial: bounded(
+                kind,
+                "chroma_spatial",
+                values.chroma_spatial,
+                Self::STRENGTH_BOUNDS.0,
+                Self::STRENGTH_BOUNDS.1,
+            )?,
+            luma_tmp: bounded(
+                kind,
+                "luma_tmp",
+                values.luma_tmp,
+                Self::STRENGTH_BOUNDS.0,
+                Self::STRENGTH_BOUNDS.1,
+            )?,
+            chroma_tmp: bounded(
+                kind,
+                "chroma_tmp",
+                values.chroma_tmp,
+                Self::STRENGTH_BOUNDS.0,
+                Self::STRENGTH_BOUNDS.1,
+            )?,
         })
     }
 
@@ -614,6 +780,11 @@ pub enum BwdifMode {
     SendField,
 }
 
+parameter_tokens!(BwdifMode {
+    SendFrame => "send_frame",
+    SendField => "send_field",
+});
+
 /// Field parity for `bwdif`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum FieldParity {
@@ -628,6 +799,12 @@ pub enum FieldParity {
     BottomFieldFirst,
 }
 
+parameter_tokens!(FieldParity {
+    Auto => "auto",
+    TopFieldFirst => "top_field_first",
+    BottomFieldFirst => "bottom_field_first",
+});
+
 /// Which frames `bwdif` deinterlaces.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum DeinterlaceSelection {
@@ -638,6 +815,11 @@ pub enum DeinterlaceSelection {
     #[serde(rename = "interlaced")]
     Interlaced,
 }
+
+parameter_tokens!(DeinterlaceSelection {
+    All => "all",
+    Interlaced => "interlaced",
+});
 
 /// Validated `bwdif` parameters: discrete enums only, no numeric escape hatch.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -1461,6 +1643,29 @@ mod tests {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(serde_json::from_str::<FilterKind>(&json).unwrap(), kind);
         }
+    }
+
+    #[test]
+    fn parameter_token_helpers_match_strict_storage_tokens() {
+        macro_rules! check {
+            ($enum:ty) => {
+                for &value in <$enum>::ALL {
+                    let token = value.as_str();
+                    assert_eq!(serde_json::to_value(value).unwrap(), token);
+                    assert_eq!(<$enum>::from_token(token), Some(value));
+                    assert_eq!(<$enum>::from_token(&format!(" {token}")), None);
+                    assert_eq!(<$enum>::from_token(&token.to_uppercase()), None);
+                }
+                assert_eq!(<$enum>::from_token(""), None);
+                assert_eq!(<$enum>::from_token("unknown"), None);
+            };
+        }
+        check!(SdrMatrix);
+        check!(ColorLevels);
+        check!(SdrGamma);
+        check!(BwdifMode);
+        check!(FieldParity);
+        check!(DeinterlaceSelection);
     }
 
     // --- chain validation ---------------------------------------------------

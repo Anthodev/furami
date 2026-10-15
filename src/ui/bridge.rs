@@ -158,6 +158,27 @@ pub(crate) mod ffi {
             selection_revision: &str,
             entry_key: &str,
         ) -> UiUpdate;
+        fn gate_set_filter_number(
+            gate: &mut RuntimeCoordinator,
+            revision: &str,
+            entry: &str,
+            parameter: &str,
+            value: f64,
+        ) -> UiUpdate;
+        fn gate_set_filter_choice(
+            gate: &mut RuntimeCoordinator,
+            revision: &str,
+            entry: &str,
+            parameter: &str,
+            value: &str,
+        ) -> UiUpdate;
+        fn gate_move_filter(
+            gate: &mut RuntimeCoordinator,
+            revision: &str,
+            entry: &str,
+            direction: &str,
+        ) -> UiUpdate;
+        fn gate_clear_filters(gate: &mut RuntimeCoordinator, revision: &str) -> UiUpdate;
         fn gate_set_scale(
             gate: &mut RuntimeCoordinator,
             selection_revision: &str,
@@ -409,6 +430,37 @@ fn gate_remove_filter(
     entry_key: &str,
 ) -> ffi::UiUpdate {
     gate.remove_filter(selection_revision, entry_key).into()
+}
+fn gate_set_filter_number(
+    gate: &mut RuntimeCoordinator,
+    revision: &str,
+    entry: &str,
+    parameter: &str,
+    value: f64,
+) -> ffi::UiUpdate {
+    gate.set_filter_number(revision, entry, parameter, value)
+        .into()
+}
+fn gate_set_filter_choice(
+    gate: &mut RuntimeCoordinator,
+    revision: &str,
+    entry: &str,
+    parameter: &str,
+    value: &str,
+) -> ffi::UiUpdate {
+    gate.set_filter_choice(revision, entry, parameter, value)
+        .into()
+}
+fn gate_move_filter(
+    gate: &mut RuntimeCoordinator,
+    revision: &str,
+    entry: &str,
+    direction: &str,
+) -> ffi::UiUpdate {
+    gate.move_filter(revision, entry, direction).into()
+}
+fn gate_clear_filters(gate: &mut RuntimeCoordinator, revision: &str) -> ffi::UiUpdate {
+    gate.clear_filters(revision).into()
 }
 fn gate_set_scale(
     gate: &mut RuntimeCoordinator,

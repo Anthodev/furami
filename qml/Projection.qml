@@ -134,24 +134,37 @@ QtObject {
             && projection.u32(value.numerator, minimum)
             && projection.u32(value.denominator, 1)
     }
-    function filterParametersValid(kind, value) {
+    function filterFieldTypes(kind) {
         switch (kind) {
         case "format":
-            return projection.strings(value, ["matrix", "levels", "gamma"])
+            return {matrix: "choice", levels: "choice", gamma: "choice"}
         case "eq":
-            return projection.numbers(value, ["contrast", "brightness", "saturation",
-                "gamma", "gamma_r", "gamma_g", "gamma_b", "gamma_weight"])
+            return {contrast: "number", brightness: "number", saturation: "number",
+                gamma: "number", gamma_r: "number", gamma_g: "number",
+                gamma_b: "number", gamma_weight: "number"}
         case "unsharp":
-            return projection.numbers(value, ["luma_msize_x", "luma_msize_y", "luma_amount",
-                "chroma_msize_x", "chroma_msize_y", "chroma_amount",
-                "alpha_msize_x", "alpha_msize_y", "alpha_amount"])
+            return {luma_msize_x: "integer", luma_msize_y: "integer", luma_amount: "number",
+                chroma_msize_x: "integer", chroma_msize_y: "integer", chroma_amount: "number",
+                alpha_msize_x: "integer", alpha_msize_y: "integer", alpha_amount: "number"}
         case "hqdn3d":
-            return projection.numbers(value, ["luma_spatial", "chroma_spatial",
-                "luma_tmp", "chroma_tmp"])
+            return {luma_spatial: "number", chroma_spatial: "number",
+                luma_tmp: "number", chroma_tmp: "number"}
         case "bwdif":
-            return projection.strings(value, ["mode", "parity", "deint"])
+            return {mode: "choice", parity: "choice", deint: "choice"}
         }
-        return false
+        return null
+    }
+    function filterParametersValid(kind, value) {
+        const types = projection.filterFieldTypes(kind)
+        if (types === null || projection.record(value) === null)
+            return false
+        const keys = Object.keys(types)
+        return Object.keys(value).length === keys.length && keys.every(function(key) {
+            if (types[key] === "choice")
+                return typeof value[key] === "string"
+            return typeof value[key] === "number" && isFinite(value[key])
+                && (types[key] !== "integer" || Math.floor(value[key]) === value[key])
+        })
     }
     function rendererSettingsValid(value) {
         return projection.strings(value, ["scale", "cscale", "dscale", "dither"])
@@ -245,6 +258,37 @@ QtObject {
             return "catalog.intervalRanges"
         return ""
     }
+    function filterFieldsValid(kind, fields) {
+        const types = projection.filterFieldTypes(kind)
+        if (types === null || !Array.isArray(fields)
+                || fields.length !== Object.keys(types).length)
+            return false
+        return fields.every(function(row, index) {
+            if (!projection.strings(row, ["key", "label", "type", "notice"])
+                    || !Object.prototype.hasOwnProperty.call(types, row.key)
+                    || types[row.key] !== row.type
+                    || fields.some(function(other, otherIndex) {
+                        return otherIndex < index && other.key === row.key
+                    })
+                    || !Array.isArray(row.choices)
+                    || !row.choices.every(projection.choiceValid))
+                return false
+            if (row.type === "choice") {
+                return row.min === null && row.max === null && row.step === null
+                    && row.choices.length > 0 && row.choices.every(function(choice, choiceIndex) {
+                        return !row.choices.some(function(other, otherIndex) {
+                            return otherIndex < choiceIndex && other.key === choice.key
+                        })
+                    })
+            }
+            return row.choices.length === 0 && projection.numbers(row, ["min", "max"])
+                && row.min <= row.max
+                && (row.type === "number" ? row.step === null
+                    : Math.floor(row.min) === row.min && Math.floor(row.max) === row.max
+                        && typeof row.step === "number" && isFinite(row.step)
+                        && row.step > 0 && Math.floor(row.step) === row.step)
+        })
+    }
     function rendererFieldValid(row) {
         if (!projection.strings(row, ["key", "label", "type", "notice"])
                 || !Array.isArray(row.choices) || !row.choices.every(projection.choiceValid))
@@ -292,6 +336,7 @@ QtObject {
                     return projection.strings(row, ["kind", "label", "reason"])
                         && projection.flags(row, ["available"])
                         && projection.filterParametersValid(row.kind, row.defaultParameters)
+                        && projection.filterFieldsValid(row.kind, row.fields)
                 }) || !Array.isArray(f.entries) || !f.entries.every(function(row) {
                     return projection.strings(row, ["key", "label", "kind", "reason"])
                         && projection.flags(row, ["enabled", "available"])
