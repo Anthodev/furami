@@ -245,6 +245,9 @@ protected:
     bool event(QEvent *event) override
     {
         Q_ASSERT(QThread::currentThread() == thread());
+        if (m_bridge && event->type() == QEvent::Wheel
+            && m_bridge->handleVolumeWheel(static_cast<QWheelEvent *>(event), this))
+            return true;
         if (m_bridge && !m_poisoned
             && (event->type() == QEvent::Wheel || event->type() == QEvent::TouchBegin
                 || event->type() == QEvent::TouchUpdate)) {
@@ -566,8 +569,10 @@ void FuramiBridge::refreshChromeFamilyActive(QWindow *focused)
     if (m_chromeFamilyActive == active)
         return;
     m_chromeFamilyActive = active;
-    if (!active)
+    if (!active) {
+        m_volumeWheelRemainder = 0;
         m_chromeIdleTimer.stop();
+    }
     emit chromeFamilyActiveChanged();
     if (!m_chromeFamilyActive) {
         // QML's outer gate passively invalidates popup epochs. Do not use the
@@ -597,6 +602,16 @@ void FuramiBridge::dismissChromePopup()
         && m_root->visibility() != QWindow::Minimized && m_chromeRegistered && m_popupOpen
         && !QMetaObject::invokeMethod(m_root, "dismissChromePopup", Qt::DirectConnection))
         failChrome(QStringLiteral("QML root dismissChromePopup hook disappeared"));
+}
+
+void FuramiBridge::toggleChromeSettings()
+{
+    assertGuiThread();
+    if (m_chromeRegistered && m_chromeFamilyActive && m_root && m_root->isVisible()
+        && m_root->visibility() != QWindow::Minimized && !m_closing && !m_quitAuthorized
+        && !m_bootstrapFailed
+        && !QMetaObject::invokeMethod(m_root, "toggleChromeSettings", Qt::DirectConnection))
+        failChrome(QStringLiteral("QML root toggleChromeSettings hook disappeared"));
 }
 
 void FuramiBridge::hideChromeWindows()
@@ -653,8 +668,9 @@ void FuramiBridge::registerChromeWindows(QWindow *top, QWindow *volume, QWindow 
     if (m_chromeRegistered || !m_root || m_quitAuthorized || m_bootstrapFailed) {
         diagnostic = QStringLiteral("chrome registration requires one live permanent root and an empty fixed registry");
     } else if (m_root->metaObject()->indexOfMethod("syncChromeGeometry()") < 0
-        || m_root->metaObject()->indexOfMethod("dismissChromePopup()") < 0) {
-        diagnostic = QStringLiteral("QML root chrome geometry/dismiss hooks are missing");
+        || m_root->metaObject()->indexOfMethod("dismissChromePopup()") < 0
+        || m_root->metaObject()->indexOfMethod("toggleChromeSettings()") < 0) {
+        diagnostic = QStringLiteral("QML root chrome geometry/dismiss/settings hooks are missing");
     } else if (top == volume || top == bottom || volume == bottom) {
         diagnostic = QStringLiteral("chrome registration requires three distinct QQuickWindows");
     } else {
@@ -778,6 +794,8 @@ void FuramiBridge::setPopupOpen(bool open)
     if (m_popupOpen == open)
         return;
     m_popupOpen = open;
+    if (open)
+        m_volumeWheelRemainder = 0;
     emitNativeDiagnostic("qt_chrome_popup", {{"open", open}, {"root", m_rootXid}});
     emit popupOpenChanged();
     scheduleGeometryLog();
@@ -1401,11 +1419,15 @@ bool FuramiBridge::handleKey(QKeyEvent *event, const char *source)
         return false;
     if (event->modifiers() != Qt::NoModifier)
         return false;
+    if (m_textEntryActive) {
+        if (key == Qt::Key_Space)
+            return false;
+        event->accept();
+        return true;
+    }
     if (key == Qt::Key_Space && m_popupOpen)
         return false;
     if (key == Qt::Key_Space) {
-        if (m_textEntryActive || event->modifiers() != Qt::NoModifier)
-            return false;
         const bool hostOwnsFocus = m_host && !m_poisoned
             && QGuiApplication::focusWindow() == m_host.data();
         const bool containerOwnsFocus = m_root && m_root->isActive() && m_container
@@ -1424,11 +1446,49 @@ bool FuramiBridge::handleKey(QKeyEvent *event, const char *source)
         toggleFullscreen();
     } else if (m_popupOpen) {
         dismissChromePopup();
-    } else if (m_root && m_root->visibility() == QWindow::FullScreen) {
-        toggleFullscreen();
     } else {
+        toggleChromeSettings();
+    }
+    event->accept();
+    return true;
+}
+
+bool FuramiBridge::handleVolumeWheel(QWheelEvent *event, QWindow *source)
+{
+    assertGuiThread();
+    if (!m_chromeRegistered || !m_chromeFamilyActive || !m_root || !m_root->isVisible()
+        || m_root->visibility() == QWindow::Minimized || m_closing || m_quitAuthorized
+        || m_bootstrapFailed || !canSetGain() || m_popupOpen || event->modifiers() != Qt::NoModifier) {
+        m_volumeWheelRemainder = 0;
         return false;
     }
+    const bool currentHost = m_host && source == m_host.data() && !m_poisoned && !m_host->poisoned();
+    const bool overVideo = source == m_root.data() && m_container && m_container->window() == m_root.data()
+        && QRectF(0, 0, m_container->width(), m_container->height()).contains(m_container->mapFromScene(event->position()));
+    const bool overVolume = m_volumeChromeWindow && source == m_volumeChromeWindow.data()
+        && m_volumeChromeWindow->isVisible()
+        && QRectF(0, 0, m_volumeChromeWindow->width(), m_volumeChromeWindow->height()).contains(event->position());
+    if (!currentHost && !overVideo && !overVolume) {
+        m_volumeWheelRemainder = 0;
+        return false;
+    }
+    if (event->phase() == Qt::ScrollBegin)
+        m_volumeWheelRemainder = 0;
+    const int delta = event->angleDelta().y();
+    if (delta == 0) {
+        m_volumeWheelRemainder = 0;
+        return false;
+    }
+    const std::int64_t angle = static_cast<std::int64_t>(m_volumeWheelRemainder) + delta;
+    const std::int64_t notches = angle / 120;
+    m_volumeWheelRemainder = static_cast<int>(angle % 120);
+    const int currentVolume = volumePercent();
+    const int target = static_cast<int>(qBound<std::int64_t>(std::int64_t{0}, currentVolume + notches * 5, std::int64_t{100}));
+    if ((delta > 0 && target == 100) || (delta < 0 && target == 0) || event->phase() == Qt::ScrollEnd)
+        m_volumeWheelRemainder = 0;
+    if (target != currentVolume)
+        setVolume(target);
+    noteNativePointerActivity(false);
     event->accept();
     return true;
 }
@@ -1478,6 +1538,9 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
         }
         if (event->type() == QEvent::KeyPress)
             return handleKey(static_cast<QKeyEvent *>(event), "chrome");
+        if (chrome == m_volumeChromeWindow.data() && event->type() == QEvent::Wheel
+            && handleVolumeWheel(static_cast<QWheelEvent *>(event), chrome))
+            return true;
         if (event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonPress
             || event->type() == QEvent::Wheel || event->type() == QEvent::TouchBegin
             || event->type() == QEvent::TouchUpdate)
@@ -1495,6 +1558,9 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
         }
     }
     if (watched == m_root) {
+        if (event->type() == QEvent::Wheel
+            && handleVolumeWheel(static_cast<QWheelEvent *>(event), m_root.data()))
+            return true;
         if (event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonPress
             || event->type() == QEvent::Wheel || event->type() == QEvent::TouchBegin
             || event->type() == QEvent::TouchUpdate) {

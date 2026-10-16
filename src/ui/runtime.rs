@@ -7922,7 +7922,7 @@ mod tests {
 
     #[test]
     fn automatic_card_audio_is_one_source_transaction_without_saving_candidate() {
-        let (mut runtime, _) = product_runtime();
+        let (mut runtime, _drivers) = product_runtime();
         let store = WritableSettings::new();
         store.bind(&mut runtime);
         let identity = card_audio_catalog_fixture(&mut runtime);
@@ -7958,7 +7958,7 @@ mod tests {
 
     #[test]
     fn explicit_saved_audio_off_and_zero_muted_gain_survive_source_choice() {
-        let (mut runtime, _) = product_runtime();
+        let (mut runtime, _drivers) = product_runtime();
         let store = WritableSettings::new();
         runtime.persistence = PersistenceSession::load(Ok(store.path()));
         remember_profile(&mut runtime.persistence, settings());

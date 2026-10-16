@@ -72,16 +72,19 @@ Resuming briefly reconnects, then shows the console's current scene.
 
 | Input | Action |
 | --- | --- |
-| `Space` | Pause or resume, when the video or window has focus |
-| `F11` | Toggle fullscreen for the Furami window only |
-| `Esc` | Dismiss the open menu or leave fullscreen |
+| `Space` | Pause or resume at video focus, outside text entry and popups |
+| `F11` | Toggle fullscreen for the Furami window only, outside text entry |
+| `Esc` | Open **Réglages** when no popup is open; otherwise dismiss the ordinary popup, without leaving fullscreen |
 | `Tab` / `Shift+Tab` | Move focus between controls |
 | **Pause / Resume** action | Same as `Space`, from Options |
-| **Volume slider** | Furami's playback volume, 0–100, immediate |
+| **Volume slider** | Furami's playback volume, 0–100, immediate; arrow keys change it by 1 point |
+| **Wheel over video or the volume rail** | Change playback volume by 5 percentage points per notch, bounded to 0–100 |
 | **Mute / Unmute** button | Furami's playback output only |
 | **Reconnect** button | Retry the last valid selection; join recovery already in progress |
 
-Focused controls keep their keys: `Space` types a space or activates the focused control instead of pausing. No global shortcuts; fullscreen and focus stay local to the window.
+Text entry takes priority: `Space` goes to the field and its validator without pausing; `F11` and `Esc` are consumed without changing fullscreen, playback or the popup. Other focused controls keep their normal `Space` behavior. Mandatory save/reset decisions stay open on `Esc`. Shortcuts use unmodified presses, ignore auto-repeat and never act globally.
+
+Wheel volume works only while Furami is active, no popup is open and no modifier is held. Menus and lists retain their normal scrolling; horizontal or pixel-only input does not change volume. Volume and mute stay independent, including while muted; neither changes the desktop mixer or output selection.
 
 ## Saved settings
 

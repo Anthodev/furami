@@ -141,6 +141,12 @@ ApplicationWindow {
         return handled
     }
 
+    function toggleChromeSettings() {
+        if (!Chrome.rootAvailable || !Projection.ready || Chrome.popupOpen || Chrome.mandatoryPopupOpen)
+            return
+        Chrome.openPopup("menu", "settings")
+    }
+
     function moveTool(window, localX, localY) {
         const point = root.contentItem.mapToGlobal(localX, localY)
         window.x = Math.round(point.x)

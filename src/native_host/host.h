@@ -13,6 +13,7 @@
 #include <QSocketNotifier>
 #include <QString>
 #include <QTimer>
+#include <QWheelEvent>
 #include <QWindow>
 #include <QtQml/qqmlregistration.h>
 
@@ -183,6 +184,7 @@ public:
     void schedulePublication(std::uint64_t generation);
     void surfaceLost(std::uint64_t generation, std::uint64_t previousXid);
     bool handleKey(QKeyEvent *event, const char *source);
+    bool handleVolumeWheel(QWheelEvent *event, QWindow *source);
     void forwardToRoot(QEvent *event, const char *source);
 
 signals:
@@ -217,6 +219,7 @@ private:
     void scheduleChromeGeometry();
     void hideChromeWindows();
     void dismissChromePopup();
+    void toggleChromeSettings();
     void failChrome(const QString &diagnostic);
     bool isChromeFamilyWindow(const QWindow *window) const;
     void refreshChromeFamilyActive(QWindow *focused);
@@ -281,6 +284,7 @@ private:
     // Resume validation/teardown. Only its fresh Live successor may present.
     bool m_presentationSuppressed = false;
     int m_volumePercent = 100;
+    int m_volumeWheelRemainder = 0;
     bool m_muted = false;
     QString m_outputRows;
     std::uint64_t m_outputCatalogRevision = 0;

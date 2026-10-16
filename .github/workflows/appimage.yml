@@ -30,7 +30,7 @@ jobs:
   build-manual:
     if: github.event_name == 'workflow_dispatch'
     name: Build AppImage artifact (manual, not published)
-    runs-on: avrea-ubuntu-24.04-2-vcpu
+    runs-on: avrea-ubuntu-24.04-4-vcpu
     timeout-minutes: 240
     steps:
       - name: Check out repository

@@ -14,6 +14,7 @@ Item {
     // root | settings | capture | audio | renderer | prefs
     property string section: "root"
     property bool editorActive: false
+    Component.onCompleted: menu.section = Chrome.menuInitialSection
 
     readonly property var profile: Projection.view
     readonly property bool settingsSection: section !== "root" && section !== "settings"
