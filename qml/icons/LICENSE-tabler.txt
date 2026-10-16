@@ -12,7 +12,7 @@ and the MultiEffect path in BrumeIcon lifts the source to white before
 colourising, so the rendered colour is exactly the requested Brume token.
 
 Icons used: camera, headphones, maximize, minimize, refresh, settings,
-adjustments, filter, palette, check, x, play, pause, chevron-down, volume,
+adjustments, palette, check, x, play, pause, chevron-down, volume,
 volume-off.
 
 --------------------------------------------------------------------------

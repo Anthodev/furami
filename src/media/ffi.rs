@@ -1,12 +1,13 @@
 //! Minimal mpv 0.41.0/client 2.5 ABI. Every handle stays on its creating thread.
 
 use super::controller::{
-    BackendCommand, BackendEvent, MediaError, OwnerBackend, PauseObservation, PreparedTreatments,
-    RequestId, StopFlag, SurfaceToken,
+    BackendCommand, BackendEvent, BackendObservation, BackendUnavailable, MediaError, OwnerBackend,
+    PauseObservation, PreparedTreatments, RequestId, RuntimeMediaObservation, StopFlag,
+    SurfaceToken,
 };
-use super::filter_catalog::CompiledFilterChain;
 use super::loopback::{
-    LoopbackCommand, LoopbackEvent, LoopbackOpen, LoopbackOwner, LoopbackReceipt,
+    HelperObservations, LoopbackCommand, LoopbackEvent, LoopbackOpen, LoopbackOwner,
+    LoopbackReceipt,
 };
 use super::session::{Observation, ObservedFacts, Source};
 use crate::capture::input::InputSpec;
@@ -16,12 +17,11 @@ use crate::domain::capture::{
 };
 use crate::domain::{
     failure::{
-        FILTER_DIAGNOSTIC_RECORDS, FILTER_DIAGNOSTIC_TEXT_CHARS, FilterAttemptDiagnostics,
-        FilterConfirmationFailure, FilterDiagnosticRecord, FilterEntryMetadata, FilterErrorKind,
-        FilterFailure,
+        TreatmentConfirmationFailure, TreatmentErrorKind, TreatmentFailure,
+        TreatmentFailureDisposition,
     },
     output::OutputPlan,
-    state::{AttemptId, FilterConfirmation, InitialPlayback, PauseRequestId, TreatmentAttemptKey},
+    state::{AttemptId, InitialPlayback, PauseRequestId, TreatmentAttemptKey, TreatmentPass},
 };
 use libloading::Library;
 use std::time::Instant;
@@ -40,7 +40,6 @@ use std::collections::VecDeque;
 #[cfg(test)]
 pub(crate) use treatment::RendererFixtureFault;
 use treatment::{TreatmentObservation, TreatmentRestore};
-
 const MPV_FORMAT_DOUBLE: c_int = 5;
 
 // Layouts and formats match mpv v0.41.0 include/mpv/client.h. No native event
@@ -449,6 +448,7 @@ unsafe extern "C" fn wake_owner(context: *mut c_void) {
 struct Handle {
     raw: NonNull<c_void>,
     functions: Functions,
+    client_api: c_ulong,
     wake: Box<WakeContext>,
     _library: Library,
     _owner_only: PhantomData<Rc<()>>,
@@ -478,6 +478,7 @@ impl Handle {
         let mut handle = Self {
             raw,
             functions,
+            client_api: api,
             wake: Box::new(WakeContext {
                 thread: thread::current(),
             }),
@@ -490,7 +491,7 @@ impl Handle {
         unsafe {
             (handle.functions.set_wakeup)(handle.raw.as_ptr(), Some(wake_owner), context);
         }
-        tracing::info!(path = %path.display(), api, "libmpv_loaded");
+        tracing::info!(event_code = "libmpv_loaded", client_api = api);
         Ok(handle)
     }
     fn checked(&self, code: c_int, operation: &str) -> Result<(), MediaError> {
@@ -513,7 +514,7 @@ impl Handle {
             (self.functions.set_option)(self.raw.as_ptr(), name.as_ptr(), value.as_ptr())
         };
         self.checked(result, name.to_str().unwrap_or("mpv option"))?;
-        tracing::info!(option = %name.to_string_lossy(), value = %value.to_string_lossy(), "mpv_option");
+        tracing::info!(event_code = "mpv_option", property = option_token(name),);
         Ok(())
     }
     fn option_double(&self, name: &CStr, mut value: f64) -> Result<(), MediaError> {
@@ -528,7 +529,7 @@ impl Handle {
             )
         };
         self.checked(result, name.to_str().unwrap_or("mpv option"))?;
-        tracing::info!(option = %name.to_string_lossy(), value, "mpv_option");
+        tracing::info!(event_code = "mpv_option", property = option_token(name),);
         Ok(())
     }
     fn property(&self, name: &CStr) -> Result<String, MediaError> {
@@ -600,8 +601,10 @@ enum Pending {
         expected: bool,
     },
     Metadata(usize),
-    FilterProgress {
-        key: TreatmentAttemptKey,
+    Diagnostic {
+        generation: u64,
+        epoch: u64,
+        field: DiagnosticField,
     },
     RendererRead {
         key: TreatmentAttemptKey,
@@ -625,8 +628,8 @@ impl Pending {
             Self::Pause | Self::PauseRead { .. } | Self::RendererPause { .. } => c"pause",
             Self::Metadata(0) => c"video-params",
             Self::Metadata(_) => c"container-fps",
-            Self::FilterProgress { .. } => c"time-pos",
             Self::RendererRead { property, .. } => super::render_catalog::native_name(property),
+            Self::Diagnostic { field, .. } => field.property(),
             #[cfg(test)]
             Self::FixtureProperty(name) => name,
         })
@@ -639,170 +642,52 @@ struct MetadataBatch {
     rerun: Option<bool>,
 }
 
-/// One keyed command window. Failure latches are independent of the bounded
-/// context ring, and no successful command reply alone completes this window.
-struct FilterObservation {
-    id: u64,
-    key: TreatmentAttemptKey,
-    entries: Vec<FilterEntryMetadata>,
-    command: Option<CString>,
-    admitted: Instant,
-    marker: u64,
-    dropped_at_begin: u64,
-    submitted: bool,
-    outcome: Option<i32>,
-    submission_error: Option<i32>,
-    reconfigured: bool,
-    baseline: Option<f64>,
-    position: Option<f64>,
-    advances: u16,
-    next_sample: Instant,
-    outstanding: bool,
-    graph_failure: bool,
-    disable: bool,
-    unrelated_error: bool,
-    attributed_ordinal: Option<usize>,
-    candidate_disable_ordinal: Option<usize>,
-    incumbent_disable_ordinal: Option<usize>,
-    failure: Option<FilterConfirmationFailure>,
-    fresh: bool,
+const BACKEND_OBSERVATION_TEXT_BYTES: usize = 128;
+
+#[derive(Clone, Copy)]
+enum DiagnosticField {
+    VoConfigured,
+    CurrentVo,
+    GpuContext,
 }
-impl FilterObservation {
-    fn new(
-        id: u64,
-        key: TreatmentAttemptKey,
-        compiled: CompiledFilterChain,
-        now: Instant,
-        marker: u64,
-        dropped: u64,
-    ) -> Self {
-        Self {
-            id,
-            key,
-            entries: compiled.entries,
-            command: Some(CString::new(compiled.vf).expect("compiler emits NUL-free syntax")),
-            admitted: now,
-            marker,
-            dropped_at_begin: dropped,
-            submitted: false,
-            outcome: None,
-            submission_error: None,
-            reconfigured: false,
-            baseline: None,
-            position: None,
-            advances: 0,
-            next_sample: now,
-            outstanding: false,
-            graph_failure: false,
-            disable: false,
-            unrelated_error: false,
-            attributed_ordinal: None,
-            candidate_disable_ordinal: None,
-            incumbent_disable_ordinal: None,
-            failure: None,
-            fresh: false,
+impl DiagnosticField {
+    const ALL: [Self; 3] = [Self::VoConfigured, Self::CurrentVo, Self::GpuContext];
+
+    fn property(self) -> &'static CStr {
+        match self {
+            Self::VoConfigured => c"vo-configured",
+            Self::CurrentVo => c"current-vo",
+            Self::GpuContext => c"current-gpu-context",
         }
     }
-    fn progress(&mut self, value: Option<f64>, now: Instant) {
-        self.outstanding = false;
-        self.next_sample = now + FilterConfirmation::SAMPLE_INTERVAL;
-        let Some(value) = value.filter(|value| value.is_finite()) else {
-            self.failure
-                .get_or_insert(FilterConfirmationFailure::ProgressUnavailable);
-            return;
-        };
-        if let Some(previous) = self.position {
-            if value < previous {
-                self.failure
-                    .get_or_insert(FilterConfirmationFailure::TimeDiscontinuity);
-            } else if value > previous {
-                self.advances += 1; // Bounded by REQUIRED_ADVANCES before the next request.
-            }
-        } else {
-            self.baseline = Some(value);
-        }
-        self.position = Some(value);
-    }
-    fn ready(&self) -> bool {
-        self.outcome.is_some_and(|error| error >= 0)
-            && self.reconfigured
-            && self.advances >= FilterConfirmation::REQUIRED_ADVANCES
-            && !self.outstanding
-    }
-    fn error_kind(&self) -> Option<FilterErrorKind> {
-        if let Some(mpv_error) = self.submission_error {
-            Some(FilterErrorKind::CommandSubmission { mpv_error })
-        } else if let Some(mpv_error) = self.outcome.filter(|error| *error < 0) {
-            Some(FilterErrorKind::CommandRejected { mpv_error })
-        } else if self.failure == Some(FilterConfirmationFailure::EvidenceLost) {
-            Some(FilterErrorKind::Unconfirmed {
-                reason: FilterConfirmationFailure::EvidenceLost,
-            })
-        } else if self.outcome.is_some_and(|error| error >= 0)
-            && (self.graph_failure || self.disable)
-        {
-            Some(FilterErrorKind::RuntimeGraph)
-        } else if let Some(reason) = self.failure {
-            Some(FilterErrorKind::Unconfirmed { reason })
-        } else if self.outcome.is_some_and(|error| error >= 0) && self.unrelated_error {
-            Some(FilterErrorKind::Unconfirmed {
-                reason: FilterConfirmationFailure::EvidenceLost,
-            })
-        } else {
-            None
-        }
+
+    fn bit(self) -> u8 {
+        1 << (self as u8)
     }
 }
 
-struct FilterHealth {
-    key: TreatmentAttemptKey,
-    treatment_key: TreatmentAttemptKey,
-    entries: Vec<FilterEntryMetadata>,
-    marker: u64,
-    dropped_at_begin: u64,
-    faulted: bool,
+/// Exactly three possible pending reads plus one latest-epoch rerun slot.
+/// Only bounded, validated scalar results survive the native event lifetime.
+struct DiagnosticBatch {
+    generation: u64,
+    epoch: u64,
+    outstanding: u8,
+    vo_configured: Option<bool>,
+    video_output: Option<String>,
+    gpu_context: Option<String>,
+    failure: Option<BackendUnavailable>,
+    rerun: Option<u64>,
 }
 
-/// Match a complete internal token, never a filter kind or a user label.
-fn filter_ordinal(text: &str, entries: &[FilterEntryMetadata]) -> Option<usize> {
-    text.split(|c: char| {
-        c.is_whitespace()
-            || matches!(
-                c,
-                '/' | ':' | '[' | ']' | '(' | ')' | '"' | '\'' | ',' | ';'
-            )
+fn diagnostic_text(value: NodeValue) -> Option<String> {
+    let NodeValue::String(value) = value else {
+        return None;
+    };
+    value.into_string().ok().filter(|text| {
+        !text.trim().is_empty()
+            && text.len() <= BACKEND_OBSERVATION_TEXT_BYTES
+            && !text.chars().any(char::is_control)
     })
-    .find_map(|token| {
-        let token = token.strip_prefix('@').unwrap_or(token);
-        let digits = token.strip_prefix("furami_")?;
-        let ordinal = digits.parse::<usize>().ok()?;
-        (!digits.is_empty()
-            && digits.bytes().all(|byte| byte.is_ascii_digit())
-            && (digits.len() == 1 || !digits.starts_with('0'))
-            && entries
-                .iter()
-                .any(|entry| entry.ordinal == ordinal && entry.enabled))
-        .then_some(ordinal)
-    })
-}
-
-fn graph_log(prefix: &str, text: &str) -> (bool, bool) {
-    let disable = prefix == "vf"
-        && text.starts_with("Disabling filter ")
-        && text.contains(" because it has failed.");
-    let graph_prefix = prefix == "vf"
-        || prefix == "lavfi"
-        || prefix.starts_with("ffmpeg/")
-        || prefix.starts_with("vf/");
-    let graph = graph_prefix
-        && (text.contains("failed to configure the filter graph")
-            || text.contains("Failed to configure the filter graph")
-            || text.contains("could not initialize filter pads")
-            || text.contains("Could not initialize filter pads")
-            || text.contains(
-                "Cannot convert decoder/filter output to any format supported by the output.",
-            ));
-    (graph, disable)
 }
 
 struct AudioRetirement {
@@ -833,10 +718,14 @@ pub(crate) struct MpvBackend {
     load_id: Option<u64>,
     load_complete: bool,
     video_started: bool,
+    playback_restart_seen: bool,
+    startup_vo_configured: bool,
     video_ended: bool,
     last_internal: u64,
     pending: Vec<(u64, Pending)>,
     metadata: Option<MetadataBatch>,
+    diagnostics: Option<RuntimeMediaObservation>,
+    diagnostics_batch: Option<DiagnosticBatch>,
     pause_pending: bool,
     pause_dirty: bool,
     emitted: VecDeque<BackendEvent>,
@@ -847,21 +736,11 @@ pub(crate) struct MpvBackend {
         PreparedTreatments,
         crate::domain::state::TreatmentConfirmation,
     )>,
-    filter_result: Option<Result<FilterConfirmation, Box<FilterFailure>>>,
-    filter_observation: Option<FilterObservation>,
-    filter_health: Option<FilterHealth>,
-    filters_poisoned: bool,
-    filter_records: VecDeque<FilterDiagnosticRecord>,
-    log_sequence: u64,
-    last_truncated_sequence: u64,
-    dropped_context: u64,
-    native_evidence_lost: bool,
-    #[cfg(test)]
-    filter_fault: Option<FixtureFault>,
-    #[cfg(test)]
-    filter_fault_pass: Option<crate::domain::state::TreatmentPass>,
+    treatment_poisoned: bool,
     #[cfg(test)]
     renderer_fixture_fault: Option<RendererFixtureFault>,
+    #[cfg(test)]
+    renderer_submission_error: Option<i32>,
     #[cfg(test)]
     fixture_recorder: Option<FixtureRecorder>,
     #[cfg(test)]
@@ -917,10 +796,14 @@ impl MpvBackend {
             load_id: None,
             load_complete: false,
             video_started: false,
+            playback_restart_seen: false,
+            startup_vo_configured: false,
             video_ended: false,
             last_internal: 1 << 63,
             pending: Vec::with_capacity(8),
             metadata: None,
+            diagnostics: None,
+            diagnostics_batch: None,
             pause_pending: false,
             pause_dirty: false,
             emitted: VecDeque::new(),
@@ -928,21 +811,11 @@ impl MpvBackend {
             treatment_observation: None,
             treatment_restore: None,
             landed_treatments: None,
-            filter_result: None,
-            filter_observation: None,
-            filter_health: None,
-            filters_poisoned: false,
-            filter_records: VecDeque::with_capacity(FILTER_DIAGNOSTIC_RECORDS),
-            log_sequence: 0,
-            last_truncated_sequence: 0,
-            dropped_context: 0,
-            native_evidence_lost: false,
-            #[cfg(test)]
-            filter_fault: None,
-            #[cfg(test)]
-            filter_fault_pass: None,
+            treatment_poisoned: false,
             #[cfg(test)]
             renderer_fixture_fault: None,
+            #[cfg(test)]
+            renderer_submission_error: None,
             #[cfg(test)]
             fixture_recorder: None,
             #[cfg(test)]
@@ -965,481 +838,49 @@ impl MpvBackend {
             recorder.record_native(event);
         }
     }
-    #[cfg(test)]
-    fn active_fixture_fault(&self) -> Option<FixtureFault> {
-        self.filter_fault.filter(|_| {
-            self.filter_fault_pass.is_none_or(|pass| {
-                self.filter_observation
-                    .as_ref()
-                    .is_some_and(|observation| observation.key.pass == pass)
-            })
-        })
-    }
 
-    fn filter_diagnostics(
-        &self,
-        key: TreatmentAttemptKey,
-        entries: &[FilterEntryMetadata],
-        marker: u64,
-        dropped: u64,
-    ) -> FilterAttemptDiagnostics {
-        let records: Vec<_> = self
-            .filter_records
-            .iter()
-            .filter(|record| record.sequence > marker)
-            .cloned()
-            .collect();
-        FilterAttemptDiagnostics {
-            key: Some(key),
-            entries: entries.to_vec(),
-            truncated: self.last_truncated_sequence > marker,
-            records,
-            native_evidence_lost: self.native_evidence_lost,
-            dropped_context: self.dropped_context.saturating_sub(dropped),
-        }
-    }
-
-    fn filter_fault(&mut self, kind: FilterErrorKind, ordinal: Option<usize>) {
-        self.filters_poisoned = true;
-        if let Some(health) = self.filter_health.as_ref().filter(|health| !health.faulted) {
-            let key = health.key;
-            let treatment_key = health.treatment_key;
-            let failure = FilterFailure {
-                kind,
-                attributed_ordinal: ordinal,
-                requires_fresh_owner: true,
-                diagnostics: self.filter_diagnostics(
-                    key,
-                    &health.entries,
-                    health.marker,
-                    health.dropped_at_begin,
-                ),
-            };
-            self.treatment_filter_revoked(&failure);
-            self.filter_health.as_mut().expect("known health").faulted = true;
-            crate::diagnostics::filter_end(key, Err(&failure), &failure.diagnostics);
+    fn revoke_treatment(&mut self, reason: TreatmentConfirmationFailure) {
+        self.treatment_poisoned = true;
+        self.treatment_lost(reason);
+        if let Some((_, confirmation)) = self.landed_treatments.take() {
+            let key = confirmation.key();
             self.emitted.push_back(BackendEvent::TreatmentFault {
-                key: treatment_key,
-                failure: Box::new(crate::domain::failure::TreatmentFailure {
-                    key: Some(treatment_key),
-                    kind: crate::domain::failure::TreatmentErrorKind::Filter(failure),
-                    disposition:
-                        crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner,
+                key,
+                failure: Box::new(TreatmentFailure {
+                    key: Some(key),
+                    kind: TreatmentErrorKind::Unconfirmed { reason },
+                    disposition: TreatmentFailureDisposition::RestoreFreshOwner,
                 }),
             });
-        } else {
-            self.treatment_lost(
-                crate::domain::failure::TreatmentConfirmationFailure::BackendUnavailable,
-            );
         }
     }
 
-    fn filter_lost(&mut self, reason: FilterConfirmationFailure) {
-        self.filters_poisoned = true;
-        self.treatment_lost(if reason == FilterConfirmationFailure::EvidenceLost {
-            crate::domain::failure::TreatmentConfirmationFailure::EvidenceLost
-        } else {
-            crate::domain::failure::TreatmentConfirmationFailure::BackendUnavailable
-        });
-        if reason == FilterConfirmationFailure::EvidenceLost {
-            self.native_evidence_lost = true;
-        }
-        if let Some(observation) = &mut self.filter_observation {
-            if reason == FilterConfirmationFailure::EvidenceLost {
-                observation.failure = Some(reason);
-                observation.attributed_ordinal = None;
-                observation.candidate_disable_ordinal = None;
-                observation.incumbent_disable_ordinal = None;
-            } else {
-                observation.failure.get_or_insert(reason);
-            }
-            observation.fresh = true;
-        }
-        if self.filter_observation.is_none() || reason == FilterConfirmationFailure::EvidenceLost {
-            self.filter_fault(FilterErrorKind::Unconfirmed { reason }, None);
-        }
-    }
-    /// Recoverable malformed raw logs still consume a non-clean observer tick.
-    /// Returning Other/result/fault must never manufacture MPV_EVENT_NONE.
-    fn malformed_filter_log(&mut self, now: Instant) -> Result<BackendEvent, MediaError> {
-        self.filter_lost(FilterConfirmationFailure::EvidenceLost);
-        self.filter_tick(now, false)?;
+    /// Malformed logs consume a non-clean tick, never a manufactured native NONE.
+    fn malformed_log(&mut self, now: Instant) -> Result<BackendEvent, MediaError> {
+        self.revoke_treatment(TreatmentConfirmationFailure::EvidenceLost);
         self.treatment_tick(now, false)?;
         Ok(self.emitted.pop_front().unwrap_or(BackendEvent::Other))
     }
 
-    fn filter_log(
-        &mut self,
-        prefix: String,
-        level: String,
-        text: String,
-    ) -> Result<(), MediaError> {
-        self.log_sequence = self
-            .log_sequence
-            .checked_add(1)
-            .ok_or_else(|| MediaError::new("filter_sequence", "native log sequence exhausted"))?;
-        #[cfg(test)]
-        self.native_record(serde_json::json!({"event":"log","sequence":self.log_sequence,"key":self.filter_observation.as_ref().map(|observation| observation.key).or_else(|| self.filter_health.as_ref().map(|health| health.key)),"prefix":prefix,"level":level,"text":text}));
-        let loss = prefix == "overflow"
+    fn native_log(&mut self, prefix: &str, level: &str, text: &str) {
+        if prefix == "overflow"
             && level == "fatal"
-            && text.starts_with("log message buffer overflow:");
-        let (graph, disable) = graph_log(&prefix, &text);
-        let is_error = matches!(level.as_str(), "fatal" | "error");
-        if is_error && !graph && !disable && self.filter_observation.is_none() {
-            self.renderer_log_error();
-        }
-        // Full copied text is classified before any retention truncation.
-        let key = self
-            .filter_observation
-            .as_ref()
-            .map(|observation| observation.key)
-            .or_else(|| self.filter_health.as_ref().map(|health| health.key));
-        let submitted = self
-            .filter_observation
-            .as_ref()
-            .is_some_and(|observation| observation.submitted);
-        if submitted {
-            let observation = self
-                .filter_observation
-                .as_mut()
-                .expect("submitted observation");
-            observation.graph_failure |= graph && is_error;
-            observation.disable |= disable;
-            if disable && observation.failure != Some(FilterConfirmationFailure::EvidenceLost) {
-                observation.incumbent_disable_ordinal =
-                    observation.incumbent_disable_ordinal.or_else(|| {
-                        self.filter_health
-                            .as_ref()
-                            .and_then(|health| filter_ordinal(&text, &health.entries))
-                    });
-                observation.candidate_disable_ordinal = observation
-                    .candidate_disable_ordinal
-                    .or_else(|| filter_ordinal(&text, &observation.entries));
-            }
-            observation.unrelated_error |= is_error && !graph && !disable && !loss;
-            if is_error
-                && !disable
-                && observation.failure != Some(FilterConfirmationFailure::EvidenceLost)
-            {
-                observation.attributed_ordinal = observation.attributed_ordinal.or_else(|| {
-                    filter_ordinal(&prefix, &observation.entries)
-                        .or_else(|| filter_ordinal(&text, &observation.entries))
-                });
-            }
-            if disable || (is_error && !loss && observation.outcome.is_some_and(|error| error >= 0))
-            {
-                observation.fresh = true;
-                self.filters_poisoned = true;
-            }
-        }
-        let incumbent_ordinal = self.filter_health.as_ref().and_then(|health| {
-            filter_ordinal(&prefix, &health.entries)
-                .or_else(|| filter_ordinal(&text, &health.entries))
-        });
-        let truncate_at = text
-            .char_indices()
-            .nth(FILTER_DIAGNOSTIC_TEXT_CHARS)
-            .map(|(index, _)| index);
-        let truncated = truncate_at.is_some();
-        let mut text = text;
-        if let Some(index) = truncate_at {
-            text.truncate(index);
-        }
-        if truncated {
-            self.last_truncated_sequence = self.log_sequence;
-        }
-        let record = FilterDiagnosticRecord {
-            sequence: self.log_sequence,
-            prefix,
-            level,
-            text,
-            truncated,
-        };
-        if self.filter_records.len() == FILTER_DIAGNOSTIC_RECORDS {
-            self.filter_records.pop_front();
-            self.dropped_context = self.dropped_context.checked_add(1).ok_or_else(|| {
-                MediaError::new("filter_sequence", "native context counter exhausted")
-            })?;
-        }
-        if let Some(key) = key {
-            crate::diagnostics::filter_record(key, &record);
-        }
-        self.filter_records.push_back(record);
-        if loss {
-            self.filter_lost(FilterConfirmationFailure::EvidenceLost);
-        } else if !submitted && !self.native_evidence_lost && ((graph && is_error) || disable) {
-            let ordinal = incumbent_ordinal;
-            self.filter_fault(FilterErrorKind::RuntimeGraph, ordinal);
-            if let Some(observation) = &mut self.filter_observation {
-                observation.failure = Some(FilterConfirmationFailure::BackendUnavailable);
-                observation.fresh = true;
-            }
-        } else if !submitted
-            && !self.native_evidence_lost
-            && is_error
-            && self.filter_health.is_some()
-            && self.treatment_observation.is_none()
+            && text.starts_with("log message buffer overflow:")
         {
-            self.filter_fault(
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::EvidenceLost,
-                },
-                None,
-            );
-            if let Some(observation) = &mut self.filter_observation {
-                observation.failure = Some(FilterConfirmationFailure::BackendUnavailable);
-                observation.fresh = true;
+            self.revoke_treatment(TreatmentConfirmationFailure::EvidenceLost);
+        } else if matches!(level, "fatal" | "error") {
+            if self.treatment_observation.is_some() {
+                // Correlate a definitive SET rejection before classifying
+                // otherwise-unattributable errors at the next clean drain.
+                self.renderer_log_error();
+            } else if self.landed_treatments.is_some() {
+                self.revoke_treatment(TreatmentConfirmationFailure::EvidenceLost);
             }
+            // Ordinary pre-proof errors have no owned proof to revoke. They
+            // neither create readiness nor clear any previously latched loss.
         }
-        Ok(())
     }
 
-    fn finish_filter(&mut self) {
-        let observation = self
-            .filter_observation
-            .take()
-            .expect("settled filter observation");
-        self.pending.retain(|(_, pending)| !matches!(pending, Pending::FilterProgress { key } if *key == observation.key));
-        let diagnostics = self.filter_diagnostics(
-            observation.key,
-            &observation.entries,
-            observation.marker,
-            observation.dropped_at_begin,
-        );
-        let result = if let Some(kind) = observation.error_kind() {
-            let failure = Box::new(FilterFailure {
-                attributed_ordinal: match &kind {
-                    FilterErrorKind::RuntimeGraph => observation
-                        .attributed_ordinal
-                        .or(observation.candidate_disable_ordinal),
-                    FilterErrorKind::CommandRejected { .. } => observation.attributed_ordinal,
-                    _ => None,
-                },
-                kind,
-                requires_fresh_owner: observation.fresh || self.filters_poisoned,
-                diagnostics,
-            });
-            crate::diagnostics::filter_end(observation.key, Err(&failure), &failure.diagnostics);
-            Err(failure)
-        } else {
-            let confirmation = FilterConfirmation::checked(
-                observation.key,
-                observation.baseline.expect("ready baseline"),
-                observation.position.expect("ready position"),
-                observation.advances,
-            )
-            .expect("observer checked positive predicate");
-            crate::diagnostics::filter_end(observation.key, Ok(&confirmation), &diagnostics);
-            self.filter_health = Some(FilterHealth {
-                key: observation.key,
-                treatment_key: self
-                    .landed_treatments
-                    .as_ref()
-                    .map_or(observation.key, |(_, confirmation)| confirmation.key()),
-                entries: observation.entries,
-                marker: observation.marker,
-                dropped_at_begin: observation.dropped_at_begin,
-                faulted: false,
-            });
-            Ok(confirmation)
-        };
-        #[cfg(test)]
-        self.native_record(serde_json::json!({"event":"result","key":observation.key,"request":observation.id,"result":result}));
-        self.filter_result = Some(result);
-    }
-
-    fn filter_tick(&mut self, now: Instant, clean: bool) -> Result<(), MediaError> {
-        #[cfg(test)]
-        if clean && let Some(observation) = &self.filter_observation {
-            let stage = if !observation.submitted {
-                "pre-submit"
-            } else if observation.ready() {
-                "post-progress"
-            } else if observation.error_kind().is_some() {
-                "settlement"
-            } else {
-                "observation"
-            };
-            self.native_record(serde_json::json!({"event":"drain","key":observation.key,"request":observation.id,"stage":stage}));
-        }
-        if let Some(observation) = &mut self.filter_observation {
-            if now.duration_since(observation.admitted) >= FilterConfirmation::DEADLINE {
-                observation.failure.get_or_insert(
-                    if observation.submitted
-                        && observation.outcome.is_some_and(|error| error >= 0)
-                        && !observation.reconfigured
-                    {
-                        FilterConfirmationFailure::MissingReconfig
-                    } else {
-                        FilterConfirmationFailure::Deadline
-                    },
-                );
-                if observation.submitted
-                    && observation.outcome.is_none()
-                    && observation.submission_error.is_none()
-                {
-                    observation.fresh = true;
-                }
-                if !clean {
-                    observation.fresh = true;
-                    self.native_evidence_lost = true;
-                    self.filters_poisoned = true;
-                }
-                self.finish_filter();
-                return Ok(());
-            }
-        } else {
-            return Ok(());
-        }
-        if clean
-            && self.filter_observation.as_ref().is_some_and(|observation| {
-                (observation.error_kind().is_some()
-                    && (!observation.submitted
-                        || observation.outcome.is_some()
-                        || observation.submission_error.is_some()))
-                    || observation.ready()
-            })
-        {
-            // Negative reply and all its buffered logs settle only at native NONE.
-            if let Some(observation) = self.filter_observation.as_ref().filter(|observation| {
-                (observation.submission_error.is_some()
-                    || observation.outcome.is_some_and(|error| error < 0))
-                    && (observation.disable || observation.fresh)
-            }) {
-                let (kind, ordinal) =
-                    if observation.failure == Some(FilterConfirmationFailure::EvidenceLost) {
-                        (
-                            FilterErrorKind::Unconfirmed {
-                                reason: FilterConfirmationFailure::EvidenceLost,
-                            },
-                            None,
-                        )
-                    } else if observation.disable {
-                        (
-                            FilterErrorKind::RuntimeGraph,
-                            observation.incumbent_disable_ordinal,
-                        )
-                    } else {
-                        (
-                            FilterErrorKind::Unconfirmed {
-                                reason: observation
-                                    .failure
-                                    .unwrap_or(FilterConfirmationFailure::EvidenceLost),
-                            },
-                            None,
-                        )
-                    };
-                self.filter_fault(kind, ordinal);
-            }
-            self.finish_filter();
-            return Ok(());
-        }
-        if clean
-            && self
-                .filter_observation
-                .as_ref()
-                .is_some_and(|observation| !observation.submitted)
-        {
-            if self.filters_poisoned || self.video_ended {
-                let observation = self
-                    .filter_observation
-                    .as_mut()
-                    .expect("admitted observation");
-                observation.failure = Some(FilterConfirmationFailure::BackendUnavailable);
-                observation.fresh = true;
-                self.finish_filter();
-                return Ok(());
-            }
-            let observation = self
-                .filter_observation
-                .as_mut()
-                .expect("admitted observation");
-            observation.submitted = true;
-            observation.marker = self.log_sequence;
-            observation.dropped_at_begin = self.dropped_context;
-            let id = observation.id;
-            let vf = observation.command.take().expect("single compiled command");
-            tracing::info!(key = ?observation.key, request = id, vf = ?vf, "filter_command_submit");
-            #[cfg(test)]
-            let result = match self.active_fixture_fault() {
-                Some(FixtureFault::CommandSubmission(error)) => {
-                    self.filter_fault.take();
-                    Ok(error)
-                }
-                Some(FixtureFault::CreationRejected) => {
-                    self.filter_fault.take();
-                    self.vf_command(id, c"@furami_0:furami_nonregistered_creation_fault")
-                }
-                _ => self.vf_command(id, &vf),
-            };
-            #[cfg(not(test))]
-            let result = self.vf_command(id, &vf);
-            let result = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    tracing::info!(request = id, diagnostic = ?error.diagnostic, "filter_backend_unavailable");
-                    self.filter_lost(FilterConfirmationFailure::BackendUnavailable);
-                    self.filter_observation
-                        .as_mut()
-                        .expect("unsubmitted window")
-                        .submitted = false;
-                    return Ok(());
-                }
-            };
-            if result < 0 {
-                let observation = self
-                    .filter_observation
-                    .as_mut()
-                    .expect("submitted observation");
-                observation.submission_error = Some(result);
-            }
-            #[cfg(test)]
-            self.native_record(
-                serde_json::json!({"event":"submission","request":id,"error":result}),
-            );
-        }
-        let sample = self
-            .filter_observation
-            .as_ref()
-            .filter(|observation| {
-                observation.submitted
-                    && observation.outcome.is_some_and(|error| error >= 0)
-                    && observation.reconfigured
-                    && !observation.outstanding
-                    && observation.error_kind().is_none()
-                    && observation.advances < FilterConfirmation::REQUIRED_ADVANCES
-                    && now >= observation.next_sample
-            })
-            .map(|observation| observation.key);
-        if let Some(key) = sample {
-            self.filter_observation
-                .as_mut()
-                .expect("sample observation")
-                .outstanding = true;
-            if self
-                .get(c"time-pos", Pending::FilterProgress { key })
-                .is_err()
-            {
-                let observation = self
-                    .filter_observation
-                    .as_mut()
-                    .expect("sample observation");
-                observation.outstanding = false;
-                observation.failure = Some(FilterConfirmationFailure::ProgressUnavailable);
-            }
-        }
-        Ok(())
-    }
-
-    fn vf_command(&self, id: u64, vf: &CStr) -> Result<i32, MediaError> {
-        #[cfg(test)]
-        self.native_record(serde_json::json!({"event":"command","key":self.filter_observation.as_ref().map(|observation| observation.key),"request":id,"argv":["vf","set",vf.to_str().expect("compiler ASCII")],"fault":format!("{:?}",self.active_fixture_fault())}));
-        let handle = self.handle()?;
-        let argv = [c"vf".as_ptr(), c"set".as_ptr(), vf.as_ptr(), ptr::null()];
-        // SAFETY: One owner handle, exact cookie and NUL-terminated compiled argv;
-        // libmpv copies the command and retains none of these borrowed pointers.
-        Ok(unsafe { (handle.functions.command_async)(handle.raw.as_ptr(), id, argv.as_ptr()) })
-    }
     fn handle(&self) -> Result<&Handle, MediaError> {
         self.handle
             .as_ref()
@@ -1451,35 +892,8 @@ impl MpvBackend {
         })?;
         Ok(self.last_internal)
     }
-    fn invalidate_filter_progress(&mut self, id: u64) -> bool {
-        let Some(index) = self.pending.iter().position(|(request, pending)| {
-            *request == id && matches!(pending, Pending::FilterProgress { .. })
-        }) else {
-            return false;
-        };
-        let (_, Pending::FilterProgress { key }) = self.pending.swap_remove(index) else {
-            unreachable!()
-        };
-        if let Some(observation) = self
-            .filter_observation
-            .as_mut()
-            .filter(|observation| observation.key == key)
-        {
-            observation.outstanding = false;
-            observation
-                .failure
-                .get_or_insert(FilterConfirmationFailure::ProgressUnavailable);
-        }
-        true
-    }
     fn get(&mut self, name: &'static CStr, pending: Pending) -> Result<(), MediaError> {
-        let id = if let Pending::FilterProgress { key } = pending
-            && let Some(observation) = &mut self.treatment_observation
-        {
-            observation.progress_request(key)?
-        } else {
-            self.next_internal()?
-        };
+        let id = self.next_internal()?;
         #[cfg(test)]
         if let Some(requests) = &mut self.property_requests {
             requests.push((id, name, None));
@@ -1507,6 +921,212 @@ impl MpvBackend {
         self.pending.push((id, pending));
         Ok(())
     }
+    fn clear_diagnostics(&mut self) {
+        self.diagnostics = None;
+        self.diagnostics_batch = None;
+        self.pending
+            .retain(|(_, pending)| !matches!(pending, Pending::Diagnostic { .. }));
+        self.emitted
+            .retain(|event| !matches!(event, BackendEvent::Diagnostics(_)));
+    }
+
+    fn record_initialized_diagnostics(&mut self, client_api: u64, version: &str) {
+        self.clear_diagnostics();
+        self.diagnostics = Some(RuntimeMediaObservation {
+            generation: self.generation,
+            observation_epoch: 0,
+            client_api,
+            // The exact already-validated release token, without incidental
+            // ASCII whitespace from the synchronous initialization read.
+            libmpv_version: version
+                .trim_matches(|c: char| c.is_ascii_whitespace())
+                .into(),
+            backend: BackendObservation::Unavailable(BackendUnavailable::NotObserved),
+            helpers: HelperObservations::default(),
+        });
+        self.emit_diagnostics();
+    }
+
+    fn emit_diagnostics(&mut self) {
+        if let Some(observation) = &self.diagnostics {
+            self.emitted
+                .push_back(BackendEvent::Diagnostics(Box::new(observation.clone())));
+        }
+    }
+
+    fn set_backend_observation(&mut self, backend: BackendObservation) {
+        if let Some(observation) = &mut self.diagnostics
+            && observation.backend != backend
+        {
+            observation.backend = backend;
+            self.emit_diagnostics();
+        }
+    }
+
+    fn sync_helper_observations(&mut self) {
+        if let (Some(owner), Some(observation)) = (&self.loopback, &mut self.diagnostics) {
+            let helpers = owner.helper_observations();
+            if observation.helpers != helpers {
+                observation.helpers = helpers;
+                self.emit_diagnostics();
+            }
+        }
+    }
+
+    fn start_diagnostics_batch(&mut self, epoch: u64) {
+        let Some(observation) = &self.diagnostics else {
+            return;
+        };
+        if observation.observation_epoch != epoch || self.diagnostics_batch.is_some() {
+            return;
+        }
+        let generation = observation.generation;
+        self.diagnostics_batch = Some(DiagnosticBatch {
+            generation,
+            epoch,
+            outstanding: 0b111,
+            vo_configured: None,
+            video_output: None,
+            gpu_context: None,
+            failure: None,
+            rerun: None,
+        });
+        for field in DiagnosticField::ALL {
+            if self
+                .get(
+                    field.property(),
+                    Pending::Diagnostic {
+                        generation,
+                        epoch,
+                        field,
+                    },
+                )
+                .is_err()
+            {
+                // No reply exists for a rejected submission. Settle just this
+                // bit while retaining any genuinely outstanding earlier reads.
+                self.diagnostic_reply(
+                    generation,
+                    epoch,
+                    field,
+                    None,
+                    Some(BackendUnavailable::SubmissionRejected),
+                );
+            }
+        }
+    }
+
+    fn diagnostic_reply(
+        &mut self,
+        generation: u64,
+        epoch: u64,
+        field: DiagnosticField,
+        value: Option<NodeValue>,
+        failure: Option<BackendUnavailable>,
+    ) {
+        let Some(batch) = &mut self.diagnostics_batch else {
+            return;
+        };
+        if batch.generation != generation
+            || batch.epoch != epoch
+            || batch.outstanding & field.bit() == 0
+        {
+            return;
+        }
+        batch.outstanding &= !field.bit();
+        let failure = failure.or_else(|| match (field, value) {
+            (DiagnosticField::VoConfigured, Some(NodeValue::Flag(value))) => {
+                batch.vo_configured = Some(value);
+                None
+            }
+            (DiagnosticField::CurrentVo | DiagnosticField::GpuContext, Some(value)) => {
+                if let Some(text) = diagnostic_text(value) {
+                    match field {
+                        DiagnosticField::CurrentVo => batch.video_output = Some(text),
+                        DiagnosticField::GpuContext => batch.gpu_context = Some(text),
+                        DiagnosticField::VoConfigured => unreachable!(),
+                    }
+                    None
+                } else {
+                    Some(BackendUnavailable::InvalidPayload)
+                }
+            }
+            (_, None) => Some(BackendUnavailable::PropertyUnavailable),
+            _ => Some(BackendUnavailable::InvalidPayload),
+        });
+        if let Some(failure) = failure {
+            batch.failure.get_or_insert(failure);
+        }
+        let failed = batch.failure;
+        let complete = batch.outstanding == 0;
+        let current = self.diagnostics.as_ref().is_some_and(|observation| {
+            observation.generation == generation && observation.observation_epoch == epoch
+        });
+        if current && matches!(field, DiagnosticField::VoConfigured) {
+            // The Boolean is independent of incidental backend-name failures.
+            // Only this exact current-epoch reply can witness decoded video.
+            self.startup_vo_configured = failure.is_none()
+                && self.diagnostics_batch.as_ref().unwrap().vo_configured == Some(true);
+        }
+        if current && let Some(failure) = failed {
+            self.set_backend_observation(BackendObservation::Unavailable(failure));
+        }
+        if !complete {
+            return;
+        }
+        let batch = self
+            .diagnostics_batch
+            .take()
+            .expect("completed diagnostic batch");
+        if current {
+            let backend = if let Some(failure) = batch.failure {
+                BackendObservation::Unavailable(failure)
+            } else if batch.vo_configured != Some(true) {
+                BackendObservation::Unavailable(BackendUnavailable::NotConfigured)
+            } else if let (Some(video_output), Some(gpu_context)) =
+                (batch.video_output, batch.gpu_context)
+            {
+                BackendObservation::Observed {
+                    video_output: video_output.into(),
+                    gpu_context: gpu_context.into(),
+                }
+            } else {
+                BackendObservation::Unavailable(BackendUnavailable::PropertyUnavailable)
+            };
+            self.set_backend_observation(backend);
+        }
+        if let Some(epoch) = batch.rerun {
+            self.start_diagnostics_batch(epoch);
+        }
+    }
+
+    fn invalidate_diagnostic_read(&mut self, id: u64) -> bool {
+        let Some(index) = self.pending.iter().position(|(request, pending)| {
+            *request == id && matches!(pending, Pending::Diagnostic { .. })
+        }) else {
+            return false;
+        };
+        let (
+            _,
+            Pending::Diagnostic {
+                generation,
+                epoch,
+                field,
+            },
+        ) = self.pending.swap_remove(index)
+        else {
+            unreachable!()
+        };
+        self.diagnostic_reply(
+            generation,
+            epoch,
+            field,
+            None,
+            Some(BackendUnavailable::InvalidPayload),
+        );
+        true
+    }
+
     fn publish_audio(&mut self, status: AudioAvailability) {
         if self.audio_status != status {
             self.audio_status = status;
@@ -1629,6 +1249,9 @@ impl MpvBackend {
     }
 
     fn consume_audio_event(&mut self, event: LoopbackEvent) {
+        // Sample before Stopped can retire the audio owner; no outcome is lost
+        // when its single event mailbox coalesces completion with a failure.
+        self.sync_helper_observations();
         match event {
             LoopbackEvent::Opening | LoopbackEvent::UnlinkedReady(_) => {}
             LoopbackEvent::Active(receipt)
@@ -1714,6 +1337,7 @@ impl MpvBackend {
     }
 
     fn drive_audio(&mut self) {
+        self.sync_helper_observations();
         for _ in 0..4 {
             let Some(event) = self.loopback.as_mut().and_then(LoopbackOwner::poll) else {
                 break;
@@ -1759,6 +1383,73 @@ impl MpvBackend {
         }
         Ok(())
     }
+    fn promote_startup(&mut self) -> Result<(), MediaError> {
+        if !self.video_started
+            && !self.video_ended
+            && !self.cancelled()
+            && self.playback_restart_seen
+            && self.startup_vo_configured
+        {
+            // force-window=no makes successful VO configuration a decoded-frame
+            // witness, not a presentation or continuing-health guarantee.
+            self.video_started = true;
+            self.begin_audio_if_ready()?;
+            self.emitted.push_back(BackendEvent::PlaybackRestart);
+        }
+        Ok(())
+    }
+
+    fn reset_startup(&mut self) {
+        self.playback_restart_seen = false;
+        self.startup_vo_configured = false;
+        self.video_started = false;
+        self.video_ended = false;
+        self.load_complete = false;
+        self.initial_audio_checked = false;
+        self.diagnostics_batch = None;
+        self.pending
+            .retain(|(_, pending)| !matches!(pending, Pending::Diagnostic { .. }));
+        self.emitted
+            .retain(|event| !matches!(event, BackendEvent::PlaybackRestart));
+        if let Some(observation) = &mut self.diagnostics {
+            if let Some(epoch) = observation.observation_epoch.checked_add(1) {
+                observation.observation_epoch = epoch;
+            } else {
+                self.video_ended = true;
+            }
+        }
+    }
+
+    fn reconfiguration_event(&mut self) -> BackendEvent {
+        self.startup_vo_configured = false;
+        let Some(observation) = &mut self.diagnostics else {
+            return BackendEvent::VideoReconfig;
+        };
+        if let Some(epoch) = observation.observation_epoch.checked_add(1) {
+            observation.observation_epoch = epoch;
+            observation.backend = BackendObservation::Unavailable(BackendUnavailable::Invalidated);
+            self.emit_diagnostics();
+            // Preserve the existing refresh event, after immediate invalidation.
+            self.emitted.push_back(BackendEvent::VideoReconfig);
+            if let Some(batch) = &mut self.diagnostics_batch {
+                batch.rerun = Some(epoch);
+            } else {
+                self.start_diagnostics_batch(epoch);
+            }
+        } else {
+            self.diagnostics_batch = None;
+            self.pending
+                .retain(|(_, pending)| !matches!(pending, Pending::Diagnostic { .. }));
+            self.set_backend_observation(BackendObservation::Unavailable(
+                BackendUnavailable::EpochExhausted,
+            ));
+            self.emitted.push_back(BackendEvent::VideoReconfig);
+        }
+        self.emitted
+            .pop_front()
+            .expect("diagnostic invalidation or refresh event")
+    }
+
     fn reply(
         &mut self,
         id: u64,
@@ -1767,69 +1458,6 @@ impl MpvBackend {
         name: Option<CString>,
         value: Option<NodeValue>,
     ) -> Result<BackendEvent, MediaError> {
-        self.reply_at(id, kind, error, name, value, Instant::now())
-    }
-    fn filter_reconfigured(&mut self) {
-        if let Some(observation) = self
-            .filter_observation
-            .as_mut()
-            .filter(|observation| observation.submitted)
-        {
-            observation.reconfigured = true;
-            tracing::info!(key = ?observation.key, "filter_video_reconfig");
-            #[cfg(test)]
-            let key = observation.key;
-            #[cfg(test)]
-            self.native_record(serde_json::json!({"event":"reconfig","key":key}));
-        }
-    }
-    fn reconfiguration_event(&mut self) -> BackendEvent {
-        self.filter_reconfigured();
-        BackendEvent::VideoReconfig
-    }
-
-    fn reply_at(
-        &mut self,
-        id: u64,
-        kind: ReplyKind,
-        error: i32,
-        name: Option<CString>,
-        value: Option<NodeValue>,
-        now: Instant,
-    ) -> Result<BackendEvent, MediaError> {
-        if kind == ReplyKind::Command
-            && let Some(observation) = self.filter_observation.as_mut()
-            && observation.submitted
-            && observation.id == id
-            && observation.outcome.is_none()
-        {
-            #[cfg(test)]
-            let key = observation.key;
-            observation.outcome = Some(error);
-            tracing::info!(key = ?observation.key, request = id, error, "filter_command_reply");
-            if error >= 0 && (observation.graph_failure || observation.unrelated_error) {
-                observation.fresh = true;
-                self.filters_poisoned = true;
-            }
-            #[cfg(test)]
-            self.native_record(
-                serde_json::json!({"event":"reply","key":key,"request":id,"error":error}),
-            );
-            #[cfg(test)]
-            if matches!(
-                self.active_fixture_fault(),
-                Some(FixtureFault::RuntimeGraph)
-            ) && error >= 0
-            {
-                self.filter_fault.take();
-                self.filter_log(
-                    "vf".into(),
-                    "error".into(),
-                    "Disabling filter furami_0 because it has failed.".into(),
-                )?;
-            }
-            return Ok(BackendEvent::Other);
-        }
         let Some((index, pending)) = self
             .pending
             .iter()
@@ -1846,6 +1474,27 @@ impl MpvBackend {
             }
             return Ok(BackendEvent::Other);
         };
+        if let Pending::Diagnostic {
+            generation,
+            epoch,
+            field,
+        } = pending
+        {
+            if kind != ReplyKind::Property {
+                return Ok(BackendEvent::Other);
+            }
+            self.pending.swap_remove(index);
+            let failure = if name.as_deref() != Some(field.property()) {
+                Some(BackendUnavailable::InvalidPayload)
+            } else if error < 0 {
+                Some(BackendUnavailable::PropertyUnavailable)
+            } else {
+                None
+            };
+            self.diagnostic_reply(generation, epoch, field, value, failure);
+            self.promote_startup()?;
+            return Ok(self.emitted.pop_front().unwrap_or(BackendEvent::Other));
+        }
         if matches!(
             pending,
             Pending::RendererRead { .. }
@@ -1879,17 +1528,6 @@ impl MpvBackend {
             }
         };
         if expected.is_some_and(|expected| name.as_deref() != Some(expected)) {
-            if let Pending::FilterProgress { key } = pending {
-                self.pending.swap_remove(index);
-                if let Some(observation) = self
-                    .filter_observation
-                    .as_mut()
-                    .filter(|observation| observation.key == key)
-                {
-                    observation.progress(None, now);
-                }
-                return Ok(BackendEvent::Other);
-            }
             return Err(MediaError::new(
                 if matches!(pending, Pending::Pause | Pending::PauseRead { .. }) {
                     "pause_property"
@@ -1900,29 +1538,18 @@ impl MpvBackend {
             ));
         }
         self.pending.swap_remove(index);
-        tracing::info!(request = id, kind = ?kind, error, property = ?name, value = ?value, "mpv_owned_reply");
+        tracing::info!(
+            event_code = "mpv_reply",
+            request_id = id,
+            kind = reply_kind_token(kind),
+            mpv_error = error,
+        );
         match pending {
             Pending::RendererRead { .. }
             | Pending::RendererSet { .. }
-            | Pending::RendererPause { .. } => {
-                unreachable!("renderer reply handled before generic dispatch")
-            }
-            Pending::FilterProgress { key } => {
-                if let Some(observation) = self
-                    .filter_observation
-                    .as_mut()
-                    .filter(|observation| observation.key == key && observation.outstanding)
-                {
-                    let position = match value {
-                        Some(NodeValue::Double(position)) if error >= 0 => Some(position),
-                        Some(NodeValue::Int(position)) if error >= 0 => Some(position as f64),
-                        _ => None,
-                    };
-                    tracing::info!(key = ?key, request = id, error, position, "filter_progress_sample");
-                    observation.progress(position, now);
-                    #[cfg(test)]
-                    self.native_record(serde_json::json!({"event":"progress","key":key,"request":id,"error":error,"position":position}));
-                }
+            | Pending::RendererPause { .. }
+            | Pending::Diagnostic { .. } => {
+                unreachable!("specialized reply handled before generic dispatch")
             }
             Pending::Pause => {
                 self.pause_pending = false;
@@ -2048,6 +1675,20 @@ impl MpvBackend {
         if property.name.is_null() {
             return Err(self.property_error(id, "null property name"));
         }
+        // SAFETY: This nonnull name is borrowed from the active native event.
+        let native_name = unsafe { CStr::from_ptr(property.name) };
+        let diagnostic_field = self.pending.iter().find_map(|(request, pending)| {
+            if *request == id
+                && let Pending::Diagnostic { field, .. } = pending
+            {
+                Some(*field)
+            } else {
+                None
+            }
+        });
+        if diagnostic_field.is_some_and(|field| native_name != field.property()) {
+            return Err(self.property_error(id, "unexpected diagnostic property name"));
+        }
         let value = if property.format == 0 {
             None
         } else {
@@ -2057,13 +1698,32 @@ impl MpvBackend {
             // SAFETY: NODE payload pointers share the event lifetime. copy_node
             // rejects invalid raw FLAG scalars before boolean normalization.
             let node = unsafe { &*property.data.cast::<MpvNode>() };
+            if let Some(field) = diagnostic_field {
+                let valid = match field {
+                    DiagnosticField::VoConfigured => node.format == 3,
+                    DiagnosticField::CurrentVo | DiagnosticField::GpuContext => {
+                        if node.format != 1 {
+                            false
+                        } else {
+                            // SAFETY: The STRING arm is active in this live
+                            // NODE. Inspect its length before allocating a copy.
+                            let string = unsafe { node.value.string };
+                            !string.is_null()
+                                && unsafe { CStr::from_ptr(string) }.to_bytes().len()
+                                    <= BACKEND_OBSERVATION_TEXT_BYTES
+                        }
+                    }
+                };
+                if !valid {
+                    return Err(self.property_error(id, "invalid bounded diagnostic scalar"));
+                }
+            }
             Some(
                 unsafe { copy_node(node, 0) }
                     .map_err(|error| self.property_error(id, error.diagnostic))?,
             )
         };
-        // SAFETY: Nonnull property name belongs to the same live native event.
-        let name = unsafe { CStr::from_ptr(property.name) }.to_owned();
+        let name = native_name.to_owned();
         Ok((name, value))
     }
 
@@ -2075,17 +1735,24 @@ impl MpvBackend {
         error: i32,
         data: *mut c_void,
     ) -> Result<BackendEvent, MediaError> {
+        // Unknown/late/duplicate cookies own no native payload. In particular a
+        // late malformed diagnostic reply cannot become a media failure.
+        let Some((_, pending)) = self.pending.iter().find(|(request, _)| *request == id) else {
+            return Ok(BackendEvent::Other);
+        };
+        // A SET cookie cannot own a GET payload, even a malformed one. Keep the
+        // exact outstanding SET available for its own scalar reply.
+        if matches!(pending, Pending::RendererSet { .. }) {
+            return Ok(BackendEvent::Other);
+        }
         // SAFETY: Caller forwards the active native GET_PROPERTY_REPLY payload.
         match unsafe { self.property_reply_payload(id, data) } {
             Ok((name, value)) => self.reply(id, ReplyKind::Property, error, Some(name), value),
-            Err(error) if self.invalidate_filter_progress(id) => {
-                tracing::info!(request = id, diagnostic = ?error.diagnostic, "filter_progress_invalid");
+            Err(_) if self.invalidate_treatment_read(id) => {
+                tracing::info!(event_code = "treatment_read_invalid", request_id = id,);
                 Ok(BackendEvent::Other)
             }
-            Err(error) if self.invalidate_treatment_read(id) => {
-                tracing::info!(request = id, diagnostic = ?error.diagnostic, "treatment_read_invalid");
-                Ok(BackendEvent::Other)
-            }
+            Err(_) if self.invalidate_diagnostic_read(id) => Ok(BackendEvent::Other),
             Err(error) => Err(error),
         }
     }
@@ -2100,7 +1767,7 @@ impl MpvBackend {
         let (terminal, reason) = match event.event_id {
             1 => (
                 BackendEvent::Shutdown,
-                FilterConfirmationFailure::BackendUnavailable,
+                TreatmentConfirmationFailure::BackendUnavailable,
             ),
             4 => {
                 return self.reply(
@@ -2123,24 +1790,141 @@ impl MpvBackend {
                         reason: end.reason,
                         error: end.error,
                     },
-                    FilterConfirmationFailure::BackendUnavailable,
+                    TreatmentConfirmationFailure::BackendUnavailable,
                 )
             }
             24 => (
                 BackendEvent::QueueOverflow,
-                FilterConfirmationFailure::EvidenceLost,
+                TreatmentConfirmationFailure::EvidenceLost,
             ),
             _ => unreachable!("terminal/set decoder only receives its pinned event IDs"),
         };
-        self.filter_lost(reason);
-        if self.filter_observation.is_some() {
-            self.finish_filter();
-        }
+        self.video_ended = true;
+        self.playback_restart_seen = false;
+        self.startup_vo_configured = false;
+        self.emitted
+            .retain(|event| !matches!(event, BackendEvent::PlaybackRestart));
+        self.revoke_treatment(reason);
         // The native terminal invalidates the aggregate before any observer tick
         // can mint a positive. Preserve the existing negative-then-terminal order.
-        self.treatment_tick(Instant::now(), false)?;
+        if self.treatment_observation.is_some() {
+            self.finish_treatment();
+        }
         self.emitted.push_back(terminal);
         Ok(self.emitted.pop_front().expect("terminal event"))
+    }
+
+    /// # Safety
+    /// `event` and its nested pinned-ABI payloads must remain live throughout
+    /// dispatch; this function never calls wait_event or retains native pointers.
+    unsafe fn native_event(&mut self, event: &MpvEvent) -> Result<BackendEvent, MediaError> {
+        let raw_id = event.event_id;
+        let result = match raw_id {
+            0 => {
+                self.treatment_tick(Instant::now(), true)?;
+                Ok(self.emitted.pop_front().unwrap_or(BackendEvent::None))
+            }
+            1 | 4 | 7 | 24 => {
+                // SAFETY: The shared decoder copies this active pinned native
+                // terminal/SET reply before the next wait_event.
+                unsafe { self.terminal_or_set_event(event) }
+            }
+            2 => {
+                if event.data.is_null() {
+                    if self.treatment_observation.is_some() || self.landed_treatments.is_some() {
+                        return self.malformed_log(Instant::now());
+                    }
+                    return Err(MediaError::new("mpv_event", "null log payload"));
+                }
+                // SAFETY: LOG_MESSAGE data matches pinned repr(C) payload and its
+                // three C strings stay valid within this wait_event interval.
+                let (prefix, level, text) = unsafe {
+                    let log = &*event.data.cast::<MpvLogMessage>();
+                    if log.prefix.is_null() || log.level.is_null() || log.text.is_null() {
+                        if self.treatment_observation.is_some() || self.landed_treatments.is_some()
+                        {
+                            return self.malformed_log(Instant::now());
+                        }
+                        return Err(MediaError::new("mpv_event", "null native log string"));
+                    }
+                    let values = (
+                        CStr::from_ptr(log.prefix).to_str(),
+                        CStr::from_ptr(log.level).to_str(),
+                        CStr::from_ptr(log.text).to_str(),
+                    );
+                    match values {
+                        (Ok(prefix), Ok(level), Ok(text)) => (prefix, level, text),
+                        _ => return self.malformed_log(Instant::now()),
+                    }
+                };
+                tracing::info!(event_code = "mpv_log", severity = severity_token(level),);
+                self.native_log(prefix, level, text);
+                Ok(BackendEvent::Other)
+            }
+            3 => {
+                // SAFETY: Copy/validate the genuine GET_PROPERTY_REPLY while
+                // its complete native payload is live, before the next wait.
+                unsafe { self.property_reply_event(event.reply_userdata, event.error, event.data) }
+            }
+            // A property/SET cookie cannot own a COMMAND result. Reject the
+            // wrong kind before touching even a malformed borrowed NODE, while
+            // preserving its pending request and the normal post-event ticks.
+            5 if self.pending.iter().any(|(request, pending)| {
+                *request == event.reply_userdata
+                    && matches!(
+                        pending,
+                        Pending::Diagnostic { .. }
+                            | Pending::RendererRead { .. }
+                            | Pending::RendererSet { .. }
+                            | Pending::RendererPause { .. }
+                    )
+            }) =>
+            {
+                Ok(BackendEvent::Other)
+            }
+            5 => {
+                // Command result is owned before leaving native event lifetime,
+                // even commands whose scalar outcome alone is sufficient.
+                let value = if event.data.is_null() {
+                    Ok(None)
+                } else {
+                    // SAFETY: COMMAND_REPLY data is pinned mpv_event_command.
+                    unsafe {
+                        copy_node(&(*event.data.cast::<MpvCommandEvent>()).result, 0).map(Some)
+                    }
+                };
+                match value {
+                    Ok(value) => self.reply(
+                        event.reply_userdata,
+                        ReplyKind::Command,
+                        event.error,
+                        None,
+                        value,
+                    ),
+                    Err(error) => Err(error),
+                }
+            }
+            8 => Ok(BackendEvent::FileLoaded),
+            17 => Ok(self.reconfiguration_event()),
+            18 => Ok(BackendEvent::Other),
+            21 => {
+                if self.video_ended || self.cancelled() {
+                    Ok(BackendEvent::Other)
+                } else if self.video_started {
+                    self.begin_audio_if_ready()?;
+                    Ok(BackendEvent::PlaybackRestart)
+                } else {
+                    self.playback_restart_seen = true;
+                    self.promote_startup()?;
+                    Ok(self.emitted.pop_front().unwrap_or(BackendEvent::Other))
+                }
+            }
+            _ => Ok(BackendEvent::Other),
+        };
+        if raw_id != 0 {
+            self.treatment_tick(Instant::now(), false)?;
+        }
+        result
     }
 }
 
@@ -2193,6 +1977,7 @@ fn check_stop(stop: &StopFlag) -> Result<(), MediaError> {
 }
 impl OwnerBackend for MpvBackend {
     fn initialize(&mut self, token: SurfaceToken, stop: &StopFlag) -> Result<(), MediaError> {
+        self.clear_diagnostics();
         check_stop(stop)?;
         self.generation = token.generation.get();
         self.owner_cancel = Some(stop.audio_cancel());
@@ -2211,14 +1996,6 @@ impl OwnerBackend for MpvBackend {
         let path = qualified_library(&self.prefix)?;
         self.handle = Some(Handle::create(&path, stop)?);
         check_stop(stop)?;
-        let paused_vf = if self.playback == InitialPlayback::Paused {
-            self.initial_treatments.as_ref().map(|(_, treatments)| {
-                CString::new(treatments.filters.vf.as_str())
-                    .expect("compiler emits NUL-free syntax")
-            })
-        } else {
-            None
-        };
         let handle = self.handle()?;
         self.install_renderer(handle)?;
         // mpv 0.41.0 registers `osc` only with HAVE_LUA. The frozen no-Lua
@@ -2231,6 +2008,7 @@ impl OwnerBackend for MpvBackend {
             (c"input-cursor", c"no"),
             (c"input-cursor-passthrough", c"yes"),
             (c"cursor-autohide", c"no"),
+            (c"force-window", c"no"),
             (c"vo", c"gpu-next"),
             (c"gpu-api", c"vulkan"),
             (c"gpu-context", c"x11vk"),
@@ -2258,9 +2036,6 @@ impl OwnerBackend for MpvBackend {
                 c"no"
             },
         )?;
-        if let Some(vf) = &paused_vf {
-            handle.option(c"vf", vf)?;
-        }
         handle.option(c"demuxer-lavf-format", c"v4l2")?;
         handle.option(c"demuxer-lavf-o", self.input.lavf_options())?;
         handle.option(c"audio", c"no")?;
@@ -2281,6 +2056,7 @@ impl OwnerBackend for MpvBackend {
         handle.checked(result, "initialize")?;
         check_stop(stop)?;
         let version = handle.property(c"mpv-version")?;
+        let client_api = handle.client_api;
         if version.trim_matches(|c: char| c.is_ascii_whitespace()) != "mpv v0.41.0" {
             return Err(MediaError::new(
                 "mpv_version",
@@ -2289,12 +2065,12 @@ impl OwnerBackend for MpvBackend {
         }
         check_stop(stop)?;
         tracing::info!(
+            event_code = "mpv_initialized",
             generation = token.generation.get(),
-            xid = token.xid.get(),
-            version,
-            "mpv_initialized"
+            window_id = token.xid.get(),
         );
         self.nominal_rate_source = Source::MpvConfiguredContainerFps;
+        self.record_initialized_diagnostics(client_api, &version);
         Ok(())
     }
     fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
@@ -2317,7 +2093,7 @@ impl OwnerBackend for MpvBackend {
                     }
                     return Err(error);
                 }
-                if self.filters_poisoned {
+                if self.treatment_poisoned {
                     self.treatment_lost(
                         crate::domain::failure::TreatmentConfirmationFailure::BackendUnavailable,
                     );
@@ -2441,7 +2217,8 @@ impl OwnerBackend for MpvBackend {
                 Ok(())
             }
             BackendCommand::LoadInput => {
-                tracing::info!(request = id.get(), "mpv_loadfile_submit");
+                self.reset_startup();
+                tracing::info!(event_code = "mpv_loadfile_submit", request_id = id.get(),);
                 self.load_id = Some(id.get());
                 let handle = self.handle()?;
                 let argv = [c"loadfile".as_ptr(), self.input.url().as_ptr(), ptr::null()];
@@ -2462,105 +2239,8 @@ impl OwnerBackend for MpvBackend {
         // SAFETY: This owner is the sole wait_event caller. All event and nested
         // values below are consumed/copied before the next wait or handle drop.
         let event = unsafe { &*(handle.functions.wait_event)(handle.raw.as_ptr(), 0.0) };
-        let raw_id = event.event_id;
-        let result = match raw_id {
-            0 => {
-                self.filter_tick(Instant::now(), true)?;
-                self.treatment_tick(Instant::now(), true)?;
-                Ok(self.emitted.pop_front().unwrap_or(BackendEvent::None))
-            }
-            1 | 4 | 7 | 24 => {
-                // SAFETY: The shared decoder copies this active pinned native
-                // terminal/SET reply before the next wait_event.
-                unsafe { self.terminal_or_set_event(event) }
-            }
-            2 => {
-                if event.data.is_null() {
-                    if self.filter_observation.is_some() || self.filter_health.is_some() {
-                        return self.malformed_filter_log(Instant::now());
-                    }
-                    return Err(MediaError::new("mpv_event", "null log payload"));
-                }
-                // SAFETY: LOG_MESSAGE data matches pinned repr(C) payload and its
-                // three C strings stay valid within this wait_event interval.
-                let (prefix, level, text) = unsafe {
-                    let log = &*event.data.cast::<MpvLogMessage>();
-                    if log.prefix.is_null() || log.level.is_null() || log.text.is_null() {
-                        if self.filter_observation.is_some() || self.filter_health.is_some() {
-                            return self.malformed_filter_log(Instant::now());
-                        }
-                        return Err(MediaError::new("mpv_event", "null native log string"));
-                    }
-                    (
-                        CStr::from_ptr(log.prefix).to_string_lossy().into_owned(),
-                        CStr::from_ptr(log.level).to_string_lossy().into_owned(),
-                        CStr::from_ptr(log.text).to_string_lossy().into_owned(),
-                    )
-                };
-                tracing::info!(mpv_prefix = ?prefix, mpv_level = ?level, mpv_text = ?text, "mpv_log");
-                self.filter_log(prefix, level, text)?;
-                Ok(BackendEvent::Other)
-            }
-            3 => {
-                // SAFETY: Copy/validate the genuine GET_PROPERTY_REPLY while
-                // its complete native payload is live, before the next wait.
-                unsafe { self.property_reply_event(event.reply_userdata, event.error, event.data) }
-            }
-            5 => {
-                // Command result is owned before leaving native event lifetime,
-                // even commands whose scalar outcome alone is sufficient.
-                let value = if event.data.is_null() {
-                    Ok(None)
-                } else {
-                    // SAFETY: COMMAND_REPLY data is pinned mpv_event_command.
-                    unsafe {
-                        copy_node(&(*event.data.cast::<MpvCommandEvent>()).result, 0).map(Some)
-                    }
-                };
-                match value {
-                    Ok(value) => self.reply(
-                        event.reply_userdata,
-                        ReplyKind::Command,
-                        event.error,
-                        None,
-                        value,
-                    ),
-                    Err(error)
-                        if self.filter_observation.as_ref().is_some_and(|observation| {
-                            observation.submitted && observation.id == event.reply_userdata
-                        }) =>
-                    {
-                        // Preserve the known scalar rejection even when its
-                        // optional native result payload is unavailable.
-                        self.reply(
-                            event.reply_userdata,
-                            ReplyKind::Command,
-                            event.error,
-                            None,
-                            None,
-                        )?;
-                        tracing::info!(request = event.reply_userdata, diagnostic = ?error.diagnostic, "filter_command_evidence_lost");
-                        self.filter_lost(FilterConfirmationFailure::EvidenceLost);
-                        Ok(BackendEvent::Other)
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            8 => Ok(BackendEvent::FileLoaded),
-            17 => Ok(self.reconfiguration_event()),
-            18 => Ok(BackendEvent::Other),
-            21 => {
-                self.video_started = true;
-                self.begin_audio_if_ready()?;
-                Ok(BackendEvent::PlaybackRestart)
-            }
-            _ => Ok(BackendEvent::Other),
-        };
-        if raw_id != 0 {
-            self.filter_tick(Instant::now(), false)?;
-            self.treatment_tick(Instant::now(), false)?;
-        }
-        result
+        // SAFETY: All pointers refer to this wait_event's still-active payload.
+        unsafe { self.native_event(event) }
     }
     fn refresh_pause(&mut self) -> Result<Option<bool>, MediaError> {
         if self.pause_pending {
@@ -2587,15 +2267,6 @@ impl OwnerBackend for MpvBackend {
         }
         Ok(None)
     }
-    fn diagnostic(&self) -> Option<String> {
-        (!self.filter_records.is_empty()).then(|| {
-            self.filter_records
-                .iter()
-                .map(|record| format!("{}/{}: {}", record.prefix, record.level, record.text))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-    }
     fn audio_status(&self) -> AudioAvailability {
         self.audio_status.clone()
     }
@@ -2609,6 +2280,8 @@ impl OwnerBackend for MpvBackend {
         self.initial_treatments.take()
     }
     fn shutdown(&mut self) -> Result<(), MediaError> {
+        self.reset_startup();
+        self.video_ended = true;
         // Retain the video handle/native lease until actual child reap AND
         // audio worker join. A blocked owner keeps this worker alive.
         if let Some(owner) = &self.loopback {
@@ -2628,8 +2301,9 @@ impl OwnerBackend for MpvBackend {
         self.retirement = None;
         drop(self.handle.take()); // real mpv_terminate_destroy on its owner thread
         self.pending.clear();
-        self.filter_observation = None;
-        self.filter_health = None;
+        self.clear_diagnostics();
+        self.treatment_observation = None;
+        self.landed_treatments = None;
         outcome
     }
 }
@@ -2718,15 +2392,6 @@ impl FixtureRecorder {
     }
 }
 
-/// Explicit native-adapter faults. They do not change production observation.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum FixtureFault {
-    CommandSubmission(i32),
-    CreationRejected,
-    RuntimeGraph,
-}
-
 /// Finite-file qualification adapter. Only initialization and input selection
 /// differ from production; control transactions and event/lifetime logic do not.
 #[cfg(test)]
@@ -2788,53 +2453,16 @@ impl FixtureBackend {
         gain: PlaybackGain,
         playback: InitialPlayback,
         watch: WatchStamp,
-        filters: crate::domain::filters::FilterChain,
         treatments: PreparedTreatments,
         key: TreatmentAttemptKey,
         recorder: Option<FixtureRecorder>,
     ) -> Result<Self, MediaError> {
-        if filters.entries().len() != treatments.filters.entries.len()
-            || filters
-                .entries()
-                .iter()
-                .zip(&treatments.filters.entries)
-                .enumerate()
-                .any(|(ordinal, (entry, metadata))| {
-                    metadata.ordinal != ordinal
-                        || metadata.label != entry.label()
-                        || metadata.enabled != entry.enabled()
-                })
-        {
-            return Err(MediaError::new(
-                "fixture_filters",
-                "compiled metadata differs from full chain",
-            ));
-        }
         let mut backend = Self::new(prefix, fixture, input, gain, playback, watch, recorder)?;
         backend.inner.initial_treatments = Some((key, treatments));
         backend.inner.fixture_recorder = backend.recorder.clone();
         Ok(backend)
     }
 
-    pub(crate) fn with_fault(mut self, fault: FixtureFault) -> Self {
-        match fault {
-            FixtureFault::CommandSubmission(error) => {
-                assert!(error < 0, "explicit fault must be negative")
-            }
-            FixtureFault::RuntimeGraph | FixtureFault::CreationRejected => {}
-        }
-        self.inner.filter_fault = Some(fault);
-        self
-    }
-    pub(crate) fn with_fault_for_pass(
-        self,
-        fault: FixtureFault,
-        pass: crate::domain::state::TreatmentPass,
-    ) -> Self {
-        let mut backend = self.with_fault(fault);
-        backend.inner.filter_fault_pass = Some(pass);
-        backend
-    }
     pub(crate) fn with_renderer_fault(mut self, fault: RendererFixtureFault) -> Self {
         self.inner.renderer_fixture_fault = Some(fault);
         self
@@ -2863,17 +2491,6 @@ impl OwnerBackend for FixtureBackend {
         self.record(FixtureMilestone::Created {
             generation: token.generation,
         })?;
-        let paused_vf = if self.inner.playback == InitialPlayback::Paused {
-            self.inner
-                .initial_treatments
-                .as_ref()
-                .map(|(_, treatments)| {
-                    CString::new(treatments.filters.vf.as_str())
-                        .expect("compiler emits NUL-free syntax")
-                })
-        } else {
-            None
-        };
         let handle = self.inner.handle()?;
         if self.inner.initial_treatments.is_some() {
             self.inner.install_renderer(handle)?;
@@ -2886,6 +2503,7 @@ impl OwnerBackend for FixtureBackend {
             (c"input-terminal", c"no"),
             (c"input-cursor", c"no"),
             (c"terminal", c"no"),
+            (c"force-window", c"no"),
             (c"vo", c"null"),
             (c"audio", c"no"),
         ];
@@ -2901,15 +2519,6 @@ impl OwnerBackend for FixtureBackend {
                 c"no"
             },
         )?;
-        if let Some(vf) = &paused_vf {
-            handle.option(c"vf", vf)?;
-            if let Some(recorder) = &self.recorder {
-                recorder.record_native(serde_json::json!({
-                    "event": "paused_filter_option", "generation": token.generation.get(),
-                    "vf": vf.to_str().expect("compiler emits UTF-8"),
-                }));
-            }
-        }
         // The fixture exercises the same full native-log classifier as production.
         let result =
             unsafe { (handle.functions.request_logs)(handle.raw.as_ptr(), c"info".as_ptr()) };
@@ -2921,6 +2530,7 @@ impl OwnerBackend for FixtureBackend {
         handle.checked(result, "fixture initialize")?;
         check_stop(stop)?;
         let version = handle.property(c"mpv-version")?;
+        let client_api = handle.client_api;
         if version.trim() != "mpv v0.41.0" {
             return Err(MediaError::new(
                 "mpv_version",
@@ -2930,7 +2540,11 @@ impl OwnerBackend for FixtureBackend {
         self.record(FixtureMilestone::Initialized {
             generation: token.generation,
             gain: self.inner.gain,
-        })
+        })?;
+        self.inner.generation = token.generation.get();
+        self.inner
+            .record_initialized_diagnostics(client_api, &version);
+        Ok(())
     }
 
     fn submit(&mut self, id: RequestId, command: BackendCommand) -> Result<(), MediaError> {
@@ -2952,6 +2566,7 @@ impl OwnerBackend for FixtureBackend {
         if command != BackendCommand::LoadInput {
             return self.inner.submit(id, command);
         }
+        self.inner.reset_startup();
         self.inner.load_id = Some(id.get());
         self.inner.native_record(serde_json::json!({"event":"loadfile","request":id.get(),"fixture":self.fixture.to_string_lossy()}));
         let handle = self.inner.handle()?;
@@ -2974,10 +2589,6 @@ impl OwnerBackend for FixtureBackend {
 
     fn refresh_observed(&mut self, started: bool) -> Result<Option<ObservedFacts>, MediaError> {
         self.inner.refresh_observed(started)
-    }
-
-    fn diagnostic(&self) -> Option<String> {
-        self.inner.diagnostic()
     }
 
     fn audio_status(&self) -> AudioAvailability {
@@ -3010,12 +2621,87 @@ impl Drop for FixtureBackend {
     }
 }
 
+/// Finite diagnostic token vocabularies for the owner-thread backend. Only
+/// these fixed identifiers reach the bounded logging layer; option/property
+/// values and native error prose never do.
+pub(super) fn pass_token(pass: TreatmentPass) -> &'static str {
+    match pass {
+        TreatmentPass::Candidate => "Candidate",
+        TreatmentPass::Restore => "Restore",
+        TreatmentPass::Open => "Open",
+    }
+}
+
+fn reply_kind_token(kind: ReplyKind) -> &'static str {
+    match kind {
+        ReplyKind::Command => "Command",
+        ReplyKind::Property => "Property",
+        ReplyKind::SetProperty => "SetProperty",
+    }
+}
+
+fn severity_token(level: &str) -> &'static str {
+    match level {
+        "fatal" => "fatal",
+        "error" => "error",
+        "warn" => "warn",
+        "info" => "info",
+        "v" | "debug" => "debug",
+        "trace" => "trace",
+        _ => "unknown",
+    }
+}
+
+fn option_token(name: &CStr) -> &'static str {
+    match name.to_str().unwrap_or("") {
+        "config" => "config",
+        "load-scripts" => "load-scripts",
+        "input-default-bindings" => "input-default-bindings",
+        "input-vo-keyboard" => "input-vo-keyboard",
+        "input-terminal" => "input-terminal",
+        "input-cursor" => "input-cursor",
+        "input-cursor-passthrough" => "input-cursor-passthrough",
+        "cursor-autohide" => "cursor-autohide",
+        "force-window" => "force-window",
+        "vo" => "vo",
+        "gpu-api" => "gpu-api",
+        "gpu-context" => "gpu-context",
+        "gpu-sw" => "gpu-sw",
+        "untimed" => "untimed",
+        "correct-pts" => "correct-pts",
+        "video-latency-hacks" => "video-latency-hacks",
+        "cache" => "cache",
+        "demuxer-readahead-secs" => "demuxer-readahead-secs",
+        "container-fps-override" => "container-fps-override",
+        "pause" => "pause",
+        "demuxer-lavf-format" => "demuxer-lavf-format",
+        "demuxer-lavf-o" => "demuxer-lavf-o",
+        "audio" => "audio",
+        "wid" => "wid",
+        _ => "Unknown",
+    }
+}
+
+pub(super) fn renderer_property_token(name: &str) -> &'static str {
+    match name {
+        "scale" => "scale",
+        "cscale" => "cscale",
+        "dscale" => "dscale",
+        "scale-antiring" => "scale-antiring",
+        "dither" => "dither",
+        "deband" => "deband",
+        "deband-iterations" => "deband-iterations",
+        "deband-grain" => "deband-grain",
+        "interpolation" => "interpolation",
+        _ => "Unknown",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const FIXTURE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-
     fn fixture_input() -> InputSpec {
         use crate::{
             capture::{input::CaptureSelection, linux},
@@ -3466,7 +3152,6 @@ mod tests {
 #[cfg(test)]
 mod reply_tests {
     use super::*;
-    use crate::domain::state::TreatmentPass;
     use crate::{
         capture::{input::CaptureSelection, linux},
         domain::capture::{CaptureMode, CapturedFourCc, FrameRate},
@@ -3495,1231 +3180,752 @@ mod reply_tests {
         )
     }
 
-    fn filter_key(apply: u64, pass: TreatmentPass) -> TreatmentAttemptKey {
-        TreatmentAttemptKey {
-            apply: crate::domain::state::ApplyId::new(apply).unwrap(),
-            attempt: AttemptId::new(1).unwrap(),
-            pass,
-        }
-    }
-    fn ordered_filters() -> crate::domain::filters::FilterChain {
-        use crate::domain::filters::{
-            ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
-        };
-        FilterChain::new(
-            (0..3)
-                .map(|ordinal| {
-                    FilterEntry::new(
-                        format!("inert\nlabel {ordinal}"),
-                        Filter::Format(FormatParams::new(
-                            SdrMatrix::Auto,
-                            ColorLevels::Auto,
-                            SdrGamma::Auto,
-                        )),
-                        ordinal != 1,
-                    )
-                })
-                .collect(),
-        )
-        .unwrap()
-    }
-    fn compiled_filters(chain: &crate::domain::filters::FilterChain) -> CompiledFilterChain {
-        crate::media::filter_catalog::compile_chain(
-            chain,
-            &crate::media::filter_catalog::fixture_capabilities(),
-        )
-        .unwrap()
-    }
-    fn admit_vf(
-        backend: &mut MpvBackend,
-        id: RequestId,
-        key: TreatmentAttemptKey,
-        chain: &crate::domain::filters::FilterChain,
-    ) -> Instant {
-        let compiled = compiled_filters(chain);
-        crate::diagnostics::filter_begin(key, &compiled.entries);
-        let observation = FilterObservation::new(
-            id.get(),
-            key,
-            compiled,
-            Instant::now(),
-            backend.log_sequence,
-            backend.dropped_context,
-        );
-        let admitted = observation.admitted;
-        backend.filter_observation = Some(observation);
-        admitted
+    fn diagnostic_backend() -> MpvBackend {
+        let mut backend = backend();
+        backend.generation = 1;
+        backend.record_initialized_diagnostics(0x0002_0005, "mpv v0.41.0");
+        backend.property_requests = Some(Vec::new());
+        backend.emitted.clear();
+        backend
     }
 
-    fn admitted_filter(chain: &crate::domain::filters::FilterChain) -> (MpvBackend, Instant) {
-        let mut backend = backend();
-        backend.property_requests = Some(Vec::new());
-        admit_vf(
-            &mut backend,
-            RequestId::for_test(17),
-            filter_key(1, TreatmentPass::Candidate),
-            chain,
-        );
-        let now = backend.filter_observation.as_ref().unwrap().admitted;
-        (backend, now)
-    }
-    fn submitted_filter() -> (MpvBackend, Instant) {
-        let (mut backend, now) = admitted_filter(&ordered_filters());
-        // Unit seam immediately after the one native argv submission; command,
-        // property replies, classifier and settlement below are production code.
-        let observation = backend.filter_observation.as_mut().unwrap();
-        observation.submitted = true;
-        observation.command.take();
-        (backend, now)
-    }
-    fn command_reply(backend: &mut MpvBackend, error: i32, now: Instant) {
-        assert_eq!(
-            backend
-                .reply_at(17, ReplyKind::Command, error, None, None, now)
-                .unwrap(),
-            BackendEvent::Other
-        );
-    }
-    fn sample(backend: &mut MpvBackend, value: NodeValue, now: Instant) {
-        backend.filter_tick(now, false).unwrap();
-        let id = backend
+    fn diagnostic_requests(backend: &MpvBackend) -> Vec<(u64, &'static CStr)> {
+        backend
             .pending
             .iter()
-            .find(|(_, pending)| matches!(pending, Pending::FilterProgress { .. }))
-            .unwrap()
-            .0;
-        assert_eq!(
+            .filter(|(_, pending)| matches!(pending, Pending::Diagnostic { .. }))
+            .map(|(id, pending)| (*id, pending.property().unwrap()))
+            .collect()
+    }
+
+    fn finish_diagnostics(backend: &mut MpvBackend, requests: &[(u64, &'static CStr)]) {
+        for &(id, name) in requests {
+            let value = match name.to_bytes() {
+                b"vo-configured" => NodeValue::Flag(true),
+                b"current-vo" => NodeValue::String(c"observed-vo".to_owned()),
+                b"current-gpu-context" => NodeValue::String(c"observed-context".to_owned()),
+                _ => panic!("unexpected diagnostic property"),
+            };
             backend
-                .reply_at(
+                .reply(
                     id,
                     ReplyKind::Property,
                     0,
-                    Some(c"time-pos".to_owned()),
+                    Some(name.to_owned()),
                     Some(value),
-                    now
+                )
+                .unwrap();
+        }
+    }
+
+    fn startup_event(backend: &mut MpvBackend, event_id: i32) -> BackendEvent {
+        let event = MpvEvent {
+            event_id,
+            error: 0,
+            reply_userdata: 0,
+            data: ptr::null_mut(),
+        };
+        // SAFETY: These scalar-only event IDs carry no native payload.
+        unsafe { backend.native_event(&event) }.unwrap()
+    }
+
+    fn startup_reply(
+        backend: &mut MpvBackend,
+        request: (u64, &'static CStr),
+        value: Option<NodeValue>,
+    ) -> BackendEvent {
+        backend
+            .reply(
+                request.0,
+                ReplyKind::Property,
+                0,
+                Some(request.1.to_owned()),
+                value,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn startup_requires_both_native_facts_independently_of_backend_names() {
+        for restart_first in [false, true] {
+            let mut backend = diagnostic_backend();
+            backend.reconfiguration_event();
+            let requests = diagnostic_requests(&backend);
+            backend.emitted.clear();
+            backend.load_id = Some(7);
+            backend.reply(7, ReplyKind::Command, 0, None, None).unwrap();
+            assert!(!backend.initial_audio_checked);
+            if restart_first {
+                assert_eq!(startup_event(&mut backend, 21), BackendEvent::Other);
+            }
+            startup_reply(&mut backend, requests[1], None);
+            startup_reply(&mut backend, requests[2], None);
+            backend.emitted.clear();
+            backend.emit_diagnostics();
+            let event = startup_reply(&mut backend, requests[0], Some(NodeValue::Flag(true)));
+            assert!(matches!(event, BackendEvent::Diagnostics(_)));
+            assert_eq!(backend.video_started, restart_first);
+            assert_eq!(backend.initial_audio_checked, restart_first);
+            let mut delivered_restart = false;
+            if !restart_first {
+                delivered_restart = matches!(
+                    startup_event(&mut backend, 21),
+                    BackendEvent::PlaybackRestart
+                );
+            }
+            assert!(backend.video_started);
+            assert!(backend.initial_audio_checked);
+            let queued_restarts = backend
+                .emitted
+                .iter()
+                .filter(|event| matches!(event, BackendEvent::PlaybackRestart))
+                .count();
+            assert_eq!(queued_restarts + usize::from(delivered_restart), 1);
+            backend.emitted.clear();
+            assert_eq!(
+                startup_event(&mut backend, 21),
+                BackendEvent::PlaybackRestart
+            );
+        }
+    }
+
+    #[test]
+    fn early_false_and_coalesced_epochs_eventually_unlock_current_true() {
+        for settle_early in [false, true] {
+            let mut backend = diagnostic_backend();
+            backend.reconfiguration_event();
+            let early = diagnostic_requests(&backend);
+            startup_reply(&mut backend, early[0], Some(NodeValue::Flag(false)));
+            if settle_early {
+                finish_diagnostics(&mut backend, &early[1..]);
+            }
+            for _ in 0..20 {
+                backend.reconfiguration_event();
+            }
+            backend.emitted.clear();
+            assert_eq!(startup_event(&mut backend, 21), BackendEvent::Other);
+            assert!(!backend.video_started);
+            if !settle_early {
+                finish_diagnostics(&mut backend, &early[1..]);
+            } else {
+                // The first later epoch now owns the outstanding batch.
+                let previous = diagnostic_requests(&backend);
+                finish_diagnostics(&mut backend, &previous);
+            }
+            assert!(!backend.video_started);
+            let fresh = diagnostic_requests(&backend);
+            finish_diagnostics(&mut backend, &fresh);
+            assert!(backend.video_started);
+            assert!(backend.diagnostics_batch.is_none());
+        }
+    }
+
+    #[test]
+    fn reconfiguration_invalidates_unpromoted_true_and_old_epoch_cannot_unlock() {
+        let mut backend = diagnostic_backend();
+        backend.reconfiguration_event();
+        let old = diagnostic_requests(&backend);
+        startup_reply(&mut backend, old[0], Some(NodeValue::Flag(true)));
+        backend.reconfiguration_event();
+        backend.emitted.clear();
+        assert_eq!(startup_event(&mut backend, 21), BackendEvent::Other);
+        finish_diagnostics(&mut backend, &old);
+        assert!(!backend.video_started);
+        let current = diagnostic_requests(&backend);
+        finish_diagnostics(&mut backend, &current);
+        assert!(backend.video_started);
+    }
+
+    #[test]
+    fn old_generation_true_and_eof_restart_never_qualify_decoded_startup() {
+        let mut old = diagnostic_backend();
+        old.reconfiguration_event();
+        let requests = diagnostic_requests(&old);
+        old.generation = 2;
+        old.diagnostics.as_mut().unwrap().generation = 2;
+        startup_event(&mut old, 21);
+        finish_diagnostics(&mut old, &requests);
+        assert!(!old.video_started);
+
+        for reason in [0, 4] {
+            let mut backend = diagnostic_backend();
+            backend.reconfiguration_event();
+            let requests = diagnostic_requests(&backend);
+            backend.emitted.clear();
+            assert_eq!(startup_event(&mut backend, 21), BackendEvent::Other);
+            let mut end = MpvEndFile {
+                reason,
+                error: 0,
+                playlist_entry_id: 1,
+                playlist_insert_id: 0,
+                playlist_insert_num_entries: 0,
+            };
+            let event = MpvEvent {
+                event_id: 7,
+                error: 0,
+                reply_userdata: 0,
+                data: ptr::from_mut(&mut end).cast(),
+            };
+            // SAFETY: END_FILE points to the live exact stack-owned ABI payload.
+            assert!(matches!(
+                unsafe { backend.native_event(&event) }.unwrap(),
+                BackendEvent::EndFile { .. }
+            ));
+            finish_diagnostics(&mut backend, &requests);
+            assert_eq!(startup_event(&mut backend, 21), BackendEvent::Other);
+            assert!(!backend.video_started);
+            assert!(!backend.initial_audio_checked);
+        }
+    }
+
+    #[test]
+    fn invalid_boolean_replies_and_wrong_cookies_never_advertise_startup() {
+        for (name, value, error) in [
+            (c"vo-configured", Some(NodeValue::Flag(false)), 0),
+            (c"vo-configured", Some(NodeValue::Int(1)), 0),
+            (c"vo-configured", None, 0),
+            (c"current-vo", Some(NodeValue::Flag(true)), 0),
+            (c"vo-configured", Some(NodeValue::Flag(true)), -10),
+        ] {
+            let mut backend = diagnostic_backend();
+            backend.reconfiguration_event();
+            let requests = diagnostic_requests(&backend);
+            startup_event(&mut backend, 21);
+            for kind in [ReplyKind::Command, ReplyKind::SetProperty] {
+                backend
+                    .reply(
+                        requests[0].0,
+                        kind,
+                        0,
+                        Some(c"vo-configured".to_owned()),
+                        Some(NodeValue::Flag(true)),
+                    )
+                    .unwrap();
+                assert!(!backend.video_started);
+            }
+            backend
+                .reply(
+                    u64::MAX,
+                    ReplyKind::Property,
+                    0,
+                    Some(c"vo-configured".to_owned()),
+                    Some(NodeValue::Flag(true)),
+                )
+                .unwrap();
+            backend
+                .reply(
+                    requests[0].0,
+                    ReplyKind::Property,
+                    error,
+                    Some(name.to_owned()),
+                    value,
+                )
+                .unwrap();
+            finish_diagnostics(&mut backend, &requests);
+            assert!(!backend.video_started);
+            assert!(!backend.initial_audio_checked);
+        }
+    }
+
+    #[test]
+    fn terminal_cancel_and_new_load_disarm_delayed_startup() {
+        for disposition in 0..4 {
+            let mut backend = diagnostic_backend();
+            backend.reconfiguration_event();
+            let requests = diagnostic_requests(&backend);
+            startup_event(&mut backend, 21);
+            match disposition {
+                0 => {
+                    startup_event(&mut backend, 1);
+                }
+                1 => {
+                    startup_event(&mut backend, 24);
+                }
+                2 => {
+                    backend.owner_cancel = Some(std::sync::Arc::new(
+                        std::sync::atomic::AtomicBool::new(true),
+                    ));
+                }
+                _ => backend.reset_startup(),
+            }
+            finish_diagnostics(&mut backend, &requests);
+            assert!(!backend.video_started);
+            assert!(!backend.initial_audio_checked);
+            assert!(
+                !backend
+                    .emitted
+                    .iter()
+                    .any(|event| matches!(event, BackendEvent::PlaybackRestart))
+            );
+        }
+    }
+
+    #[test]
+    fn preproof_errors_create_neither_poison_nor_readiness_and_known_loss_is_sticky() {
+        let mut backend = diagnostic_backend();
+        for level in ["error", "fatal"] {
+            backend.native_log("arbitrary", level, "unclassified private prose");
+            assert!(!backend.treatment_poisoned);
+            assert!(!backend.video_started);
+            assert!(backend.emitted.is_empty());
+        }
+        backend.revoke_treatment(TreatmentConfirmationFailure::EvidenceLost);
+        backend.native_log("arbitrary", "error", "another error");
+        assert!(backend.treatment_poisoned);
+        let mut overflow = diagnostic_backend();
+        overflow.native_log("overflow", "fatal", "log message buffer overflow: dropped");
+        assert!(overflow.treatment_poisoned);
+        let mut malformed = diagnostic_backend();
+        malformed.malformed_log(Instant::now()).unwrap();
+        assert!(malformed.treatment_poisoned);
+    }
+
+    #[test]
+    fn diagnostics_require_three_exact_fresh_properties_not_requested_options() {
+        let mut backend = diagnostic_backend();
+        assert!(matches!(
+            backend.reconfiguration_event(),
+            BackendEvent::Diagnostics(observation)
+                if observation.backend == BackendObservation::Unavailable(BackendUnavailable::Invalidated)
+        ));
+        let requests = diagnostic_requests(&backend);
+        assert_eq!(requests.len(), 3);
+        let epoch = backend.diagnostics.as_ref().unwrap().observation_epoch;
+        assert_eq!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::VideoReconfig)
+        );
+        finish_diagnostics(&mut backend, &requests[..2]);
+        assert!(matches!(
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Unavailable(_)
+        ));
+        finish_diagnostics(&mut backend, &requests[2..]);
+        let observation = backend.diagnostics.as_ref().unwrap();
+        assert_eq!(observation.generation, 1);
+        assert_eq!(observation.observation_epoch, epoch);
+        assert_eq!(observation.client_api, 0x0002_0005);
+        assert_eq!(observation.libmpv_version.as_ref(), "mpv v0.41.0");
+        assert_eq!(
+            observation.backend,
+            BackendObservation::Observed {
+                video_output: "observed-vo".into(),
+                gpu_context: "observed-context".into(),
+            }
+        );
+        let retained = observation.clone();
+        assert_eq!(
+            backend
+                .reply(
+                    requests[0].0,
+                    ReplyKind::Property,
+                    0,
+                    Some(requests[0].1.to_owned()),
+                    Some(NodeValue::Flag(false))
                 )
                 .unwrap(),
             BackendEvent::Other
         );
-    }
-    fn complete_progress(backend: &mut MpvBackend, now: Instant) -> Instant {
-        sample(backend, NodeValue::Double(0.0), now);
-        let mut clock = now;
-        for position in 1..=32 {
-            clock += FilterConfirmation::SAMPLE_INTERVAL;
-            sample(backend, NodeValue::Double(f64::from(position)), clock);
-        }
-        clock
-    }
-    fn result_failure(backend: &mut MpvBackend) -> Box<FilterFailure> {
-        backend
-            .filter_result
-            .take()
-            .expect("settled vf result")
-            .unwrap_err()
-    }
-    fn confirmed_filter() -> MpvBackend {
-        let (mut backend, now) = submitted_filter();
-        command_reply(&mut backend, 0, now);
-        backend.filter_reconfigured();
-        let final_time = complete_progress(&mut backend, now);
-        backend.filter_tick(final_time, true).unwrap();
-        assert!(matches!(backend.filter_result.take(), Some(Ok(_))));
-        backend
-    }
-
-    #[test]
-    fn late_vf_fault_revokes_latest_treatment_without_losing_graph_origin() {
-        let mut backend = confirmed_filter();
-        let origin = filter_key(1, TreatmentPass::Candidate);
-        let current = filter_key(2, TreatmentPass::Candidate);
-        // Renderer-only settlement preserves the graph and changes its consumer key.
-        backend.filter_health.as_mut().unwrap().treatment_key = current;
-        backend
-            .filter_log(
-                "vf".into(),
-                "error".into(),
-                "Disabling filter furami_2 because it has failed.".into(),
-            )
-            .unwrap();
-        let Some(BackendEvent::TreatmentFault { key, failure }) = backend.emitted.pop_front()
-        else {
-            panic!("late vf fault did not revoke the current treatment")
-        };
-        assert_eq!(key, current);
-        assert_eq!(failure.key, Some(current));
+        assert_eq!(backend.diagnostics.as_ref(), Some(&retained));
+        // Unknown/duplicate payloads are ignored before dereferencing native data.
         assert_eq!(
-            failure.disposition,
-            crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner
+            unsafe { backend.property_reply_event(requests[0].0, 0, ptr::null_mut()) }.unwrap(),
+            BackendEvent::Other
         );
-        let crate::domain::failure::TreatmentErrorKind::Filter(filter) = failure.kind else {
-            panic!("late vf fault lost graph provenance")
-        };
-        assert_eq!(filter.diagnostics.key, Some(origin));
-        assert_eq!(filter.kind, FilterErrorKind::RuntimeGraph);
-        assert_eq!(filter.attributed_ordinal, Some(2));
-        assert!(filter.requires_fresh_owner);
-        assert!(backend.filters_poisoned);
-    }
-
-    #[test]
-    fn filter_predicate_requires_both_witnesses_32_advances_one_read_and_final_clean_drain() {
-        for reconfig_first in [true, false] {
-            let (mut backend, now) = submitted_filter();
-            if reconfig_first {
-                backend.filter_reconfigured();
-            } else {
-                command_reply(&mut backend, 0, now);
-            }
-            backend.filter_tick(now, false).unwrap();
-            assert!(
-                backend.property_requests.as_ref().unwrap().is_empty(),
-                "one witness cannot begin a baseline"
-            );
-            if reconfig_first {
-                command_reply(&mut backend, 0, now);
-            } else {
-                backend.filter_reconfigured();
-            }
-            backend.filter_tick(now, false).unwrap();
-            assert_eq!(backend.property_requests.as_ref().unwrap().len(), 1);
-            backend
-                .filter_tick(now + FilterConfirmation::SAMPLE_INTERVAL, false)
-                .unwrap();
-            assert_eq!(
-                backend.property_requests.as_ref().unwrap().len(),
-                1,
-                "one outstanding read"
-            );
-            let id = backend.pending[0].0;
-            backend
-                .reply_at(
-                    id,
-                    ReplyKind::Property,
-                    0,
-                    Some(c"time-pos".to_owned()),
-                    Some(NodeValue::Double(0.0)),
-                    now,
-                )
-                .unwrap();
-            backend
-                .filter_tick(
-                    now + FilterConfirmation::SAMPLE_INTERVAL - std::time::Duration::from_nanos(1),
-                    false,
-                )
-                .unwrap();
-            assert_eq!(
-                backend.property_requests.as_ref().unwrap().len(),
-                1,
-                "sample interval is not shortened"
-            );
-            let mut clock = now;
-            for position in 1..=31 {
-                clock += FilterConfirmation::SAMPLE_INTERVAL;
-                sample(&mut backend, NodeValue::Double(f64::from(position)), clock);
-            }
-            backend.filter_tick(clock, true).unwrap();
-            assert!(
-                backend.filter_result.is_none(),
-                "31 advances do not confirm"
-            );
-            clock += FilterConfirmation::SAMPLE_INTERVAL;
-            sample(&mut backend, NodeValue::Double(31.0), clock);
-            assert_eq!(
-                backend.filter_observation.as_ref().unwrap().advances,
-                31,
-                "equal samples do not count"
-            );
-            clock += FilterConfirmation::SAMPLE_INTERVAL;
-            sample(&mut backend, NodeValue::Double(32.0), clock);
-            backend.filter_tick(clock, false).unwrap();
-            assert!(
-                backend.filter_result.is_none(),
-                "progress must be followed by native NONE"
-            );
-            backend.filter_tick(clock, true).unwrap();
-            let Some(Ok(receipt)) = backend.filter_result.take() else {
-                panic!("no confirmed vf result")
-            };
-            assert_eq!(receipt.key(), filter_key(1, TreatmentPass::Candidate));
-            assert_eq!(receipt.baseline(), 0.0);
-            assert_eq!(receipt.last_position(), 32.0);
-            assert_eq!(receipt.advances(), 32);
-            assert!(!backend.filters_poisoned);
-        }
-    }
-
-    #[test]
-    fn filter_pre_submission_drain_is_bounded_and_flood_never_confirms() {
-        let (mut backend, now) = admitted_filter(&ordered_filters());
-        for _ in 0..64 {
-            backend.filter_tick(now, false).unwrap();
-            assert!(!backend.filter_observation.as_ref().unwrap().submitted);
-        }
-        backend
-            .filter_tick(now + FilterConfirmation::DEADLINE, false)
-            .unwrap();
-        let failure = result_failure(&mut backend);
+        assert!(matches!(
+            backend.reconfiguration_event(),
+            BackendEvent::Diagnostics(observation)
+                if observation.backend == BackendObservation::Unavailable(BackendUnavailable::Invalidated)
+                    && observation.observation_epoch == epoch + 1
+        ));
         assert_eq!(
-            failure.kind,
-            FilterErrorKind::Unconfirmed {
-                reason: FilterConfirmationFailure::Deadline
-            }
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Unavailable(BackendUnavailable::Invalidated)
         );
-        assert!(failure.requires_fresh_owner);
-        assert!(failure.diagnostics.native_evidence_lost);
-        assert!(backend.property_requests.as_ref().unwrap().is_empty());
+        finish_diagnostics(&mut backend, &requests); // Previous epoch's duplicate replies.
+        assert_eq!(diagnostic_requests(&backend).len(), 3);
+        assert_eq!(
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Unavailable(BackendUnavailable::Invalidated)
+        );
+        let fresh = diagnostic_requests(&backend);
+        finish_diagnostics(&mut backend, &fresh);
+        assert!(matches!(
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Observed { .. }
+        ));
     }
 
     #[test]
-    fn filter_missing_reconfig_and_insufficient_progress_have_no_success_fallback() {
-        for reconfigured in [false, true] {
-            let (mut backend, now) = submitted_filter();
-            command_reply(&mut backend, 0, now);
-            if reconfigured {
-                backend.filter_reconfigured();
-                sample(&mut backend, NodeValue::Double(4.0), now);
-            }
-            backend
-                .filter_tick(now + FilterConfirmation::DEADLINE, true)
-                .unwrap();
-            let failure = result_failure(&mut backend);
-            assert_eq!(
-                failure.kind,
-                FilterErrorKind::Unconfirmed {
-                    reason: if reconfigured {
-                        FilterConfirmationFailure::Deadline
-                    } else {
-                        FilterConfirmationFailure::MissingReconfig
-                    }
-                }
-            );
-            assert!(
-                !failure.requires_fresh_owner,
-                "clean intact deadline permits one in-place restoration"
-            );
+    fn diagnostic_reconfig_coalesces_one_active_batch_and_only_latest_epoch_rerun() {
+        let mut backend = diagnostic_backend();
+        backend.reconfiguration_event();
+        let first = diagnostic_requests(&backend);
+        for _ in 0..100 {
+            backend.reconfiguration_event();
+            assert_eq!(diagnostic_requests(&backend).len(), 3);
         }
+        let latest = backend.diagnostics.as_ref().unwrap().observation_epoch;
+        backend.emitted.clear();
+        finish_diagnostics(&mut backend, &first);
+        assert_eq!(diagnostic_requests(&backend).len(), 3);
+        assert_eq!(backend.diagnostics_batch.as_ref().unwrap().epoch, latest);
+        assert!(matches!(
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Unavailable(_)
+        ));
+        assert!(!backend.emitted.iter().any(|event| matches!(event, BackendEvent::Diagnostics(observation) if matches!(observation.backend, BackendObservation::Observed { .. }))));
+        let current = diagnostic_requests(&backend);
+        finish_diagnostics(&mut backend, &current);
+        assert!(backend.diagnostics_batch.is_none());
+        assert!(diagnostic_requests(&backend).is_empty());
+        assert!(matches!(
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Observed { .. }
+        ));
     }
 
     #[test]
-    fn filter_progress_wrong_cookie_wrong_name_and_invalid_values_cannot_confirm() {
-        for value in [
-            NodeValue::Double(f64::NAN),
-            NodeValue::Double(f64::INFINITY),
-            NodeValue::None,
-            NodeValue::Flag(true),
-            NodeValue::String(c"1.0".to_owned()),
+    fn diagnostic_payload_property_and_submission_failures_are_nonfatal() {
+        for invalid in [
+            None,
+            Some(NodeValue::Flag(false)),
+            Some(NodeValue::String(c"wrong-type".to_owned())),
         ] {
-            let (mut backend, now) = submitted_filter();
-            command_reply(&mut backend, 0, now);
-            backend.filter_reconfigured();
-            backend.filter_tick(now, false).unwrap();
-            let id = backend.pending[0].0;
+            let mut backend = diagnostic_backend();
+            backend.reconfiguration_event();
+            let requests = diagnostic_requests(&backend);
             backend
-                .reply_at(
-                    id + 100,
+                .reply(
+                    requests[0].0,
                     ReplyKind::Property,
                     0,
-                    Some(c"time-pos".to_owned()),
-                    Some(NodeValue::Double(1.0)),
-                    now,
+                    Some(requests[0].1.to_owned()),
+                    invalid,
                 )
                 .unwrap();
-            assert!(backend.filter_observation.as_ref().unwrap().outstanding);
-            backend
-                .reply_at(
-                    id,
-                    ReplyKind::Property,
-                    0,
-                    Some(c"time-pos".to_owned()),
-                    Some(value),
-                    now,
-                )
-                .unwrap();
-            backend.filter_tick(now, true).unwrap();
+            finish_diagnostics(&mut backend, &requests[1..]);
+            assert!(matches!(
+                backend.diagnostics.as_ref().unwrap().backend,
+                BackendObservation::Unavailable(_)
+            ));
+        }
+        for malformed in [false, true] {
+            let mut backend = diagnostic_backend();
+            backend.reconfiguration_event();
+            let requests = diagnostic_requests(&backend);
+            backend.emitted.clear();
+            if malformed {
+                assert!(
+                    unsafe { backend.property_reply_event(requests[0].0, 0, ptr::null_mut()) }
+                        .is_ok()
+                );
+            } else {
+                assert!(
+                    backend
+                        .reply(
+                            requests[0].0,
+                            ReplyKind::Property,
+                            0,
+                            Some(c"wrong-name".to_owned()),
+                            Some(NodeValue::Flag(true))
+                        )
+                        .is_ok()
+                );
+            }
+            finish_diagnostics(&mut backend, &requests[1..]);
             assert_eq!(
-                result_failure(&mut backend).kind,
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::ProgressUnavailable
-                }
+                backend.diagnostics.as_ref().unwrap().backend,
+                BackendObservation::Unavailable(BackendUnavailable::InvalidPayload)
             );
         }
-        let (mut backend, now) = submitted_filter();
-        backend
-            .reply_at(18, ReplyKind::Command, 0, None, None, now)
-            .unwrap();
-        assert!(
-            backend
-                .filter_observation
-                .as_ref()
-                .unwrap()
-                .outcome
-                .is_none()
-        );
-        command_reply(&mut backend, 0, now);
-        backend.filter_reconfigured();
-        backend.filter_tick(now, false).unwrap();
-        let id = backend.pending[0].0;
-        backend
-            .reply_at(
-                id,
-                ReplyKind::Property,
-                0,
-                Some(c"vf".to_owned()),
-                Some(NodeValue::Double(1.0)),
-                now,
-            )
-            .unwrap();
-        backend.filter_tick(now, true).unwrap();
-        assert_eq!(
-            result_failure(&mut backend).kind,
-            FilterErrorKind::Unconfirmed {
-                reason: FilterConfirmationFailure::ProgressUnavailable
+        for rejected in [false, true] {
+            let mut backend = diagnostic_backend();
+            if rejected {
+                backend.last_internal = u64::MAX - 1; // One submitted read, then two rejected submissions.
+            } else {
+                backend.property_requests = None; // Real get rejects the absent handle.
             }
-        );
+            assert!(matches!(
+                backend.reconfiguration_event(),
+                BackendEvent::Diagnostics(_)
+            ));
+            let issued = diagnostic_requests(&backend);
+            finish_diagnostics(&mut backend, &issued);
+            assert_eq!(
+                backend.diagnostics.as_ref().unwrap().backend,
+                BackendObservation::Unavailable(BackendUnavailable::SubmissionRejected)
+            );
+            assert!(backend.diagnostics_batch.is_none());
+            assert!(backend.handle.is_none());
+        }
     }
 
     #[test]
-    fn filter_backwards_and_unavailable_progress_and_malformed_native_payload_fail_typed() {
-        for malformed in [false, true] {
-            let (mut backend, now) = submitted_filter();
-            command_reply(&mut backend, 0, now);
-            backend.filter_reconfigured();
-            sample(&mut backend, NodeValue::Double(3.0), now);
-            let next = now + FilterConfirmation::SAMPLE_INTERVAL;
-            backend.filter_tick(next, false).unwrap();
-            let id = backend.pending[0].0;
-            if malformed {
-                assert!(backend.invalidate_filter_progress(id));
-            } else {
-                backend
-                    .reply_at(
-                        id,
-                        ReplyKind::Property,
-                        0,
-                        Some(c"time-pos".to_owned()),
-                        Some(NodeValue::Double(2.0)),
-                        next,
-                    )
-                    .unwrap();
-            }
-            backend.filter_tick(next, true).unwrap();
-            assert_eq!(
-                result_failure(&mut backend).kind,
-                FilterErrorKind::Unconfirmed {
-                    reason: if malformed {
-                        FilterConfirmationFailure::ProgressUnavailable
-                    } else {
-                        FilterConfirmationFailure::TimeDiscontinuity
-                    }
-                }
-            );
+    fn diagnostics_reject_failed_empty_oversized_and_non_utf8_backend_values() {
+        for value in [
+            NodeValue::String(c"".to_owned()),
+            NodeValue::String(c"   ".to_owned()),
+            NodeValue::String(CString::new("x".repeat(129)).unwrap()),
+            NodeValue::String(CString::new(vec![0xff]).unwrap()),
+            NodeValue::Int(1),
+        ] {
+            let mut backend = diagnostic_backend();
+            backend.reconfiguration_event();
+            let requests = diagnostic_requests(&backend);
+            finish_diagnostics(&mut backend, &requests[..1]);
+            backend
+                .reply(
+                    requests[1].0,
+                    ReplyKind::Property,
+                    0,
+                    Some(requests[1].1.to_owned()),
+                    Some(value),
+                )
+                .unwrap();
+            finish_diagnostics(&mut backend, &requests[2..]);
+            assert!(matches!(
+                backend.diagnostics.as_ref().unwrap().backend,
+                BackendObservation::Unavailable(_)
+            ));
         }
-        let (mut backend, now) = submitted_filter();
-        command_reply(&mut backend, 0, now);
-        backend.filter_reconfigured();
-        backend.filter_tick(now, false).unwrap();
-        let id = backend.pending[0].0;
+        let mut backend = diagnostic_backend();
+        backend.reconfiguration_event();
+        let requests = diagnostic_requests(&backend);
         backend
-            .reply_at(
-                id,
+            .reply(
+                requests[0].0,
                 ReplyKind::Property,
                 -10,
-                Some(c"time-pos".to_owned()),
-                None,
-                now,
+                Some(requests[0].1.to_owned()),
+                Some(NodeValue::Flag(true)),
             )
             .unwrap();
-        backend.filter_tick(now, true).unwrap();
+        finish_diagnostics(&mut backend, &requests[1..]);
         assert_eq!(
-            result_failure(&mut backend).kind,
-            FilterErrorKind::Unconfirmed {
-                reason: FilterConfirmationFailure::ProgressUnavailable
-            }
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Unavailable(BackendUnavailable::PropertyUnavailable)
         );
     }
 
     #[test]
-    fn filter_negative_reply_owns_buffered_creation_logs_in_both_orders_without_poison() {
-        for logs_first in [false, true] {
-            let (mut backend, now) = submitted_filter();
-            if !logs_first {
-                command_reply(&mut backend, -12, now);
-            }
-            backend
-                .filter_log(
-                    "vf/furami_0".into(),
-                    "error".into(),
-                    "could not initialize filter pads".into(),
-                )
-                .unwrap();
-            backend.filter_tick(now, false).unwrap();
-            assert!(
-                backend.filter_result.is_none() && backend.emitted.is_empty(),
-                "no early rejection settlement or false incumbent fault"
-            );
-            if logs_first {
-                command_reply(&mut backend, -12, now);
-            }
-            backend.filter_tick(now, true).unwrap();
-            let failure = result_failure(&mut backend);
-            assert_eq!(
-                failure.kind,
-                FilterErrorKind::CommandRejected { mpv_error: -12 }
-            );
-            assert_eq!(failure.attributed_ordinal, Some(0));
-            assert_eq!(failure.diagnostics.records.len(), 1);
-            assert!(!failure.requires_fresh_owner);
-            assert!(!backend.filters_poisoned);
-        }
-    }
-
-    #[test]
-    fn filter_direct_submission_error_settles_nonfatally_after_its_clean_log_drain() {
-        let (mut backend, now) = admitted_filter(&ordered_filters());
-        backend.filter_fault = Some(FixtureFault::CommandSubmission(-3));
-        backend.filter_tick(now, true).unwrap();
-        backend
-            .filter_log("vf".into(), "error".into(), "creation context".into())
-            .unwrap();
-        backend.filter_tick(now, false).unwrap();
-        assert!(backend.filter_result.is_none() && backend.emitted.is_empty());
-        backend.filter_tick(now, true).unwrap();
-        let failure = result_failure(&mut backend);
+    fn diagnostic_epoch_exhaustion_and_new_generation_never_reuse_old_backend() {
+        let mut backend = diagnostic_backend();
+        backend.reconfiguration_event();
+        let old = diagnostic_requests(&backend);
+        backend.diagnostics.as_mut().unwrap().observation_epoch = u64::MAX;
+        backend.reconfiguration_event();
+        finish_diagnostics(&mut backend, &old);
         assert_eq!(
-            failure.kind,
-            FilterErrorKind::CommandSubmission { mpv_error: -3 }
+            backend.diagnostics.as_ref().unwrap().observation_epoch,
+            u64::MAX
         );
-        assert!(!failure.requires_fresh_owner);
-        assert_eq!(failure.diagnostics.records.len(), 1);
-        assert!(!backend.filters_poisoned);
-    }
-
-    #[test]
-    fn filter_rejected_candidate_with_incumbent_disable_keeps_rejection_and_revokes_health() {
-        use crate::domain::filters::{FilterChain, FilterEntry};
-        for logs_first in [false, true] {
-            let mut backend = confirmed_filter();
-            let candidate = FilterChain::new(
-                ordered_filters()
-                    .entries()
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, entry)| {
-                        FilterEntry::new(
-                            format!("new candidate label {ordinal}"),
-                            entry.filter().clone(),
-                            entry.enabled(),
-                        )
-                    })
-                    .collect(),
-            )
-            .unwrap();
-            let now = admit_vf(
-                &mut backend,
-                RequestId::for_test(18),
-                filter_key(2, TreatmentPass::Candidate),
-                &candidate,
-            );
-            let observation = backend.filter_observation.as_mut().unwrap();
-            observation.submitted = true;
-            observation.command.take();
-            if !logs_first {
-                backend
-                    .reply_at(18, ReplyKind::Command, -12, None, None, now)
-                    .unwrap();
-            }
+        assert_eq!(
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Unavailable(BackendUnavailable::EpochExhausted)
+        );
+        backend.generation = 2;
+        backend.record_initialized_diagnostics(0x0002_0005, "mpv v0.41.0");
+        assert!(diagnostic_requests(&backend).is_empty());
+        let initial = backend.diagnostics.as_ref().unwrap().clone();
+        assert_eq!(initial.generation, 2);
+        assert_eq!(initial.observation_epoch, 0);
+        assert_eq!(
+            initial.backend,
+            BackendObservation::Unavailable(BackendUnavailable::NotObserved)
+        );
+        for &(id, name) in &old {
             backend
-                .filter_log(
-                    "vf".into(),
-                    "error".into(),
-                    "Disabling filter furami_2 because it has failed.".into(),
+                .reply(
+                    id,
+                    ReplyKind::Property,
+                    0,
+                    Some(name.to_owned()),
+                    Some(NodeValue::Flag(true)),
                 )
                 .unwrap();
-            if logs_first {
-                backend
-                    .reply_at(18, ReplyKind::Command, -12, None, None, now)
-                    .unwrap();
-            }
-            backend.filter_tick(now, true).unwrap();
-            let Some(BackendEvent::TreatmentFault { key, failure }) = backend.emitted.pop_front()
-            else {
-                panic!("missing independent incumbent fault")
-            };
-            assert_eq!(key, filter_key(1, TreatmentPass::Candidate));
-            let crate::domain::failure::TreatmentErrorKind::Filter(failure) = failure.kind else {
-                panic!("incumbent fault lost vf provenance")
-            };
-            assert_eq!(failure.kind, FilterErrorKind::RuntimeGraph);
-            assert_eq!(failure.attributed_ordinal, Some(2));
-            assert_eq!(failure.diagnostics.entries[2].label, "inert\nlabel 2");
-            let failure = result_failure(&mut backend);
-            assert_eq!(
-                failure.kind,
-                FilterErrorKind::CommandRejected { mpv_error: -12 }
-            );
-            assert_eq!(
-                failure.attributed_ordinal, None,
-                "incumbent disable cannot attribute the rejected candidate"
-            );
-            assert_eq!(
-                failure.diagnostics.entries[2].label,
-                "new candidate label 2"
-            );
-            assert!(failure.requires_fresh_owner);
-            assert!(backend.filters_poisoned);
         }
+        assert_eq!(backend.diagnostics.as_ref(), Some(&initial));
+        backend.shutdown().unwrap();
+        assert!(backend.diagnostics.is_none());
     }
 
     #[test]
-    fn filter_successful_command_disable_attributes_only_the_installed_candidate() {
-        for logs_first in [false, true] {
-            let (mut backend, now) = submitted_filter();
-            if !logs_first {
-                command_reply(&mut backend, 0, now);
-            }
+    fn initialized_observation_is_queued_and_initialization_failure_clears_it() {
+        let mut backend = backend();
+        assert!(backend.diagnostics.is_none());
+        backend.generation = 1;
+        backend.record_initialized_diagnostics(0x0002_0005, "mpv v0.41.0");
+        assert!(matches!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::Diagnostics(observation))
+                if observation.generation == 1
+                    && observation.client_api == 0x0002_0005
+                    && observation.libmpv_version.as_ref() == "mpv v0.41.0"
+                    && observation.backend == BackendObservation::Unavailable(BackendUnavailable::NotObserved)
+        ));
+        assert_eq!(
             backend
-                .filter_log(
-                    "vf".into(),
-                    "error".into(),
-                    "Disabling filter furami_2 because it has failed.".into(),
+                .initialize(
+                    SurfaceToken {
+                        generation: super::super::controller::Generation::new(2).unwrap(),
+                        xid: super::super::controller::X11WindowId::new(71).unwrap(),
+                    },
+                    &StopFlag::for_test()
                 )
-                .unwrap();
-            if logs_first {
-                command_reply(&mut backend, 0, now);
-            }
-            backend.filter_tick(now, true).unwrap();
-            let failure = result_failure(&mut backend);
-            assert_eq!(failure.kind, FilterErrorKind::RuntimeGraph);
-            assert_eq!(failure.attributed_ordinal, Some(2));
-            assert!(failure.requires_fresh_owner);
-            assert!(backend.filters_poisoned);
-        }
+                .unwrap_err()
+                .code,
+            "media_prefix"
+        );
+        assert!(backend.diagnostics.is_none());
+        assert!(
+            !backend
+                .emitted
+                .iter()
+                .any(|event| matches!(event, BackendEvent::Diagnostics(_)))
+        );
     }
 
     #[test]
-    fn filter_native_loss_supersedes_prior_progress_failure_and_clears_attribution() {
-        for prior in [
-            FilterConfirmationFailure::ProgressUnavailable,
-            FilterConfirmationFailure::TimeDiscontinuity,
-        ] {
-            let (mut backend, now) = submitted_filter();
-            command_reply(&mut backend, 0, now);
-            backend.filter_reconfigured();
-            sample(&mut backend, NodeValue::Double(3.0), now);
-            let next = now + FilterConfirmation::SAMPLE_INTERVAL;
-            sample(
-                &mut backend,
-                if prior == FilterConfirmationFailure::ProgressUnavailable {
-                    NodeValue::None
-                } else {
-                    NodeValue::Double(2.0)
-                },
-                next,
-            );
-            assert_eq!(
-                backend.filter_observation.as_ref().unwrap().failure,
-                Some(prior)
-            );
-            backend
-                .filter_log(
-                    "vf/furami_0".into(),
-                    "error".into(),
-                    "could not initialize filter pads".into(),
-                )
-                .unwrap();
+    fn diagnostic_wrong_kind_keeps_exact_read_and_native_invalid_scalars_are_nonfatal() {
+        let mut backend = diagnostic_backend();
+        backend.reconfiguration_event();
+        let requests = diagnostic_requests(&backend);
+        backend.emitted.clear();
+        assert_eq!(startup_event(&mut backend, 21), BackendEvent::Other);
+        for kind in [ReplyKind::Command, ReplyKind::SetProperty] {
             assert_eq!(
                 backend
-                    .filter_observation
-                    .as_ref()
-                    .unwrap()
-                    .attributed_ordinal,
-                Some(0)
-            );
-            backend
-                .filter_log(
-                    "overflow".into(),
-                    "fatal".into(),
-                    "log message buffer overflow: native discarded messages".into(),
-                )
-                .unwrap();
-            backend
-                .filter_log(
-                    "vf".into(),
-                    "error".into(),
-                    "Disabling filter furami_2 because it has failed.".into(),
-                )
-                .unwrap();
-            backend.filter_tick(next, true).unwrap();
-            let failure = result_failure(&mut backend);
-            assert_eq!(
-                failure.kind,
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::EvidenceLost
-                }
-            );
-            assert_eq!(
-                failure.attributed_ordinal, None,
-                "lost native evidence cannot regain attribution from later logs"
-            );
-            assert!(failure.diagnostics.native_evidence_lost);
-            assert!(failure.requires_fresh_owner);
-            assert!(backend.filters_poisoned);
-        }
-    }
-
-    #[test]
-    fn filter_native_loss_preserves_known_negative_causes_without_attribution() {
-        for submission in [false, true] {
-            let (mut backend, now) = if submission {
-                admitted_filter(&ordered_filters())
-            } else {
-                submitted_filter()
-            };
-            if submission {
-                backend.filter_fault = Some(FixtureFault::CommandSubmission(-3));
-                backend.filter_tick(now, true).unwrap();
-            } else {
-                command_reply(&mut backend, -12, now);
-            }
-            backend
-                .filter_log(
-                    "vf/furami_0".into(),
-                    "error".into(),
-                    "could not initialize filter pads".into(),
-                )
-                .unwrap();
-            backend
-                .filter_log(
-                    "overflow".into(),
-                    "fatal".into(),
-                    "log message buffer overflow: native discarded messages".into(),
-                )
-                .unwrap();
-            backend.filter_tick(now, true).unwrap();
-            let failure = result_failure(&mut backend);
-            assert_eq!(
-                failure.kind,
-                if submission {
-                    FilterErrorKind::CommandSubmission { mpv_error: -3 }
-                } else {
-                    FilterErrorKind::CommandRejected { mpv_error: -12 }
-                }
-            );
-            assert_eq!(failure.attributed_ordinal, None);
-            assert!(failure.diagnostics.native_evidence_lost);
-            assert!(failure.requires_fresh_owner);
-            assert!(backend.filters_poisoned);
-        }
-    }
-
-    #[test]
-    fn filter_pre_submission_native_loss_survives_later_labelled_and_unrelated_errors() {
-        for incumbent in [false, true] {
-            for (prefix, text) in [
-                ("vf/furami_0", "could not initialize filter pads"),
-                ("vf", "Disabling filter furami_2 because it has failed."),
-                ("vo/gpu-next", "unrelated rendering failure"),
-            ] {
-                let mut backend = if incumbent {
-                    confirmed_filter()
-                } else {
-                    backend()
-                };
-                let key = filter_key(2, TreatmentPass::Candidate);
-                let now = admit_vf(
-                    &mut backend,
-                    RequestId::for_test(18),
-                    key,
-                    &ordered_filters(),
-                );
-                backend
-                    .filter_log(
-                        "overflow".into(),
-                        "fatal".into(),
-                        "log message buffer overflow: native discarded messages".into(),
+                    .reply(
+                        requests[0].0,
+                        kind,
+                        0,
+                        Some(requests[0].1.to_owned()),
+                        Some(NodeValue::Flag(true))
                     )
-                    .unwrap();
-                if incumbent {
-                    let Some(BackendEvent::TreatmentFault {
-                        key: prior,
-                        failure,
-                    }) = backend.emitted.pop_front()
-                    else {
-                        panic!("native loss did not revoke the confirmed incumbent")
-                    };
-                    assert_eq!(prior, filter_key(1, TreatmentPass::Candidate));
-                    assert_eq!(
-                        failure.disposition,
-                        crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner,
-                    );
-                    let crate::domain::failure::TreatmentErrorKind::Filter(failure) = failure.kind
-                    else {
-                        panic!("native loss fault lost vf provenance")
-                    };
-                    assert_eq!(
-                        failure.kind,
-                        FilterErrorKind::Unconfirmed {
-                            reason: FilterConfirmationFailure::EvidenceLost
-                        }
-                    );
-                    assert_eq!(failure.attributed_ordinal, None);
-                    assert!(failure.requires_fresh_owner);
-                }
-                backend
-                    .filter_log(prefix.into(), "error".into(), text.into())
-                    .unwrap();
-                assert!(
-                    backend.emitted.is_empty(),
-                    "later logs cannot fabricate an attributed incumbent fault"
-                );
-                assert!(!backend.filter_observation.as_ref().unwrap().submitted);
-                backend.filter_tick(now, true).unwrap();
-                let failure = result_failure(&mut backend);
-                assert_eq!(
-                    failure.kind,
-                    FilterErrorKind::Unconfirmed {
-                        reason: FilterConfirmationFailure::EvidenceLost
-                    }
-                );
-                assert_eq!(failure.attributed_ordinal, None);
-                assert_eq!(failure.diagnostics.key, Some(key));
-                assert!(failure.diagnostics.native_evidence_lost);
-                assert!(failure.requires_fresh_owner);
-                assert!(backend.filters_poisoned);
-                if incumbent {
-                    assert!(backend.filter_health.as_ref().unwrap().faulted);
-                }
-            }
+                    .unwrap(),
+                BackendEvent::Other
+            );
+            assert_eq!(diagnostic_requests(&backend).len(), 3);
         }
-    }
-
-    #[test]
-    fn filter_native_loss_survives_malformed_outstanding_progress_reply_and_later_labels() {
-        for post_baseline in [false, true] {
-            let mut backend = confirmed_filter();
-            let key = filter_key(2, TreatmentPass::Candidate);
-            admit_vf(
-                &mut backend,
-                RequestId::for_test(18),
-                key,
-                &ordered_filters(),
-            );
-            let observation = backend.filter_observation.as_mut().unwrap();
-            let now = observation.admitted;
-            observation.submitted = true;
-            observation.command.take();
-            backend
-                .reply_at(18, ReplyKind::Command, 0, None, None, now)
-                .unwrap();
-            backend.filter_reconfigured();
-            if post_baseline {
-                sample(&mut backend, NodeValue::Double(0.0), now);
-            }
-            let read_time = now
-                + if post_baseline {
-                    FilterConfirmation::SAMPLE_INTERVAL
-                } else {
-                    std::time::Duration::ZERO
-                };
-            backend.filter_tick(read_time, false).unwrap();
-            let id = backend
-                .pending
-                .iter()
-                .find(|(_, pending)| matches!(pending, Pending::FilterProgress { .. }))
-                .unwrap()
-                .0;
-            assert!(backend.filter_observation.as_ref().unwrap().outstanding);
-            backend
-                .filter_log(
-                    "overflow".into(),
-                    "fatal".into(),
-                    "log message buffer overflow: native discarded messages".into(),
-                )
-                .unwrap();
-            let Some(BackendEvent::TreatmentFault {
-                key: prior,
-                failure,
-            }) = backend.emitted.pop_front()
-            else {
-                panic!("incumbent native loss fault missing")
-            };
-            assert_eq!(prior, filter_key(1, TreatmentPass::Candidate));
-            let crate::domain::failure::TreatmentErrorKind::Filter(failure) = failure.kind else {
-                panic!("native loss fault lost vf provenance")
-            };
-            assert_eq!(
-                failure.kind,
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::EvidenceLost
-                }
-            );
-            assert_eq!(failure.attributed_ordinal, None);
-            assert!(backend.invalidate_filter_progress(id));
-            assert!(!backend.filter_observation.as_ref().unwrap().outstanding);
-            assert_eq!(
-                backend.filter_observation.as_ref().unwrap().failure,
-                Some(FilterConfirmationFailure::EvidenceLost)
-            );
-            backend
-                .filter_log(
-                    "vf/furami_0".into(),
-                    "error".into(),
-                    "could not initialize filter pads".into(),
-                )
-                .unwrap();
-            backend
-                .filter_log(
-                    "vf".into(),
-                    "error".into(),
-                    "Disabling filter furami_2 because it has failed.".into(),
-                )
-                .unwrap();
-            backend.filter_tick(read_time, true).unwrap();
-            let failure = result_failure(&mut backend);
-            assert_eq!(
-                failure.kind,
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::EvidenceLost
-                }
-            );
-            assert_eq!(failure.attributed_ordinal, None);
-            assert_eq!(failure.diagnostics.key, Some(key));
-            assert!(failure.diagnostics.native_evidence_lost);
-            assert!(failure.requires_fresh_owner);
-            assert!(backend.filters_poisoned);
-            assert!(backend.emitted.is_empty());
-        }
-    }
-
-    #[test]
-    fn filter_malformed_log_flood_ticks_deadline_without_fabricating_clean_drain() {
-        for submitted in [false, true] {
-            let mut backend = confirmed_filter();
-            let recorder = FixtureRecorder::default();
-            backend.fixture_recorder = Some(recorder.clone());
-            let key = filter_key(2, TreatmentPass::Candidate);
-            admit_vf(
-                &mut backend,
-                RequestId::for_test(18),
-                key,
-                &ordered_filters(),
-            );
-            let observation = backend.filter_observation.as_mut().unwrap();
-            let now = observation.admitted;
-            if submitted {
-                observation.submitted = true;
-                observation.command.take();
-            }
-            for index in 0..64 {
-                let event = backend
-                    .malformed_filter_log(now + std::time::Duration::from_millis(index))
-                    .unwrap();
-                if index == 0 {
-                    let BackendEvent::TreatmentFault { failure, .. } = event else {
-                        panic!("incumbent loss fault missing")
-                    };
-                    let crate::domain::failure::TreatmentErrorKind::Filter(failure) = failure.kind
-                    else {
-                        panic!("native loss fault lost vf provenance")
-                    };
-                    assert_eq!(
-                        failure.kind,
-                        FilterErrorKind::Unconfirmed {
-                            reason: FilterConfirmationFailure::EvidenceLost
-                        }
-                    );
-                    assert_eq!(failure.attributed_ordinal, None);
-                } else {
-                    assert_eq!(event, BackendEvent::Other);
-                }
-                assert!(backend.filter_observation.is_some());
-            }
-            let event = backend
-                .malformed_filter_log(now + FilterConfirmation::DEADLINE)
-                .unwrap();
-            assert_eq!(
-                event,
-                BackendEvent::Other,
-                "vf settlement is private to the aggregate owner"
-            );
-            let failure = result_failure(&mut backend);
-            assert_eq!(failure.diagnostics.key, Some(key));
-            assert_eq!(
-                failure.kind,
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::EvidenceLost
-                }
-            );
-            assert_eq!(failure.attributed_ordinal, None);
-            assert!(failure.requires_fresh_owner);
-            assert!(failure.diagnostics.native_evidence_lost);
-            assert!(backend.filter_observation.is_none());
-            assert!(backend.filters_poisoned);
-            assert!(
-                recorder
-                    .native_snapshot()
-                    .unwrap()
-                    .iter()
-                    .all(|event| event["event"] != "drain"),
-                "non-clean raw-event handling cannot invent a NONE milestone"
-            );
-        }
-    }
-
-    #[test]
-    fn filter_final_progress_loses_to_graph_and_full_text_latches_survive_ring_eviction() {
-        let (mut backend, now) = submitted_filter();
-        command_reply(&mut backend, 0, now);
-        backend.filter_reconfigured();
-        let final_time = complete_progress(&mut backend, now);
-        backend
-            .filter_log(
-                "vf".into(),
-                "error".into(),
-                format!(
-                    "failed to configure the filter graph {} furami_2",
-                    "é".repeat(2500)
-                ),
-            )
-            .unwrap();
-        for _ in 0..32 {
-            backend
-                .filter_log("vf".into(), "warn".into(), "context only".into())
-                .unwrap();
-        }
-        backend.filter_tick(final_time, true).unwrap();
-        let failure = result_failure(&mut backend);
-        assert_eq!(failure.kind, FilterErrorKind::RuntimeGraph);
-        assert_eq!(failure.attributed_ordinal, Some(2));
-        assert!(failure.requires_fresh_owner);
-        assert!(failure.diagnostics.truncated);
-        assert!(failure.diagnostics.dropped_context > 0);
-        assert_eq!(failure.diagnostics.records.len(), 16);
+        let mut invalid_flag = MpvNode {
+            format: 3,
+            value: MpvNodeValue { flag: 2 },
+        };
+        let mut property = MpvPropertyEvent {
+            name: c"vo-configured".as_ptr(),
+            format: 6,
+            data: ptr::from_mut(&mut invalid_flag).cast(),
+        };
+        // SAFETY: Stack-owned property and NODE live throughout this synchronous call.
         assert!(
-            failure
-                .diagnostics
-                .records
-                .iter()
-                .all(|record| record.text == "context only")
-        );
-    }
-
-    #[test]
-    fn filter_native_log_loss_during_and_after_confirmation_is_not_retention_eviction() {
-        for late in [false, true] {
-            let mut backend = if late {
-                confirmed_filter()
-            } else {
-                submitted_filter().0
-            };
-            let key = filter_key(1, TreatmentPass::Candidate);
-            if !late {
-                command_reply(&mut backend, 0, Instant::now());
+            unsafe {
+                backend.property_reply_event(requests[0].0, 0, ptr::from_mut(&mut property).cast())
             }
-            backend
-                .filter_log(
-                    "overflow".into(),
-                    "fatal".into(),
-                    "log message buffer overflow: native discarded messages".into(),
-                )
-                .unwrap();
-            if !late {
-                backend.filter_tick(Instant::now(), true).unwrap();
-            }
-            let failure = if late {
-                let Some(BackendEvent::TreatmentFault {
-                    key: observed,
-                    failure,
-                }) = backend.emitted.pop_front()
-                else {
-                    panic!("late native loss did not revoke confirmation")
-                };
-                assert_eq!(observed, key);
-                let crate::domain::failure::TreatmentErrorKind::Filter(failure) = failure.kind
-                else {
-                    panic!("late native loss fault lost vf provenance")
-                };
-                Box::new(failure)
-            } else {
-                result_failure(&mut backend)
-            };
-            assert_eq!(
-                failure.kind,
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::EvidenceLost
-                }
-            );
-            assert_eq!(failure.attributed_ordinal, None);
-            assert_eq!(failure.diagnostics.key, Some(key));
-            assert!(failure.diagnostics.native_evidence_lost);
-            assert!(failure.requires_fresh_owner);
-            assert!(backend.filters_poisoned);
-        }
-        let mut backend = confirmed_filter();
-        for _ in 0..64 {
-            backend
-                .filter_log(
-                    "vf".into(),
-                    "warn".into(),
-                    "retained context eviction".into(),
-                )
-                .unwrap();
-        }
-        assert!(backend.emitted.is_empty());
-        assert!(
-            !backend.filters_poisoned,
-            "Rust context eviction is not native loss"
+            .is_ok()
         );
-    }
-
-    #[test]
-    fn filter_poison_is_sticky_across_clear_and_identical_or_retained_entry_replays() {
-        for chain in [
-            crate::domain::filters::FilterChain::default(),
-            ordered_filters(),
-        ] {
-            let mut backend = confirmed_filter();
-            backend
-                .filter_log(
-                    "vf".into(),
-                    "error".into(),
-                    "Disabling filter furami_0 because it has failed.".into(),
-                )
-                .unwrap();
-            assert!(matches!(
-                backend.emitted.pop_front(),
-                Some(BackendEvent::TreatmentFault { .. })
-            ));
-            admit_vf(
-                &mut backend,
-                RequestId::for_test(18),
-                filter_key(2, TreatmentPass::Candidate),
-                &chain,
-            );
-            backend.filter_tick(Instant::now(), true).unwrap();
-            let failure = result_failure(&mut backend);
-            assert_eq!(
-                failure.kind,
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::BackendUnavailable
-                }
-            );
-            assert!(failure.requires_fresh_owner);
-            assert!(backend.filters_poisoned);
-        }
-        assert!(
-            !confirmed_filter().filters_poisoned,
-            "a fresh owner independently proves the chain"
-        );
-    }
-
-    #[test]
-    fn filter_rejection_with_undrained_flood_keeps_known_cause_and_marks_lost_health() {
-        let (mut backend, now) = submitted_filter();
-        command_reply(&mut backend, -12, now);
-        for _ in 0..64 {
-            backend.filter_tick(now, false).unwrap();
-        }
-        backend
-            .filter_tick(now + FilterConfirmation::DEADLINE, false)
-            .unwrap();
-        let failure = result_failure(&mut backend);
+        finish_diagnostics(&mut backend, &requests[1..]);
+        assert!(!backend.video_started);
         assert_eq!(
-            failure.kind,
-            FilterErrorKind::CommandRejected { mpv_error: -12 }
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Unavailable(BackendUnavailable::InvalidPayload)
         );
-        assert!(failure.requires_fresh_owner);
-        assert!(failure.diagnostics.native_evidence_lost);
+
+        backend.reconfiguration_event();
+        let requests = diagnostic_requests(&backend);
+        let oversized = CString::new("x".repeat(129)).unwrap();
+        let mut node = MpvNode {
+            format: 1,
+            value: MpvNodeValue {
+                string: oversized.as_ptr().cast_mut(),
+            },
+        };
+        let mut property = MpvPropertyEvent {
+            name: c"current-vo".as_ptr(),
+            format: 6,
+            data: ptr::from_mut(&mut node).cast(),
+        };
+        let current_vo = requests
+            .iter()
+            .find(|(_, name)| *name == c"current-vo")
+            .unwrap()
+            .0;
+        // SAFETY: The CString and both native wrappers outlive the borrowed decode.
+        assert!(
+            unsafe {
+                backend.property_reply_event(current_vo, 0, ptr::from_mut(&mut property).cast())
+            }
+            .is_ok()
+        );
+        finish_diagnostics(&mut backend, &requests);
+        assert_eq!(
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Unavailable(BackendUnavailable::InvalidPayload)
+        );
     }
 
     #[test]
-    fn filter_attribution_matches_only_whole_enabled_internal_tokens() {
-        let entries = compiled_filters(&ordered_filters()).entries;
-        for valid in [
-            "furami_0",
-            "[vf/furami_2]",
-            "Disabling filter furami_2 because it has failed.",
-        ] {
-            assert!(filter_ordinal(valid, &entries).is_some());
+    fn native_dispatch_ignores_malformed_command_result_for_diagnostic_cookie_before_decode() {
+        let mut backend = diagnostic_backend();
+        backend.reconfiguration_event();
+        backend.emitted.clear();
+        let requests = diagnostic_requests(&backend);
+        let before = backend.diagnostics.as_ref().unwrap().clone();
+        assert_eq!(startup_event(&mut backend, 21), BackendEvent::Other);
+        assert!(!backend.video_started);
+        let mut command = MpvCommandEvent {
+            result: MpvNode {
+                format: 3,
+                value: MpvNodeValue { flag: 2 },
+            },
+        };
+        let mut event = MpvEvent {
+            event_id: 5,
+            error: 0,
+            reply_userdata: requests[0].0,
+            data: ptr::from_mut(&mut command).cast(),
+        };
+        for error in [0, -10] {
+            event.error = error;
+            // SAFETY: Stack-owned COMMAND_REPLY wrapper/result live for this call.
+            assert_eq!(
+                unsafe { backend.native_event(&event) }.unwrap(),
+                BackendEvent::Other
+            );
+            assert_eq!(diagnostic_requests(&backend), requests);
+            assert_eq!(backend.diagnostics.as_ref(), Some(&before));
+            assert!(!backend.video_started);
         }
-        for invalid in [
-            "furami_1",
-            "furami_200",
-            "furami_02",
-            "furami_2suffix",
-            "furami_2-suffix",
-            "furami_2.other",
-            "x_furami_2",
-            "furami_2é",
-            "format",
-            "inert label 2",
-        ] {
-            assert_eq!(filter_ordinal(invalid, &entries), None, "{invalid}");
-        }
-    }
+        let mut configured = MpvNode {
+            format: 3,
+            value: MpvNodeValue { flag: 1 },
+        };
+        let mut property = MpvPropertyEvent {
+            name: c"vo-configured".as_ptr(),
+            format: 6,
+            data: ptr::from_mut(&mut configured).cast(),
+        };
+        event.event_id = 3;
+        event.error = 0;
+        event.data = ptr::from_mut(&mut property).cast();
+        // SAFETY: The genuine-shaped GET payload is alive for the dispatch.
+        assert!(unsafe { backend.native_event(&event) }.is_ok());
+        assert!(backend.video_started);
+        finish_diagnostics(&mut backend, &requests[1..]);
+        assert!(matches!(
+            backend.diagnostics.as_ref().unwrap().backend,
+            BackendObservation::Observed { .. }
+        ));
 
-    #[test]
-    fn filter_terminal_and_queue_loss_latches_revoke_confirmation_without_attribution() {
-        for reason in [
-            FilterConfirmationFailure::BackendUnavailable,
-            FilterConfirmationFailure::EvidenceLost,
-        ] {
-            let (mut backend, now) = submitted_filter();
-            command_reply(&mut backend, 0, now);
-            backend.filter_reconfigured();
-            let clock = complete_progress(&mut backend, now);
-            backend.filter_lost(reason);
-            backend.filter_tick(clock, true).unwrap();
-            let failure = result_failure(&mut backend);
-            assert_eq!(failure.kind, FilterErrorKind::Unconfirmed { reason });
-            assert!(failure.requires_fresh_owner);
-            assert_eq!(failure.attributed_ordinal, None);
-        }
-    }
-
-    #[test]
-    fn filter_output_conversion_and_unrelated_errors_are_honest_chain_failures() {
-        for (prefix, level, text, expected) in [
-            (
-                "vf",
-                "fatal",
-                "Cannot convert decoder/filter output to any format supported by the output.",
-                FilterErrorKind::RuntimeGraph,
-            ),
-            (
-                "vo/gpu-next",
-                "error",
-                "unrelated rendering failure",
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::EvidenceLost,
-                },
-            ),
-        ] {
-            let (mut backend, now) = submitted_filter();
-            command_reply(&mut backend, 0, now);
-            backend
-                .filter_log(prefix.into(), level.into(), text.into())
-                .unwrap();
-            backend.filter_tick(now, true).unwrap();
-            let failure = result_failure(&mut backend);
-            assert_eq!(failure.kind, expected);
-            assert_eq!(failure.attributed_ordinal, None);
-            assert!(failure.requires_fresh_owner);
-        }
-    }
-
-    #[test]
-    fn filter_diagnostic_text_is_2048_unicode_scalars_not_bytes() {
-        let (mut backend, _) = submitted_filter();
-        backend
-            .filter_log("vf".into(), "warn".into(), "é".repeat(2049))
-            .unwrap();
-        let record = backend.filter_records.back().unwrap();
-        assert!(record.truncated);
-        assert_eq!(record.text.chars().count(), 2048);
-        assert_eq!(record.text.len(), 4096);
-        assert!(!backend.filters_poisoned);
+        let mut pause_backend = diagnostic_backend();
+        pause_backend
+            .pending
+            .push((event.reply_userdata, Pending::Pause));
+        event.event_id = 5;
+        event.data = ptr::from_mut(&mut command).cast();
+        // SAFETY: Same live malformed NODE, this time not owned by diagnostics.
+        assert!(unsafe { pause_backend.native_event(&event) }.is_err());
+        assert_eq!(pause_backend.pending.len(), 1);
     }
 
     #[test]
@@ -5340,7 +4546,6 @@ mod reply_tests {
         audio.output = initial.clone();
         let requested = audio.input.requested();
         let settings = crate::domain::state::DraftSettings {
-            filters: crate::domain::filters::FilterChain::default(),
             video: crate::domain::capture::VideoRequest::manual(
                 crate::domain::capture::ModeRequest {
                     identity: requested.identity.clone(),
@@ -5357,10 +4562,7 @@ mod reply_tests {
         let stamp = audio.watch;
         let (drivers_tx, drivers) = std::sync::mpsc::channel();
         let mut gate = GateRunner::with_spawner(
-            crate::media::render_catalog::QualifiedTreatmentCapabilities {
-                filters: Ok(crate::media::filter_catalog::fixture_capabilities()),
-                renderer: Ok(crate::media::render_catalog::fixture_capabilities()),
-            },
+            Ok(crate::media::render_catalog::fixture_capabilities()),
             move |generation, session| {
                 let requested = session.video.requested();
                 let (driver, backend) = Driver::pair(Config::default());
@@ -5392,7 +4594,6 @@ mod reply_tests {
             key,
             prepared,
             crate::media::controller::test_support::prepared_treatments(
-                &crate::domain::filters::FilterChain::default(),
                 &crate::domain::render::RendererSettings::default(),
             ),
             PlaybackGain::default(),

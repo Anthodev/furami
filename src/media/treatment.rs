@@ -1,5 +1,5 @@
-//! Owner-only aggregate transaction. Native replies, never requested values,
-//! authorize the renderer proof; vf owns its independent observation window.
+//! Owner-only renderer transaction. Native replies, never requested values,
+//! authorize the complete proof after an actual clean native drain.
 use super::*;
 use crate::domain::{
     failure::{
@@ -7,10 +7,7 @@ use crate::domain::{
         TreatmentErrorKind, TreatmentFailure, TreatmentFailureDisposition,
     },
     render::RendererProperty,
-    state::{
-        FilterEvidence, FilterTreatmentProof, RendererConfirmation, TreatmentConfirmation,
-        TreatmentPass,
-    },
+    state::{RendererConfirmation, TreatmentConfirmation, TreatmentPass},
 };
 use crate::media::{
     controller::PreparedTreatments,
@@ -24,13 +21,22 @@ enum Phase {
     Set,
     Readback,
     Verify,
-    Filter,
-    Final,
 }
 
-// Each pass needs at most 48 renderer/pause requests and 201 vf samples.
+fn phase_token(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Snapshot => "Snapshot",
+        Phase::Write => "Write",
+        Phase::Set => "Set",
+        Phase::Readback => "Readback",
+        Phase::Verify => "Verify",
+    }
+}
+
+// Snapshot (10), SET/readback (18), and full verification (10).
 // Reserve candidate and its sole restoration before the first native write.
-const PASS_REQUESTS: u64 = 249;
+const PASS_REQUESTS: u64 = 38;
+const TREATMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
@@ -51,8 +57,6 @@ pub(super) struct TreatmentObservation {
     mutated: bool,
     uncertain_set: bool,
     unattributed_error: bool,
-    vf_changed: bool,
-    filters: Option<FilterTreatmentProof>,
     admitted: Instant,
     request: u64,
     request_end: u64,
@@ -63,9 +67,7 @@ pub(super) struct TreatmentObservation {
 pub(super) struct TreatmentRestore {
     apply: crate::domain::state::ApplyId,
     prior: PreparedTreatments,
-    origin: FilterEvidence,
     playback: InitialPlayback,
-    vf_touched: bool,
     snapshot_verified: bool,
     restore_admitted: bool,
     request: u64,
@@ -130,10 +132,37 @@ impl TreatmentObservation {
         }
     }
     fn renderer_failure(&mut self, property: RendererProperty, kind: RendererErrorKind) {
-        let disposition = match kind {
-            RendererErrorKind::IncumbentMismatch => TreatmentFailureDisposition::RestoreFreshOwner,
-            RendererErrorKind::ReadbackMismatch => TreatmentFailureDisposition::RestoreSameOwner,
-            _ => self.disposition(),
+        let proof_lost = self.failure.as_ref().is_some_and(|failure| {
+            failure.disposition == TreatmentFailureDisposition::RestoreFreshOwner
+        });
+        // A correlated definitive SET refusal remains the primary cause even
+        // when native evidence loss arrived first; it cannot restore health.
+        if matches!(
+            kind,
+            RendererErrorKind::Rejected { .. }
+                | RendererErrorKind::Submission {
+                    operation: RendererOperation::Set,
+                    ..
+                }
+        ) && self
+            .failure
+            .as_ref()
+            .is_some_and(|failure| matches!(failure.kind, TreatmentErrorKind::Unconfirmed { .. }))
+        {
+            self.failure = None;
+        }
+        let disposition = if proof_lost {
+            TreatmentFailureDisposition::RestoreFreshOwner
+        } else {
+            match kind {
+                RendererErrorKind::IncumbentMismatch | RendererErrorKind::MalformedReadback => {
+                    TreatmentFailureDisposition::RestoreFreshOwner
+                }
+                RendererErrorKind::ReadbackMismatch => {
+                    TreatmentFailureDisposition::RestoreSameOwner
+                }
+                _ => self.disposition(),
+            }
         };
         self.failure.get_or_insert_with(|| TreatmentFailure {
             key: Some(self.key),
@@ -166,15 +195,6 @@ impl TreatmentObservation {
         }
         self.request += 1;
         Ok(self.request)
-    }
-    pub(super) fn progress_request(&mut self, key: TreatmentAttemptKey) -> Result<u64, MediaError> {
-        if key != self.key {
-            return Err(MediaError::new(
-                "request_key",
-                "vf sample does not match the reserved treatment",
-            ));
-        }
-        self.next_request()
     }
 }
 
@@ -230,7 +250,14 @@ impl MpvBackend {
         id: u64,
         name: &'static CStr,
     ) -> Result<Result<(), i32>, MediaError> {
-        tracing::info!(key = ?key, request = id, property = %name.to_string_lossy(), "renderer_get_submit");
+        tracing::info!(
+            event_code = "renderer_get_submit",
+            apply_id = key.apply.get(),
+            attempt_id = key.attempt.get(),
+            pass = super::pass_token(key.pass),
+            request_id = id,
+            property = super::renderer_property_token(name.to_str().unwrap_or("Unknown")),
+        );
         #[cfg(test)]
         {
             self.native_record(serde_json::json!({"event":"renderer_get","request":id,"property":name.to_str().expect("static native name")}));
@@ -262,10 +289,21 @@ impl MpvBackend {
         } else {
             value
         };
-        tracing::info!(key = ?key, request = id, property = %native_name(property).to_string_lossy(), value = ?value, "renderer_set_submit");
+        tracing::info!(
+            event_code = "renderer_set_submit",
+            apply_id = key.apply.get(),
+            attempt_id = key.attempt.get(),
+            pass = super::pass_token(key.pass),
+            request_id = id,
+            property =
+                super::renderer_property_token(native_name(property).to_str().unwrap_or("Unknown")),
+        );
         #[cfg(test)]
         {
             self.native_record(serde_json::json!({"event":"renderer_set","key":key,"request":id,"property":native_name(property).to_str().expect("static name"),"value":format!("{value:?}")}));
+            if let Some(error) = self.renderer_submission_error.take() {
+                return Ok(Err(error));
+            }
             if let Some(requests) = &mut self.property_requests {
                 let node = match value {
                     NativeRendererValue::Choice(value) => NodeValue::String(value.to_owned()),
@@ -308,7 +346,7 @@ impl MpvBackend {
         key: TreatmentAttemptKey,
         target: PreparedTreatments,
     ) -> Result<(), MediaError> {
-        if self.treatment_observation.is_some() || self.filter_observation.is_some() {
+        if self.treatment_observation.is_some() {
             return Err(MediaError::new(
                 "treatment_admission",
                 "one treatment transaction already pending",
@@ -319,7 +357,7 @@ impl MpvBackend {
         } else {
             InitialPlayback::Live
         };
-        let (request, request_end, origin, vf_changed) = if key.pass == TreatmentPass::Restore {
+        let (request, request_end) = if key.pass == TreatmentPass::Restore {
             let retained = self
                 .treatment_restore
                 .as_mut()
@@ -341,12 +379,7 @@ impl MpvBackend {
                 ));
             }
             retained.restore_admitted = true;
-            (
-                retained.request,
-                retained.request_end,
-                Some(retained.origin),
-                retained.vf_touched,
-            )
+            (retained.request, retained.request_end)
         } else {
             let prior = self.landed_treatments.as_ref();
             if key.pass != TreatmentPass::Open && prior.is_none() {
@@ -355,15 +388,8 @@ impl MpvBackend {
                     "incumbent treatment proof unavailable",
                 ));
             }
-            let vf_changed = if key.pass == TreatmentPass::Open {
-                playback == InitialPlayback::Live
-            } else {
-                prior.is_none_or(|(prior, _)| prior.filters.vf != target.filters.vf)
-            };
-            let origin = prior.map(|(_, confirmation)| confirmation.filters().origin());
-            // Reserve both candidate and the sole same-owner restore before writing.
-            // Renderer/pause and the independent bounded vf observer share this
-            // finite reservation; incidental metadata retains its existing path.
+            // Reserve candidate and its sole restoration before any native write.
+            // Incidental source metadata retains its existing request path.
             let request = self.last_internal;
             let end = request.checked_add(PASS_REQUESTS * 2).ok_or_else(|| {
                 MediaError::new(
@@ -372,49 +398,24 @@ impl MpvBackend {
                 )
             })?;
             self.last_internal = end;
-            if let Some((prior, confirmation)) = prior {
+            if let Some((prior, _)) = prior {
                 self.treatment_restore = Some(TreatmentRestore {
                     apply: key.apply,
                     prior: prior.clone(),
-                    origin: confirmation.filters().origin(),
                     playback,
-                    vf_touched: false,
                     snapshot_verified: false,
                     restore_admitted: false,
                     request: request + PASS_REQUESTS,
                     request_end: end,
                 });
             }
-            (request, request + PASS_REQUESTS, origin, vf_changed)
+            (request, request + PASS_REQUESTS)
         };
-        if vf_changed && playback == InitialPlayback::Paused {
-            return Err(MediaError::new(
-                "treatment_admission",
-                "paused vf changes require a fresh Open",
-            ));
-        }
-        let filters = if key.pass == TreatmentPass::Open && playback == InitialPlayback::Paused {
-            Some(FilterTreatmentProof::PreparedPaused { key })
-        } else if !vf_changed {
-            origin.map(|origin| FilterTreatmentProof::Preserved { origin })
-        } else {
-            None
-        };
-        let failure = self.filters_poisoned.then(|| TreatmentFailure {
+        let failure = self.treatment_poisoned.then_some(TreatmentFailure {
             key: Some(key),
-            kind: TreatmentErrorKind::Filter(FilterFailure {
-                kind: FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::BackendUnavailable,
-                },
-                requires_fresh_owner: true,
-                attributed_ordinal: None,
-                diagnostics: self.filter_diagnostics(
-                    key,
-                    &target.filters.entries,
-                    self.log_sequence,
-                    self.dropped_context,
-                ),
-            }),
+            kind: TreatmentErrorKind::Unconfirmed {
+                reason: TreatmentConfirmationFailure::EvidenceLost,
+            },
             disposition: TreatmentFailureDisposition::RestoreFreshOwner,
         });
         let observation = TreatmentObservation {
@@ -432,20 +433,24 @@ impl MpvBackend {
             different: [false; 9],
             mutated: false,
             uncertain_set: false,
-            vf_changed,
             unattributed_error: false,
-            filters,
             admitted: Instant::now(),
             request,
             request_end,
             failure,
-            failure_without_drain: self.filters_poisoned,
+            failure_without_drain: self.treatment_poisoned,
         };
-        tracing::info!(key = ?key, request = id, playback = ?playback, vf_changed, renderer = ?observation.target.renderer.requested(), "treatment_admitted");
+        tracing::info!(
+            event_code = "treatment_admitted",
+            apply_id = key.apply.get(),
+            attempt_id = key.attempt.get(),
+            pass = super::pass_token(key.pass),
+            request_id = id,
+        );
         #[cfg(test)]
         self.native_record(serde_json::json!({
             "event":"treatment_admission", "key":key, "request":id,
-            "playback":playback, "vf_changed":vf_changed,
+            "playback":playback,
             "renderer":observation.target.renderer.requested()
         }));
         self.treatment_observation = Some(observation);
@@ -458,16 +463,6 @@ impl MpvBackend {
         }
     }
 
-    pub(super) fn treatment_filter_revoked(&mut self, failure: &FilterFailure) {
-        if let Some(observation) = &mut self.treatment_observation {
-            observation.failure.get_or_insert_with(|| TreatmentFailure {
-                key: Some(observation.key),
-                kind: TreatmentErrorKind::Filter(failure.clone()),
-                disposition: TreatmentFailureDisposition::RestoreFreshOwner,
-            });
-            observation.lost(TreatmentConfirmationFailure::BackendUnavailable);
-        }
-    }
     pub(super) fn renderer_log_error(&mut self) {
         if let Some(observation) = &mut self.treatment_observation {
             observation.unattributed_error = true;
@@ -506,45 +501,32 @@ impl MpvBackend {
         true
     }
 
-    fn finish_treatment(&mut self) {
+    pub(super) fn finish_treatment(&mut self) {
         let mut observation = self
             .treatment_observation
             .take()
             .expect("settled treatment");
-        if self.filters_poisoned
-            || self.native_evidence_lost
-            || self
-                .filter_health
-                .as_ref()
-                .is_some_and(|health| health.faulted)
-        {
-            observation.lost(if self.native_evidence_lost {
-                TreatmentConfirmationFailure::EvidenceLost
-            } else {
-                TreatmentConfirmationFailure::BackendUnavailable
-            });
-        }
-        if observation.failure.is_some() {
-            if let Some(filter) = &mut self.filter_observation {
-                filter
-                    .failure
-                    .get_or_insert(FilterConfirmationFailure::BackendUnavailable);
-                filter.fresh = true;
-                self.finish_filter();
-            }
-            self.filter_result = None;
+        if self.treatment_poisoned {
+            observation.lost(TreatmentConfirmationFailure::EvidenceLost);
         }
         self.pending.retain(|(_, pending)| !matches!(pending,
             Pending::RendererRead { key, .. } | Pending::RendererSet { key, .. } | Pending::RendererPause { key, .. }
             if *key == observation.key));
+        if let Some(failure) = &observation.failure
+            && failure.disposition == TreatmentFailureDisposition::RestoreFreshOwner
+        {
+            let reason = match &failure.kind {
+                TreatmentErrorKind::Unconfirmed { reason } => *reason,
+                TreatmentErrorKind::Renderer(_) => TreatmentConfirmationFailure::EvidenceLost,
+            };
+            self.revoke_treatment(reason);
+        }
         let result = if let Some(failure) = observation.failure {
             Err(Box::new(failure))
         } else {
             let confirmation = TreatmentConfirmation::checked(
                 observation.key,
                 observation.playback,
-                observation.vf_changed,
-                observation.filters.expect("completed vf proof"),
                 RendererConfirmation::checked(
                     observation.key,
                     observation.target.renderer.requested().clone(),
@@ -553,25 +535,11 @@ impl MpvBackend {
             match confirmation {
                 Ok(confirmation) => {
                     tracing::info!(
-                        key = ?observation.key, playback = ?observation.playback,
-                        requested = ?observation.target.renderer.requested(),
-                        canonical_native = ?observation.target.renderer.native(),
-                        filters = ?confirmation.filters(), "treatment_confirmed"
+                        event_code = "treatment_confirmed",
+                        apply_id = observation.key.apply.get(),
+                        attempt_id = observation.key.attempt.get(),
+                        pass = super::pass_token(observation.key.pass),
                     );
-                    if self.filter_health.is_none() {
-                        let origin = confirmation.filters().origin().key();
-                        self.filter_health = Some(FilterHealth {
-                            key: origin,
-                            treatment_key: observation.key,
-                            entries: observation.target.filters.entries.clone(),
-                            marker: self.log_sequence,
-                            dropped_at_begin: self.dropped_context,
-                            faulted: false,
-                        });
-                    }
-                    if let Some(health) = &mut self.filter_health {
-                        health.treatment_key = observation.key;
-                    }
                     self.landed_treatments = Some((observation.target, confirmation.clone()));
                     self.treatment_restore = None;
                     Ok(confirmation)
@@ -587,8 +555,7 @@ impl MpvBackend {
             .as_ref()
             .is_err_and(|failure| failure.disposition == TreatmentFailureDisposition::Untouched)
             && self.landed_treatments.is_some()
-            && !self.filters_poisoned
-            && !self.native_evidence_lost
+            && !self.treatment_poisoned
         {
             self.treatment_restore = None;
         }
@@ -607,59 +574,16 @@ impl MpvBackend {
         let Some(mut observation) = self.treatment_observation.take() else {
             return Ok(());
         };
-        // A component deadline/evidence-loss negative is already settled by the
-        // vf observer. Consume it without waiting for a NONE that may never come.
-        if observation.phase == Phase::Filter {
-            if let Some(result) = self.filter_result.take() {
-                match result {
-                    Ok(confirmation) if observation.failure.is_none() => {
-                        observation.filters =
-                            Some(FilterTreatmentProof::Reconfigured(confirmation));
-                        observation.phase = Phase::Final;
-                        observation.index = 0;
-                        observation.admitted = now;
-                    }
-                    Ok(_) => {}
-                    Err(failure) => {
-                        let vf_untouched = matches!(
-                            failure.kind,
-                            FilterErrorKind::CommandRejected { .. }
-                                | FilterErrorKind::CommandSubmission { .. }
-                        ) && !failure.requires_fresh_owner;
-                        if vf_untouched && let Some(retained) = &mut self.treatment_restore {
-                            retained.vf_touched = false;
-                        }
-                        let disposition = if failure.requires_fresh_owner || !clean {
-                            TreatmentFailureDisposition::RestoreFreshOwner
-                        } else if observation.mutated || !vf_untouched {
-                            TreatmentFailureDisposition::RestoreSameOwner
-                        } else {
-                            TreatmentFailureDisposition::Untouched
-                        };
-                        if observation.failure.as_ref().is_none_or(|current| {
-                            matches!(current.kind, TreatmentErrorKind::Unconfirmed { .. })
-                        }) {
-                            observation.failure = Some(TreatmentFailure {
-                                key: Some(observation.key),
-                                kind: TreatmentErrorKind::Filter(*failure),
-                                disposition,
-                            });
-                        }
-                        observation.failure_without_drain |= !clean;
-                    }
-                }
-            }
-            let settled =
-                observation.failure.is_some() && (clean || observation.failure_without_drain);
-            self.treatment_observation = Some(observation);
-            if settled {
-                self.finish_treatment();
-            }
-            return Ok(());
+        #[cfg(test)]
+        if clean {
+            self.native_record(serde_json::json!({
+                "event":"treatment_drain", "key":observation.key,
+                "phase":phase_token(observation.phase), "index":observation.index,
+                "pending":observation.pending,
+            }));
         }
-        if observation.phase != Phase::Filter
-            && now.duration_since(observation.admitted) >= FilterConfirmation::DEADLINE
-        {
+        let deadline_reached = now.duration_since(observation.admitted) >= TREATMENT_DEADLINE;
+        if deadline_reached {
             if observation.pending && observation.phase == Phase::Set {
                 observation.uncertain_set = true;
             }
@@ -684,7 +608,11 @@ impl MpvBackend {
                 &observation.failure,
                 Some(TreatmentFailure {
                     kind: TreatmentErrorKind::Renderer(RendererFailure {
-                        kind: RendererErrorKind::Rejected { .. },
+                        kind: RendererErrorKind::Rejected { .. }
+                            | RendererErrorKind::Submission {
+                                operation: RendererOperation::Set,
+                                ..
+                            },
                         ..
                     }),
                     ..
@@ -694,13 +622,16 @@ impl MpvBackend {
             observation.lost(TreatmentConfirmationFailure::EvidenceLost);
         }
         if observation.failure.is_some() {
+            // Preserve an unresolved SET cookie through this native drain so
+            // a buffered scalar rejection can retain the definitive cause.
+            // Proof is already revoked: no request or success can be issued.
+            let awaiting_set_reply = !clean
+                && !deadline_reached
+                && observation.pending
+                && observation.phase == Phase::Set;
+            let settled = !awaiting_set_reply && (clean || observation.failure_without_drain);
             self.treatment_observation = Some(observation);
-            if clean
-                || self
-                    .treatment_observation
-                    .as_ref()
-                    .is_some_and(|observation| observation.failure_without_drain)
-            {
+            if settled {
                 self.finish_treatment();
             }
             return Ok(());
@@ -713,8 +644,7 @@ impl MpvBackend {
         // validation path before this complete native treatment is published.
         // Do not add a treatment-specific metadata batch or assume invariance.
         if observation.index == 10
-            && (observation.phase == Phase::Final
-                || (observation.phase == Phase::Verify && !observation.vf_changed))
+            && observation.phase == Phase::Verify
             && (self.metadata.is_some() || self.pause_pending)
         {
             self.treatment_observation = Some(observation);
@@ -733,33 +663,6 @@ impl MpvBackend {
                     observation.index = 0;
                 }
                 Phase::Verify => {
-                    if observation.vf_changed {
-                        if let Some(retained) = &mut self.treatment_restore {
-                            retained.vf_touched = true;
-                        }
-                        let compiled = observation.target.filters.clone();
-                        crate::diagnostics::filter_begin(observation.key, &compiled.entries);
-                        #[cfg(test)]
-                        self.native_record(serde_json::json!({
-                            "event":"admission", "key":observation.key, "request":observation.id,
-                            "entries":compiled.entries,
-                        }));
-                        self.filter_observation = Some(FilterObservation::new(
-                            observation.id,
-                            observation.key,
-                            compiled,
-                            now,
-                            self.log_sequence,
-                            self.dropped_context,
-                        ));
-                        observation.phase = Phase::Filter;
-                    } else {
-                        self.treatment_observation = Some(observation);
-                        self.finish_treatment();
-                        return Ok(());
-                    }
-                }
-                Phase::Final => {
                     self.treatment_observation = Some(observation);
                     self.finish_treatment();
                     return Ok(());
@@ -780,10 +683,6 @@ impl MpvBackend {
             } else {
                 observation.phase = Phase::Set;
             }
-        }
-        if observation.phase == Phase::Filter {
-            self.treatment_observation = Some(observation);
-            return Ok(());
         }
         let id = match observation.next_request() {
             Ok(id) => id,
@@ -867,25 +766,34 @@ impl MpvBackend {
         name: Option<&CStr>,
         value: Option<&NodeValue>,
     ) {
-        #[cfg(test)]
-        self.native_record(serde_json::json!({
-            "event":"renderer_reply", "request":id, "kind":format!("{kind:?}"), "error":error,
-            "property":name.and_then(|name| name.to_str().ok()),
-            "value":format!("{value:?}")
-        }));
-        let Some(observation) = &mut self.treatment_observation else {
-            return;
-        };
         let key = match pending {
             Pending::RendererRead { key, .. }
             | Pending::RendererSet { key, .. }
             | Pending::RendererPause { key, .. } => key,
             _ => return,
         };
+        #[cfg(test)]
+        self.native_record(serde_json::json!({
+            "event":"renderer_reply", "key":key, "request":id, "kind":format!("{kind:?}"), "error":error,
+            "property":name.and_then(|name| name.to_str().ok()),
+            "value":format!("{value:?}")
+        }));
+        let Some(observation) = &mut self.treatment_observation else {
+            return;
+        };
         if key != observation.key {
             return;
         }
-        tracing::info!(key = ?key, request = id, phase = ?observation.phase, kind = ?kind, error, property = ?name, value = ?value, "renderer_owned_reply");
+        tracing::info!(
+            event_code = "renderer_owned_reply",
+            apply_id = key.apply.get(),
+            attempt_id = key.attempt.get(),
+            pass = super::pass_token(key.pass),
+            request_id = id,
+            phase = phase_token(observation.phase),
+            kind = super::reply_kind_token(kind),
+            mpv_error = error,
+        );
         observation.pending = false;
         match pending {
             Pending::RendererSet { property, .. } => {
@@ -986,7 +894,6 @@ mod tests {
     use super::*;
     use crate::domain::{
         capture::{CaptureMode, CapturedFourCc, FrameRate},
-        filters::FilterChain,
         render::RendererSettings,
         state::{ApplyId, AttemptId},
     };
@@ -1035,7 +942,6 @@ mod tests {
             },
         );
         let treatments = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
             &RendererSettings::default(),
         );
         let values = std::array::from_fn(|index| node(treatments.renderer.native()[index].1));
@@ -1044,14 +950,6 @@ mod tests {
             playback,
             RendererSettings::default(),
         );
-        backend.filter_health = Some(FilterHealth {
-            key: key(1, TreatmentPass::Open),
-            treatment_key: key(1, TreatmentPass::Open),
-            entries: Vec::new(),
-            marker: 0,
-            dropped_at_begin: 0,
-            faulted: false,
-        });
         backend.landed_treatments = Some((treatments, confirmation));
         backend.property_requests = Some(Vec::new());
         (backend, values)
@@ -1060,7 +958,7 @@ mod tests {
     fn answer(
         backend: &mut MpvBackend,
         current: &mut [NodeValue; 9],
-        now: Instant,
+        _now: Instant,
         requests: &mut Vec<(&'static CStr, bool)>,
     ) {
         let Some((id, name, value)) = backend.property_requests.as_mut().unwrap().pop() else {
@@ -1079,7 +977,7 @@ mod tests {
         if let Some(value) = value {
             current[index.unwrap()] = value;
             backend
-                .reply_at(id, ReplyKind::SetProperty, 0, None, None, now)
+                .reply(id, ReplyKind::SetProperty, 0, None, None)
                 .unwrap();
         } else {
             let value = match name {
@@ -1100,13 +998,12 @@ mod tests {
                 (_, value) => value,
             };
             backend
-                .reply_at(
+                .reply(
                     id,
                     ReplyKind::Property,
                     0,
                     Some(name.to_owned()),
                     Some(value),
-                    now,
                 )
                 .unwrap();
         }
@@ -1129,7 +1026,9 @@ mod tests {
                     // renderer proof is the nine property reads plus the owned
                     // pause read driven by the treatment protocol, which each
                     // case still asserts through its recorded requests.
-                    BackendEvent::Observed { .. } | BackendEvent::PauseObserved(_) => {}
+                    BackendEvent::Observed { .. }
+                    | BackendEvent::PauseObserved(_)
+                    | BackendEvent::TreatmentFault { .. } => {}
                     BackendEvent::TreatmentResult { result, .. } => {
                         return (result, requests);
                     }
@@ -1143,13 +1042,10 @@ mod tests {
     }
 
     #[test]
-    fn renderer_only_live_and_paused_verify_every_property_without_reinstalling_vf() {
+    fn renderer_only_live_and_paused_verify_every_property_without_restarting() {
         for playback in [InitialPlayback::Live, InitialPlayback::Paused] {
             let (mut backend, mut current) = incumbent(playback);
-            let target = crate::media::controller::test_support::prepared_treatments(
-                &FilterChain::default(),
-                &reference(),
-            );
+            let target = crate::media::controller::test_support::prepared_treatments(&reference());
             backend
                 .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
                 .unwrap();
@@ -1158,15 +1054,7 @@ mod tests {
             assert_eq!(confirmation.playback(), playback);
             assert_eq!(confirmation.key(), key(2, TreatmentPass::Candidate));
             assert_eq!(confirmation.renderer().settings(), &reference());
-            assert_eq!(
-                confirmation.filters().origin().key(),
-                key(1, TreatmentPass::Open)
-            );
-            assert!(matches!(
-                confirmation.filters(),
-                FilterTreatmentProof::Preserved { .. }
-            ));
-            assert!(backend.filter_observation.is_none() && backend.filter_result.is_none());
+            assert_eq!(confirmation.renderer().key(), confirmation.key());
             assert_eq!(backend.paused, playback == InitialPlayback::Paused);
             for (property, _) in backend
                 .landed_treatments
@@ -1209,10 +1097,7 @@ mod tests {
     #[test]
     fn successful_set_reply_cannot_confirm_or_replace_separate_readback() {
         let (mut backend, mut current) = incumbent(InitialPlayback::Live);
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
-            &reference(),
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
@@ -1235,18 +1120,17 @@ mod tests {
         assert!(value.is_none());
         let id = *id;
         backend
-            .reply_at(
+            .reply(
                 id + 1,
                 ReplyKind::Property,
                 0,
                 Some(c"scale".to_owned()),
                 Some(current[0].clone()),
-                now,
             )
             .unwrap();
         assert!(backend.treatment_observation.as_ref().unwrap().pending);
         backend
-            .reply_at(id, ReplyKind::SetProperty, 0, None, None, now)
+            .reply(id, ReplyKind::SetProperty, 0, None, None)
             .unwrap();
         assert!(backend.treatment_observation.as_ref().unwrap().pending);
         assert!(backend.emitted.is_empty());
@@ -1263,10 +1147,7 @@ mod tests {
             } else {
                 NodeValue::String(c"mitchell".to_owned())
             };
-            let target = crate::media::controller::test_support::prepared_treatments(
-                &FilterChain::default(),
-                &reference(),
-            );
+            let target = crate::media::controller::test_support::prepared_treatments(&reference());
             backend
                 .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
                 .unwrap();
@@ -1287,27 +1168,18 @@ mod tests {
             );
             assert_eq!(
                 failure.disposition,
-                if malformed {
-                    TreatmentFailureDisposition::Untouched
-                } else {
-                    TreatmentFailureDisposition::RestoreFreshOwner
-                }
+                TreatmentFailureDisposition::RestoreFreshOwner
             );
-            assert_eq!(
-                backend.landed_treatments.as_ref().unwrap().1.key(),
-                key(1, TreatmentPass::Open)
-            );
+            assert!(backend.landed_treatments.is_none());
+            assert!(backend.treatment_poisoned);
         }
     }
 
     #[test]
-    fn settled_second_write_failure_restores_the_whole_prior_once_without_vf() {
+    fn settled_second_write_failure_restores_the_whole_prior_once() {
         let (mut backend, mut current) = incumbent(InitialPlayback::Paused);
         let prior = backend.landed_treatments.as_ref().unwrap().0.clone();
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
-            &reference(),
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
@@ -1325,7 +1197,7 @@ mod tests {
             {
                 let (id, _, _) = backend.property_requests.as_mut().unwrap().pop().unwrap();
                 backend
-                    .reply_at(id, ReplyKind::SetProperty, -9, None, None, now)
+                    .reply(id, ReplyKind::SetProperty, -9, None, None)
                     .unwrap();
                 rejected = true;
                 break;
@@ -1357,7 +1229,6 @@ mod tests {
             current,
             std::array::from_fn(|index| node(prior.renderer.native()[index].1))
         );
-        assert!(backend.filter_observation.is_none());
         assert!(
             backend
                 .begin_treatment(9, key(2, TreatmentPass::Restore), prior)
@@ -1369,10 +1240,7 @@ mod tests {
     #[test]
     fn unknown_set_completion_requires_fresh_owner_and_exhaustion_refuses_before_writing() {
         let (mut backend, mut current) = incumbent(InitialPlayback::Live);
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
-            &reference(),
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target.clone())
             .unwrap();
@@ -1384,8 +1252,12 @@ mod tests {
         }
         backend.treatment_tick(now, true).unwrap();
         backend
-            .treatment_tick(now + FilterConfirmation::DEADLINE, true)
+            .treatment_tick(now + TREATMENT_DEADLINE, true)
             .unwrap();
+        assert!(matches!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::TreatmentFault { .. })
+        ));
         let Some(BackendEvent::TreatmentResult {
             result: Err(failure),
             ..
@@ -1407,11 +1279,8 @@ mod tests {
             })
         ));
         let (mut exhausted, _) = incumbent(InitialPlayback::Live);
-        exhausted.last_internal = u64::MAX - 100;
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &changed_graph(),
-            &reference(),
-        );
+        exhausted.last_internal = u64::MAX - (PASS_REQUESTS * 2 - 1);
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         exhausted
             .submit(
                 RequestId::for_test(9),
@@ -1430,72 +1299,6 @@ mod tests {
             panic!("pre-mutation exhaustion refusal");
         };
         assert_eq!(failure.disposition, TreatmentFailureDisposition::Untouched);
-    }
-
-    #[test]
-    fn renderer_reconfiguration_cannot_satisfy_the_later_vf_window_or_commit_partially() {
-        use crate::domain::filters::{
-            ColorLevels, Filter, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
-        };
-        let (mut backend, mut current) = incumbent(InitialPlayback::Live);
-        let prior = backend.landed_treatments.as_ref().unwrap().0.clone();
-        let chain = FilterChain::new(vec![FilterEntry::new(
-            "indivisible vf and renderer".into(),
-            Filter::Format(FormatParams::new(
-                SdrMatrix::Bt709,
-                ColorLevels::Limited,
-                SdrGamma::Bt1886,
-            )),
-            true,
-        )])
-        .unwrap();
-        let target =
-            crate::media::controller::test_support::prepared_treatments(&chain, &reference());
-        backend
-            .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
-            .unwrap();
-        let admitted = backend.treatment_observation.as_ref().unwrap().admitted;
-        let now = admitted + std::time::Duration::from_secs(5);
-        backend.filter_reconfigured();
-        let mut requests = Vec::new();
-        for _ in 0..128 {
-            backend.treatment_tick(now, true).unwrap();
-            if backend.filter_observation.is_some() {
-                break;
-            }
-            answer(&mut backend, &mut current, now, &mut requests);
-        }
-        let filter = backend
-            .filter_observation
-            .as_mut()
-            .expect("vf admitted only after complete renderer verification");
-        assert_eq!(filter.admitted, now);
-        assert!(!filter.reconfigured);
-        assert_eq!(filter.advances, 0);
-        filter.outcome = Some(0); // Fake command succeeded but no reconfiguration witness.
-        filter.failure = Some(FilterConfirmationFailure::MissingReconfig);
-        backend.finish_filter();
-        backend.treatment_tick(now, true).unwrap();
-        let Some(BackendEvent::TreatmentResult {
-            result: Err(failure),
-            ..
-        }) = backend.emitted.pop_front()
-        else {
-            panic!("no partial renderer success");
-        };
-        assert_eq!(
-            failure.disposition,
-            TreatmentFailureDisposition::RestoreSameOwner
-        );
-        assert_eq!(backend.landed_treatments.as_ref().unwrap().0, prior);
-        assert_eq!(
-            backend.landed_treatments.as_ref().unwrap().1.key(),
-            key(1, TreatmentPass::Open)
-        );
-        assert!(
-            requests.iter().any(|(_, set)| *set),
-            "renderer actually changed in the fake native state"
-        );
     }
 
     #[test]
@@ -1574,10 +1377,7 @@ mod tests {
         values.dscale = ScalerChoice::Inherit;
         values.dither = DitherMode::No;
         let settings = RendererSettings::new(values).unwrap();
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
-            &settings,
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&settings);
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
@@ -1610,15 +1410,11 @@ mod tests {
                     >= 2
             );
         }
-        assert!(backend.filter_observation.is_none());
     }
 
     #[test]
     fn canonical_binary32_equality_is_exact_and_cancellation_wins_between_requests() {
-        let compiled = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
-            &reference(),
-        );
+        let compiled = crate::media::controller::test_support::prepared_treatments(&reference());
         let expected = compiled.renderer.native()[3].1;
         assert!(matches_native(
             RendererProperty::ScaleAntiring,
@@ -1650,6 +1446,10 @@ mod tests {
             issued,
             "no next request after evidence loss"
         );
+        assert!(matches!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::TreatmentFault { .. })
+        ));
         let Some(BackendEvent::TreatmentResult {
             result: Err(failure),
             ..
@@ -1665,69 +1465,29 @@ mod tests {
     }
 
     #[test]
-    fn known_vf_poison_refuses_with_typed_frozen_diagnostics_before_native_work() {
-        for filters in [FilterChain::default(), changed_graph()] {
-            let (mut backend, _) = incumbent(InitialPlayback::Live);
-            let prior = backend.landed_treatments.clone();
-            backend.filters_poisoned = true;
-            let target =
-                crate::media::controller::test_support::prepared_treatments(&filters, &reference());
-            let entries = target.filters.entries.clone();
-            let requested = key(2, TreatmentPass::Candidate);
-            backend
-                .submit(
-                    RequestId::for_test(7),
-                    BackendCommand::ApplyTreatments {
-                        key: requested,
-                        treatments: Box::new(target),
-                    },
-                )
-                .unwrap();
-            let now = backend.treatment_observation.as_ref().unwrap().admitted;
-            backend.treatment_tick(now, false).unwrap();
-            let Some(BackendEvent::TreatmentResult {
-                key: observed,
-                result: Err(failure),
-                ..
-            }) = backend.emitted.pop_front()
-            else {
-                panic!("known poisoned vf must return a typed refusal");
-            };
-            assert_eq!(observed, requested);
-            assert_eq!(failure.key, Some(requested));
-            assert_eq!(
-                failure.disposition,
-                TreatmentFailureDisposition::RestoreFreshOwner
-            );
-            let TreatmentErrorKind::Filter(filter) = failure.kind else {
-                panic!("known vf poison must retain the vf failure type");
-            };
-            assert_eq!(
-                filter.kind,
-                FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::BackendUnavailable,
-                }
-            );
-            assert!(filter.requires_fresh_owner);
-            assert_eq!(filter.attributed_ordinal, None);
-            assert_eq!(filter.diagnostics.key, Some(requested));
-            assert_eq!(filter.diagnostics.entries, entries);
-            assert!(backend.property_requests.as_ref().unwrap().is_empty());
-            assert!(backend.pending.is_empty());
-            assert!(backend.filter_observation.is_none());
-            assert!(backend.filter_result.is_none());
-            assert_eq!(backend.landed_treatments, prior);
-        }
+    fn known_proof_loss_is_sticky_and_refuses_before_native_work() {
+        let (mut backend, _) = incumbent(InitialPlayback::Live);
+        backend.revoke_treatment(TreatmentConfirmationFailure::EvidenceLost);
+        assert!(matches!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::TreatmentFault { .. })
+        ));
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
+        let error = backend
+            .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
+            .unwrap_err();
+        assert_eq!(error.code, "treatment_admission");
+        assert!(backend.property_requests.as_ref().unwrap().is_empty());
+        assert!(backend.pending.is_empty());
+        assert!(backend.landed_treatments.is_none());
+        assert!(backend.treatment_poisoned);
     }
 
     #[test]
     fn first_set_definitively_rejected_keeps_the_verified_prior_untouched() {
         let (mut backend, mut current) = incumbent(InitialPlayback::Live);
         let prior = current.clone();
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
-            &reference(),
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
@@ -1742,7 +1502,7 @@ mod tests {
         assert_eq!(property, c"scale");
         assert!(value.is_some());
         backend
-            .reply_at(id, ReplyKind::SetProperty, -9, None, None, now)
+            .reply(id, ReplyKind::SetProperty, -9, None, None)
             .unwrap();
         let (result, later_requests) = settle(&mut backend, &mut current);
         let failure = result.unwrap_err();
@@ -1753,25 +1513,11 @@ mod tests {
             backend.landed_treatments.as_ref().unwrap().1.key(),
             key(1, TreatmentPass::Open)
         );
-        assert!(backend.filter_observation.is_none());
     }
 
-    fn changed_graph() -> FilterChain {
-        use crate::domain::filters::{
-            ColorLevels, Filter, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
-        };
-        FilterChain::new(vec![FilterEntry::new(
-            "real producer-path unit graph".into(),
-            Filter::Format(FormatParams::new(
-                SdrMatrix::Bt709,
-                ColorLevels::Limited,
-                SdrGamma::Bt1886,
-            )),
-            true,
-        )])
-        .unwrap()
-    }
-
+    // Write/0 is transient within the first SET tick. Use Snapshot/10 to
+    // stop before that submission; the caller can then install a fault or
+    // submit the SET and exercise its real native reply path.
     fn advance_to(
         backend: &mut MpvBackend,
         current: &mut [NodeValue; 9],
@@ -1798,10 +1544,7 @@ mod tests {
     fn pending_source_refresh_blocks_complete_renderer_proof_and_expires_safely() {
         let (mut backend, mut current) = incumbent(InitialPlayback::Live);
         let prior = backend.landed_treatments.clone();
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
-            &reference(),
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
@@ -1813,8 +1556,12 @@ mod tests {
         assert!(backend.emitted.is_empty());
         assert_eq!(backend.landed_treatments, prior);
         backend
-            .treatment_tick(now + FilterConfirmation::DEADLINE, true)
+            .treatment_tick(now + TREATMENT_DEADLINE, true)
             .unwrap();
+        assert!(matches!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::TreatmentFault { .. })
+        ));
         let Some(BackendEvent::TreatmentResult {
             result: Err(failure),
             ..
@@ -1827,122 +1574,76 @@ mod tests {
             TreatmentFailureDisposition::RestoreFreshOwner
         );
         assert_eq!(backend.property_requests.as_ref().unwrap().len(), issued);
-        assert_eq!(backend.landed_treatments, prior);
+        assert!(backend.landed_treatments.is_none());
     }
 
     #[test]
-    fn native_graph_revocation_during_renderer_verification_cannot_publish_preserved_success() {
+    fn native_loss_during_renderer_verification_revokes_prior_before_candidate_failure() {
         let (mut backend, mut current) = incumbent(InitialPlayback::Live);
-        let chain = changed_graph();
-        let prior = crate::media::controller::test_support::prepared_treatments(
-            &chain,
-            &RendererSettings::default(),
-        );
-        backend.filter_health.as_mut().unwrap().entries = prior.filters.entries.clone();
-        backend.landed_treatments.as_mut().unwrap().0 = prior;
-        let target =
-            crate::media::controller::test_support::prepared_treatments(&chain, &reference());
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
         let now = advance_to(&mut backend, &mut current, Phase::Verify, 4);
-        backend
-            .filter_log(
-                "vf".into(),
-                "error".into(),
-                "Disabling filter furami_0 because it has failed.".into(),
-            )
-            .unwrap();
+        backend.native_log("overflow", "fatal", "log message buffer overflow: lost");
         backend.treatment_tick(now, false).unwrap();
+        let events: Vec<_> = backend.emitted.drain(..).collect();
+        assert!(
+            matches!(&events[0], BackendEvent::TreatmentFault { key: applied, failure }
+            if *applied == key(1, TreatmentPass::Open)
+                && matches!(failure.kind, TreatmentErrorKind::Unconfirmed { reason: TreatmentConfirmationFailure::EvidenceLost }))
+        );
+        assert!(
+            matches!(&events[1], BackendEvent::TreatmentResult { key: attempted, result: Err(failure), .. }
+            if *attempted == key(2, TreatmentPass::Candidate)
+                && failure.disposition == TreatmentFailureDisposition::RestoreFreshOwner)
+        );
+        assert_eq!(events.len(), 2);
+        assert!(backend.landed_treatments.is_none());
         assert!(backend.treatment_observation.is_none());
         assert!(backend.pending.is_empty());
-        let events: Vec<_> = backend.emitted.drain(..).collect();
-        assert!(events.iter().any(|event| matches!(event,
-            BackendEvent::TreatmentFault { key: applied, .. } if *applied == key(1, TreatmentPass::Open))));
-        assert!(events.iter().any(|event| matches!(event,
-            BackendEvent::TreatmentResult { key: attempted, result: Err(failure), .. }
-                if *attempted == key(2, TreatmentPass::Candidate)
-                    && failure.disposition == TreatmentFailureDisposition::RestoreFreshOwner
-                    && matches!(&failure.kind, TreatmentErrorKind::Filter(filter)
-                        if filter.kind == FilterErrorKind::RuntimeGraph))));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, BackendEvent::TreatmentResult { result: Ok(_), .. }))
-        );
-        assert_eq!(
-            backend.landed_treatments.as_ref().unwrap().1.key(),
-            key(1, TreatmentPass::Open)
-        );
     }
 
     #[test]
-    fn graph_revocation_after_vf_confirmation_keeps_origin_but_revokes_last_applied_identity() {
+    fn late_native_error_revokes_latest_renderer_identity_exactly_once() {
         let (mut backend, mut current) = incumbent(InitialPlayback::Live);
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &changed_graph(),
-            &reference(),
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
-        let now = advance_to(&mut backend, &mut current, Phase::Filter, 10);
-        let filter = backend.filter_observation.as_mut().unwrap();
-        filter.submitted = true;
-        filter.outcome = Some(0);
-        filter.reconfigured = true;
-        filter.baseline = Some(0.0);
-        filter.position = Some(2.0);
-        filter.advances = 32;
-        backend.finish_filter();
-        assert_eq!(
-            backend.filter_health.as_ref().unwrap().key,
-            key(2, TreatmentPass::Candidate)
-        );
-        assert_eq!(
-            backend.filter_health.as_ref().unwrap().treatment_key,
-            key(1, TreatmentPass::Open)
-        );
-        backend.treatment_tick(now, true).unwrap();
-        assert_eq!(
-            backend.treatment_observation.as_ref().unwrap().phase,
-            Phase::Final
-        );
-        backend
-            .filter_log(
-                "vf".into(),
-                "error".into(),
-                "Disabling filter furami_0 because it has failed.".into(),
-            )
-            .unwrap();
-        backend.treatment_tick(now, false).unwrap();
-        let events: Vec<_> = backend.emitted.drain(..).collect();
-        assert!(events.iter().any(|event| matches!(event,
-            BackendEvent::TreatmentFault { key: applied, failure }
-                if *applied == key(1, TreatmentPass::Open)
-                    && matches!(&failure.kind, TreatmentErrorKind::Filter(filter)
-                        if filter.diagnostics.key == Some(key(2, TreatmentPass::Candidate))))));
-        assert!(events.iter().any(|event| matches!(event,
-            BackendEvent::TreatmentResult { result: Err(failure), .. }
-                if failure.disposition == TreatmentFailureDisposition::RestoreFreshOwner)));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, BackendEvent::TreatmentResult { result: Ok(_), .. }))
-        );
-        assert_eq!(
-            backend.landed_treatments.as_ref().unwrap().1.key(),
-            key(1, TreatmentPass::Open)
-        );
+        assert!(settle(&mut backend, &mut current).0.is_ok());
+        for _ in 0..64 {
+            backend.native_log("vo/gpu-next", "warn", "context only");
+        }
+        assert!(backend.emitted.is_empty());
+        assert!(!backend.treatment_poisoned);
+        for _ in 0..64 {
+            backend.native_log("vo/gpu-next", "error", "native renderer unavailable");
+        }
+        let Some(BackendEvent::TreatmentFault {
+            key: applied,
+            failure,
+        }) = backend.emitted.pop_front()
+        else {
+            panic!("latest confirmed renderer must be revoked");
+        };
+        assert_eq!(applied, key(2, TreatmentPass::Candidate));
+        assert_eq!(failure.key, Some(applied));
+        assert!(matches!(
+            failure.kind,
+            TreatmentErrorKind::Unconfirmed {
+                reason: TreatmentConfirmationFailure::EvidenceLost
+            }
+        ));
+        assert!(backend.emitted.is_empty());
+        assert!(backend.treatment_poisoned);
+        assert!(backend.landed_treatments.is_none());
     }
 
     #[test]
-    fn sustained_nonclean_events_settle_renderer_and_vf_deadlines_without_faking_none() {
+    fn sustained_nonclean_events_settle_renderer_deadline_without_faking_none() {
         let (mut backend, _) = incumbent(InitialPlayback::Live);
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
-            &reference(),
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
@@ -1955,8 +1656,12 @@ mod tests {
             assert!(backend.emitted.is_empty());
         }
         backend
-            .treatment_tick(now + FilterConfirmation::DEADLINE, false)
+            .treatment_tick(now + TREATMENT_DEADLINE, false)
             .unwrap();
+        assert!(matches!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::TreatmentFault { .. })
+        ));
         let Some(BackendEvent::TreatmentResult {
             result: Err(failure),
             ..
@@ -1978,55 +1683,17 @@ mod tests {
             })
         ));
         assert!(backend.treatment_observation.is_none());
-
-        let (mut backend, mut current) = incumbent(InitialPlayback::Live);
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &changed_graph(),
-            &reference(),
-        );
-        backend
-            .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
-            .unwrap();
-        advance_to(&mut backend, &mut current, Phase::Filter, 10);
-        let now =
-            backend.filter_observation.as_ref().unwrap().admitted + FilterConfirmation::DEADLINE;
-        backend.filter_tick(now, false).unwrap();
-        backend.treatment_tick(now, false).unwrap();
-        let Some(BackendEvent::TreatmentResult {
-            result: Err(failure),
-            ..
-        }) = backend.emitted.pop_front()
-        else {
-            panic!("the genuine vf deadline negative must not wait for NONE");
-        };
-        assert_eq!(
-            failure.disposition,
-            TreatmentFailureDisposition::RestoreFreshOwner
-        );
-        assert!(matches!(
-            failure.kind,
-            TreatmentErrorKind::Filter(FilterFailure {
-                kind: FilterErrorKind::Unconfirmed {
-                    reason: FilterConfirmationFailure::Deadline
-                },
-                ..
-            })
-        ));
-        assert!(backend.treatment_observation.is_none());
     }
 
     #[test]
     fn malformed_native_log_producer_ticks_and_settles_aggregate_without_none() {
         let (mut backend, _) = incumbent(InitialPlayback::Live);
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
-            &reference(),
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
         let now = backend.treatment_observation.as_ref().unwrap().admitted;
-        let first = backend.malformed_filter_log(now).unwrap();
+        let first = backend.malformed_log(now).unwrap();
         assert!(!matches!(
             first,
             BackendEvent::None | BackendEvent::TreatmentResult { result: Ok(_), .. }
@@ -2037,7 +1704,7 @@ mod tests {
                 if failure.disposition == TreatmentFailureDisposition::RestoreFreshOwner)));
         for _ in 0..64 {
             assert!(!matches!(
-                backend.malformed_filter_log(now).unwrap(),
+                backend.malformed_log(now).unwrap(),
                 BackendEvent::None | BackendEvent::TreatmentResult { result: Ok(_), .. }
             ));
         }
@@ -2055,10 +1722,7 @@ mod tests {
             let mut values = reference().values();
             values.interpolation = true;
             let settings = RendererSettings::new(values).unwrap();
-            let prior = crate::media::controller::test_support::prepared_treatments(
-                &FilterChain::default(),
-                &settings,
-            );
+            let prior = crate::media::controller::test_support::prepared_treatments(&settings);
             let mut current = std::array::from_fn(|index| node(prior.renderer.native()[index].1));
             let index = property.map_or(9, |property| {
                 prior
@@ -2099,6 +1763,10 @@ mod tests {
                     .unwrap();
             assert!(matches!(result, BackendEvent::Other));
             backend.treatment_tick(now, false).unwrap();
+            assert!(matches!(
+                backend.emitted.pop_front(),
+                Some(BackendEvent::TreatmentFault { .. })
+            ));
             let Some(BackendEvent::TreatmentResult {
                 result: Err(failure),
                 ..
@@ -2121,10 +1789,7 @@ mod tests {
                 (_, other) => panic!("wrong property-aware malformed payload failure: {other:?}"),
             }
             assert!(backend.pending.is_empty());
-            assert_eq!(
-                backend.landed_treatments.as_ref().unwrap().1.key(),
-                key(1, TreatmentPass::Open)
-            );
+            assert!(backend.landed_treatments.is_none());
         }
     }
 
@@ -2133,10 +1798,7 @@ mod tests {
         let (mut backend, current) = incumbent(InitialPlayback::Live);
         let before = backend.landed_treatments.clone();
         backend.last_internal = u64::MAX - (PASS_REQUESTS * 2 - 1);
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &changed_graph(),
-            &reference(),
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .submit(
                 RequestId::for_test(7),
@@ -2173,10 +1835,7 @@ mod tests {
         let (mut backend, mut current) = incumbent(InitialPlayback::Paused);
         let prior = backend.landed_treatments.as_ref().unwrap().0.clone();
         backend.last_internal = u64::MAX - PASS_REQUESTS * 2;
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &FilterChain::default(),
-            &reference(),
-        );
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
@@ -2184,7 +1843,7 @@ mod tests {
         backend.treatment_tick(now, true).unwrap();
         let (id, _, _) = backend.property_requests.as_mut().unwrap().pop().unwrap();
         backend
-            .reply_at(id, ReplyKind::SetProperty, -4, None, None, now)
+            .reply(id, ReplyKind::SetProperty, -4, None, None)
             .unwrap();
         backend.treatment_tick(now, true).unwrap();
         let Some(BackendEvent::TreatmentResult {
@@ -2219,88 +1878,601 @@ mod tests {
     }
 
     #[test]
-    fn combined_changed_vf_requires_reconfig_and_32_timed_samples_before_final_readback() {
+    fn open_live_and_paused_read_all_nine_properties_and_pause_before_clean_drain() {
+        for playback in [InitialPlayback::Live, InitialPlayback::Paused] {
+            let (mut backend, mut current) = incumbent(playback);
+            backend.landed_treatments = None;
+            let target = crate::media::controller::test_support::prepared_treatments(
+                &RendererSettings::default(),
+            );
+            let open = key(1, TreatmentPass::Open);
+            backend.begin_treatment(7, open, target).unwrap();
+            let now = advance_to(&mut backend, &mut current, Phase::Verify, 10);
+            assert!(backend.emitted.is_empty());
+            backend.treatment_tick(now, false).unwrap();
+            assert!(backend.treatment_observation.is_some());
+            assert!(backend.emitted.is_empty());
+            backend.treatment_tick(now, true).unwrap();
+            let Some(BackendEvent::TreatmentResult {
+                result: Ok(confirmation),
+                ..
+            }) = backend.emitted.pop_front()
+            else {
+                panic!("complete Open requires actual final clean drain");
+            };
+            assert_eq!(confirmation.key(), open);
+            assert_eq!(confirmation.playback(), playback);
+            assert_eq!(confirmation.renderer().key(), open);
+            assert!(backend.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_terminals_revoke_incumbent_then_candidate_before_terminal_at_every_boundary() {
+        for event_id in [1, 7, 24] {
+            for (phase, index) in [
+                (Phase::Snapshot, 0),
+                (Phase::Snapshot, 10),
+                (Phase::Verify, 10),
+            ] {
+                let (mut backend, mut current) = incumbent(InitialPlayback::Live);
+                let target =
+                    crate::media::controller::test_support::prepared_treatments(&reference());
+                backend
+                    .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
+                    .unwrap();
+                let now = advance_to(&mut backend, &mut current, phase, index);
+                if phase == Phase::Snapshot && index == 10 {
+                    backend.treatment_tick(now, true).unwrap();
+                    assert!(backend.treatment_observation.as_ref().unwrap().pending);
+                }
+                let mut end = MpvEndFile {
+                    reason: 4,
+                    error: -12,
+                    playlist_entry_id: 0,
+                    playlist_insert_id: 0,
+                    playlist_insert_num_entries: 0,
+                };
+                let raw = MpvEvent {
+                    event_id,
+                    error: 0,
+                    reply_userdata: 0,
+                    data: if event_id == 7 {
+                        ptr::from_mut(&mut end).cast()
+                    } else {
+                        ptr::null_mut()
+                    },
+                };
+                // SAFETY: The native-layout event and optional END_FILE payload
+                // remain live for this exact synchronous production decoder.
+                let first = unsafe { backend.native_event(&raw) }.unwrap();
+                let mut events = vec![first];
+                events.extend(backend.emitted.drain(..));
+                assert!(
+                    matches!(&events[0], BackendEvent::TreatmentFault { key: applied, .. } if *applied == key(1, TreatmentPass::Open))
+                );
+                assert!(
+                    matches!(&events[1], BackendEvent::TreatmentResult { result: Err(failure), .. }
+                    if failure.disposition == TreatmentFailureDisposition::RestoreFreshOwner)
+                );
+                assert!(matches!(
+                    (&events[2], event_id),
+                    (BackendEvent::Shutdown, 1)
+                        | (BackendEvent::EndFile { .. }, 7)
+                        | (BackendEvent::QueueOverflow, 24)
+                ));
+                assert_eq!(events.len(), 3);
+                assert!(backend.landed_treatments.is_none());
+                assert!(backend.treatment_poisoned);
+                assert!(backend.treatment_observation.is_none());
+                assert!(backend.pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn known_set_rejection_owns_error_logs_in_both_orders_without_revoking_incumbent() {
+        for logs_first in [false, true] {
+            let (mut backend, mut current) = incumbent(InitialPlayback::Live);
+            let prior = backend.landed_treatments.clone();
+            let target = crate::media::controller::test_support::prepared_treatments(&reference());
+            backend
+                .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
+                .unwrap();
+            let now = advance_to(&mut backend, &mut current, Phase::Snapshot, 10);
+            backend.treatment_tick(now, true).unwrap();
+            let (id, _, _) = backend.property_requests.as_mut().unwrap().pop().unwrap();
+            if !logs_first {
+                backend
+                    .reply(id, ReplyKind::SetProperty, -9, None, None)
+                    .unwrap();
+            }
+            backend.native_log("vo/gpu-next", "error", "invalid native choice");
+            backend.treatment_tick(now, false).unwrap();
+            assert!(
+                backend.emitted.is_empty(),
+                "known rejection waits for a genuine clean log drain"
+            );
+            if logs_first {
+                backend
+                    .reply(id, ReplyKind::SetProperty, -9, None, None)
+                    .unwrap();
+            }
+            backend.treatment_tick(now, true).unwrap();
+            let Some(BackendEvent::TreatmentResult {
+                result: Err(failure),
+                ..
+            }) = backend.emitted.pop_front()
+            else {
+                panic!("known rejection must preserve its exact native cause");
+            };
+            assert!(matches!(
+                failure.kind,
+                TreatmentErrorKind::Renderer(RendererFailure {
+                    kind: RendererErrorKind::Rejected { mpv_error: -9 },
+                    ..
+                })
+            ));
+            assert_eq!(failure.disposition, TreatmentFailureDisposition::Untouched);
+            assert_eq!(backend.landed_treatments, prior);
+            assert!(!backend.treatment_poisoned);
+            assert!(backend.emitted.is_empty());
+        }
+    }
+
+    #[test]
+    fn direct_set_submission_refusal_with_logs_keeps_prior_untouched() {
         let (mut backend, mut current) = incumbent(InitialPlayback::Live);
-        backend.last_internal = u64::MAX - PASS_REQUESTS * 2;
-        let target = crate::media::controller::test_support::prepared_treatments(
-            &changed_graph(),
-            &reference(),
-        );
+        let prior = backend.landed_treatments.clone();
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
         backend
             .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
             .unwrap();
-        assert_eq!(backend.reconfiguration_event(), BackendEvent::VideoReconfig);
-        let now = advance_to(&mut backend, &mut current, Phase::Filter, 10);
-        let filter = backend.filter_observation.as_mut().unwrap();
-        assert!(
-            !filter.reconfigured,
-            "renderer reconfiguration predates vf admission"
-        );
-        // Existing unit seam immediately after the native argv submission.
-        // The command reply, reconfig producer, timed GETs and proof are real code.
-        filter.submitted = true;
-        filter.command.take();
-        let command = filter.id;
-        let admitted = filter.admitted;
-        assert_eq!(admitted, now);
-        backend
-            .reply_at(command, ReplyKind::Command, 0, None, None, admitted)
-            .unwrap();
-        assert_eq!(backend.reconfiguration_event(), BackendEvent::VideoReconfig);
-        let mut clock = admitted;
-        for position in 0..=32 {
-            if position != 0 {
-                clock += FilterConfirmation::SAMPLE_INTERVAL;
-            }
-            backend.filter_tick(clock, false).unwrap();
-            let (id, name, value) = backend.property_requests.as_mut().unwrap().pop().unwrap();
-            assert_eq!(name, c"time-pos");
-            assert!(value.is_none());
-            backend
-                .reply_at(
-                    id,
-                    ReplyKind::Property,
-                    0,
-                    Some(name.to_owned()),
-                    Some(NodeValue::Double(f64::from(position))),
-                    clock,
-                )
-                .unwrap();
-            assert!(
-                !backend.emitted.iter().any(|event| matches!(
-                    event,
-                    BackendEvent::TreatmentResult { result: Ok(_), .. }
-                ))
-            );
-        }
-        backend.filter_tick(clock, true).unwrap();
-        backend.treatment_tick(clock, true).unwrap();
-        assert_eq!(
-            backend.treatment_observation.as_ref().unwrap().phase,
-            Phase::Final
-        );
-        let (result, requests) = settle(&mut backend, &mut current);
-        let confirmation = result.unwrap();
+        let now = advance_to(&mut backend, &mut current, Phase::Snapshot, 10);
+        backend.renderer_submission_error = Some(-3);
+        backend.treatment_tick(now, true).unwrap();
+        backend.native_log("vo/gpu-next", "error", "native submission rejected");
+        backend.treatment_tick(now, false).unwrap();
+        assert!(backend.emitted.is_empty());
+        backend.treatment_tick(now, true).unwrap();
+        let Some(BackendEvent::TreatmentResult {
+            result: Err(failure),
+            ..
+        }) = backend.emitted.pop_front()
+        else {
+            panic!("submission refusal must remain nonfatal and typed");
+        };
         assert!(matches!(
-            confirmation.filters(),
-            FilterTreatmentProof::Reconfigured(_)
+            failure.kind,
+            TreatmentErrorKind::Renderer(RendererFailure {
+                kind: RendererErrorKind::Submission {
+                    operation: RendererOperation::Set,
+                    mpv_error: -3
+                },
+                ..
+            })
         ));
-        assert_eq!(confirmation.renderer().settings(), &reference());
-        assert_eq!(backend.last_internal, u64::MAX);
-        for (property, _) in backend
-            .landed_treatments
-            .as_ref()
-            .unwrap()
-            .0
-            .renderer
-            .native()
-        {
+        assert_eq!(failure.disposition, TreatmentFailureDisposition::Untouched);
+        assert_eq!(backend.landed_treatments, prior);
+        assert!(!backend.treatment_poisoned);
+        assert!(backend.property_requests.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_loss_plus_rejected_candidate_preserves_primary_cause_in_both_orders() {
+        for loss_first in [false, true] {
+            let (mut backend, mut current) = incumbent(InitialPlayback::Live);
+            let target = crate::media::controller::test_support::prepared_treatments(&reference());
+            backend
+                .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
+                .unwrap();
+            let now = advance_to(&mut backend, &mut current, Phase::Snapshot, 10);
+            backend.treatment_tick(now, true).unwrap();
+            let (id, _, _) = backend.property_requests.as_mut().unwrap().pop().unwrap();
+            let mut log = MpvLogMessage {
+                prefix: c"overflow".as_ptr(),
+                level: c"fatal".as_ptr(),
+                text: c"log message buffer overflow: lost".as_ptr(),
+                log_level: 10,
+            };
+            let loss = MpvEvent {
+                event_id: 2,
+                error: 0,
+                reply_userdata: 0,
+                data: ptr::from_mut(&mut log).cast(),
+            };
+            let rejection = MpvEvent {
+                event_id: 4,
+                error: -9,
+                reply_userdata: id,
+                data: ptr::null_mut(),
+            };
+            let order = if loss_first {
+                [&loss, &rejection]
+            } else {
+                [&rejection, &loss]
+            };
+            let mut events = Vec::new();
+            for raw in order {
+                // SAFETY: The actual native event decoder receives live stack
+                // layouts, including its ordinary non-clean post-event tick.
+                let event = unsafe { backend.native_event(raw) }.unwrap();
+                assert!(!matches!(
+                    event,
+                    BackendEvent::None | BackendEvent::TreatmentResult { result: Ok(_), .. }
+                ));
+                if !matches!(event, BackendEvent::Other) {
+                    events.push(event);
+                }
+                events.extend(backend.emitted.drain(..));
+                if loss_first && raw.event_id == 2 {
+                    assert!(backend.treatment_observation.as_ref().unwrap().pending);
+                    assert!(
+                        backend
+                            .pending
+                            .iter()
+                            .any(|(request, pending)| *request == id
+                                && matches!(pending, Pending::RendererSet { .. }))
+                    );
+                    assert!(
+                        events
+                            .iter()
+                            .all(|event| !matches!(event, BackendEvent::TreatmentResult { .. }))
+                    );
+                }
+            }
+            assert_eq!(events.len(), 2);
             assert!(
-                requests
-                    .iter()
-                    .any(|(name, set)| *name == native_name(*property) && !*set)
+                matches!(&events[0], BackendEvent::TreatmentFault { key: applied, .. }
+                if *applied == key(1, TreatmentPass::Open))
             );
+            let BackendEvent::TreatmentResult {
+                result: Err(failure),
+                ..
+            } = &events[1]
+            else {
+                panic!("both incumbent loss and exact candidate rejection remain observable");
+            };
+            assert!(matches!(
+                failure.kind,
+                TreatmentErrorKind::Renderer(RendererFailure {
+                    kind: RendererErrorKind::Rejected { mpv_error: -9 },
+                    ..
+                })
+            ));
+            assert_eq!(
+                failure.disposition,
+                TreatmentFailureDisposition::RestoreFreshOwner
+            );
+            assert!(backend.landed_treatments.is_none());
+            assert!(backend.treatment_poisoned);
+            assert!(backend.emitted.is_empty());
         }
+    }
+
+    #[test]
+    fn renderer_wrong_kind_command_payload_is_ignored_before_native_decode() {
+        for (phase, index) in [
+            (Phase::Snapshot, 0),
+            (Phase::Snapshot, 9),
+            (Phase::Snapshot, 10),
+        ] {
+            let (mut backend, mut current) = incumbent(InitialPlayback::Live);
+            let target = crate::media::controller::test_support::prepared_treatments(&reference());
+            backend
+                .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
+                .unwrap();
+            let now = advance_to(&mut backend, &mut current, phase, index);
+            backend.treatment_tick(now, true).unwrap();
+            let id = backend.pending[0].0;
+            let mut payload = MpvCommandEvent {
+                result: MpvNode {
+                    value: MpvNodeValue { int64: 0 },
+                    format: 99,
+                },
+            };
+            let raw = MpvEvent {
+                event_id: 5,
+                error: 0,
+                reply_userdata: id,
+                data: ptr::from_mut(&mut payload).cast(),
+            };
+            // SAFETY: The deliberately malformed native-layout command payload
+            // stays live, but a property/SET cookie must reject its kind first.
+            assert_eq!(
+                unsafe { backend.native_event(&raw) }.unwrap(),
+                BackendEvent::Other
+            );
+            assert_eq!(backend.pending[0].0, id);
+            assert!(backend.treatment_observation.as_ref().unwrap().pending);
+            assert!(!backend.treatment_poisoned);
+            assert!(settle(&mut backend, &mut current).0.is_ok());
+        }
+    }
+
+    #[test]
+    fn malformed_native_log_payloads_revoke_proof_without_manufacturing_none() {
+        for malformed in 0..3 {
+            let (mut backend, _) = incumbent(InitialPlayback::Live);
+            let target = crate::media::controller::test_support::prepared_treatments(&reference());
+            backend
+                .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
+                .unwrap();
+            let invalid = CString::new(vec![255]).unwrap();
+            let mut log = MpvLogMessage {
+                prefix: if malformed == 1 {
+                    ptr::null()
+                } else {
+                    c"vo/gpu-next".as_ptr()
+                },
+                level: c"error".as_ptr(),
+                text: invalid.as_ptr(),
+                log_level: 20,
+            };
+            let raw = MpvEvent {
+                event_id: 2,
+                error: 0,
+                reply_userdata: 0,
+                data: if malformed == 0 {
+                    ptr::null_mut()
+                } else {
+                    ptr::from_mut(&mut log).cast()
+                },
+            };
+            // SAFETY: The deliberately invalid strings/nulls are checked by the
+            // real native decoder while all nonnull stack pointers stay live.
+            let first = unsafe { backend.native_event(&raw) }.unwrap();
+            assert!(
+                matches!(first, BackendEvent::TreatmentFault { key: applied, .. }
+                if applied == key(1, TreatmentPass::Open))
+            );
+            let Some(BackendEvent::TreatmentResult {
+                result: Err(failure),
+                ..
+            }) = backend.emitted.pop_front()
+            else {
+                panic!("malformed native log cannot authorize renderer proof");
+            };
+            assert!(matches!(
+                failure.kind,
+                TreatmentErrorKind::Unconfirmed {
+                    reason: TreatmentConfirmationFailure::EvidenceLost,
+                }
+            ));
+            assert_eq!(
+                failure.disposition,
+                TreatmentFailureDisposition::RestoreFreshOwner
+            );
+            assert!(backend.treatment_poisoned);
+            assert!(backend.landed_treatments.is_none());
+            assert!(backend.pending.is_empty());
+            assert!(backend.emitted.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejected_set_with_sustained_nonclean_flood_keeps_cause_and_loses_proof_at_deadline() {
+        let (mut backend, mut current) = incumbent(InitialPlayback::Live);
+        let target = crate::media::controller::test_support::prepared_treatments(&reference());
+        backend
+            .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
+            .unwrap();
+        let now = advance_to(&mut backend, &mut current, Phase::Snapshot, 10);
+        backend.treatment_tick(now, true).unwrap();
+        let (id, _, _) = backend.property_requests.as_mut().unwrap().pop().unwrap();
+        backend
+            .reply(id, ReplyKind::SetProperty, -9, None, None)
+            .unwrap();
+        for step in 1..100 {
+            backend.native_log("vo/gpu-next", "warn", "bounded context");
+            backend
+                .treatment_tick(now + std::time::Duration::from_millis(step * 100), false)
+                .unwrap();
+            assert!(backend.emitted.is_empty());
+        }
+        backend
+            .treatment_tick(now + TREATMENT_DEADLINE, false)
+            .unwrap();
+        assert!(matches!(
+            backend.emitted.pop_front(),
+            Some(BackendEvent::TreatmentFault { .. })
+        ));
+        let Some(BackendEvent::TreatmentResult {
+            result: Err(failure),
+            ..
+        }) = backend.emitted.pop_front()
+        else {
+            panic!("the original deadline must settle without a fabricated clean drain");
+        };
+        assert!(matches!(
+            failure.kind,
+            TreatmentErrorKind::Renderer(RendererFailure {
+                kind: RendererErrorKind::Rejected { mpv_error: -9 },
+                ..
+            })
+        ));
+        assert_eq!(
+            failure.disposition,
+            TreatmentFailureDisposition::RestoreFreshOwner
+        );
+        assert!(backend.landed_treatments.is_none());
+        assert!(backend.treatment_poisoned);
         assert!(backend.pending.is_empty());
+        assert!(backend.emitted.is_empty());
+    }
+    #[test]
+    fn renderer_set_cookie_ignores_malformed_get_payload_before_exact_rejection() {
+        for null_payload in [false, true] {
+            let (mut backend, mut current) = incumbent(InitialPlayback::Live);
+            let prior = backend.landed_treatments.clone();
+            let target = crate::media::controller::test_support::prepared_treatments(&reference());
+            backend
+                .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
+                .unwrap();
+            let now = advance_to(&mut backend, &mut current, Phase::Snapshot, 10);
+            backend.treatment_tick(now, true).unwrap();
+            let (id, _, _) = backend.property_requests.as_mut().unwrap().pop().unwrap();
+            let mut node = MpvNode {
+                value: MpvNodeValue { int64: 0 },
+                format: 99,
+            };
+            let mut payload = MpvPropertyEvent {
+                name: c"scale".as_ptr(),
+                format: 6,
+                data: ptr::from_mut(&mut node).cast(),
+            };
+            let wrong_kind = MpvEvent {
+                event_id: 3,
+                error: 0,
+                reply_userdata: id,
+                data: if null_payload {
+                    ptr::null_mut()
+                } else {
+                    ptr::from_mut(&mut payload).cast()
+                },
+            };
+            // SAFETY: The actual GET producer must reject this SET cookie's
+            // kind before inspecting the null or invalid native NODE payload.
+            assert_eq!(
+                unsafe { backend.native_event(&wrong_kind) }.unwrap(),
+                BackendEvent::Other
+            );
+            assert!(backend.treatment_observation.as_ref().unwrap().pending);
+            assert!(
+                backend
+                    .pending
+                    .iter()
+                    .any(|(request, pending)| *request == id
+                        && matches!(pending, Pending::RendererSet { .. }))
+            );
+            assert!(!backend.treatment_poisoned);
+            assert!(backend.emitted.is_empty());
+            let rejection = MpvEvent {
+                event_id: 4,
+                error: -9,
+                reply_userdata: id,
+                data: ptr::null_mut(),
+            };
+            // SAFETY: SET replies use only the live event's exact scalar cookie.
+            assert_eq!(
+                unsafe { backend.native_event(&rejection) }.unwrap(),
+                BackendEvent::Other
+            );
+            let none = MpvEvent {
+                event_id: 0,
+                error: 0,
+                reply_userdata: 0,
+                data: ptr::null_mut(),
+            };
+            // SAFETY: NONE owns no nested native payload.
+            let BackendEvent::TreatmentResult {
+                result: Err(failure),
+                ..
+            } = (unsafe { backend.native_event(&none) }).unwrap()
+            else {
+                panic!("the exact native rejection must survive wrong-kind GET traffic");
+            };
+            assert!(matches!(
+                failure.kind,
+                TreatmentErrorKind::Renderer(RendererFailure {
+                    kind: RendererErrorKind::Rejected { mpv_error: -9 },
+                    ..
+                })
+            ));
+            assert_eq!(failure.disposition, TreatmentFailureDisposition::Untouched);
+            assert_eq!(backend.landed_treatments, prior);
+            assert!(!backend.treatment_poisoned);
+            assert!(backend.pending.is_empty());
+            assert!(backend.emitted.is_empty());
+        }
+    }
+
+    #[test]
+    fn lost_pending_set_stops_at_clean_drain_or_original_deadline_without_new_work() {
+        for deadline in [false, true] {
+            let (mut backend, mut current) = incumbent(InitialPlayback::Live);
+            let target = crate::media::controller::test_support::prepared_treatments(&reference());
+            backend
+                .begin_treatment(7, key(2, TreatmentPass::Candidate), target)
+                .unwrap();
+            let now = advance_to(&mut backend, &mut current, Phase::Snapshot, 10);
+            backend.treatment_tick(now, true).unwrap();
+            let (id, _, _) = backend.property_requests.as_mut().unwrap().pop().unwrap();
+            let mut log = MpvLogMessage {
+                prefix: c"overflow".as_ptr(),
+                level: c"fatal".as_ptr(),
+                text: c"log message buffer overflow: lost".as_ptr(),
+                log_level: 10,
+            };
+            let loss = MpvEvent {
+                event_id: 2,
+                error: 0,
+                reply_userdata: 0,
+                data: ptr::from_mut(&mut log).cast(),
+            };
+            // SAFETY: Genuine native log dispatch includes its post-event tick.
+            assert_eq!(
+                unsafe { backend.native_event(&loss) }.unwrap(),
+                BackendEvent::Other
+            );
+            assert!(matches!(
+                backend.emitted.pop_front(),
+                Some(BackendEvent::TreatmentFault { .. })
+            ));
+            assert!(backend.emitted.is_empty());
+            assert!(backend.pending.iter().any(|(request, _)| *request == id));
+            let failure = if deadline {
+                for step in 1..100 {
+                    backend
+                        .treatment_tick(now + std::time::Duration::from_millis(step * 100), false)
+                        .unwrap();
+                    assert!(backend.treatment_observation.is_some());
+                    assert!(backend.emitted.is_empty());
+                }
+                backend
+                    .treatment_tick(now + TREATMENT_DEADLINE, false)
+                    .unwrap();
+                let Some(BackendEvent::TreatmentResult {
+                    result: Err(failure),
+                    ..
+                }) = backend.emitted.pop_front()
+                else {
+                    panic!("lost SET must settle at the original deadline under a non-clean flood");
+                };
+                failure
+            } else {
+                let none = MpvEvent {
+                    event_id: 0,
+                    error: 0,
+                    reply_userdata: 0,
+                    data: ptr::null_mut(),
+                };
+                // SAFETY: A genuine clean-drain event owns no nested payload.
+                let BackendEvent::TreatmentResult {
+                    result: Err(failure),
+                    ..
+                } = (unsafe { backend.native_event(&none) }).unwrap()
+                else {
+                    panic!("a clean drain ends the bounded correlation window");
+                };
+                failure
+            };
+            assert!(matches!(
+                failure.kind,
+                TreatmentErrorKind::Unconfirmed {
+                    reason: TreatmentConfirmationFailure::EvidenceLost,
+                }
+            ));
+            assert_eq!(
+                failure.disposition,
+                TreatmentFailureDisposition::RestoreFreshOwner
+            );
+            assert!(backend.treatment_poisoned);
+            assert!(backend.landed_treatments.is_none());
+            assert!(backend.treatment_observation.is_none());
+            assert!(backend.pending.is_empty());
+            assert!(backend.property_requests.as_ref().unwrap().is_empty());
+            assert!(backend.emitted.is_empty());
+        }
     }
 }

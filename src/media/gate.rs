@@ -2,12 +2,12 @@
 
 use super::{
     controller::{
-        Generation, MediaError, OwnerEndpoint, PlaybackIntent, PreparedTreatments, SessionConfig,
-        Snapshot, SurfaceToken, TreatmentSnapshot, TreatmentStatus,
+        Generation, MediaError, OwnerEndpoint, PlaybackIntent, PreparedTreatments,
+        RuntimeMediaObservation, SessionConfig, Snapshot, SurfaceToken, TreatmentSnapshot,
+        TreatmentStatus,
     },
-    filter_catalog::{FilterCatalogError, compile_chain},
-    render_catalog::{RendererCatalogError, compile_renderer},
-    session::{SessionFacts, VerificationStatus},
+    render_catalog::{RendererCapabilities, RendererCatalogError, compile_renderer},
+    session::{SessionFacts, Source, VerificationStatus},
 };
 use crate::{
     app::{
@@ -21,15 +21,13 @@ use crate::{
     capture::PreparedCapture,
     domain::{
         capture::{
-            AudioAvailability, AudioEpoch, AudioSelection, AudioSilence, PlaybackGain, WatchStamp,
+            AudioAvailability, AudioEpoch, AudioSelection, AudioSilence, FrameRate, PlaybackGain,
+            WatchStamp,
         },
-        failure::{
-            ApplyFailure, Cause, FailureCategory, FilterAttemptDiagnostics, FilterEntryMetadata,
-            FilterErrorKind, FilterFailure, LifecycleFailure, Stage, ValidationLayer,
-        },
+        failure::{ApplyFailure, Cause, FailureCategory, LifecycleFailure, Stage, ValidationLayer},
         output::OutputPlan,
         state::{
-            AttemptId, AttemptKey, DraftSettings, InitialPlayback, PauseRequestId,
+            AttemptId, AttemptKey, AttemptPurpose, DraftSettings, InitialPlayback, PauseRequestId,
             TreatmentAttemptKey, TreatmentPass,
         },
     },
@@ -37,11 +35,28 @@ use crate::{
 
 type Spawner = dyn FnMut(Generation, SessionConfig) -> Result<OwnerEndpoint, MediaError>;
 
+/// Exact facts retained only when this concrete owner produced an accepted
+/// opening receipt. Neither field is a measured hardware cadence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PlaybackTimingFact {
+    pub value: f64,
+    pub source: Source,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReceiptTimingFacts {
+    pub key: AttemptKey,
+    pub generation: Generation,
+    pub requested: FrameRate,
+    pub status: FactStatus,
+    pub observation: Option<PlaybackTimingFact>,
+}
+
 pub(crate) struct GateRunner {
     state: GateState,
     endpoint: Option<OwnerEndpoint>,
     spawn: Box<Spawner>,
-    capabilities: super::render_catalog::QualifiedTreatmentCapabilities,
+    capabilities: Result<RendererCapabilities, RendererCatalogError>,
     key: Option<AttemptKey>,
     requested: Option<DraftSettings>,
     opening_result_sent: bool,
@@ -76,20 +91,22 @@ pub(crate) struct GateRunner {
     fatal_native: Option<ApplyFailure>,
     ended: bool,
     audio: AudioAvailability,
+    diagnostics: Option<RuntimeMediaObservation>,
+    receipt_timing: Option<ReceiptTimingFacts>,
     pub(crate) report: String,
 }
 
 impl GateRunner {
     pub(crate) fn new(
         prefix: String,
-        capabilities: super::render_catalog::QualifiedTreatmentCapabilities,
+        capabilities: Result<RendererCapabilities, RendererCatalogError>,
     ) -> Self {
         Self::with_spawner(capabilities, move |generation, config| {
             OwnerEndpoint::spawn(generation, prefix.clone(), config)
         })
     }
     pub(crate) fn with_spawner(
-        capabilities: super::render_catalog::QualifiedTreatmentCapabilities,
+        capabilities: Result<RendererCapabilities, RendererCatalogError>,
         spawn: impl FnMut(Generation, SessionConfig) -> Result<OwnerEndpoint, MediaError> + 'static,
     ) -> Self {
         Self {
@@ -131,6 +148,8 @@ impl GateRunner {
             fatal_native: None,
             ended: false,
             audio: AudioAvailability::Disabled,
+            diagnostics: None,
+            receipt_timing: None,
             report: String::new(),
         }
     }
@@ -160,10 +179,19 @@ impl GateRunner {
     pub(crate) fn fatal_native_failure(&self) -> Option<&ApplyFailure> {
         self.fatal_native.as_ref()
     }
-    /// Borrow the already retained owner observation for cold structured output.
-    /// Reading it never consumes the transaction event or builds diagnostics.
-    pub(crate) fn treatment_snapshot(&self) -> Option<&TreatmentSnapshot> {
-        self.last_treatment.as_ref()
+    pub(crate) fn diagnostics_observation(&self) -> Option<&RuntimeMediaObservation> {
+        let key = self.key?;
+        self.diagnostics.as_ref().filter(|observation| {
+            self.endpoint.is_some() && observation.generation == key.attempt.get()
+        })
+    }
+    pub(crate) fn receipt_timing_facts(&self) -> Option<&ReceiptTimingFacts> {
+        let key = self.key?;
+        self.receipt_timing.as_ref().filter(|facts| {
+            self.endpoint.is_some()
+                && facts.key == key
+                && facts.generation.get() == key.attempt.get()
+        })
     }
     fn map_failure(&self, error: MediaError) -> Option<ApplyFailure> {
         let requested = self.requested.clone()?;
@@ -205,6 +233,7 @@ impl GateRunner {
             return;
         }
         self.failure_sent = true;
+        self.receipt_timing = None;
         self.pause_request = None;
         self.discard_treatment_confirmation();
         self.retained_progress = None;
@@ -329,8 +358,14 @@ impl GateRunner {
             return;
         }
         self.apply_native(update);
+        self.diagnostics = None;
+        self.receipt_timing = None;
         self.release_event = Some(SessionEvent::NativeReleased { attempt });
-        tracing::info!(apply_id = self.key.map(|key| key.apply.get()), attempt_id = attempt.get(), requested = ?self.requested, "apply_native_released");
+        tracing::info!(
+            event_code = "apply_native_released",
+            apply_id = self.key.map_or(0, |key| key.apply.get()),
+            attempt_id = attempt.get(),
+        );
     }
     fn discard_treatment_confirmation(&mut self) {
         if matches!(
@@ -355,7 +390,7 @@ impl GateRunner {
         if snapshot
             .treatments
             .as_ref()
-            .is_some_and(|filters| matches!(filters.status, TreatmentStatus::Failed(_)))
+            .is_some_and(|treatments| matches!(treatments.status, TreatmentStatus::Failed(_)))
         {
             self.project_treatments(snapshot);
         }
@@ -393,51 +428,52 @@ impl GateRunner {
     }
     fn project_treatments(&mut self, snapshot: &Snapshot) {
         let Some(open) = self.key else { return };
-        let Some(filters) = &snapshot.treatments else {
+        let Some(treatments) = &snapshot.treatments else {
             return;
         };
-        if filters.key.attempt != open.attempt
+        if treatments.key.attempt != open.attempt
             || self.last_treatment.as_ref().is_some_and(|last| {
-                last.sequence > filters.sequence
-                    || (last.key == filters.key
-                        && last.sequence == filters.sequence
-                        && last.status == filters.status)
+                last.sequence > treatments.sequence
+                    || (last.key == treatments.key
+                        && last.sequence == treatments.sequence
+                        && last.status == treatments.status)
             })
         {
             return;
         }
         let was_confirmed = self.last_treatment.as_ref().is_some_and(|last| {
-            last.key == filters.key && matches!(last.status, TreatmentStatus::Confirmed(_))
+            last.key == treatments.key && matches!(last.status, TreatmentStatus::Confirmed(_))
         });
-        self.last_treatment = Some(filters.clone());
+        self.last_treatment = Some(treatments.clone());
         self.dirty = true;
-        self.treatment_event = match &filters.status {
+        self.treatment_event = match &treatments.status {
             TreatmentStatus::Pending => None,
             TreatmentStatus::Confirmed(confirmation) => {
-                self.applied_treatment = Some(filters.key);
+                self.applied_treatment = Some(treatments.key);
                 self.last_treatment_fault = None;
                 self.treatment_fault_event = None;
                 Some(SessionEvent::TreatmentResult {
-                    key: filters.key,
+                    key: treatments.key,
                     result: Ok(confirmation.clone()),
                 })
             }
             TreatmentStatus::Failed(failure) => {
-                if filters.key.pass == TreatmentPass::Open && !self.verified {
+                if treatments.key.pass == TreatmentPass::Open && !self.verified {
                     self.emit_failure(treatment_apply_failure(
                         self.requested.as_ref().expect("owned opening settings"),
                         (**failure).clone(),
                     ));
                 }
                 Some(
-                    if was_confirmed || self.verified && filters.key.pass == TreatmentPass::Open {
+                    if was_confirmed || self.verified && treatments.key.pass == TreatmentPass::Open
+                    {
                         SessionEvent::TreatmentFault {
-                            key: filters.key,
+                            key: treatments.key,
                             failure: failure.clone(),
                         }
                     } else {
                         SessionEvent::TreatmentResult {
-                            key: filters.key,
+                            key: treatments.key,
                             result: Err(failure.clone()),
                         }
                     },
@@ -450,6 +486,14 @@ impl GateRunner {
         if snapshot.generation.get() != key.attempt.get() {
             return None;
         }
+        match &snapshot.diagnostics {
+            Some(observation) if observation.generation != key.attempt.get() => {}
+            observation => self.diagnostics.clone_from(observation),
+        }
+        if snapshot.stream_ended.is_some() || snapshot.failure.is_some() {
+            self.diagnostics = None;
+            self.receipt_timing = None;
+        }
         // Terminal observations prohibit success, not retention of a settled
         // exact-key negative. Classify it before any ended/cleanup early return.
         self.project_treatment_failure(&snapshot);
@@ -461,6 +505,7 @@ impl GateRunner {
             )
         {
             self.discard_treatment_confirmation();
+            self.receipt_timing = None;
         }
         if let Some((reason, error)) = snapshot.stream_ended
             && !self.ended_sent
@@ -575,6 +620,29 @@ impl GateRunner {
         if !self.opening_result_sent && self.state.phase() == GatePhase::Ready {
             match verified_receipt(key, self.requested.as_ref()?, &snapshot) {
                 Ok(Some(receipt)) => {
+                    self.receipt_timing = Some(ReceiptTimingFacts {
+                        key,
+                        generation: snapshot.generation,
+                        requested: receipt.settings.video.mode.rate,
+                        status: receipt.verification.nominal_rate,
+                        observation: snapshot
+                            .session
+                            .as_ref()
+                            .and_then(|session| session.observed.nominal_rate.as_ref())
+                            .filter(|observation| {
+                                observation.value.is_finite()
+                                    && observation.value > 0.0
+                                    && matches!(
+                                        (receipt.verification.nominal_rate, observation.source),
+                                        (FactStatus::Configured, Source::MpvConfiguredContainerFps)
+                                            | (FactStatus::Approximate, Source::MpvContainerFps)
+                                    )
+                            })
+                            .map(|observation| PlaybackTimingFact {
+                                value: observation.value,
+                                source: observation.source,
+                            }),
+                    });
                     self.opening_result_sent = true;
                     self.verified = true;
                     return Some(SessionEvent::OpenVerified {
@@ -616,17 +684,12 @@ impl SessionRunner for GateRunner {
         &mut self,
         settings: &DraftSettings,
     ) -> Result<Self::PreparedTreatments, ApplyFailure> {
-        let filters = match &self.capabilities.filters {
-            Ok(capabilities) => compile_chain(&settings.filters, capabilities)
-                .map_err(|error| catalog_failure(settings, &error))?,
-            Err(error) => return Err(catalog_failure(settings, error)),
-        };
-        let renderer = match &self.capabilities.renderer {
+        let renderer = match &self.capabilities {
             Ok(capabilities) => compile_renderer(&settings.renderer, capabilities)
                 .map_err(|error| renderer_catalog_failure(settings, &error))?,
             Err(error) => return Err(renderer_catalog_failure(settings, error)),
         };
-        Ok(PreparedTreatments { filters, renderer })
+        Ok(PreparedTreatments { renderer })
     }
     fn begin_open(
         &mut self,
@@ -648,6 +711,8 @@ impl SessionRunner for GateRunner {
                 "previous physical lease not retired",
             )));
         }
+        self.diagnostics = None;
+        self.receipt_timing = None;
         let Some(generation) = Generation::new(key.attempt.get()) else {
             return Err(StartFailure::NoResourcesCreated(ApplyFailure::new(
                 FailureCategory::Lifecycle(LifecycleFailure::Protocol),
@@ -669,11 +734,12 @@ impl SessionRunner for GateRunner {
                 "native gate rejected fresh attempt",
             )));
         }
-        let event = serde_json::json!({
-            "event": "Opening", "apply_id": key.apply.get(), "attempt_id": key.attempt.get(),
-            "purpose": key.purpose, "requested": requested, "gain": gain,
-        });
-        tracing::info!(event = %event, "apply_open_submit");
+        tracing::info!(
+            event_code = "apply_open_submit",
+            apply_id = key.apply.get(),
+            attempt_id = key.attempt.get(),
+            purpose = purpose_token(key.purpose),
+        );
         let (_, video, _, _, watch, selected_route) = prepared.into_parts();
         let config = SessionConfig {
             video,
@@ -683,7 +749,6 @@ impl SessionRunner for GateRunner {
             output,
             watch,
             selected_route,
-            filters: requested.filters.clone(),
             treatments,
             treatment_key: TreatmentAttemptKey {
                 apply: key.apply,
@@ -774,6 +839,7 @@ impl SessionRunner for GateRunner {
             return StopSubmission::AlreadyStopping;
         }
         self.pause_request = None;
+        self.receipt_timing = None;
         self.retained_progress = None;
         self.discard_treatment_confirmation();
         let update = self.state.stop(attempt);
@@ -838,6 +904,8 @@ impl SessionRunner for GateRunner {
                         .owner_stopped(key.attempt, outcome.as_ref().err().cloned());
                     self.apply_native(update);
                     self.endpoint = None;
+                    self.diagnostics = None;
+                    self.receipt_timing = None;
                     if let Some(snapshot) = &snapshot
                         && let Some((reason, error)) = snapshot.stream_ended
                         && !self.ended_sent
@@ -859,9 +927,9 @@ impl SessionRunner for GateRunner {
                         outcome,
                     });
                     tracing::info!(
+                        event_code = "apply_owner_stopped",
                         apply_id = key.apply.get(),
                         attempt_id = key.attempt.get(),
-                        "apply_owner_stopped"
                     );
                 }
                 Some(Err(error)) => {
@@ -907,11 +975,13 @@ impl SessionRunner for GateRunner {
                 .or_else(|| self.treatment_fault_event.take())
         })();
         if let Some(event) = &event {
-            log_session_event(self.key, self.requested.as_ref(), event);
+            log_session_event(self.key, event);
         }
         if matches!(&event, Some(SessionEvent::NativeReleased { .. })) {
             self.key = None;
             self.requested = None;
+            self.diagnostics = None;
+            self.receipt_timing = None;
             self.audio_event = None;
             self.stream_event = None;
             self.detached_event = None;
@@ -1126,57 +1196,6 @@ fn fact_status(status: VerificationStatus) -> FactStatus {
         VerificationStatus::Configured => FactStatus::Configured,
     }
 }
-fn catalog_failure(settings: &DraftSettings, error: &FilterCatalogError) -> ApplyFailure {
-    let missing = matches!(error, FilterCatalogError::MissingCapability { .. });
-    let failure = FilterFailure {
-        kind: if missing {
-            FilterErrorKind::Prevalidation
-        } else {
-            FilterErrorKind::CatalogUnavailable
-        },
-        attributed_ordinal: match error {
-            FilterCatalogError::MissingCapability { filter, .. } => settings
-                .filters
-                .entries()
-                .iter()
-                .position(|entry| entry.kind() == *filter),
-            _ => None,
-        },
-        requires_fresh_owner: false,
-        diagnostics: FilterAttemptDiagnostics {
-            key: None,
-            entries: settings
-                .filters
-                .entries()
-                .iter()
-                .enumerate()
-                .map(|(ordinal, entry)| FilterEntryMetadata {
-                    ordinal,
-                    label: entry.label().to_owned(),
-                    enabled: entry.enabled(),
-                })
-                .collect(),
-            records: Vec::new(),
-            native_evidence_lost: false,
-            truncated: false,
-            dropped_context: 0,
-        },
-    };
-    ApplyFailure::new(
-        FailureCategory::Validation(ValidationLayer::Filters),
-        Stage::Prevalidation,
-        Cause::Generic,
-        settings.clone(),
-        "filter_prepare",
-        error.to_string(),
-    )
-    .with_treatment(crate::domain::failure::TreatmentFailure {
-        key: None,
-        kind: crate::domain::failure::TreatmentErrorKind::Filter(failure),
-        disposition: crate::domain::failure::TreatmentFailureDisposition::Untouched,
-    })
-}
-
 fn renderer_catalog_failure(
     settings: &DraftSettings,
     error: &RendererCatalogError,
@@ -1367,12 +1386,41 @@ fn verified_receipt(
     }))
 }
 
-fn log_session_event(
-    key: Option<AttemptKey>,
-    requested: Option<&DraftSettings>,
-    event: &SessionEvent,
-) {
-    let (name, attempt) = match event {
+/// Finite diagnostic token vocabularies. Only these fixed identifiers reach
+/// the bounded logging layer, never raw settings, receipts or error prose.
+fn purpose_token(purpose: AttemptPurpose) -> &'static str {
+    match purpose {
+        AttemptPurpose::Candidate => "Candidate",
+        AttemptPurpose::Restore => "Restore",
+        AttemptPurpose::Reconnect => "Reconnect",
+        AttemptPurpose::Resume => "Resume",
+        AttemptPurpose::Recovery => "Recovery",
+    }
+}
+
+fn stage_token(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Prevalidation => "Prevalidation",
+        Stage::InputConstruction => "InputConstruction",
+        Stage::Open => "Open",
+        Stage::Negotiation => "Negotiation",
+        Stage::StreamStart => "StreamStart",
+        Stage::Verification => "Verification",
+        Stage::Unknown => "Unknown",
+    }
+}
+
+fn cause_token(cause: Cause) -> &'static str {
+    match cause {
+        Cause::RequestedModeRefused => "RequestedModeRefused",
+        Cause::Busy => "Busy",
+        Cause::Permission => "Permission",
+        Cause::Generic => "Generic",
+    }
+}
+
+fn log_session_event(key: Option<AttemptKey>, event: &SessionEvent) {
+    let (kind, attempt) = match event {
         SessionEvent::TreatmentResult { key, .. } => ("TreatmentResult", key.attempt),
         SessionEvent::TreatmentFault { key, .. } => ("TreatmentFault", key.attempt),
         SessionEvent::OpenVerified { key, .. } => ("OpenVerified", key.attempt),
@@ -1396,29 +1444,26 @@ fn log_session_event(
         } => Some(failure),
         _ => None,
     };
-    let receipt = match event {
-        SessionEvent::OpenVerified { receipt, .. } => Some(serde_json::json!({
-            "settings": receipt.settings,
-            "verification": {
-                "captured_fourcc": format!("{:?}", receipt.verification.captured_fourcc),
-                "decoded_size": format!("{:?}", receipt.verification.decoded_size),
-                "nominal_rate": format!("{:?}", receipt.verification.nominal_rate),
-            },
-            "audio": match &receipt.audio {
-                AudioOutcome::Disabled => serde_json::json!("Disabled"),
-                AudioOutcome::Active { route } => serde_json::json!({"Active": {"source": route.source(), "route": route}}),
-                AudioOutcome::Silent { source, reason } => serde_json::json!({"Silent": {"source": source, "reason": reason}}),
-            },
-            "treatments": receipt.treatments,
-        })),
-        _ => None,
-    };
-    let value = serde_json::json!({
-        "event": name, "apply_id": key.map(|key| key.apply.get()),
-        "attempt_id": attempt.get(), "purpose": key.map(|key| key.purpose),
-        "requested": requested, "failure": failure, "receipt": receipt,
-    });
-    tracing::info!(event = %value, "apply_session_event");
+    let apply_id = key.map_or(0, |key| key.apply.get());
+    let purpose = key.map_or("Unknown", |key| purpose_token(key.purpose));
+    match failure {
+        Some(failure) => tracing::info!(
+            event_code = "media_session_event",
+            kind,
+            apply_id,
+            attempt_id = attempt.get(),
+            purpose,
+            stage = stage_token(failure.stage),
+            cause = cause_token(failure.cause),
+        ),
+        None => tracing::info!(
+            event_code = "media_session_event",
+            kind,
+            apply_id,
+            attempt_id = attempt.get(),
+            purpose,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1438,11 +1483,8 @@ mod tests {
         },
     };
     use std::sync::mpsc;
-    fn capabilities() -> super::super::render_catalog::QualifiedTreatmentCapabilities {
-        super::super::render_catalog::QualifiedTreatmentCapabilities {
-            filters: Ok(super::super::filter_catalog::fixture_capabilities()),
-            renderer: Ok(super::super::render_catalog::fixture_capabilities()),
-        }
+    fn capabilities() -> Result<RendererCapabilities, RendererCatalogError> {
+        Ok(super::super::render_catalog::fixture_capabilities())
     }
 
     /// Only the deterministic prepared-value port is synthetic. The product,
@@ -1588,17 +1630,10 @@ mod tests {
         // Spawning happens on the app thread; the recorder alone crosses threads.
         let opens = Rc::new(RefCell::new(Vec::new()));
         let owner_opens = Rc::clone(&opens);
-        let capabilities = super::super::render_catalog::QualifiedTreatmentCapabilities::query(
+        let capabilities = super::super::render_catalog::query_qualified_capabilities(
             std::path::Path::new(&prefix),
         );
-        assert!(
-            capabilities.filters.is_ok(),
-            "frozen qualified filter catalog"
-        );
-        assert!(
-            capabilities.renderer.is_ok(),
-            "frozen qualified renderer catalog"
-        );
+        assert!(capabilities.is_ok(), "frozen qualified renderer catalog");
         let runner = GateRunner::with_spawner(capabilities, move |generation, config| {
             let requested = config.video.requested();
             let input = config
@@ -1620,7 +1655,6 @@ mod tests {
                     config.gain,
                     config.playback,
                     config.watch,
-                    config.filters,
                     config.treatments,
                     config.treatment_key,
                     Some(recorder),
@@ -1806,7 +1840,6 @@ mod tests {
             rate: FrameRate::new(60, 1).unwrap(),
         };
         DraftSettings {
-            filters: crate::domain::filters::FilterChain::default(),
             video: crate::domain::capture::VideoRequest::manual(
                 crate::domain::capture::ModeRequest {
                     identity: session_fixture(&["/dev/video0"], mode).devices()[0]
@@ -1862,10 +1895,7 @@ mod tests {
         }
     }
     fn prepared_treatments(settings: &DraftSettings) -> PreparedTreatments {
-        super::super::controller::test_support::prepared_treatments(
-            &settings.filters,
-            &settings.renderer,
-        )
+        super::super::controller::test_support::prepared_treatments(&settings.renderer)
     }
     fn open(runner: &mut GateRunner, value: u64) {
         runner
@@ -2468,7 +2498,180 @@ mod tests {
             failure: None,
             audio,
             treatment_fault: None,
+            diagnostics: None,
         }
+    }
+
+    fn diagnostics_fixture(generation: u64) -> RuntimeMediaObservation {
+        RuntimeMediaObservation {
+            generation,
+            observation_epoch: 1,
+            client_api: 0x0002_0005,
+            libmpv_version: "mpv v0.41.0".into(),
+            backend: super::super::controller::BackendObservation::Observed {
+                video_output: "actual-output".into(),
+                gpu_context: "actual-context".into(),
+            },
+            helpers: super::super::loopback::HelperObservations::default(),
+        }
+    }
+
+    fn runner_for_snapshot(settings: &DraftSettings) -> (GateRunner, mpsc::Receiver<Driver>) {
+        let (mut runner, drivers) = runner(Config::default());
+        runner
+            .begin_open(
+                key(1),
+                fixture_prepared(settings.clone()).unwrap(),
+                prepared_treatments(settings),
+                PlaybackGain::default(),
+                InitialPlayback::Live,
+                output_fixture_plan(),
+            )
+            .unwrap();
+        // Inject already observed snapshots without waking a native backend.
+        runner.state.surface_ready(key(1).attempt);
+        (runner, drivers)
+    }
+
+    fn verify_snapshot(runner: &mut GateRunner, snapshot: &Snapshot) -> bool {
+        (0..8).any(|_| {
+            matches!(
+                runner.snapshot(snapshot.clone()),
+                Some(SessionEvent::OpenVerified { .. })
+            )
+        })
+    }
+
+    fn retire_snapshot_runner(runner: &mut GateRunner) {
+        let attempt = runner.key.unwrap().attempt;
+        runner.stop(attempt, StopReason::Close);
+        stopped(runner);
+        runner.native_released(attempt);
+        runner.poll();
+    }
+
+    #[test]
+    fn gate_retains_only_current_generation_diagnostics_and_clears_actual_retirement() {
+        let settings = settings();
+        let (mut runner, _drivers) = runner_for_snapshot(&settings);
+        let mut current = snapshot(&settings, AudioAvailability::Disabled);
+        current.diagnostics = Some(diagnostics_fixture(1));
+        runner.snapshot(current.clone());
+        assert_eq!(
+            runner.diagnostics_observation(),
+            current.diagnostics.as_ref()
+        );
+        let mut stale = current.clone();
+        stale.generation = Generation::new(2).unwrap();
+        stale.diagnostics = Some(diagnostics_fixture(2));
+        assert!(runner.snapshot(stale).is_none());
+        assert_eq!(
+            runner.diagnostics_observation(),
+            current.diagnostics.as_ref()
+        );
+        current.diagnostics = Some(diagnostics_fixture(2));
+        runner.snapshot(current);
+        assert_eq!(runner.diagnostics_observation().unwrap().generation, 1);
+        retire_snapshot_runner(&mut runner);
+        assert!(runner.diagnostics_observation().is_none());
+        open(&mut runner, 2);
+        assert!(runner.diagnostics_observation().is_none());
+        retire_snapshot_runner(&mut runner);
+    }
+
+    #[test]
+    fn receipt_timing_retains_exact_requested_rate_and_actual_configured_or_approximate_source() {
+        use super::super::session::{Observation, Source};
+        for (source, value, status) in [
+            (
+                Source::MpvConfiguredContainerFps,
+                59.5,
+                FactStatus::Configured,
+            ),
+            (
+                Source::MpvContainerFps,
+                60_000.0 / 1001.0,
+                FactStatus::Approximate,
+            ),
+        ] {
+            let mut settings = settings();
+            settings.video.mode.rate = FrameRate::new(60_000, 1001).unwrap();
+            let (mut runner, _drivers) = runner_for_snapshot(&settings);
+            let mut current = snapshot(&settings, AudioAvailability::Disabled);
+            current.session.as_mut().unwrap().observed.nominal_rate =
+                Some(Observation { value, source });
+            assert!(verify_snapshot(&mut runner, &current));
+            let timing = *runner.receipt_timing_facts().unwrap();
+            assert_eq!(timing.key, key(1));
+            assert_eq!(timing.generation, current.generation);
+            assert_eq!(timing.requested, settings.video.mode.rate);
+            assert_eq!(timing.status, status);
+            assert_eq!(
+                timing.observation,
+                Some(PlaybackTimingFact { value, source })
+            );
+            let mut wrong_generation = current.clone();
+            wrong_generation.generation = Generation::new(2).unwrap();
+            runner.snapshot(wrong_generation);
+            assert_eq!(runner.receipt_timing_facts(), Some(&timing));
+            // Pause and a hot treatment have a new operation but the same owner.
+            current.pause = Some(super::super::controller::PauseObservation {
+                request: None,
+                paused: true,
+            });
+            let hot_key = TreatmentAttemptKey {
+                apply: ApplyId::new(2).unwrap(),
+                attempt: key(1).attempt,
+                pass: TreatmentPass::Candidate,
+            };
+            current.treatments = Some(TreatmentSnapshot {
+                key: hot_key,
+                sequence: 2,
+                status: TreatmentStatus::Confirmed(
+                    super::super::controller::test_support::treatment_confirmation(
+                        hot_key,
+                        InitialPlayback::Paused,
+                        settings.renderer.clone(),
+                    ),
+                ),
+            });
+            runner.snapshot(current.clone());
+            assert_eq!(runner.receipt_timing_facts(), Some(&timing));
+            current.stream_ended = Some((0, 0));
+            runner.snapshot(current);
+            assert!(runner.receipt_timing_facts().is_none());
+            retire_snapshot_runner(&mut runner);
+            open(&mut runner, 2);
+            assert!(runner.receipt_timing_facts().is_none());
+            retire_snapshot_runner(&mut runner);
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_timing_never_becomes_configured_and_rejected_receipts_record_nothing() {
+        use super::super::session::{Observation, Source};
+        for value in [None, Some(f64::NAN), Some(0.0), Some(f64::INFINITY)] {
+            let settings = settings();
+            let (mut runner, _drivers) = runner_for_snapshot(&settings);
+            let mut current = snapshot(&settings, AudioAvailability::Disabled);
+            current.session.as_mut().unwrap().observed.nominal_rate =
+                value.map(|value| Observation {
+                    value,
+                    source: Source::MpvConfiguredContainerFps,
+                });
+            assert!(verify_snapshot(&mut runner, &current));
+            let timing = runner.receipt_timing_facts().unwrap();
+            assert_eq!(timing.status, FactStatus::Unverified);
+            assert!(timing.observation.is_none());
+            retire_snapshot_runner(&mut runner);
+        }
+        let settings = settings();
+        let (mut runner, _drivers) = runner_for_snapshot(&settings);
+        let mut rejected = snapshot(&settings, AudioAvailability::Disabled);
+        rejected.session.as_mut().unwrap().requested.mode.rate = FrameRate::new(30, 1).unwrap();
+        assert!(!verify_snapshot(&mut runner, &rejected));
+        assert!(runner.receipt_timing_facts().is_none());
+        retire_snapshot_runner(&mut runner);
     }
     #[test]
     fn receipt_requires_session_facts_and_exact_enabled_audio_outcome() {
@@ -2862,6 +3065,177 @@ mod tests {
         );
         assert!(drivers.try_recv().is_err());
     }
+
+    #[test]
+    fn startup_timeout_boundary_projects_through_owner_gate_and_report_before_real_ack() {
+        use super::super::controller::SubmitStatus;
+        use crate::domain::state::{CleanupStatus, ProductPhase};
+
+        let requested = settings();
+        let prepared = fixture_prepared(requested.clone()).unwrap();
+        let requested_facts = prepared.selection().requested();
+        let (gate, drivers) = runner(Config {
+            hold_shutdown: true,
+            creates_handle: true,
+            ..Config::default()
+        });
+        let mut app = FixtureApp::new(
+            requested.clone(),
+            PlaybackGain::default(),
+            FixtureValidator::default(),
+            gate,
+        );
+        app.apply(app.model().state_identity(), app.model().draft().revision)
+            .unwrap();
+        app.poll();
+        let (opening, _) = app.model().opening().unwrap();
+        assert!(app.runner_mut().take_native_update().create_native);
+        let driver = drivers.recv().unwrap();
+        app.runner_mut().surface_ready(token(opening.attempt.get()));
+        driver.initialized.recv().unwrap();
+        let (_, command) = driver.submitted.recv().unwrap();
+        assert_eq!(command, super::super::controller::BackendCommand::LoadInput);
+        driver.fence();
+
+        // Time is advanced only at the production pure batch-boundary helper.
+        // The same error then follows an actual accepted-load owner's stop,
+        // run_backend wrapping, destruction, gate and report paths. This is not
+        // a claim that ten wall-clock seconds elapsed in the threaded fixture.
+        let endpoint = app.runner_mut().endpoint.as_ref().unwrap();
+        let snapshot = endpoint.take_snapshot().unwrap();
+        assert!(!snapshot.load_complete && snapshot.readiness.is_none());
+        let error = Driver::expired_initial_readiness(snapshot, &requested_facts);
+        assert_eq!(error.session.as_ref().unwrap().requested, requested_facts);
+        assert_eq!(
+            endpoint.stop(token(opening.attempt.get()).generation, Some(error)),
+            SubmitStatus::Accepted
+        );
+        driver.shutdown_started.recv().unwrap();
+        app.poll();
+
+        let failure = app.model().failures().unwrap().candidate.as_ref().unwrap();
+        assert_eq!(failure.operation, "startup_readiness_timeout");
+        assert_eq!(failure.requested.as_ref(), &requested);
+        assert_eq!(failure.category, FailureCategory::Session);
+        assert_eq!(
+            (failure.stage, failure.cause),
+            (Stage::Unknown, Cause::Generic)
+        );
+        assert!(failure.evidence.is_none() && failure.treatment.is_none());
+        assert!(app.model().active().is_none() && app.model().last_valid().is_none());
+        assert_eq!(app.model().phase(), ProductPhase::CleaningFailedCandidate);
+        assert_eq!(app.model().cleanup(), &CleanupStatus::Draining);
+
+        let report = crate::diagnostics::report::FailureLanes::from(app.diagnostic_failures());
+        let candidate = report.candidate.as_ref().unwrap();
+        assert_eq!(candidate.operation, "startup_readiness_timeout");
+        assert_eq!(candidate.identity.operation, Some(opening.apply.get()));
+        assert_eq!(candidate.identity.attempt, Some(opening.attempt.get()));
+        assert_eq!(
+            (candidate.stage, candidate.cause),
+            (Stage::Unknown, Cause::Generic)
+        );
+        assert!(candidate.evidence.is_none() && candidate.treatment.is_none());
+        assert!(matches!(
+            &candidate.correlation,
+            crate::diagnostics::report::FailureCorrelation::Attempt { key }
+                if key.operation == opening.apply.get()
+                    && key.attempt == opening.attempt.get()
+        ));
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serialized["candidate"]["operation"],
+            "startup_readiness_timeout"
+        );
+        assert!(serialized["candidate"]["evidence"].is_null());
+        assert!(serialized["candidate"]["treatment"].is_null());
+
+        assert!(driver.destroyed.try_recv().is_err());
+        assert!(!app.runner_mut().take_native_update().release_native);
+        app.poll();
+        assert_eq!(app.model().cleanup(), &CleanupStatus::Draining);
+        driver.shutdown_release.send(()).unwrap();
+        app.runner_mut()
+            .endpoint
+            .as_mut()
+            .unwrap()
+            .wait_for_ack()
+            .unwrap();
+        assert!(driver.destroyed.recv().unwrap());
+        fixture_app_native_release(&mut app, opening.attempt);
+        assert_eq!(app.model().phase(), ProductPhase::ErrorWithoutActive);
+        assert_eq!(app.model().cleanup(), &CleanupStatus::Complete);
+        assert!(app.model().active().is_none() && app.model().last_valid().is_none());
+        assert!(drivers.try_recv().is_err());
+        assert!(driver.submitted.try_recv().is_err());
+        assert_eq!(
+            app.model()
+                .failures()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .operation,
+            "startup_readiness_timeout"
+        );
+    }
+
+    #[test]
+    fn recovered_guarded_restart_still_requires_complete_open_treatment_before_active() {
+        let requested = settings();
+        let (gate, drivers) = runner(Config {
+            creates_handle: true,
+            ..Config::default()
+        });
+        let mut app = FixtureApp::new(
+            requested.clone(),
+            PlaybackGain::default(),
+            FixtureValidator::default(),
+            gate,
+        );
+        app.apply(app.model().state_identity(), app.model().draft().revision)
+            .unwrap();
+        app.poll();
+        let (opening, _) = app.model().opening().unwrap();
+        assert!(app.runner_mut().take_native_update().create_native);
+        let driver = drivers.recv().unwrap();
+        app.runner_mut().surface_ready(token(opening.attempt.get()));
+        driver.initialized.recv().unwrap();
+        let (load, _) = driver.submitted.recv().unwrap();
+        driver.send(BackendEvent::FileLoaded);
+        driver.send(BackendEvent::CommandReply {
+            id: load.get(),
+            error: 0,
+        });
+        driver.send(BackendEvent::Other);
+        driver.send(BackendEvent::VideoReconfig);
+        driver.fence();
+        app.poll();
+        assert!(app.model().active().is_none() && app.model().last_valid().is_none());
+        assert!(driver.submitted.try_recv().is_err());
+
+        // This fixture event supplies the adapter's guarded decoded-video fact;
+        // real raw-event/property correlation is covered in the FFI tests.
+        driver.send(BackendEvent::PlaybackRestart);
+        driver.fence();
+        app.poll();
+        assert!(app.model().active().is_none() && app.model().last_valid().is_none());
+        let confirmation = driver.confirm_open_treatments();
+        assert_eq!(confirmation.key().apply, opening.apply);
+        assert_eq!(confirmation.key().attempt, opening.attempt);
+        assert_eq!(confirmation.key().pass, TreatmentPass::Open);
+        driver.fence();
+        fixture_wait(&mut app, "recovered guarded first Open", |app| {
+            app.model()
+                .active()
+                .is_some_and(|active| active.attempt() == opening.attempt)
+        });
+        assert_eq!(app.model().last_valid().unwrap().settings(), &requested);
+        assert!(app.take_verified_applied().is_some());
+        assert!(drivers.try_recv().is_err());
+        fixture_app_quit(&mut app);
+    }
+
     fn fixture_app_live(config: Config) -> (FixtureApp, Driver, mpsc::Receiver<Driver>) {
         let (gate, drivers) = runner(config);
         let mut app = FixtureApp::new(
@@ -2907,32 +3281,22 @@ mod tests {
                 .is_some_and(|active| active.attempt() == attempt)
         });
     }
-    fn fixture_chain(label: &str) -> crate::domain::filters::FilterChain {
-        use crate::domain::filters::{
-            ColorLevels, Filter, FilterChain, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
-        };
-        FilterChain::new(vec![FilterEntry::new(
-            label.into(),
-            Filter::Format(FormatParams::new(
-                SdrMatrix::Auto,
-                ColorLevels::Auto,
-                SdrGamma::Auto,
-            )),
-            true,
-        )])
-        .unwrap()
+    fn fixture_renderer(antiring: f64) -> crate::domain::render::RendererSettings {
+        let mut values = crate::domain::render::RendererSettings::default().values();
+        values.scale_antiring = antiring;
+        crate::domain::render::RendererSettings::new(values).unwrap()
     }
     fn fixture_treatment_request(
         app: &mut FixtureApp,
         driver: &Driver,
-        chain: crate::domain::filters::FilterChain,
+        renderer: crate::domain::render::RendererSettings,
     ) -> (
         super::super::controller::RequestId,
         TreatmentAttemptKey,
         DraftSettings,
     ) {
         let mut candidate = app.model().draft().settings.clone();
-        candidate.filters = chain;
+        candidate.renderer = renderer;
         let revision = app
             .edit_draft(app.model().draft().revision, candidate.clone())
             .unwrap();
@@ -2983,15 +3347,15 @@ mod tests {
                     });
                     let prior = app.model().last_valid().unwrap().settings().clone();
                     let old = app.model().active().unwrap().attempt();
-                    let (id, key, candidate) = fixture_treatment_request(
-                        &mut app,
-                        &driver,
-                        fixture_chain("terminal candidate"),
-                    );
-                    let mut failure = filter_failure(key);
+                    let (id, key, candidate) =
+                        fixture_treatment_request(&mut app, &driver, fixture_renderer(0.5));
+                    let mut failure = treatment_failure(key);
                     if rejected {
-                        failure.kind = FilterErrorKind::CommandRejected { mpv_error: -5 };
-                        failure.requires_fresh_owner = false;
+                        failure.kind = renderer_failure_kind(
+                            crate::domain::failure::RendererErrorKind::Rejected { mpv_error: -5 },
+                        );
+                        failure.disposition =
+                            crate::domain::failure::TreatmentFailureDisposition::Untouched;
                     }
                     let expected_kind = failure.kind.clone();
                     if end_first {
@@ -3003,7 +3367,7 @@ mod tests {
                     driver.send(BackendEvent::TreatmentResult {
                         id: id.get(),
                         key,
-                        result: Err(Box::new(aggregate_filter_failure(failure))),
+                        result: Err(Box::new(failure)),
                     });
                     if !end_first {
                         driver.send(BackendEvent::EndFile {
@@ -3044,17 +3408,12 @@ mod tests {
                     );
                     assert!(
                         app.model().recovery().is_none(),
-                        "filter terminal is not physical-removal recovery"
+                        "renderer terminal is not physical-removal recovery"
                     );
                     let cause = app.model().failures().unwrap().candidate.clone().unwrap();
                     assert_eq!(cause.requested.as_ref(), &candidate);
-                    let crate::domain::failure::TreatmentErrorKind::Filter(filter) =
-                        &cause.treatment.as_ref().unwrap().kind
-                    else {
-                        panic!("terminal aggregate failure lost vf provenance")
-                    };
-                    assert_eq!(filter.kind, expected_kind);
-                    assert_eq!(filter.diagnostics.key, Some(key));
+                    assert_eq!(cause.treatment.as_ref().unwrap().kind, expected_kind);
+                    assert_eq!(cause.treatment.as_ref().unwrap().key, Some(key));
                     assert_eq!(app.model().last_valid().unwrap().settings(), &prior);
                     assert!(app.model().validation_request().is_none());
                     assert_eq!(app.model().cleanup(), &CleanupStatus::Draining);
@@ -3115,20 +3474,17 @@ mod tests {
             });
             let old = app.model().active().unwrap().attempt();
             let prior = app.model().last_valid().unwrap().settings().clone();
-            let (id, candidate, _) = fixture_treatment_request(
-                &mut app,
-                &driver,
-                fixture_chain("unconfirmed candidate"),
-            );
-            let mut unconfirmed = filter_failure(candidate);
-            unconfirmed.kind = FilterErrorKind::Unconfirmed {
-                reason: crate::domain::failure::FilterConfirmationFailure::Deadline,
-            };
-            unconfirmed.requires_fresh_owner = false;
+            let (id, candidate, _) =
+                fixture_treatment_request(&mut app, &driver, fixture_renderer(0.5));
+            let mut unconfirmed = treatment_failure(candidate);
+            unconfirmed.kind =
+                renderer_failure_kind(crate::domain::failure::RendererErrorKind::ReadbackMismatch);
+            unconfirmed.disposition =
+                crate::domain::failure::TreatmentFailureDisposition::RestoreSameOwner;
             driver.send(BackendEvent::TreatmentResult {
                 id: id.get(),
                 key: candidate,
-                result: Err(Box::new(aggregate_filter_failure(unconfirmed))),
+                result: Err(Box::new(unconfirmed)),
             });
             driver.fence();
             app.poll();
@@ -3159,7 +3515,9 @@ mod tests {
                 });
             }
             driver.fence();
-            app.poll();
+            fixture_wait(&mut app, "same-owner Restore terminal consumed", |app| {
+                app.model().phase() == ProductPhase::ErrorWithoutActive
+            });
             assert_eq!(app.model().phase(), ProductPhase::ErrorWithoutActive);
             assert!(app.model().failures().unwrap().candidate.is_some());
             let cause = app.model().failures().unwrap().restore.as_ref().unwrap();
@@ -3196,7 +3554,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_to_coordinator_late_fault_plus_ended_restores_then_verified_chain_not_old_history() {
+    fn gate_to_coordinator_late_fault_plus_ended_restores_then_verified_renderer_not_old_history() {
         use crate::domain::state::ProductPhase;
         for end_first in [false, true] {
             let (mut app, driver, drivers) = fixture_app_live(Config {
@@ -3206,7 +3564,7 @@ mod tests {
             });
             let old = app.model().active().unwrap().attempt();
             let (id, key, applied) =
-                fixture_treatment_request(&mut app, &driver, fixture_chain("then verified chain"));
+                fixture_treatment_request(&mut app, &driver, fixture_renderer(0.5));
             driver.send(BackendEvent::TreatmentResult {
                 id: id.get(),
                 key,
@@ -3279,7 +3637,8 @@ mod tests {
         }
     }
     #[test]
-    fn gate_to_coordinator_watcher_removal_overrides_graph_and_ended_and_recovers_only_prior() {
+    fn gate_to_coordinator_watcher_removal_overrides_renderer_fault_and_ended_and_recovers_only_prior()
+     {
         use crate::domain::capture::{
             LossEvidence, ObservationEpoch, RecoveryObservation, SourcePresence, VideoPresence,
         };
@@ -3290,11 +3649,8 @@ mod tests {
         });
         let old = app.model().active().unwrap().attempt();
         let prior = app.model().last_valid().unwrap().settings().clone();
-        let (id, key, candidate) = fixture_treatment_request(
-            &mut app,
-            &driver,
-            fixture_chain("cancelled graph candidate"),
-        );
+        let (id, key, candidate) =
+            fixture_treatment_request(&mut app, &driver, fixture_renderer(0.5));
         driver.send(BackendEvent::TreatmentResult {
             id: id.get(),
             key,
@@ -3370,7 +3726,7 @@ mod tests {
         let confirmed = app.model().confirmed_treatment_key().unwrap();
         let mut source = prior.clone();
         source.video.mode.rate = FrameRate::new(30, 1).unwrap();
-        source.filters = fixture_chain("superseded source candidate");
+        source.renderer = fixture_renderer(0.4);
         app.edit_draft(app.model().draft().revision, source)
             .unwrap();
         let source_admission = app
@@ -3383,7 +3739,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         let mut newer = app.model().draft().settings.clone();
-        newer.filters = fixture_chain("newer editable draft");
+        newer.renderer = fixture_renderer(0.7);
         app.edit_draft(app.model().draft().revision, newer.clone())
             .unwrap();
         // Emulate an already-copied sticky native fault delivered while shutdown
@@ -3460,34 +3816,24 @@ mod tests {
         fixture_app_quit(&mut app);
     }
 
-    fn filter_failure(key: TreatmentAttemptKey) -> crate::domain::failure::FilterFailure {
-        crate::domain::failure::FilterFailure {
-            kind: FilterErrorKind::RuntimeGraph,
-            attributed_ordinal: None,
-            requires_fresh_owner: true,
-            diagnostics: FilterAttemptDiagnostics {
-                key: Some(key),
-                entries: Vec::new(),
-                records: Vec::new(),
-                native_evidence_lost: false,
-                truncated: false,
-                dropped_context: 0,
+    fn renderer_failure_kind(
+        kind: crate::domain::failure::RendererErrorKind,
+    ) -> crate::domain::failure::TreatmentErrorKind {
+        crate::domain::failure::TreatmentErrorKind::Renderer(
+            crate::domain::failure::RendererFailure {
+                property: crate::domain::render::RendererProperty::Scale,
+                diagnostic: format!("{kind:?}"),
+                kind,
             },
-        }
+        )
     }
     fn treatment_failure(key: TreatmentAttemptKey) -> TreatmentFailure {
-        aggregate_filter_failure(filter_failure(key))
-    }
-
-    fn aggregate_filter_failure(filter: crate::domain::failure::FilterFailure) -> TreatmentFailure {
         TreatmentFailure {
-            key: filter.diagnostics.key,
-            disposition: if filter.requires_fresh_owner {
-                crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner
-            } else {
-                crate::domain::failure::TreatmentFailureDisposition::RestoreSameOwner
-            },
-            kind: crate::domain::failure::TreatmentErrorKind::Filter(filter),
+            key: Some(key),
+            disposition: crate::domain::failure::TreatmentFailureDisposition::RestoreFreshOwner,
+            kind: renderer_failure_kind(
+                crate::domain::failure::RendererErrorKind::IncumbentMismatch,
+            ),
         }
     }
 
@@ -3500,21 +3846,18 @@ mod tests {
     }
 
     #[test]
-    fn filter_preparation_uses_cached_refusal_without_owner_io() {
+    fn renderer_preparation_uses_cached_refusal_without_owner_io() {
         let mut gate = GateRunner::with_spawner(
-            super::super::render_catalog::QualifiedTreatmentCapabilities {
-                filters: Err(FilterCatalogError::InvalidPrefix {
-                    detail: "observed startup refusal".into(),
-                }),
-                renderer: Ok(super::super::render_catalog::fixture_capabilities()),
-            },
+            Err(RendererCatalogError::InvalidPrefix {
+                detail: "observed startup refusal".into(),
+            }),
             |_, _| panic!("prevalidation cannot create an owner"),
         );
         let before = gate.state.phase();
         let failure = gate.prepare_treatments(&settings()).unwrap_err();
         assert_eq!(
             failure.category,
-            FailureCategory::Validation(ValidationLayer::Filters)
+            FailureCategory::Validation(ValidationLayer::Renderer)
         );
         assert_eq!(failure.stage, Stage::Prevalidation);
         let treatment = failure.treatment.unwrap();
@@ -3522,36 +3865,27 @@ mod tests {
             treatment.disposition,
             crate::domain::failure::TreatmentFailureDisposition::Untouched
         );
-        let crate::domain::failure::TreatmentErrorKind::Filter(filter) = treatment.kind else {
-            panic!("filter catalog failure lost its typed provenance")
-        };
-        assert_eq!(filter.kind, FilterErrorKind::CatalogUnavailable);
-        assert_eq!(
-            filter.diagnostics.key, None,
-            "no invented initial physical owner"
-        );
+        assert!(matches!(
+            treatment.kind,
+            crate::domain::failure::TreatmentErrorKind::Unconfirmed {
+                reason: crate::domain::failure::TreatmentConfirmationFailure::BackendUnavailable,
+            }
+        ));
+        assert_eq!(treatment.key, None, "no invented initial physical owner");
         assert_eq!(gate.state.phase(), before);
         assert!(gate.endpoint.is_none() && gate.key.is_none());
         assert!(!gate.take_native_update().create_native);
     }
     #[test]
-    fn complete_treatment_preparation_keeps_original_ordinals_and_disabled_metadata_without_owner_io()
-     {
+    fn complete_renderer_preparation_keeps_all_nine_properties_without_owner_io() {
         let mut gate = GateRunner::with_spawner(capabilities(), |_, _| {
             panic!("in-memory preparation cannot create an owner")
         });
         let mut requested = settings();
-        requested.filters = native_chain();
+        requested.renderer = fixture_renderer(0.7);
         let treatments = gate.prepare_treatments(&requested).unwrap();
-        let compiled = treatments.filters;
-        assert!(compiled.vf.starts_with("@furami_0:"));
-        assert!(compiled.vf.contains(",@furami_2:"));
-        assert!(!compiled.vf.contains("@furami_1:"));
-        assert!(!compiled.vf.contains("disabled eq"));
-        assert_eq!(compiled.entries.len(), 3);
-        assert_eq!(compiled.entries[1].ordinal, 1);
-        assert_eq!(compiled.entries[1].label, "disabled eq\ninert");
-        assert!(!compiled.entries[1].enabled);
+        assert_eq!(treatments.renderer.requested(), &requested.renderer);
+        assert_eq!(treatments.renderer.native().len(), 9);
         assert!(gate.endpoint.is_none() && gate.key.is_none());
         assert!(!gate.take_native_update().create_native);
     }
@@ -3938,7 +4272,7 @@ mod tests {
         gate.poll();
     }
     #[test]
-    fn terminal_snapshot_retains_typed_filter_cause_instead_of_flattening_it() {
+    fn terminal_snapshot_retains_typed_renderer_cause_instead_of_flattening_it() {
         let (mut gate, drivers) = runner(Config::default());
         open(&mut gate, 1);
         let driver = drivers.recv().unwrap();
@@ -3958,11 +4292,11 @@ mod tests {
             "physical owner failure",
         ));
         let Some(SessionEvent::OpenFailed { failure, .. }) = gate.snapshot(progress) else {
-            panic!("terminal filter failure must revoke opening");
+            panic!("terminal renderer failure must revoke opening");
         };
         assert_eq!(
             failure.treatment.unwrap().kind,
-            crate::domain::failure::TreatmentErrorKind::Filter(filter_failure(open_key))
+            treatment_failure(open_key).kind
         );
         gate.endpoint.as_mut().unwrap().wait_for_ack().unwrap();
         // Verify port-visible outcomes, not the gate's private retained slot.
@@ -3976,12 +4310,7 @@ mod tests {
                 }
                 | SessionEvent::TreatmentFault { key, failure } => {
                     assert_eq!(key, open_key);
-                    assert_eq!(
-                        failure.kind,
-                        crate::domain::failure::TreatmentErrorKind::Filter(filter_failure(
-                            open_key
-                        ))
-                    );
+                    assert_eq!(failure.kind, treatment_failure(open_key).kind);
                     retained_negative = true;
                 }
                 SessionEvent::OpenVerified { .. }
@@ -4010,128 +4339,73 @@ mod tests {
         );
     }
 
-    fn assert_native_confirmations(evidence: &[serde_json::Value]) {
-        for (result_index, result) in evidence
-            .iter()
-            .enumerate()
-            .filter(|(_, event)| event["event"] == "result" && event["result"].get("Ok").is_some())
-        {
-            let confirmation = &result["result"]["Ok"];
+    fn assert_native_renderer_confirmations(evidence: &[serde_json::Value]) {
+        let mut confirmed = 0;
+        for (result_index, result) in evidence.iter().enumerate().filter(|(_, event)| {
+            event["event"] == "treatment_result" && event["result"].get("Ok").is_some()
+        }) {
+            confirmed += 1;
             let key = &result["key"];
-            let command_index = evidence[..result_index]
+            let admission_index = evidence[..result_index]
+                .iter()
+                .rposition(|event| event["event"] == "treatment_admission" && &event["key"] == key)
+                .expect("each result owns one exact admission");
+            let drain_index = evidence[admission_index..result_index]
                 .iter()
                 .rposition(|event| {
-                    event["event"] == "command"
+                    event["event"] == "treatment_drain"
                         && &event["key"] == key
-                        && event["request"] == result["request"]
+                        && event["phase"] == "Verify"
+                        && event["index"] == 10
+                        && event["pending"] == false
                 })
-                .expect("confirmation must retain exact command");
-            let admission_index = evidence[..command_index]
-                .iter()
-                .rposition(|event| {
-                    event["event"] == "admission"
-                        && &event["key"] == key
-                        && event["request"] == result["request"]
-                })
-                .expect("native pass must retain exact keyed admission");
-            assert!(
-                evidence[admission_index + 1..command_index]
-                    .iter()
-                    .any(|event| {
-                        event["event"] == "drain"
-                            && event["stage"] == "pre-submit"
+                .map(|index| admission_index + index)
+                .expect("complete proof follows a real clean native drain");
+            for property in [
+                "scale",
+                "cscale",
+                "dscale",
+                "scale-antiring",
+                "dither",
+                "deband-iterations",
+                "deband-grain",
+                "interpolation",
+                "deband",
+                "pause",
+            ] {
+                assert!(
+                    evidence[admission_index..drain_index].iter().any(|event| {
+                        event["event"] == "renderer_reply"
                             && &event["key"] == key
-                            && event["request"] == result["request"]
+                            && event["kind"] == "Property"
+                            && event["property"] == property
+                            && event["error"] == 0
                     }),
-                "keyed admission must precede clean raw MPV_EVENT_NONE drain, then command submission"
-            );
-            let reply_index = evidence[command_index..result_index]
-                .iter()
-                .position(|event| {
-                    event["event"] == "reply"
-                        && &event["key"] == key
-                        && event["request"] == result["request"]
-                        && event["error"].as_i64().is_some_and(|error| error >= 0)
-                })
-                .map(|index| command_index + index)
-                .expect("matching successful native command reply");
-            let reconfig_index = evidence[command_index..result_index]
-                .iter()
-                .position(|event| event["event"] == "reconfig" && &event["key"] == key)
-                .map(|index| command_index + index)
-                .expect("in-window native reconfiguration");
-            let baseline = confirmation["baseline"]
-                .as_f64()
-                .expect("finite confirmed baseline");
-            let last = confirmation["last_position"]
-                .as_f64()
-                .expect("finite final sample");
-            let mut prior = baseline;
-            let mut advances = 0;
-            let mut saw_baseline = false;
-            let progress_start = reply_index.max(reconfig_index) + 1;
-            let mut final_sample_index = None;
-            for (offset, sample) in evidence[progress_start..result_index]
-                .iter()
-                .enumerate()
-                .filter(|(_, event)| event["event"] == "progress" && &event["key"] == key)
-            {
-                assert!(sample["error"].as_i64().is_some_and(|error| error >= 0));
-                let position = sample["position"].as_f64().expect("numeric native sample");
-                assert!(position.is_finite() && position >= prior);
-                if !saw_baseline {
-                    assert_eq!(position, baseline);
-                    saw_baseline = true;
-                } else if position > prior {
-                    advances += 1;
-                }
-                prior = position;
-                final_sample_index = Some(progress_start + offset);
+                    "genuine property reply required for {property}"
+                );
             }
-            assert!(saw_baseline);
-            assert_eq!(
-                advances, 32,
-                "exact 32 post-baseline strict native advances"
-            );
-            assert_eq!(prior, last);
-            assert_eq!(confirmation["advances"], 32);
-            let final_sample_index =
-                final_sample_index.expect("confirmed final native progress reply");
-            assert!(
-                evidence[final_sample_index + 1..result_index]
-                    .iter()
-                    .any(|event| {
-                        event["event"] == "drain"
-                            && event["stage"] == "post-progress"
-                            && &event["key"] == key
-                            && event["request"] == result["request"]
-                    }),
-                "consumed final sample must precede clean raw MPV_EVENT_NONE drain, then success publication"
-            );
+            assert_eq!(result["result"]["Ok"]["key"], *key);
+            assert_eq!(result["result"]["Ok"]["renderer"]["key"], *key);
         }
+        assert!(
+            confirmed > 0,
+            "native evidence must contain actual renderer confirmations"
+        );
     }
 
-    #[derive(Clone, Copy)]
-    struct NativeTreatmentFault {
-        filters: Option<(crate::media::ffi::FixtureFault, TreatmentPass)>,
-        renderer: Option<crate::media::ffi::RendererFixtureFault>,
-    }
-
-    fn native_filter_runner(
+    fn native_renderer_runner(
         prefix: String,
         fixture: std::path::PathBuf,
         recorder: crate::media::ffi::FixtureRecorder,
-        fault: Option<NativeTreatmentFault>,
-        restore_fault: bool,
+        fault: Option<crate::media::ffi::RendererFixtureFault>,
     ) -> GateRunner {
-        let capabilities = super::super::render_catalog::QualifiedTreatmentCapabilities::query(
+        let capabilities = super::super::render_catalog::query_qualified_capabilities(
             std::path::Path::new(&prefix),
         );
         assert!(
-            capabilities.filters.is_ok() && capabilities.renderer.is_ok(),
-            "genuine qualified treatment capabilities required"
+            capabilities.is_ok(),
+            "genuine qualified renderer capabilities required"
         );
-        let mut empty_opens = 0;
         GateRunner::with_spawner(capabilities, move |generation, config| {
             let input = config
                 .video
@@ -4141,11 +4415,6 @@ mod tests {
                 ))
                 .map_err(|error| MediaError::new("fixture_input", error.to_string()))?;
             let requested = input.requested().clone();
-            if config.filters.entries().is_empty() {
-                empty_opens += 1;
-            }
-            let inject_restore =
-                restore_fault && config.filters.entries().is_empty() && empty_opens > 1;
             let prefix = prefix.clone();
             let fixture = fixture.clone();
             let recorder = recorder.clone();
@@ -4157,79 +4426,18 @@ mod tests {
                     config.gain,
                     config.playback,
                     config.watch,
-                    config.filters,
                     config.treatments,
                     config.treatment_key,
                     Some(recorder),
                 )
                 .expect("validated native fixture backend");
-                let backend = if inject_restore {
-                    backend.with_fault_for_pass(
-                        crate::media::ffi::FixtureFault::RuntimeGraph,
-                        TreatmentPass::Open,
-                    )
-                } else if let Some((fault, pass)) = fault.and_then(|fault| fault.filters) {
-                    backend.with_fault_for_pass(fault, pass)
-                } else {
-                    backend
-                };
-                if let Some(fault) = fault.and_then(|fault| fault.renderer) {
+                if let Some(fault) = fault {
                     backend.with_renderer_fault(fault)
                 } else {
                     backend
                 }
             })
         })
-    }
-
-    fn native_gate_event<T>(
-        gate: &mut GateRunner,
-        label: &str,
-        mut accept: impl FnMut(SessionEvent) -> Option<T>,
-    ) -> T {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            if let Some(event) = gate.poll() {
-                eprintln!("native gate {label}: {event:?}");
-                if let Some(result) = accept(event) {
-                    return result;
-                }
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "native {label} timeout: phase={:?}, failure={:?}",
-                gate.phase(),
-                gate.state.failure()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-    }
-
-    fn native_gate_retire(gate: &mut GateRunner) {
-        let Some(attempt) = gate.attempt() else {
-            return;
-        };
-        gate.stop(attempt, StopReason::Quit);
-        if gate.endpoint.is_some() {
-            native_gate_event(gate, "genuine owner destruction", |event| match event {
-                SessionEvent::OwnerStopped {
-                    attempt: stopped,
-                    outcome,
-                } if stopped == attempt => {
-                    outcome.expect("native fixture owner must retire cleanly");
-                    Some(())
-                }
-                _ => None,
-            });
-        }
-        assert!(gate.endpoint.is_none());
-        assert_eq!(gate.phase(), GatePhase::Releasing);
-        gate.native_released(attempt);
-        native_gate_event(gate, "native release", |event| match event {
-            SessionEvent::NativeReleased { attempt: released } if released == attempt => Some(()),
-            _ => None,
-        });
-        assert!(gate.key.is_none());
     }
 
     fn native_app_wait(
@@ -4269,301 +4477,25 @@ mod tests {
         }
     }
 
-    fn native_chain() -> crate::domain::filters::FilterChain {
-        use crate::domain::filters::*;
-        FilterChain::new(vec![
-            FilterEntry::new(
-                "format reference".into(),
-                Filter::Format(FormatParams::new(
-                    SdrMatrix::Auto,
-                    ColorLevels::Auto,
-                    SdrGamma::Auto,
-                )),
-                true,
-            ),
-            FilterEntry::new(
-                "disabled eq\ninert".into(),
-                Filter::Eq(
-                    EqParams::new(EqValues {
-                        contrast: 1.0,
-                        brightness: 0.0,
-                        saturation: 1.0,
-                        gamma: 1.0,
-                        gamma_r: 1.0,
-                        gamma_g: 1.0,
-                        gamma_b: 1.0,
-                        gamma_weight: 1.0,
-                    })
-                    .unwrap(),
-                ),
-                false,
-            ),
-            FilterEntry::new(
-                "retained hqdn3d".into(),
-                Filter::Hqdn3d(
-                    Hqdn3dParams::new(Hqdn3dValues {
-                        luma_spatial: 0.0,
-                        chroma_spatial: 0.0,
-                        luma_tmp: 0.0,
-                        chroma_tmp: 0.0,
-                    })
-                    .unwrap(),
-                ),
-                true,
-            ),
-        ])
-        .unwrap()
-    }
-
-    fn native_submit_chain(
-        gate: &mut GateRunner,
-        apply: u64,
-        chain: crate::domain::filters::FilterChain,
-    ) -> Result<crate::domain::state::FilterConfirmation, Box<FilterFailure>> {
-        let key = TreatmentAttemptKey {
-            apply: ApplyId::new(apply).unwrap(),
-            attempt: gate.attempt().unwrap(),
-            pass: TreatmentPass::Candidate,
-        };
-        let mut settings = gate.requested.clone().unwrap();
-        settings.filters = chain;
-        let compiled = gate
-            .prepare_treatments(&settings)
-            .expect("native chain must compile");
-        eprintln!(
-            "native submitted chain: {}",
-            serde_json::json!({"key": key, "chain": settings.filters, "vf": compiled.filters.vf})
-        );
-        assert_eq!(
-            gate.submit_treatments(key, compiled),
-            SubmitStatus::Accepted
-        );
-        native_gate_event(gate, "whole chain result", |event| match event {
-            SessionEvent::TreatmentResult {
-                key: observed,
-                result,
-            } if observed == key => Some(
-                result
-                    .map(|confirmation| match confirmation.filters().origin() {
-                        crate::domain::state::FilterEvidence::Confirmed(confirmation) => {
-                            confirmation
-                        }
-                        _ => panic!("LIVE vf native test requires real progress evidence"),
-                    })
-                    .map_err(|failure| match failure.kind {
-                        crate::domain::failure::TreatmentErrorKind::Filter(failure) => {
-                            Box::new(failure)
-                        }
-                        other => panic!("unexpected renderer failure in vf regression: {other:?}"),
-                    }),
-            ),
-            SessionEvent::TreatmentFault {
-                key: observed,
-                failure,
-            } if observed == key => Some(Err(match failure.kind {
-                crate::domain::failure::TreatmentErrorKind::Filter(failure) => Box::new(failure),
-                other => panic!("unexpected non-vf fault: {other:?}"),
-            })),
-            SessionEvent::OpenFailed { failure, .. }
-            | SessionEvent::SessionFailed { failure, .. } => {
-                panic!("unexpected whole-owner failure for chain: {failure:?}")
-            }
-            _ => None,
-        })
-    }
-
     #[test]
-    #[ignore = "requires frozen libmpv and absolute normal/tiny FURAMI filter fixtures"]
-    fn real_libmpv_filter_transactions() {
-        use crate::domain::filters::*;
-        use crate::domain::state::ProductPhase;
-        use crate::media::ffi::{FixtureFault, FixtureMilestone, FixtureRecorder};
+    #[ignore = "requires frozen libmpv and absolute FURAMI_PLAYBACK_FIXTURE"]
+    fn real_libmpv_renderer_paused_open_lifecycle() {
+        use crate::domain::state::{PlaybackState, ProductPhase};
+        use crate::media::ffi::{FixtureMilestone, FixtureRecorder};
         use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("furami=trace")
-            .with_test_writer()
-            .try_init();
-        let prefix = std::env::var("FURAMI_MEDIA_PREFIX")
-            .expect("FURAMI_MEDIA_PREFIX required; no silent native skip");
-        let prefix_path = std::path::Path::new(&prefix);
-        assert!(
-            prefix_path.is_absolute() && prefix_path.is_dir(),
-            "absolute frozen media prefix required"
+        let prefix = std::env::var("FURAMI_MEDIA_PREFIX").expect("real qualified prefix required");
+        let fixture = std::path::PathBuf::from(
+            std::env::var_os("FURAMI_PLAYBACK_FIXTURE").expect("absolute real fixture required"),
         );
-        let fixture = |name| {
-            let path = std::path::PathBuf::from(
-                std::env::var_os(name)
-                    .unwrap_or_else(|| panic!("{name} required; no silent native skip")),
-            );
-            assert!(
-                path.is_absolute() && path.is_file(),
-                "absolute existing {name} fixture required"
-            );
-            path.canonicalize()
-                .expect("native fixture canonicalization")
-        };
-        let normal = fixture("FURAMI_PLAYBACK_FIXTURE");
-        let tiny = fixture("FURAMI_FILTER_FAILURE_FIXTURE");
-        assert_ne!(
-            normal, tiny,
-            "normal and 4x4 failing fixture must be distinct"
-        );
-        let library = prefix_path
-            .join("lib/libmpv.so")
-            .canonicalize()
-            .expect("frozen libmpv artifact required");
-        assert!(
-            library.starts_with(prefix_path.canonicalize().unwrap()),
-            "libmpv must remain inside frozen prefix"
-        );
-        eprintln!(
-            "native contract artifacts: {}",
-            serde_json::json!({
-                "prefix": prefix, "libmpv": library, "normal": normal, "tiny": tiny,
-                "sample_ms": 50, "strict_advances": 32, "pass_deadline_ms": 10000,
-            })
-        );
-
         let recorder = FixtureRecorder::default();
-        let mut gate = native_filter_runner(
-            prefix.clone(),
-            normal.clone(),
-            recorder.clone(),
-            None,
-            false,
-        );
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let mut requested = settings();
-            requested.video.mode.size = FrameSize::new(320, 240).unwrap();
-            requested.video.mode.rate = FrameRate::new(30, 1).unwrap();
-            let prepared = fixture_prepared(requested.clone()).unwrap();
-            let compiled = gate.prepare_treatments(&requested).unwrap();
-            gate.begin_open(
-                key(1),
-                prepared,
-                compiled,
-                PlaybackGain::default(),
-                InitialPlayback::Live,
-                output_fixture_plan(),
-            )
-            .unwrap();
-            assert!(gate.take_native_update().create_native);
-            gate.surface_ready(token(1));
-            let receipt =
-                native_gate_event(&mut gate, "native initial empty confirmation", |event| {
-                    match event {
-                        SessionEvent::OpenVerified { receipt, .. } => Some(receipt),
-                        SessionEvent::OpenFailed { failure, .. } => {
-                            panic!("initial contract contradiction: {failure:?}")
-                        }
-                        _ => None,
-                    }
-                });
-            assert!(receipt.matches(&requested) && receipt.matches_treatments(key(1)));
-            let confirmed = native_submit_chain(&mut gate, 2, FilterChain::default())
-                .expect("unchanged empty graph preserves its real initial witness");
-            assert_eq!(confirmed.advances(), 32);
-            let chain = native_chain();
-            native_submit_chain(&mut gate, 3, chain.clone())
-                .expect("three entry/middle-disabled contract");
-            let mut replacement = chain.clone();
-            replacement
-                .replace(
-                    0,
-                    FilterEntry::new(
-                        "format reference".into(),
-                        Filter::Format(FormatParams::new(
-                            SdrMatrix::Bt709,
-                            ColorLevels::Limited,
-                            SdrGamma::Bt1886,
-                        )),
-                        true,
-                    ),
-                )
-                .unwrap();
-            native_submit_chain(&mut gate, 4, replacement.clone())
-                .expect("retained-entry replacement must independently confirm");
-            replacement.move_entry(2, 0).unwrap();
-            native_submit_chain(&mut gate, 5, replacement.clone())
-                .expect("retained-entry reorder must independently confirm");
-            native_submit_chain(&mut gate, 6, replacement.clone())
-                .expect("identical compiled graph preserves the real vf origin");
-            replacement.set_enabled(0, false).unwrap();
-            replacement.set_enabled(1, false).unwrap();
-            native_submit_chain(&mut gate, 7, replacement)
-                .expect("all-disabled chain clears via same command");
-            native_submit_chain(&mut gate, 8, FilterChain::default())
-                .expect("final empty chain clear");
-            let loaded = std::fs::read_to_string("/proc/self/maps").expect("loaded library paths");
-            for line in loaded.lines().filter(|line| {
-                line.contains("libmpv")
-                    || line.contains("libavfilter")
-                    || line.contains("libplacebo")
-            }) {
-                eprintln!("native loaded artifact: {line}");
-            }
-        }));
-        native_gate_retire(&mut gate);
-        let evidence = recorder.native_snapshot().unwrap();
-        eprintln!(
-            "native normal raw evidence: {}",
-            serde_json::to_string(&evidence).unwrap()
-        );
-        if let Err(payload) = result {
-            resume_unwind(payload)
-        }
-        assert_native_confirmations(&evidence);
-        let commands: Vec<_> = evidence
-            .iter()
-            .filter(|event| event["event"] == "command")
-            .collect();
-        assert_eq!(
-            commands.len(),
-            5,
-            "initial Open plus four compiled graph changes; renderer/no-op requests never resend vf"
-        );
-        for command in &commands {
-            assert_eq!(command["argv"][0], "vf");
-            assert_eq!(command["argv"][1], "set");
-            assert_eq!(command["argv"].as_array().unwrap().len(), 3);
-        }
-        let three = commands
-            .iter()
-            .find(|event| event["key"]["apply"] == 3)
-            .unwrap()["argv"][2]
-            .as_str()
-            .unwrap();
-        assert!(three.starts_with("@furami_0:") && three.contains(",@furami_2:"));
-        assert!(!three.contains("@furami_1:") && !three.contains("disabled eq"));
-        for apply in [1, 7] {
-            assert_eq!(
-                commands
-                    .iter()
-                    .find(|event| event["key"]["apply"] == apply)
-                    .unwrap()["argv"][2],
-                ""
-            );
-        }
-        for apply in [2, 6, 8] {
-            assert!(
-                !commands.iter().any(|event| event["key"]["apply"] == apply),
-                "equal compiled graphs must preserve origin without vf writes"
-            );
-        }
-        // Complete treatments persist through real pause, preparation-only
-        // paused reconnect, and fresh LIVE resume/restart owners.
-        let recorder = FixtureRecorder::default();
-        let gate = native_filter_runner(
-            prefix.clone(),
-            normal.clone(),
-            recorder.clone(),
-            None,
-            false,
-        );
+        let gate = native_renderer_runner(prefix, fixture, recorder.clone(), None);
         let mut prior = settings();
         prior.video.mode.size = FrameSize::new(320, 240).unwrap();
         prior.video.mode.rate = FrameRate::new(30, 1).unwrap();
-        prior.filters = native_chain();
+        prior.renderer = serde_json::from_str(include_str!(
+            "../../tests/fixtures/FUR-016/reference-renderer.json"
+        ))
+        .unwrap();
         let mut app = FixtureApp::new(
             prior.clone(),
             PlaybackGain::default(),
@@ -4575,31 +4507,21 @@ mod tests {
             let admission = app
                 .apply(app.model().state_identity(), app.model().draft().revision)
                 .unwrap();
-            native_app_wait(&mut app, "complete startup LIVE filter proof", |app| {
+            native_app_wait(&mut app, "complete startup renderer proof", |app| {
                 app.model().active().is_some()
             });
             let first = app.model().active().unwrap().attempt();
             assert!(
-                matches!(app.take_verified_applied(), Some(crate::app::apply::VerifiedApplied::Open { key, applied })
-                if key.apply == admission.id() && applied.settings() == &prior)
+                matches!(app.take_verified_applied(), Some(crate::app::apply::VerifiedApplied::Open { key, applied }) if key.apply == admission.id() && applied.settings() == &prior)
             );
             assert_eq!(app.pause(first).unwrap(), SubmitStatus::Accepted);
             native_app_wait(&mut app, "actual pause readback", |app| {
-                app.model().active().is_some_and(|active| {
-                    active.playback() == crate::domain::state::PlaybackState::Paused
-                })
+                app.model()
+                    .active()
+                    .is_some_and(|active| active.playback() == PlaybackState::Paused)
             });
-            let before_pause_close = recorder.native_snapshot().unwrap();
-            assert_eq!(
-                before_pause_close
-                    .iter()
-                    .filter(|event| event["event"] == "command")
-                    .count(),
-                1,
-                "ordinary pause must issue no vf command"
-            );
             let mut newer = prior.clone();
-            newer.filters = FilterChain::default();
+            newer.renderer = crate::domain::render::RendererSettings::default();
             app.edit_draft(app.model().draft().revision, newer.clone())
                 .unwrap();
             app.close(app.model().state_identity()).unwrap();
@@ -4611,49 +4533,40 @@ mod tests {
                 app.reconnect(app.model().state_identity()).unwrap(),
                 crate::domain::state::ReconnectAdmission::Started(_)
             ));
-            native_app_wait(&mut app, "complete paused reconnect preparation", |app| {
+            native_app_wait(&mut app, "complete paused renderer preparation", |app| {
                 app.model().active().is_some()
             });
             let prepared = app.model().active().unwrap();
-            assert_eq!(
-                prepared.playback(),
-                crate::domain::state::PlaybackState::Paused
-            );
+            assert_eq!(prepared.playback(), PlaybackState::Paused);
             assert_eq!(prepared.applied().settings(), &prior);
             let paused_owner = prepared.attempt();
             assert_ne!(paused_owner, first);
+            let confirmation = app.model().confirmed_treatments().unwrap();
+            assert_eq!(confirmation.playback(), InitialPlayback::Paused);
+            assert_eq!(confirmation.renderer().settings(), &prior.renderer);
             assert!(
                 app.take_verified_applied().is_none(),
-                "PreparedPaused never authorizes save"
+                "PausedPrepared never authorizes save"
             );
-            let after_preparation = recorder.native_snapshot().unwrap();
+            let before_resume = recorder.native_snapshot().unwrap();
             assert_eq!(
-                after_preparation
+                before_resume
                     .iter()
-                    .filter(|event| event["event"] == "command")
+                    .filter(|event| event["event"] == "pause_submit")
                     .count(),
                 1,
-                "paused preparation must not temporarily unpause or submit vf set"
+                "paused Open never temporarily unpauses"
             );
-            let option = after_preparation
-                .iter()
-                .find(|event| event["event"] == "paused_filter_option")
-                .expect("real checked vf option before paused load");
-            let compiled = app.runner_mut().prepare_treatments(&prior).unwrap();
-            assert_eq!(option["vf"], compiled.filters.vf);
             app.resume(app.model().state_identity(), paused_owner)
                 .unwrap();
             native_app_wait(&mut app, "fresh complete LIVE resume proof", |app| {
-                app.model().active().is_some_and(|active| {
-                    active.playback() == crate::domain::state::PlaybackState::Live
-                })
+                app.model()
+                    .active()
+                    .is_some_and(|active| active.playback() == PlaybackState::Live)
             });
             assert_eq!(app.model().active().unwrap().applied().settings(), &prior);
             assert_ne!(app.model().active().unwrap().attempt(), paused_owner);
-            assert!(
-                app.take_verified_applied().is_none(),
-                "Resume has no user-save event"
-            );
+            assert!(app.take_verified_applied().is_none());
             let resumed = app.model().active().unwrap().attempt();
             app.restart(app.model().state_identity()).unwrap();
             native_app_wait(&mut app, "fresh complete LIVE restart proof", |app| {
@@ -4663,10 +4576,7 @@ mod tests {
             });
             assert_eq!(app.model().active().unwrap().applied().settings(), &prior);
             assert!(app.model().draft().settings.same_request(&newer));
-            assert!(
-                app.take_verified_applied().is_none(),
-                "Restart has no user-save event"
-            );
+            assert!(app.take_verified_applied().is_none());
         }));
         app.quit();
         native_app_wait(
@@ -4674,29 +4584,6 @@ mod tests {
             "complete lifecycle actual owner retirement",
             |app| app.model().shutdown_ready(),
         );
-        let lifecycle_evidence = recorder.native_snapshot().unwrap();
-        eprintln!(
-            "native complete lifecycle evidence: {}",
-            serde_json::to_string(&lifecycle_evidence).unwrap()
-        );
-        if let Err(payload) = result {
-            resume_unwind(payload)
-        }
-        assert_native_confirmations(&lifecycle_evidence);
-        let commands: Vec<_> = lifecycle_evidence
-            .iter()
-            .filter(|event| event["event"] == "command")
-            .collect();
-        assert_eq!(
-            commands.len(),
-            3,
-            "startup/resume/restart each independently confirm, paused owner preparation is not proof"
-        );
-        for command in commands {
-            assert!(command["argv"][2].as_str().unwrap().contains("@furami_0:"));
-            assert!(command["argv"][2].as_str().unwrap().contains("@furami_2:"));
-            assert!(!command["argv"][2].as_str().unwrap().contains("@furami_1:"));
-        }
         let milestones = recorder.snapshot().unwrap();
         assert_eq!(
             milestones
@@ -4712,400 +4599,10 @@ mod tests {
                 .count(),
             4
         );
-
-        for fault in [
-            FixtureFault::CommandSubmission(-12),
-            FixtureFault::CreationRejected,
-        ] {
-            let recorder = FixtureRecorder::default();
-            let mut gate = native_filter_runner(
-                prefix.clone(),
-                normal.clone(),
-                recorder.clone(),
-                Some(NativeTreatmentFault {
-                    filters: Some((fault, TreatmentPass::Candidate)),
-                    renderer: None,
-                }),
-                false,
-            );
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let mut requested = settings();
-                requested.video.mode.size = FrameSize::new(320, 240).unwrap();
-                requested.video.mode.rate = FrameRate::new(30, 1).unwrap();
-                let compiled = gate.prepare_treatments(&requested).unwrap();
-                gate.begin_open(
-                    key(1),
-                    fixture_prepared(requested).unwrap(),
-                    compiled,
-                    PlaybackGain::default(),
-                    InitialPlayback::Live,
-                    output_fixture_plan(),
-                )
-                .unwrap();
-                gate.take_native_update();
-                gate.surface_ready(token(1));
-                native_gate_event(&mut gate, "healthy fault incumbent", |event| match event {
-                    SessionEvent::OpenVerified { .. } => Some(()),
-                    SessionEvent::OpenFailed { failure, .. } => {
-                        panic!("incumbent must open: {failure:?}")
-                    }
-                    _ => None,
-                });
-                let failure = native_submit_chain(&mut gate, 2, native_chain()).unwrap_err();
-                assert!(matches!(
-                    (&fault, &failure.kind),
-                    (
-                        FixtureFault::CommandSubmission(-12),
-                        FilterErrorKind::CommandSubmission { mpv_error: -12 }
-                    ) | (
-                        FixtureFault::CreationRejected,
-                        FilterErrorKind::CommandRejected { .. }
-                    )
-                ));
-                assert!(
-                    !failure.requires_fresh_owner,
-                    "clean native rejection must preserve incumbent: {failure:?}"
-                );
-                assert_eq!(gate.phase(), GatePhase::Ready);
-                assert!(gate.endpoint.is_some());
-                native_submit_chain(&mut gate, 3, FilterChain::default())
-                    .expect("same healthy owner must independently confirm after rejection");
-                assert_eq!(
-                    recorder
-                        .snapshot()
-                        .unwrap()
-                        .iter()
-                        .filter(|event| matches!(event, FixtureMilestone::Created { .. }))
-                        .count(),
-                    1
-                );
-            }));
-            native_gate_retire(&mut gate);
-            let evidence = recorder.native_snapshot().unwrap();
-            eprintln!(
-                "native synchronous fault evidence: {}",
-                serde_json::to_string(&evidence).unwrap()
-            );
-            if let Err(payload) = result {
-                resume_unwind(payload)
-            }
-            assert_native_confirmations(&evidence);
-        }
-
-        let recorder = FixtureRecorder::default();
-        let mut gate =
-            native_filter_runner(prefix.clone(), tiny.clone(), recorder.clone(), None, false);
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let mut requested = settings();
-            requested.video.mode.size = FrameSize::new(4, 4).unwrap();
-            requested.video.mode.rate = FrameRate::new(30, 1).unwrap();
-            let compiled = gate.prepare_treatments(&requested).unwrap();
-            gate.begin_open(
-                key(1),
-                fixture_prepared(requested).unwrap(),
-                compiled,
-                PlaybackGain::default(),
-                InitialPlayback::Live,
-                output_fixture_plan(),
-            )
-            .unwrap();
-            gate.take_native_update();
-            gate.surface_ready(token(1));
-            native_gate_event(
-                &mut gate,
-                "tiny healthy owner before poisoning",
-                |event| match event {
-                    SessionEvent::OpenVerified { .. } => Some(()),
-                    SessionEvent::OpenFailed { failure, .. } => {
-                        panic!("tiny empty owner must open: {failure:?}")
-                    }
-                    _ => None,
-                },
-            );
-            let failed = FilterChain::new(vec![FilterEntry::new(
-                "retained failed bwdif".into(),
-                Filter::Bwdif(BwdifParams::new(
-                    BwdifMode::SendFrame,
-                    FieldParity::Auto,
-                    DeinterlaceSelection::All,
-                )),
-                true,
-            )])
-            .unwrap();
-            let failure = native_submit_chain(&mut gate, 2, failed.clone()).unwrap_err();
-            assert_eq!(failure.kind, FilterErrorKind::RuntimeGraph);
-            assert!(failure.requires_fresh_owner);
-            let installed_commands = recorder
-                .native_snapshot()
-                .unwrap()
-                .iter()
-                .filter(|event| event["event"] == "command")
-                .count();
-            let mut retained_entries = failed.entries().to_vec();
-            retained_entries.push(FilterEntry::new(
-                "new format retaining failed entry".into(),
-                Filter::Format(FormatParams::new(
-                    SdrMatrix::Auto,
-                    ColorLevels::Auto,
-                    SdrGamma::Auto,
-                )),
-                true,
-            ));
-            for (apply, chain) in [
-                (3, failed),
-                (4, FilterChain::new(retained_entries).unwrap()),
-                (5, FilterChain::default()),
-            ] {
-                let denied = native_submit_chain(&mut gate, apply, chain).unwrap_err();
-                assert_eq!(
-                    denied.kind,
-                    FilterErrorKind::Unconfirmed {
-                        reason:
-                            crate::domain::failure::FilterConfirmationFailure::BackendUnavailable,
-                    },
-                    "identical, retained-entry and empty replay must never confirm on poisoned owner"
-                );
-                assert!(denied.requires_fresh_owner);
-                assert_eq!(
-                    denied.diagnostics.key.unwrap().attempt,
-                    gate.attempt().unwrap()
-                );
-            }
-            assert_eq!(
-                recorder
-                    .native_snapshot()
-                    .unwrap()
-                    .iter()
-                    .filter(|event| event["event"] == "command")
-                    .count(),
-                installed_commands,
-                "poison denies all later native vf writes rather than attempting a reset"
-            );
-            assert_eq!(
-                recorder
-                    .snapshot()
-                    .unwrap()
-                    .iter()
-                    .filter(|event| matches!(event, FixtureMilestone::Created { .. }))
-                    .count(),
-                1
-            );
-        }));
-        native_gate_retire(&mut gate);
-        let evidence = recorder.native_snapshot().unwrap();
-        eprintln!(
-            "native poisoned-owner replay evidence: {}",
-            serde_json::to_string(&evidence).unwrap()
-        );
+        assert_native_renderer_confirmations(&recorder.native_snapshot().unwrap());
         if let Err(payload) = result {
-            resume_unwind(payload)
+            resume_unwind(payload);
         }
-        assert_native_confirmations(&evidence);
-
-        for restore_fault in [false, true] {
-            let recorder = FixtureRecorder::default();
-            let gate = native_filter_runner(
-                prefix.clone(),
-                tiny.clone(),
-                recorder.clone(),
-                None,
-                restore_fault,
-            );
-            let mut prior = settings();
-            prior.video.mode.size = FrameSize::new(4, 4).unwrap();
-            prior.video.mode.rate = FrameRate::new(30, 1).unwrap();
-            let mut app = FixtureApp::new(
-                prior.clone(),
-                PlaybackGain::default(),
-                FixtureValidator::default(),
-                gate,
-            );
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                app.apply(app.model().state_identity(), app.model().draft().revision)
-                    .unwrap();
-                native_app_wait(&mut app, "tiny empty initial verified owner", |app| {
-                    app.model().active().is_some()
-                });
-                let first = app.model().active().unwrap().attempt();
-                app.take_verified_applied()
-                    .expect("full initial LIVE receipt");
-                let mut candidate = prior.clone();
-                candidate.filters = FilterChain::new(vec![FilterEntry::new(
-                    "tiny bwdif\ninert user label".into(),
-                    Filter::Bwdif(BwdifParams::new(
-                        BwdifMode::SendFrame,
-                        FieldParity::Auto,
-                        DeinterlaceSelection::All,
-                    )),
-                    true,
-                )])
-                .unwrap();
-                let revision = app
-                    .edit_draft(app.model().draft().revision, candidate.clone())
-                    .unwrap();
-                let crate::domain::state::ApplyAdmission::Treatments {
-                    key: admitted,
-                    revision: admitted_revision,
-                } = app.apply(app.model().state_identity(), revision).unwrap()
-                else {
-                    panic!("same-source bwdif must use the actual live coordinator path")
-                };
-                assert_eq!(admitted_revision, revision);
-                assert_eq!(admitted.attempt, first);
-                assert_eq!(admitted.pass, TreatmentPass::Candidate);
-                assert_eq!(app.model().phase(), ProductPhase::ApplyingTreatments);
-                assert_eq!(
-                    app.validator_mut().requests.len(),
-                    1,
-                    "live candidate performs no capture validation/open"
-                );
-                let mut newer = candidate.clone();
-                newer.filters.set_enabled(0, false).unwrap();
-                app.edit_draft(revision, newer.clone()).unwrap();
-                native_app_wait(
-                    &mut app,
-                    "delayed tiny graph failure and one fresh restoration",
-                    |app| {
-                        matches!(
-                            app.model().phase(),
-                            ProductPhase::ErrorWithActiveRestored
-                                | ProductPhase::ErrorWithoutActive
-                        ) && matches!(
-                            app.model().cleanup(),
-                            crate::domain::state::CleanupStatus::Complete
-                        )
-                    },
-                );
-                let failures = app
-                    .model()
-                    .failures()
-                    .expect("candidate failure retained")
-                    .clone();
-                let filter = failures
-                    .candidate
-                    .as_ref()
-                    .and_then(|failure| failure.treatment.as_ref())
-                    .and_then(|treatment| match &treatment.kind {
-                        crate::domain::failure::TreatmentErrorKind::Filter(filter) => Some(filter),
-                        _ => None,
-                    })
-                    .expect("tiny candidate must retain typed filter cause");
-                assert_eq!(
-                    filter.kind,
-                    FilterErrorKind::RuntimeGraph,
-                    "successful command followed by asynchronous graph failure is required"
-                );
-                assert!(filter.requires_fresh_owner);
-                assert_eq!(filter.diagnostics.key, Some(admitted));
-                let evidence = recorder.native_snapshot().unwrap();
-                let key = serde_json::to_value(filter.diagnostics.key.unwrap()).unwrap();
-                let reply = evidence
-                    .iter()
-                    .position(|event| {
-                        event["event"] == "reply"
-                            && event["key"] == key
-                            && event["error"].as_i64().is_some_and(|error| error >= 0)
-                    })
-                    .expect("tiny domain-valid vf set must genuinely reply success");
-                assert!(
-                    evidence[reply + 1..].iter().any(|event| {
-                        event["event"] == "log"
-                            && event["key"] == key
-                            && event["text"].as_str().is_some_and(|text| {
-                                text.contains("Disabling filter")
-                                    || text.contains("failed to configure the filter graph")
-                                    || text.contains("could not initialize filter pads")
-                            })
-                    }),
-                    "measured delayed graph/disable evidence must follow successful reply"
-                );
-                assert!(
-                    filter.attributed_ordinal.is_none_or(|ordinal| ordinal == 0),
-                    "only proven enabled internal label may attribute"
-                );
-                assert_eq!(
-                    app.model().draft().settings,
-                    newer,
-                    "newer edited draft must survive failed frozen candidate"
-                );
-                assert_eq!(
-                    failures.candidate.as_ref().unwrap().requested.as_ref(),
-                    &candidate
-                );
-                assert_eq!(app.model().last_valid().unwrap().settings(), &prior);
-                assert!(
-                    app.take_verified_applied().is_none(),
-                    "a restoration cannot mint a user applied receipt"
-                );
-                assert!(!app.has_user_apply_result_or_pending(admitted.apply));
-                if restore_fault {
-                    assert_eq!(app.model().phase(), ProductPhase::ErrorWithoutActive);
-                    assert!(app.model().active().is_none());
-                    assert!(
-                        failures
-                            .restore
-                            .as_ref()
-                            .and_then(|failure| failure.treatment.as_ref())
-                            .is_some()
-                    );
-                } else {
-                    assert_eq!(app.model().phase(), ProductPhase::ErrorWithActiveRestored);
-                    let restored = app.model().active().unwrap();
-                    assert_ne!(
-                        restored.attempt(),
-                        first,
-                        "empty restoration must use fresh actual owner"
-                    );
-                    assert_eq!(restored.applied().settings(), &prior);
-                }
-                assert_eq!(
-                    app.validator_mut().requests.len(),
-                    2,
-                    "initial and exactly one fresh Restore"
-                );
-                assert_eq!(
-                    recorder
-                        .snapshot()
-                        .unwrap()
-                        .iter()
-                        .filter(|event| matches!(event, FixtureMilestone::Created { .. }))
-                        .count(),
-                    2
-                );
-                eprintln!(
-                    "native tiny application outcome: state={:?}, failures={:?}",
-                    app.model().state_identity(),
-                    app.model().failures()
-                );
-            }));
-            app.quit();
-            native_app_wait(&mut app, "native tiny Quit retirement", |app| {
-                app.model().shutdown_ready()
-            });
-            let milestones = recorder.snapshot().unwrap();
-            assert_eq!(
-                milestones
-                    .iter()
-                    .filter(|event| matches!(event, FixtureMilestone::Created { .. }))
-                    .count(),
-                milestones
-                    .iter()
-                    .filter(|event| matches!(event, FixtureMilestone::Destroyed { .. }))
-                    .count()
-            );
-            let evidence = recorder.native_snapshot().unwrap();
-            eprintln!(
-                "native tiny raw evidence restore_fault={restore_fault}: {}",
-                serde_json::to_string(&evidence).unwrap()
-            );
-            if let Err(payload) = result {
-                resume_unwind(payload)
-            }
-            assert_native_confirmations(&evidence);
-        }
-        eprintln!(
-            "native contract qualifies finite null-output owner/gate/app evidence only, not physical display, arbitrary future frames, audio or Qt surface lifecycle"
-        );
     }
 
     fn native_renderer_app(
@@ -5113,15 +4610,9 @@ mod tests {
         fixture: &std::path::Path,
         size: FrameSize,
         recorder: &crate::media::ffi::FixtureRecorder,
-        fault: Option<NativeTreatmentFault>,
+        fault: Option<crate::media::ffi::RendererFixtureFault>,
     ) -> FixtureApp {
-        let gate = native_filter_runner(
-            prefix.into(),
-            fixture.into(),
-            recorder.clone(),
-            fault,
-            false,
-        );
+        let gate = native_renderer_runner(prefix.into(), fixture.into(), recorder.clone(), fault);
         let mut requested = settings();
         requested.video.mode.size = size;
         requested.video.mode.rate = FrameRate::new(30, 1).unwrap();
@@ -5158,10 +4649,7 @@ mod tests {
         });
         let confirmation = app.model().confirmed_treatments().unwrap();
         assert_eq!(confirmation.renderer().settings(), &renderer);
-        assert!(matches!(
-            confirmation.filters(),
-            crate::domain::state::FilterTreatmentProof::Preserved { .. }
-        ));
+        assert_eq!(confirmation.renderer().key(), key);
         key
     }
 
@@ -5175,11 +4663,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires frozen libmpv and absolute normal/tiny FURAMI filter fixtures"]
+    #[ignore = "requires frozen libmpv and absolute FURAMI_PLAYBACK_FIXTURE"]
     fn real_libmpv_renderer_transactions() {
         use crate::domain::{
             failure::{RendererErrorKind, TreatmentErrorKind},
-            filters::*,
             render::{DitherMode, RendererProperty, RendererSettings, ScalerChoice, ScalerKernel},
             state::{PlaybackState, ProductPhase},
         };
@@ -5194,8 +4681,6 @@ mod tests {
             path.canonicalize().unwrap()
         };
         let normal = fixture("FURAMI_PLAYBACK_FIXTURE");
-        let tiny = fixture("FURAMI_FILTER_FAILURE_FIXTURE");
-        assert_ne!(normal, tiny);
         let reference: RendererSettings = serde_json::from_str(include_str!(
             "../../tests/fixtures/FUR-016/reference-renderer.json"
         ))
@@ -5227,7 +4712,6 @@ mod tests {
         );
         let result = catch_unwind(AssertUnwindSafe(|| {
             let incumbent = app.model().active().unwrap().attempt();
-            let graph_origin = app.model().confirmed_filter_origin().unwrap();
             let requested_capture = app.model().last_valid().unwrap().settings().video.clone();
             let mut requested = reference.clone();
             native_renderer_apply(&mut app, requested.clone());
@@ -5280,7 +4764,6 @@ mod tests {
                 app.model().active().unwrap().playback(),
                 PlaybackState::Paused
             );
-            assert_eq!(app.model().confirmed_filter_origin(), Some(graph_origin));
             assert_eq!(
                 app.model().last_valid().unwrap().settings().video,
                 requested_capture
@@ -5288,7 +4771,7 @@ mod tests {
             assert_eq!(app.validator_mut().requests.len(), 1);
             assert_eq!(created(&recorder), 1);
             assert_eq!(destroyed(&recorder), 0);
-            for event in ["loadfile", "command", "pause_submit"] {
+            for event in ["loadfile", "pause_submit"] {
                 assert_eq!(
                     before
                         .iter()
@@ -5298,7 +4781,7 @@ mod tests {
                         .iter()
                         .filter(|record| record["event"] == event)
                         .count(),
-                    "paused renderer-only must not load/open, reinstall vf, or change pause"
+                    "paused renderer-only must not load/open or change pause"
                 );
             }
             let reads: std::collections::BTreeSet<_> = after
@@ -5351,12 +4834,9 @@ mod tests {
 
         for restore_fails in [false, true] {
             let recorder = FixtureRecorder::default();
-            let fault = NativeTreatmentFault {
-                filters: None,
-                renderer: Some(RendererFixtureFault {
-                    candidate: RendererProperty::Cscale,
-                    restore: restore_fails.then_some(RendererProperty::Scale),
-                }),
+            let fault = RendererFixtureFault {
+                candidate: RendererProperty::Cscale,
+                restore: restore_fails.then_some(RendererProperty::Scale),
             };
             let mut app = native_renderer_app(
                 &prefix,
@@ -5446,14 +4926,7 @@ mod tests {
                         .count(),
                     1
                 );
-                assert_eq!(
-                    events
-                        .iter()
-                        .filter(|event| event["event"] == "command")
-                        .count(),
-                    1,
-                    "renderer rejection must not reinstall untouched vf"
-                );
+                assert_native_renderer_confirmations(&events);
                 eprintln!(
                     "real renderer restore failure={restore_fails}: {}",
                     serde_json::to_string(&events).unwrap()
@@ -5466,82 +4939,6 @@ mod tests {
             }
         }
 
-        let recorder = FixtureRecorder::default();
-        let mut app = native_renderer_app(
-            &prefix,
-            &tiny,
-            FrameSize::new(4, 4).unwrap(),
-            &recorder,
-            None,
-        );
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let prior = app.model().last_valid().unwrap().clone();
-            let original = app.model().active().unwrap().attempt();
-            let mut candidate = app.model().draft().settings.clone();
-            candidate.renderer = reference.clone();
-            candidate.filters = FilterChain::new(vec![FilterEntry::new(
-                "real delayed bwdif graph failure after renderer writes".into(),
-                Filter::Bwdif(BwdifParams::new(
-                    BwdifMode::SendFrame,
-                    FieldParity::Auto,
-                    DeinterlaceSelection::All,
-                )),
-                true,
-            )])
-            .unwrap();
-            let revision = app
-                .edit_draft(app.model().draft().revision, candidate.clone())
-                .unwrap();
-            app.apply(app.model().state_identity(), revision).unwrap();
-            native_app_wait(
-                &mut app,
-                "real combined vf failure restores renderer and graph",
-                |app| {
-                    app.model().phase() == ProductPhase::ErrorWithActiveRestored
-                        && app.model().cleanup() == &crate::domain::state::CleanupStatus::Complete
-                },
-            );
-            let failure = app
-                .model()
-                .failures()
-                .unwrap()
-                .candidate
-                .as_ref()
-                .unwrap()
-                .treatment
-                .as_ref()
-                .unwrap();
-            assert!(
-                matches!(&failure.kind, TreatmentErrorKind::Filter(filter) if filter.kind == FilterErrorKind::RuntimeGraph)
-            );
-            assert_ne!(app.model().active().unwrap().attempt(), original);
-            assert_eq!(app.model().last_valid(), Some(&prior));
-            assert!(app.model().draft().settings.same_request(&candidate));
-            assert_eq!(
-                app.model()
-                    .confirmed_treatments()
-                    .unwrap()
-                    .renderer()
-                    .settings(),
-                &prior.settings().renderer
-            );
-            assert_eq!(created(&recorder), 2);
-            assert_eq!(destroyed(&recorder), 1);
-            let events = recorder.native_snapshot().unwrap();
-            assert!(events.iter().any(
-                |event| event["event"] == "renderer_set" && event["key"]["pass"] == "Candidate"
-            ));
-            assert_native_confirmations(&events);
-            eprintln!(
-                "real combined renderer/vf restoration: {}",
-                serde_json::to_string(&events).unwrap()
-            );
-        }));
-        native_renderer_close(&mut app);
-        assert_eq!(created(&recorder), destroyed(&recorder));
-        if let Err(payload) = result {
-            resume_unwind(payload);
-        }
         eprintln!(
             "native renderer gate proves real libmpv properties/transactions only; null output is not gpu-next pixels, HDMI SDR visual certification, audio, interpolation effectiveness, or Qt surface lifecycle"
         );

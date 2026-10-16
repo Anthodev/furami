@@ -12,10 +12,6 @@ use crate::domain::capture::{
     AudioSelection, AudioSourceIdentity, CaptureModeRequest, CapturedFourCc, DeviceIdentity,
     FrameRate, FrameSize, InputFormatPolicy, PlaybackGain, UsbTopology, VideoRequest,
 };
-use crate::domain::filters::{
-    ColorLevels, EqParams, EqValues, Filter, FilterChain, FilterEntry, FormatParams, Hqdn3dParams,
-    Hqdn3dValues, SdrGamma, SdrMatrix,
-};
 use crate::domain::output::{PersistentOutputChoice, SinkIdentity};
 use crate::domain::render::{
     DebandValues, DitherMode, RendererSettings, RendererValues, ScalerChoice, ScalerKernel,
@@ -109,7 +105,6 @@ fn source_identity() -> AudioSourceIdentity {
 
 fn draft_settings() -> DraftSettings {
     DraftSettings {
-        filters: crate::domain::filters::FilterChain::default(),
         video: video_request(0x3231_564E, 1920, 1080, 60000, 1001),
         audio: AudioSelection::Enabled {
             source: source_identity(),
@@ -124,6 +119,7 @@ fn preferences() -> LocalPreferences {
         fullscreen: true,
         output: PersistentOutputChoice::Auto,
         stats_hidden: false,
+        logging_enabled: false,
     }
 }
 
@@ -191,7 +187,7 @@ fn applied_settings(settings: DraftSettings) -> AppliedSettings {
 }
 
 /// Open aggregate keyed to the physical opening: the media owner returns it
-/// only after nine native renderer readbacks plus its vf proof.
+/// only after nine native renderer readbacks and matching playback.
 fn open_verified(model: &mut ProductModel, key: crate::domain::state::AttemptKey) {
     use crate::domain::state::{TreatmentAttemptKey, TreatmentPass};
     let request = model.opening_request().expect("opening request for proof");
@@ -261,7 +257,7 @@ fn valid_document_loads_completely() {
     fs::write(&path, canonical_document()).unwrap();
 
     let (store, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("expected loaded document, got {outcome:?}");
     };
     assert!(!store.is_refused());
@@ -279,7 +275,7 @@ fn required_nullable_fields_distinguish_null_from_missing() {
     // applied: null is explicit and valid.
     fs::write(&path, document_with_applied("null")).unwrap();
     let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("applied:null must load, got {outcome:?}");
     };
     assert!(document.profiles.entries().is_empty());
@@ -293,7 +289,7 @@ fn required_nullable_fields_distinguish_null_from_missing() {
     )
     .unwrap();
     let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("serial:null must load, got {outcome:?}");
     };
     assert_eq!(
@@ -327,7 +323,7 @@ fn required_nullable_fields_distinguish_null_from_missing() {
     );
     fs::write(&path, document_with_applied(&disabled_null)).unwrap();
     let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("retained:null must load, got {outcome:?}");
     };
     assert_eq!(
@@ -695,7 +691,7 @@ fn value_violations_are_refused_without_touching_the_file() {
 #[test]
 fn unsupported_schema_versions_are_refused_before_decoding() {
     let directory = temp_dir("versions");
-    for version in ["0", "3", "999", "18446744073709551615"] {
+    for version in ["0", "4", "999", "18446744073709551615"] {
         let json =
             format!(r#"{{"schema_version":{version},"applied":null,"preferences":{PREFS}}}"#);
         let (store, outcome) = refused_schema(&directory, version, &json);
@@ -746,7 +742,7 @@ fn applied_and_preferences_round_trip_exactly() {
     fs::write(&path, canonical_document()).unwrap();
 
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("expected loaded document");
     };
     assert_eq!(last_settings(&document), Some(&draft_settings()));
@@ -758,7 +754,11 @@ fn applied_and_preferences_round_trip_exactly() {
     assert!(matches!(outcome.durability(), Durability::Confirmed));
 
     let (reloaded, reload_outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(reloaded_document) = reload_outcome else {
+    let LoadOutcome::Loaded {
+        document: reloaded_document,
+        ..
+    } = reload_outcome
+    else {
         panic!("expected reloaded document");
     };
     assert_eq!(last_settings(&reloaded_document), Some(&draft_settings()));
@@ -778,7 +778,6 @@ fn stored_fps_is_exact_integer_rational() {
     // Write a 120/2 request: it must land normalized as 60/1, never as a
     // float, and 60000/1001 must survive untouched.
     let draft = DraftSettings {
-        filters: crate::domain::filters::FilterChain::default(),
         video: VideoRequest {
             identity: DeviceIdentity::new(
                 0x1234,
@@ -821,7 +820,7 @@ fn stored_fps_is_exact_integer_rational() {
     );
 
     let (store, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("expected loaded document");
     };
     let stored = last_settings(&document).unwrap();
@@ -839,7 +838,7 @@ fn preferences_only_save_preserves_published_applied() {
     fs::write(&path, canonical_document()).unwrap();
 
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("expected loaded document");
     };
     let applied_before = last_settings(&document).cloned();
@@ -849,6 +848,7 @@ fn preferences_only_save_preserves_published_applied() {
         fullscreen: false,
         output: PersistentOutputChoice::Auto,
         stats_hidden: false,
+        logging_enabled: false,
     };
     persist_globals(&mut store, new_preferences.clone()).unwrap();
 
@@ -859,7 +859,7 @@ fn preferences_only_save_preserves_published_applied() {
     assert_eq!(store.snapshot().unwrap().preferences, new_preferences);
 
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("expected reloaded document");
     };
     assert_eq!(last_settings(&document).cloned(), applied_before);
@@ -901,7 +901,7 @@ fn legacy_video_document_migrates_without_changing_the_manual_pin() {
     fs::write(&path, &original).unwrap();
 
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("expected loaded document");
     };
     let applied = last_settings(&document).unwrap();
@@ -921,7 +921,10 @@ fn legacy_video_document_migrates_without_changing_the_manual_pin() {
     )
     .unwrap();
     let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(migrated) = outcome else {
+    let LoadOutcome::Loaded {
+        document: migrated, ..
+    } = outcome
+    else {
         panic!("migrated profile must load")
     };
     assert_eq!(last_settings(&migrated), last_settings(&document));
@@ -973,7 +976,7 @@ fn auto_video_policy_round_trips_with_marker_and_historical_concrete() {
     );
 
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("auto document must reload");
     };
     let stored = last_settings(&document).unwrap();
@@ -1034,7 +1037,7 @@ fn auto_policy_with_non_concrete_fourcc_is_refused_at_decode_and_blocks_saves() 
     fs::write(&path, &valid).unwrap();
     let (_, outcome) = SettingsStore::load(path.clone());
     assert!(
-        matches!(outcome, LoadOutcome::Loaded(_)),
+        matches!(outcome, LoadOutcome::Loaded { .. }),
         "admissible auto document must load: {outcome:?}"
     );
 
@@ -1196,7 +1199,7 @@ fn manual_bgr3_video_encoding_is_preserved() {
     );
 
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("manual BGR3 document must reload");
     };
     let stored = last_settings(&document).unwrap();
@@ -1233,7 +1236,10 @@ fn stats_visibility_defaults_and_persists_without_changing_applied() {
     let path = settings_path(&directory);
     fs::write(&path, canonical_document()).unwrap();
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(original) = outcome else {
+    let LoadOutcome::Loaded {
+        document: original, ..
+    } = outcome
+    else {
         panic!("legacy document must load");
     };
     assert!(!original.preferences.stats_hidden);
@@ -1241,7 +1247,10 @@ fn stats_visibility_defaults_and_persists_without_changing_applied() {
     hidden.stats_hidden = true;
     persist_globals(&mut store, hidden.clone()).unwrap();
     let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(reloaded) = outcome else {
+    let LoadOutcome::Loaded {
+        document: reloaded, ..
+    } = outcome
+    else {
         panic!("hidden preference must reload");
     };
     assert_eq!(reloaded.profiles, original.profiles);
@@ -1256,7 +1265,10 @@ fn stats_visibility_defaults_and_persists_without_changing_applied() {
     assert!(store.snapshot().unwrap().preferences.stats_hidden);
     store.reset(hidden.clone()).unwrap();
     let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(reset) = outcome else {
+    let LoadOutcome::Loaded {
+        document: reset, ..
+    } = outcome
+    else {
         panic!("reset preference must reload");
     };
     assert!(reset.profiles.entries().is_empty());
@@ -1285,6 +1297,144 @@ fn invalid_stats_visibility_preserves_original_and_refuses_automatic_saves() {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostic logging opt-in preference
+// ---------------------------------------------------------------------------
+
+#[test]
+fn logging_preference_absent_from_every_supported_version_starts_off() {
+    for version in [1, 2, 3] {
+        let directory = temp_dir("logging-absent");
+        let path = settings_path(&directory);
+        let document = if version == 1 {
+            canonical_document()
+        } else {
+            v2_document("[]", "null").replacen(
+                r#""schema_version":2"#,
+                &format!(r#""schema_version":{version}"#),
+                1,
+            )
+        };
+        fs::write(&path, document).unwrap();
+        let (_, outcome) = SettingsStore::load(path);
+        let LoadOutcome::Loaded { document, .. } = outcome else {
+            panic!("v{version} document must load")
+        };
+        assert!(!document.preferences.logging_enabled);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn logging_opt_in_is_written_only_as_explicit_true_and_false_is_omitted() {
+    let directory = temp_dir("logging-roundtrip");
+    let path = settings_path(&directory);
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    assert!(matches!(outcome, LoadOutcome::Missing));
+
+    let mut opted_in = preferences();
+    opted_in.logging_enabled = true;
+    persist_globals(&mut store, opted_in.clone()).unwrap();
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .contains(r#""logging_enabled":true"#)
+    );
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded {
+        document: reloaded, ..
+    } = outcome
+    else {
+        panic!("opt-in preference must reload");
+    };
+    assert_eq!(reloaded.preferences, opted_in);
+
+    opted_in.logging_enabled = false;
+    persist_globals(&mut store, opted_in.clone()).unwrap();
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(document["preferences"].get("logging_enabled").is_none());
+    let (_, outcome) = SettingsStore::load(path);
+    let LoadOutcome::Loaded { document: off, .. } = outcome else {
+        panic!("off preference must reload");
+    };
+    assert_eq!(off.preferences, opted_in);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn logging_opt_in_survives_reset_and_leaves_profiles_and_other_globals_unchanged() {
+    let directory = temp_dir("logging-reset");
+    let path = settings_path(&directory);
+    fs::write(&path, canonical_document()).unwrap();
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded {
+        document: original, ..
+    } = outcome
+    else {
+        panic!("legacy document must load");
+    };
+    let mut opted_in = original.preferences.clone();
+    opted_in.logging_enabled = true;
+    persist_verified(
+        &mut store,
+        &applied_settings(draft_settings()),
+        opted_in.clone(),
+    )
+    .unwrap();
+    assert!(store.snapshot().unwrap().preferences.logging_enabled);
+    store.reset(opted_in.clone()).unwrap();
+    let (_, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded {
+        document: reset, ..
+    } = outcome
+    else {
+        panic!("reset preference must reload");
+    };
+    assert!(reset.profiles.entries().is_empty());
+    assert!(reset.last_source.is_none());
+    assert_eq!(reset.preferences, opted_in);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn invalid_logging_preference_is_refused_without_best_effort_extraction() {
+    let directory = temp_dir("logging-refusals");
+    for value in [
+        "null",
+        "\"true\"",
+        "1",
+        "{}",
+        "true,\"logging_enabled\":false",
+    ] {
+        let document = format!(
+            r#"{{"schema_version":1,"applied":null,"preferences":{{"volume_percent":73,"muted":false,"fullscreen":true,"logging_enabled":{value}}}}}"#
+        );
+        let (mut store, outcome) = refused_schema(&directory, value, &document);
+        assert!(matches!(outcome, LoadOutcome::Refused(_)));
+        assert!(persist_globals(&mut store, preferences()).is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), document.as_bytes());
+    }
+    // A refused document carrying the true opt-in beside an unrelated invalid
+    // field stays refused: the flag is never extracted best-effort.
+    let poisoned = r#"{"schema_version":1,"applied":null,"preferences":{"volume_percent":73,"muted":false,"fullscreen":true,"logging_enabled":true,"output":null}}"#;
+    let (store, outcome) = refused_schema(&directory, "refused-true-flag", poisoned);
+    assert!(matches!(outcome, LoadOutcome::Refused(_)));
+    assert!(store.snapshot().is_none());
+    // An explicit false is a valid document and still means off.
+    let explicit_false = r#"{"schema_version":1,"applied":null,"preferences":{"volume_percent":73,"muted":false,"fullscreen":true,"logging_enabled":false}}"#;
+    let path = settings_path(&directory);
+    fs::write(&path, explicit_false).unwrap();
+    let (mut store, outcome) = SettingsStore::load(path.clone());
+    let LoadOutcome::Loaded { document, .. } = outcome else {
+        panic!("explicit false must load");
+    };
+    assert!(!document.preferences.logging_enabled);
+    persist_globals(&mut store, document.preferences).unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(wire["preferences"].get("logging_enabled").is_none());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // Output choice preference
 // ---------------------------------------------------------------------------
 
@@ -1302,6 +1452,7 @@ fn manual_output_preferences() -> LocalPreferences {
         fullscreen: true,
         output: PersistentOutputChoice::Manual(manual_sink_identity()),
         stats_hidden: false,
+        logging_enabled: false,
     }
 }
 
@@ -1336,7 +1487,7 @@ fn manual_output_choice_round_trips_exactly() {
     );
 
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("manual output document must reload");
     };
     assert_eq!(document.preferences, manual);
@@ -1362,7 +1513,7 @@ fn auto_output_choice_omits_the_output_key_and_defaults_from_missing() {
     let legacy = format!(r#"{{"schema_version":1,"applied":null,"preferences":{PREFS}}}"#);
     fs::write(&path, legacy.as_bytes()).unwrap();
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("legacy v1 document must reload");
     };
     assert_eq!(document.preferences.output, PersistentOutputChoice::Auto);
@@ -1464,7 +1615,10 @@ fn manual_output_preference_save_preserves_applied_and_unrelated_preferences() {
     let path = settings_path(&directory);
     fs::write(&path, canonical_document().as_bytes()).unwrap();
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(previous) = outcome else {
+    let LoadOutcome::Loaded {
+        document: previous, ..
+    } = outcome
+    else {
         panic!("expected valid original");
     };
     let applied_before = last_settings(&previous).cloned();
@@ -1481,7 +1635,7 @@ fn manual_output_preference_save_preserves_applied_and_unrelated_preferences() {
     assert_eq!(store.snapshot().unwrap().preferences, switched);
 
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("manual output document must reload");
     };
     assert_eq!(last_settings(&document).cloned(), applied_before);
@@ -1535,7 +1689,10 @@ fn invalid_in_memory_preferences_preserve_file_and_published_snapshot() {
     let original = canonical_document();
     fs::write(&path, original.as_bytes()).unwrap();
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(previous) = outcome else {
+    let LoadOutcome::Loaded {
+        document: previous, ..
+    } = outcome
+    else {
         panic!("expected valid original");
     };
     let applied = applied_settings(draft_settings());
@@ -1547,6 +1704,7 @@ fn invalid_in_memory_preferences_preserve_file_and_published_snapshot() {
         fullscreen: false,
         output: PersistentOutputChoice::Auto,
         stats_hidden: false,
+        logging_enabled: false,
     };
     for operation in ["applied", "preferences", "reset"] {
         let result = match operation {
@@ -1570,7 +1728,7 @@ fn invalid_in_memory_preferences_preserve_file_and_published_snapshot() {
 fn failed_reset_preserves_refusal_original_and_blocks_automatic_saves() {
     let directory = temp_dir("failed-reset");
     let path = settings_path(&directory);
-    let original = br#"{"schema_version":3,"future":"preserve this original"}"#;
+    let original = br#"{"schema_version":4,"future":"preserve this original"}"#;
     fs::write(&path, original).unwrap();
     let mut store = SettingsStore::with_injected_fault(path.clone(), WriteFaultPoint::PartialWrite);
     assert!(store.is_refused());
@@ -1583,6 +1741,7 @@ fn failed_reset_preserves_refusal_original_and_blocks_automatic_saves() {
         fullscreen: false,
         output: PersistentOutputChoice::Auto,
         stats_hidden: false,
+        logging_enabled: false,
     };
     assert!(matches!(
         store.reset(invalid),
@@ -1603,7 +1762,7 @@ fn failed_reset_preserves_refusal_original_and_blocks_automatic_saves() {
     let (_, outcome) = SettingsStore::load(path.clone());
     assert!(matches!(
         outcome,
-        LoadOutcome::Refused(SettingsLoadError::UnsupportedVersion { version: 3, .. })
+        LoadOutcome::Refused(SettingsLoadError::UnsupportedVersion { version: 4, .. })
     ));
     let applied = applied_settings(draft_settings());
     assert!(matches!(
@@ -1650,6 +1809,7 @@ fn precommit_faults_leave_original_file_intact_and_loadable() {
             fullscreen: false,
             output: PersistentOutputChoice::Auto,
             stats_hidden: false,
+            logging_enabled: false,
         };
         let result = persist_verified(&mut store, &applied, attempted_preferences.clone());
         let expected_error = match point {
@@ -1673,7 +1833,10 @@ fn precommit_faults_leave_original_file_intact_and_loadable() {
         );
         assert_no_temp_files(&directory);
         let (_, reloaded) = SettingsStore::load(path.clone());
-        let LoadOutcome::Loaded(reloaded) = reloaded else {
+        let LoadOutcome::Loaded {
+            document: reloaded, ..
+        } = reloaded
+        else {
             panic!("{point:?}: original must stay loadable immediately after failure");
         };
         assert_eq!(*reloaded, previous, "{point:?}");
@@ -1682,7 +1845,7 @@ fn precommit_faults_leave_original_file_intact_and_loadable() {
         let outcome = persist_globals(&mut store, attempted_preferences.clone()).unwrap();
         assert!(outcome.is_confirmed(), "{point:?}");
         let (_, outcome) = SettingsStore::load(path);
-        let LoadOutcome::Loaded(document) = outcome else {
+        let LoadOutcome::Loaded { document, .. } = outcome else {
             panic!("{point:?}: next preference write must load");
         };
         assert_eq!(document.profiles, previous.profiles, "{point:?}");
@@ -1709,6 +1872,7 @@ fn partial_write_never_leaves_half_content_in_place() {
         fullscreen: false,
         output: PersistentOutputChoice::Auto,
         stats_hidden: false,
+        logging_enabled: false,
     };
     assert!(matches!(
         persist_verified(&mut store, &applied, attempted_preferences),
@@ -1718,7 +1882,7 @@ fn partial_write_never_leaves_half_content_in_place() {
     assert_eq!(fs::read(&path).unwrap(), complete);
     assert_eq!(store.snapshot(), Some(&previous));
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("partial write must leave the original immediately loadable");
     };
     assert_eq!(*document, previous);
@@ -1747,7 +1911,7 @@ fn explicit_reset_clears_refusal_and_writes_null_applied() {
     assert_eq!(store.snapshot().unwrap().preferences, preferences());
 
     let (mut reloaded, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("reset must produce a loadable file");
     };
     assert!(document.profiles.entries().is_empty());
@@ -1760,10 +1924,11 @@ fn explicit_reset_clears_refusal_and_writes_null_applied() {
         fullscreen: false,
         output: PersistentOutputChoice::Auto,
         stats_hidden: false,
+        logging_enabled: false,
     };
     persist_globals(&mut reloaded, later.clone()).unwrap();
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("expected loaded document after later save");
     };
     assert!(document.profiles.entries().is_empty());
@@ -1778,7 +1943,7 @@ fn reset_refuses_nothing_about_the_previous_content_and_is_explicit_only() {
     let path = settings_path(&directory);
     fs::write(&path, canonical_document()).unwrap();
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(_) = outcome else {
+    let LoadOutcome::Loaded { .. } = outcome else {
         panic!("expected loaded document");
     };
 
@@ -1815,7 +1980,7 @@ fn parent_sync_uncertainty_is_committed_but_unconfirmed() {
 
         // The file is complete and loadable, and the store published it.
         let (reloaded, outcome) = SettingsStore::load(path);
-        let LoadOutcome::Loaded(document) = outcome else {
+        let LoadOutcome::Loaded { document, .. } = outcome else {
             panic!("{point:?}: committed file must load");
         };
         assert_eq!(last_settings(&document), Some(&draft_settings()));
@@ -1852,7 +2017,7 @@ fn temporary_files_are_never_loaded_as_settings() {
 
     let (store, outcome) = SettingsStore::load(path);
     assert!(
-        matches!(outcome, LoadOutcome::Loaded(_)),
+        matches!(outcome, LoadOutcome::Loaded { .. }),
         "stray temp file must not affect loading: {outcome:?}"
     );
     assert!(!store.is_refused());
@@ -1860,492 +2025,246 @@ fn temporary_files_are_never_loaded_as_settings() {
 }
 
 // ---------------------------------------------------------------------------
-// Applied filter chains (FUR-015)
+// Retired settings migration: legacy reads are lazy, current writes are strict
 // ---------------------------------------------------------------------------
 
-const THREE_FILTER_ENTRIES: &str = concat!(
-    r#"{"entries":["#,
-    r#"{"label":"Levels","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"bt709","levels":"limited","gamma":"bt1886"}}},"#,
-    r#"{"label":"Contrast","enabled":false,"filter":{"kind":"eq","parameters":{"contrast":1.5,"brightness":0.1,"saturation":1.2,"gamma":1.1,"gamma_r":1.0,"gamma_g":1.0,"gamma_b":1.0,"gamma_weight":0.5}}},"#,
-    r#"{"label":"Denoise","enabled":true,"filter":{"kind":"hqdn3d","parameters":{"luma_spatial":4.0,"chroma_spatial":3.0,"luma_tmp":6.0,"chroma_tmp":4.5}}}"#,
-    r#"]}"#,
-);
+/// Historical wire payload, intentionally not represented by a domain model.
+const RETIRED_FILTERS: &str = r#"{"entries":[{"label":"Levels","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"bt709","levels":"limited","gamma":"bt1886"}}}]}"#;
 
-/// Inject a `filters` member into the object-form `APPLIED` fixture.
 fn applied_with_filters(filters_json: &str) -> String {
-    let inner = APPLIED
-        .strip_suffix('}')
-        .expect("APPLIED fixture is an object");
+    let inner = APPLIED.strip_suffix('}').unwrap();
     format!(r#"{inner},"filters":{filters_json}}}"#)
 }
 
-fn three_entry_chain() -> FilterChain {
-    FilterChain::new(vec![
-        FilterEntry::new(
-            "Levels".to_owned(),
-            Filter::Format(FormatParams::new(
-                SdrMatrix::Bt709,
-                ColorLevels::Limited,
-                SdrGamma::Bt1886,
-            )),
-            true,
-        ),
-        FilterEntry::new(
-            "Contrast".to_owned(),
-            Filter::Eq(
-                EqParams::new(EqValues {
-                    contrast: 1.5,
-                    brightness: 0.1,
-                    saturation: 1.2,
-                    gamma: 1.1,
-                    gamma_r: 1.0,
-                    gamma_g: 1.0,
-                    gamma_b: 1.0,
-                    gamma_weight: 0.5,
-                })
-                .unwrap(),
-            ),
-            false,
-        ),
-        FilterEntry::new(
-            "Denoise".to_owned(),
-            Filter::Hqdn3d(
-                Hqdn3dParams::new(Hqdn3dValues {
-                    luma_spatial: 4.0,
-                    chroma_spatial: 3.0,
-                    luma_tmp: 6.0,
-                    chroma_tmp: 4.5,
-                })
-                .unwrap(),
-            ),
-            true,
-        ),
-    ])
-    .unwrap()
-}
+#[test]
+fn legacy_retired_values_are_ignored_lazily_and_v3_preserves_every_remaining_field() {
+    let directory = temp_dir("retired-settings-migration");
+    let path = settings_path(&directory);
+    let (a, b) = two_profile_settings();
+    let globals = LocalPreferences {
+        gain: PlaybackGain::new(0, true).unwrap(),
+        fullscreen: true,
+        output: PersistentOutputChoice::Manual(manual_sink_identity()),
+        stats_hidden: true,
+        logging_enabled: true,
+    };
+    for version in [1, 2] {
+        let entries = if version == 1 {
+            vec![SourceProfile::new(ProfileBinding::Serial, a.clone()).unwrap()]
+        } else {
+            vec![
+                SourceProfile::new(ProfileBinding::Serial, a.clone()).unwrap(),
+                SourceProfile::new(ProfileBinding::Topology, b.clone()).unwrap(),
+            ]
+        };
+        let expected = StoredDocument {
+            profiles: SourceProfiles::new(entries).unwrap(),
+            last_source: Some(if version == 1 {
+                a.video.identity.clone()
+            } else {
+                b.video.identity.clone()
+            }),
+            preferences: globals.clone(),
+        };
+        let current = crate::settings::schema::encode(&expected).unwrap();
+        for retired in [
+            None,
+            Some(RETIRED_FILTERS),
+            Some("null"),
+            Some("false"),
+            Some("42"),
+            Some(r#""arbitrary legacy text""#),
+            Some("[]"),
+            Some(r#"{"entries":"invalid","future":{"duplicate":1,"duplicate":2}}"#),
+        ] {
+            let mut wire: serde_json::Value = serde_json::from_slice(&current).unwrap();
+            wire["schema_version"] = version.into();
+            if version == 1 {
+                let applied = wire["profiles"][0]["settings"].take();
+                let object = wire.as_object_mut().unwrap();
+                object.remove("profiles");
+                object.remove("last_source");
+                object.insert("applied".into(), applied);
+            }
+            // Insert raw JSON to preserve duplicate fields inside the retired
+            // value: IgnoredAny must skip it without validating the old model.
+            let mut legacy = serde_json::to_string(&wire).unwrap();
+            if let Some(retired) = retired {
+                let settings = if version == 1 {
+                    &wire["applied"]
+                } else {
+                    &wire["profiles"][1]["settings"]
+                };
+                let settings = serde_json::to_string(settings).unwrap();
+                let with_retired = format!(
+                    "{},\"filters\":{retired}}}",
+                    settings.strip_suffix('}').unwrap()
+                );
+                legacy = legacy.replacen(&settings, &with_retired, 1);
+            }
+            fs::write(&path, &legacy).unwrap();
+            let (mut store, outcome) = SettingsStore::load(path.clone());
+            let LoadOutcome::Loaded {
+                document,
+                retired_filters_present,
+            } = outcome
+            else {
+                panic!("v{version} {retired:?} must load: {outcome:?}")
+            };
+            assert_eq!(retired_filters_present, retired.is_some());
+            assert_eq!(*document, expected);
+            assert_eq!(store.snapshot(), Some(&expected));
+            assert_eq!(fs::read(&path).unwrap(), legacy.as_bytes());
+            assert_no_temp_files(&directory);
 
-fn draft_with_filters(filters: FilterChain) -> DraftSettings {
-    DraftSettings {
-        filters,
-        ..draft_settings()
+            store
+                .save_profiles(
+                    &document.profiles,
+                    document.last_source.as_ref(),
+                    document.preferences.clone(),
+                )
+                .unwrap();
+            let written = fs::read(&path).unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&written).unwrap();
+            assert_eq!(wire["schema_version"], 3);
+            for profile in wire["profiles"].as_array().unwrap() {
+                assert!(profile["settings"].get("filters").is_none());
+            }
+            let (_, outcome) = SettingsStore::load(path.clone());
+            let LoadOutcome::Loaded {
+                document,
+                retired_filters_present,
+            } = outcome
+            else {
+                panic!("v3 migration must reload")
+            };
+            assert!(!retired_filters_present);
+            assert_eq!(*document, expected);
+            // An old strict build cannot accept the new discriminator, and
+            // reverting the executable cannot recover discarded filter bytes.
+            assert_ne!(wire["schema_version"], version);
+        }
     }
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
-fn pre_filter_v1_document_migrates_preserving_empty_chain() {
-    let directory = temp_dir("filters-parity");
+fn retired_key_duplicates_current_keys_and_malformed_json_refuse_without_partial_recovery() {
+    let directory = temp_dir("retired-key-refusal");
     let path = settings_path(&directory);
-    let original = canonical_document();
-    fs::write(&path, &original).unwrap();
-
-    let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
-        panic!("pre-filter v1 document must load, got {outcome:?}");
-    };
-    let loaded = last_settings(&document).expect("applied present");
-    assert!(loaded.filters.entries().is_empty());
-    assert_eq!(loaded, &draft_settings());
-    assert_eq!(fs::read_to_string(&path).unwrap(), original);
-
-    persist_verified(
-        &mut store,
-        &applied_settings(draft_settings()),
-        preferences(),
-    )
-    .unwrap();
-
-    let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(migrated) = outcome else {
-        panic!("migrated profile must load")
-    };
-    assert_eq!(last_settings(&migrated), last_settings(&document));
-    fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
-fn full_filter_chain_round_trips_exactly_through_the_store() {
-    let directory = temp_dir("filters-roundtrip");
-    let path = settings_path(&directory);
-    fs::write(
-        &path,
-        document_with_applied(&applied_with_filters(THREE_FILTER_ENTRIES)),
-    )
-    .unwrap();
-
-    let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
-        panic!("three-entry chain must load, got {outcome:?}");
-    };
-    assert_eq!(
-        last_settings(&document).unwrap().filters,
-        three_entry_chain()
-    );
-
-    let applied = applied_settings(draft_with_filters(three_entry_chain()));
-    persist_verified(&mut store, &applied, preferences()).unwrap();
-
-    let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(reloaded) = outcome else {
-        panic!("re-encoded document must load");
-    };
-    let entries = last_settings(&reloaded).unwrap().filters.entries();
-    assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].label(), "Levels");
-    assert!(entries[0].enabled());
-    assert_eq!(entries[1].label(), "Contrast");
-    assert!(!entries[1].enabled());
-    assert_eq!(entries[2].label(), "Denoise");
-    assert!(entries[2].enabled());
-    assert_eq!(
-        last_settings(&reloaded).unwrap().filters,
-        three_entry_chain()
-    );
-    assert!(
-        fs::read_to_string(&path)
-            .unwrap()
-            .contains(r#""filters":{"entries":["#),
-        "the nonempty chain must be written"
-    );
-    fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
-fn inert_labels_unicode_whitespace_controls_and_nul_survive_the_store() {
-    let directory = temp_dir("filters-inert-labels");
-    let path = settings_path(&directory);
-    // NBSP as raw UTF-8, plus a JSON \n and a JSON \u0000: all are inert domain
-    // text and must never be treated as a control surface.
-    let filters = concat!(
-        r#"{"entries":["#,
-        r#"{"label":"\u00a0NBSP","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}},"#,
-        r#"{"label":"line\nbreak","enabled":true,"filter":{"kind":"eq","parameters":{"contrast":1.0,"brightness":0.0,"saturation":1.0,"gamma":1.0,"gamma_r":1.0,"gamma_g":1.0,"gamma_b":1.0,"gamma_weight":1.0}}},"#,
-        r#"{"label":"nul\u0000byte","enabled":false,"filter":{"kind":"hqdn3d","parameters":{"luma_spatial":1.0,"chroma_spatial":1.0,"luma_tmp":1.0,"chroma_tmp":1.0}}}"#,
-        r#"]}"#,
-    );
-    let expected = FilterChain::new(vec![
-        FilterEntry::new(
-            "\u{a0}NBSP".to_owned(),
-            Filter::Format(FormatParams::new(
-                SdrMatrix::Auto,
-                ColorLevels::Auto,
-                SdrGamma::Auto,
-            )),
-            true,
-        ),
-        FilterEntry::new(
-            "line\nbreak".to_owned(),
-            Filter::Eq(
-                EqParams::new(EqValues {
-                    contrast: 1.0,
-                    brightness: 0.0,
-                    saturation: 1.0,
-                    gamma: 1.0,
-                    gamma_r: 1.0,
-                    gamma_g: 1.0,
-                    gamma_b: 1.0,
-                    gamma_weight: 1.0,
-                })
-                .unwrap(),
-            ),
-            true,
-        ),
-        FilterEntry::new(
-            "nul\0byte".to_owned(),
-            Filter::Hqdn3d(
-                Hqdn3dParams::new(Hqdn3dValues {
-                    luma_spatial: 1.0,
-                    chroma_spatial: 1.0,
-                    luma_tmp: 1.0,
-                    chroma_tmp: 1.0,
-                })
-                .unwrap(),
-            ),
-            false,
-        ),
-    ])
-    .unwrap();
-
-    fs::write(&path, document_with_applied(&applied_with_filters(filters))).unwrap();
-    let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
-        panic!("inert labels must load, got {outcome:?}");
-    };
-    assert_eq!(last_settings(&document).unwrap().filters, expected);
-
-    let applied = applied_settings(draft_with_filters(expected.clone()));
-    persist_verified(&mut store, &applied, preferences()).unwrap();
-    let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(reloaded) = outcome else {
-        panic!("re-encoded inert labels must load");
-    };
-    assert_eq!(last_settings(&reloaded).unwrap().filters, expected);
-
-    // The bytes on disk prove real JSON escaping rather than a stored echo.
-    let written = fs::read_to_string(&path).unwrap();
-    assert!(
-        written.contains("line\\nbreak"),
-        "newline must be escaped: {written}"
-    );
-    assert!(
-        written.contains("nul\\u0000byte"),
-        "NUL must be escaped: {written}"
-    );
-    assert!(
-        written.contains('\u{a0}'),
-        "NBSP must survive as raw UTF-8: {written}"
-    );
-    fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
-fn all_disabled_nonempty_chain_is_serialized_and_reloaded_exactly() {
-    let directory = temp_dir("filters-all-disabled");
-    let path = settings_path(&directory);
-    let filters = concat!(
-        r#"{"entries":["#,
-        r#"{"label":"a","enabled":false,"filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}},"#,
-        r#"{"label":"b","enabled":false,"filter":{"kind":"hqdn3d","parameters":{"luma_spatial":0.0,"chroma_spatial":0.0,"luma_tmp":0.0,"chroma_tmp":0.0}}}"#,
-        r#"]}"#,
-    );
-    let expected = FilterChain::new(vec![
-        FilterEntry::new(
-            "a".to_owned(),
-            Filter::Format(FormatParams::new(
-                SdrMatrix::Auto,
-                ColorLevels::Auto,
-                SdrGamma::Auto,
-            )),
-            false,
-        ),
-        FilterEntry::new(
-            "b".to_owned(),
-            Filter::Hqdn3d(
-                Hqdn3dParams::new(Hqdn3dValues {
-                    luma_spatial: 0.0,
-                    chroma_spatial: 0.0,
-                    luma_tmp: 0.0,
-                    chroma_tmp: 0.0,
-                })
-                .unwrap(),
-            ),
-            false,
-        ),
-    ])
-    .unwrap();
-
-    fs::write(&path, document_with_applied(&applied_with_filters(filters))).unwrap();
-    let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
-        panic!("all-disabled chain must load, got {outcome:?}");
-    };
-    assert_eq!(last_settings(&document).unwrap().filters, expected);
-
-    let applied = applied_settings(draft_with_filters(expected.clone()));
-    persist_verified(&mut store, &applied, preferences()).unwrap();
-    assert!(
-        fs::read_to_string(&path)
-            .unwrap()
-            .contains(r#""filters":{"entries":["#),
-        "a nonempty all-disabled chain must still be written"
-    );
-    let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(reloaded) = outcome else {
-        panic!("all-disabled chain must reload");
-    };
-    assert_eq!(last_settings(&reloaded).unwrap().filters, expected);
-    fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
-fn malformed_filter_json_refuses_the_complete_original_and_blocks_saves_until_reset() {
-    let valid_entry = r#"{"label":"a","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}}"#;
-    let duplicate_filters_key = {
-        let inner = APPLIED
-            .strip_suffix('}')
-            .expect("APPLIED fixture is an object");
-        let chain = r#"{"entries":[]}"#;
-        let applied = format!(r#"{inner},"filters":{chain},"filters":{chain}}}"#);
-        format!(r#"{{"schema_version":1,"applied":{applied},"preferences":{PREFS}}}"#)
-    };
-    let cases: Vec<(&str, String)> = vec![
-        (
-            "filters null",
-            document_with_applied(&applied_with_filters("null")),
-        ),
-        (
-            "filters array",
-            document_with_applied(&applied_with_filters("[]")),
-        ),
-        (
-            "filters string",
-            document_with_applied(&applied_with_filters("\"entries\"")),
-        ),
-        (
-            "filters unknown field",
-            document_with_applied(&applied_with_filters(r#"{"entries":[],"command":"vf"}"#)),
-        ),
-        (
-            "filters missing entries",
-            document_with_applied(&applied_with_filters("{}")),
-        ),
-        (
-            "entry positional array",
-            document_with_applied(&applied_with_filters(&format!(
-                r#"{{"entries":[[{valid_entry}]]}}"#
-            ))),
-        ),
-        (
-            "duplicate label",
-            document_with_applied(&applied_with_filters(&format!(
-                r#"{{"entries":[{valid_entry},{valid_entry}]}}"#
-            ))),
-        ),
-        (
-            "duplicate entry field",
-            document_with_applied(&applied_with_filters(
-                r#"{"entries":[{"label":"a","label":"b","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}}]}"#,
-            )),
-        ),
-        (
-            "unknown entry field",
-            document_with_applied(&applied_with_filters(
-                r#"{"entries":[{"label":"a","enabled":true,"extra":1,"filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}}]}"#,
-            )),
-        ),
-        (
-            "missing enabled",
-            document_with_applied(&applied_with_filters(
-                r#"{"entries":[{"label":"a","filter":{"kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}}]}"#,
-            )),
-        ),
-        (
-            "unknown filter kind",
-            document_with_applied(&applied_with_filters(
-                r#"{"entries":[{"label":"a","enabled":true,"filter":{"kind":"sharpen","parameters":{}}}]}"#,
-            )),
-        ),
-        (
-            "duplicate parameter key",
-            document_with_applied(&applied_with_filters(
-                r#"{"entries":[{"label":"a","enabled":true,"filter":{"kind":"format","parameters":{"matrix":"auto","matrix":"auto","levels":"auto","gamma":"auto"}}}]}"#,
-            )),
-        ),
-        (
-            "duplicate parameter key parameters-first",
-            document_with_applied(&applied_with_filters(
-                r#"{"entries":[{"label":"a","enabled":true,"filter":{"parameters":{"matrix":"auto","matrix":"auto","levels":"auto","gamma":"auto"},"kind":"format"}}]}"#,
-            )),
-        ),
-        (
-            "duplicate kind tag",
-            document_with_applied(&applied_with_filters(
-                r#"{"entries":[{"label":"a","enabled":true,"filter":{"kind":"format","kind":"format","parameters":{"matrix":"auto","levels":"auto","gamma":"auto"}}}]}"#,
-            )),
-        ),
-        (
-            "invalid params even disabled",
-            document_with_applied(&applied_with_filters(
-                r#"{"entries":[{"label":"a","enabled":false,"filter":{"kind":"eq","parameters":{"contrast":5000.0,"brightness":0.0,"saturation":1.0,"gamma":1.0,"gamma_r":1.0,"gamma_g":1.0,"gamma_b":1.0,"gamma_weight":1.0}}}]}"#,
-            )),
-        ),
-        ("duplicate filters key", duplicate_filters_key),
-    ];
-
-    let directory = temp_dir("filters-violations");
-    let path = settings_path(&directory);
-    let applied = applied_settings(draft_with_filters(three_entry_chain()));
-    for (label, json) in cases {
-        fs::write(&path, &json).unwrap();
-        let original = fs::read(&path).unwrap();
-
-        let (mut store, outcome) = SettingsStore::load(path.clone());
-        assert!(
-            matches!(
+    let inner = APPLIED.strip_suffix('}').unwrap();
+    for version in [1, 2, 3] {
+        let mut cases = vec![
+            format!(r#"{inner},"filters":null,"filters":false}}"#),
+            format!(r#"{inner},"filters":null,"future":true}}"#),
+            format!(r#"{inner},"filters":null,"renderer":null}}"#),
+            format!(r#"{inner},"filters":null,"audio":null}}"#),
+        ];
+        if version == 3 {
+            for retired in ["null", RETIRED_FILTERS, "42", "[]"] {
+                cases.push(applied_with_filters(retired));
+            }
+        }
+        for settings in cases {
+            let json = if version == 1 {
+                document_with_applied(&settings)
+            } else {
+                v2_document(&format!("[{}]", wire_profile("serial", &settings)), "null").replacen(
+                    r#""schema_version":2"#,
+                    &format!(r#""schema_version":{version}"#),
+                    1,
+                )
+            };
+            let (mut store, outcome) = refused_schema(&directory, &json, &json);
+            assert!(matches!(
                 outcome,
                 LoadOutcome::Refused(SettingsLoadError::Schema { .. })
-            ),
-            "{label}: expected schema refusal, got {outcome:?}"
-        );
-        assert!(store.is_refused(), "{label}");
-        assert!(store.snapshot().is_none(), "{label}");
-        assert!(
-            matches!(
-                persist_verified(&mut store, &applied, preferences()),
+            ));
+            assert!(store.snapshot().is_none());
+            assert!(matches!(
+                persist_globals(&mut store, manual_output_preferences()),
                 Err(SettingsWriteError::RefusedOriginal { .. })
-            ),
-            "{label}: applied write must stay blocked"
-        );
-        assert!(
-            matches!(
-                persist_globals(&mut store, preferences()),
-                Err(SettingsWriteError::RefusedOriginal { .. })
-            ),
-            "{label}: preference write must stay blocked"
-        );
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            original,
-            "{label}: the complete original must be preserved"
-        );
-        assert_no_temp_files(&directory);
-
-        // Only an explicit reset clears the refusal.
-        store.reset(preferences()).unwrap();
-        assert!(!store.is_refused(), "{label}");
-        let (_, outcome) = SettingsStore::load(path.clone());
-        assert!(
-            matches!(outcome, LoadOutcome::Loaded(_)),
-            "{label}: reset must produce a loadable document"
-        );
+            ));
+            assert_eq!(fs::read(&path).unwrap(), json.as_bytes());
+            store.reset(preferences()).unwrap();
+            assert!(!store.is_refused());
+            let (_, outcome) = SettingsStore::load(path.clone());
+            assert!(matches!(
+                outcome,
+                LoadOutcome::Loaded {
+                    retired_filters_present: false,
+                    ..
+                }
+            ));
+        }
+        let malformed = format!(r#"{inner},"filters":{{"entries":[}}}}"#);
+        let json = if version == 1 {
+            document_with_applied(&malformed)
+        } else {
+            v2_document(&format!("[{}]", wire_profile("serial", &malformed)), "null").replacen(
+                r#""schema_version":2"#,
+                &format!(r#""schema_version":{version}"#),
+                1,
+            )
+        };
+        fs::write(&path, &json).unwrap();
+        let (mut store, outcome) = SettingsStore::load(path.clone());
+        assert!(matches!(
+            outcome,
+            LoadOutcome::Refused(SettingsLoadError::MalformedJson { .. })
+        ));
+        assert!(matches!(
+            persist_globals(&mut store, preferences()),
+            Err(SettingsWriteError::RefusedOriginal { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), json.as_bytes());
     }
-    fs::remove_dir_all(&directory).unwrap();
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
-fn full_chain_rename_fault_preserves_the_original_and_reports_persistence_separately() {
-    let directory = temp_dir("filters-fault");
+fn lazy_migration_rename_fault_preserves_legacy_bytes_and_the_full_renderer() {
+    let directory = temp_dir("retired-migration-fault");
     let path = settings_path(&directory);
-    fs::write(&path, canonical_document()).unwrap();
-    let original = fs::read(&path).unwrap();
-
+    let legacy = document_with_applied(&applied_with_filters(RETIRED_FILTERS));
+    fs::write(&path, &legacy).unwrap();
     let mut store = SettingsStore::with_injected_fault(path.clone(), WriteFaultPoint::BeforeRename);
     let previous = store.snapshot().unwrap().clone();
-    let applied = applied_settings(draft_with_filters(three_entry_chain()));
-
-    let result = persist_verified(&mut store, &applied, preferences());
-    assert!(
-        matches!(result, Err(SettingsWriteError::Rename { .. })),
-        "persistence failure must be reported separately: {result:?}"
-    );
+    let target = draft_with_renderer(reference_renderer());
+    let applied = applied_settings(target.clone());
+    assert!(matches!(
+        persist_verified(&mut store, &applied, preferences()),
+        Err(SettingsWriteError::Rename { .. })
+    ));
     assert_eq!(store.snapshot(), Some(&previous));
-    assert_eq!(
-        fs::read(&path).unwrap(),
-        original,
-        "original bytes must survive a rename fault"
-    );
+    assert_eq!(fs::read(&path).unwrap(), legacy.as_bytes());
     assert_no_temp_files(&directory);
     let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(reloaded) = outcome else {
-        panic!("original must stay loadable immediately after the fault");
+    let LoadOutcome::Loaded {
+        document,
+        retired_filters_present,
+    } = outcome
+    else {
+        panic!("legacy original must remain loadable")
     };
-    assert_eq!(*reloaded, previous);
+    assert!(retired_filters_present);
+    assert_eq!(*document, previous);
     assert!(
-        last_settings(&reloaded)
+        persist_verified(&mut store, &applied, preferences())
             .unwrap()
-            .filters
-            .entries()
-            .is_empty()
+            .is_confirmed()
     );
-
-    // The fault fires once: the next write commits the full chain.
-    let outcome = persist_verified(&mut store, &applied, preferences()).unwrap();
-    assert!(outcome.is_confirmed());
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(stored) = outcome else {
-        panic!("committed chain must load");
+    let LoadOutcome::Loaded {
+        document,
+        retired_filters_present,
+    } = outcome
+    else {
+        panic!("committed renderer must load")
     };
-    assert_eq!(last_settings(&stored).unwrap().filters, three_entry_chain());
-    fs::remove_dir_all(&directory).unwrap();
+    assert!(!retired_filters_present);
+    assert_eq!(last_settings(&document), Some(&target));
+    fs::remove_dir_all(directory).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -2401,7 +2320,7 @@ fn pre_renderer_v1_document_migrates_preserving_baseline() {
     fs::write(&path, &original).unwrap();
 
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("pre-renderer v1 document must load, got {outcome:?}");
     };
     let loaded = last_settings(&document).expect("applied present");
@@ -2417,7 +2336,10 @@ fn pre_renderer_v1_document_migrates_preserving_baseline() {
     .unwrap();
 
     let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(migrated) = outcome else {
+    let LoadOutcome::Loaded {
+        document: migrated, ..
+    } = outcome
+    else {
         panic!("migrated profile must load")
     };
     assert_eq!(last_settings(&migrated), last_settings(&document));
@@ -2436,7 +2358,7 @@ fn reference_renderer_round_trips_exactly_through_the_store() {
     .unwrap();
 
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("reference renderer document must load, got {outcome:?}");
     };
     let loaded = last_settings(&document).expect("applied present");
@@ -2453,7 +2375,10 @@ fn reference_renderer_round_trips_exactly_through_the_store() {
         "a non-baseline renderer is persisted in full: {written}"
     );
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(reloaded) = outcome else {
+    let LoadOutcome::Loaded {
+        document: reloaded, ..
+    } = outcome
+    else {
         panic!("re-encoded reference must load");
     };
     assert_eq!(
@@ -2654,7 +2579,7 @@ fn malformed_renderer_json_refuses_the_complete_original_and_blocks_saves_until_
         assert!(!store.is_refused(), "{label}");
         let (_, outcome) = SettingsStore::load(path.clone());
         assert!(
-            matches!(outcome, LoadOutcome::Loaded(_)),
+            matches!(outcome, LoadOutcome::Loaded { .. }),
             "{label}: reset must produce a loadable document"
         );
     }
@@ -2682,7 +2607,6 @@ fn profile_identity(port: u8, serial: Option<&str>) -> DeviceIdentity {
 fn two_profile_settings() -> (DraftSettings, DraftSettings) {
     let a = DraftSettings {
         video: auto_video_request(),
-        filters: three_entry_chain(),
         renderer: reference_renderer(),
         ..draft_settings()
     };
@@ -2700,15 +2624,6 @@ fn two_profile_settings() -> (DraftSettings, DraftSettings) {
                 .unwrap(),
             ),
         },
-        filters: FilterChain::new(
-            three_entry_chain()
-                .entries()
-                .iter()
-                .rev()
-                .cloned()
-                .collect(),
-        )
-        .unwrap(),
         renderer: RendererSettings::default(),
     };
     b.video.identity = profile_identity(3, Some("B"));
@@ -2716,7 +2631,7 @@ fn two_profile_settings() -> (DraftSettings, DraftSettings) {
 }
 
 #[test]
-fn source_profiles_round_trip_all_six_fields_and_globals_without_cross_source_inheritance() {
+fn source_profiles_round_trip_all_settings_and_globals_without_cross_source_inheritance() {
     let directory = temp_dir("multi-profile");
     let path = settings_path(&directory);
     let (a, b) = two_profile_settings();
@@ -2728,13 +2643,14 @@ fn source_profiles_round_trip_all_six_fields_and_globals_without_cross_source_in
         fullscreen: true,
         output: PersistentOutputChoice::Manual(manual_sink_identity()),
         stats_hidden: true,
+        logging_enabled: true,
     };
     let (mut store, _) = SettingsStore::load(path.clone());
     store
         .save_profiles(&profiles, Some(&b.video.identity), globals.clone())
         .unwrap();
     let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("all profiles must reload")
     };
     assert_eq!(document.profiles.entries().len(), 2);
@@ -2756,7 +2672,7 @@ fn source_profiles_round_trip_all_six_fields_and_globals_without_cross_source_in
 fn unique_serial_port_move_replaces_one_profile_and_last_source_only_after_verified_save() {
     let directory = temp_dir("serial-port-move");
     let path = settings_path(&directory);
-    let settings = draft_with_filters(three_entry_chain());
+    let settings = draft_with_renderer(reference_renderer());
     let old = settings.video.identity.clone();
     let moved = profile_identity(8, Some("SER42"));
     let mut profiles = SourceProfiles::default();
@@ -2781,7 +2697,7 @@ fn unique_serial_port_move_replaces_one_profile_and_last_source_only_after_verif
         .save_profiles(&profiles, Some(&moved), preferences())
         .unwrap();
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("moved profile must reload")
     };
     assert_eq!(document.profiles.entries().len(), 1);
@@ -2864,7 +2780,7 @@ fn duplicate_serial_observation_is_sticky_without_b_success_and_survives_global_
         .save_profiles(&profiles, Some(&a), manual_output_preferences())
         .unwrap();
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(mut document) = outcome else {
+    let LoadOutcome::Loaded { mut document, .. } = outcome else {
         panic!("collision profile must reload")
     };
     document.profiles.observe(std::iter::once(&a));
@@ -2914,7 +2830,7 @@ fn collision_without_profiles_restricts_first_success_and_a_pre_collision_serial
 fn v1_migration_is_lazy_and_the_first_global_save_preserves_full_profile_and_preferences() {
     let directory = temp_dir("v1-lazy-migration");
     let path = settings_path(&directory);
-    let payload = applied_with_filters(THREE_FILTER_ENTRIES);
+    let payload = applied_with_filters(RETIRED_FILTERS);
     let payload = format!(
         "{},\"renderer\":{}}}",
         payload.strip_suffix('}').unwrap(),
@@ -2923,11 +2839,10 @@ fn v1_migration_is_lazy_and_the_first_global_save_preserves_full_profile_and_pre
     let legacy = document_with_applied(&payload);
     fs::write(&path, legacy.as_bytes()).unwrap();
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("complete v1 payload must migrate")
     };
     let expected = DraftSettings {
-        filters: three_entry_chain(),
         renderer: reference_renderer(),
         ..draft_settings()
     };
@@ -2951,11 +2866,14 @@ fn v1_migration_is_lazy_and_the_first_global_save_preserves_full_profile_and_pre
         .unwrap();
     let bytes = fs::read(&path).unwrap();
     let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(wire["schema_version"], 2);
+    assert_eq!(wire["schema_version"], 3);
     assert!(wire.get("applied").is_none());
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(migrated) = outcome else {
-        panic!("lazy v2 save must reload")
+    let LoadOutcome::Loaded {
+        document: migrated, ..
+    } = outcome
+    else {
+        panic!("lazy v3 save must reload")
     };
     assert_eq!(last_settings(&migrated), Some(&expected));
     assert_eq!(migrated.last_source, document.last_source);
@@ -2974,7 +2892,7 @@ fn wire_profile(binding: &str, settings: &str) -> String {
 }
 
 #[test]
-fn strict_v2_refuses_invalid_collection_pointer_duplicates_nulls_and_settings_without_touching_bytes()
+fn strict_v2_and_v3_refuse_invalid_collection_pointer_duplicates_nulls_and_settings_without_touching_bytes()
  {
     let directory = temp_dir("v2-refusals");
     let serial = wire_profile("serial", APPLIED);
@@ -3124,16 +3042,6 @@ fn strict_v2_refuses_invalid_collection_pointer_duplicates_nulls_and_settings_wi
             ),
         ),
         (
-            "null filters",
-            v2_document(
-                &format!(
-                    "[{}]",
-                    wire_profile("serial", &applied_with_filters("null"))
-                ),
-                "null",
-            ),
-        ),
-        (
             "null renderer",
             v2_document(
                 &format!(
@@ -3166,17 +3074,23 @@ fn strict_v2_refuses_invalid_collection_pointer_duplicates_nulls_and_settings_wi
             ),
         ),
     ];
-    for (label, json) in cases {
-        let (mut store, _) = refused_schema(&directory, label, &json);
-        assert!(
-            matches!(
-                store.save_profiles(&SourceProfiles::default(), None, preferences()),
-                Err(SettingsWriteError::RefusedOriginal { .. })
-            ),
-            "{label}"
-        );
-        assert_eq!(fs::read(store.path()).unwrap(), json.as_bytes(), "{label}");
-        assert_no_temp_files(&directory);
+    for version in [2, 3] {
+        for (label, json) in &cases {
+            let json = json.replace(
+                r#""schema_version":2"#,
+                &format!(r#""schema_version":{version}"#),
+            );
+            let (mut store, _) = refused_schema(&directory, label, &json);
+            assert!(
+                matches!(
+                    store.save_profiles(&SourceProfiles::default(), None, preferences()),
+                    Err(SettingsWriteError::RefusedOriginal { .. })
+                ),
+                "v{version}: {label}"
+            );
+            assert_eq!(fs::read(store.path()).unwrap(), json.as_bytes(), "{label}");
+            assert_no_temp_files(&directory);
+        }
     }
     fs::remove_dir_all(directory).unwrap();
 }
@@ -3196,7 +3110,7 @@ fn topology_duplicates_of_one_serial_group_are_legal_and_never_promoted_after_re
     );
     fs::write(&path, original.as_bytes()).unwrap();
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(mut document) = outcome else {
+    let LoadOutcome::Loaded { mut document, .. } = outcome else {
         panic!("topology group must load")
     };
     assert_eq!(document.profiles.entries().len(), 2);
@@ -3213,7 +3127,10 @@ fn topology_duplicates_of_one_serial_group_are_legal_and_never_promoted_after_re
         .save_profiles(&document.profiles, None, preferences())
         .unwrap();
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(reloaded) = outcome else {
+    let LoadOutcome::Loaded {
+        document: reloaded, ..
+    } = outcome
+    else {
         panic!("topology group must survive save")
     };
     assert_eq!(document.profiles, reloaded.profiles);
@@ -3237,7 +3154,11 @@ fn preference_save_and_precommit_failure_preserve_all_profiles_and_the_committed
         .save_profiles(&profiles, Some(&b.video.identity), globals_before.clone())
         .unwrap();
     let (_, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(global_save) = outcome else {
+    let LoadOutcome::Loaded {
+        document: global_save,
+        ..
+    } = outcome
+    else {
         panic!("global save must load")
     };
     assert_eq!(
@@ -3272,7 +3193,7 @@ fn preference_save_and_precommit_failure_preserve_all_profiles_and_the_committed
         .save_profiles(&profiles, Some(&a.video.identity), globals.clone())
         .unwrap();
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("whole-collection retry must load")
     };
     assert_eq!(
@@ -3328,7 +3249,7 @@ fn v1_preferences_only_migrates_lazily_with_empty_profiles_and_unchanged_globals
     let original = document_with_applied("null");
     fs::write(&path, original.as_bytes()).unwrap();
     let (mut store, outcome) = SettingsStore::load(path.clone());
-    let LoadOutcome::Loaded(document) = outcome else {
+    let LoadOutcome::Loaded { document, .. } = outcome else {
         panic!("v1 globals must load")
     };
     assert!(document.profiles.entries().is_empty());
@@ -3339,7 +3260,10 @@ fn v1_preferences_only_migrates_lazily_with_empty_profiles_and_unchanged_globals
         .save_profiles(&document.profiles, None, document.preferences.clone())
         .unwrap();
     let (_, outcome) = SettingsStore::load(path);
-    let LoadOutcome::Loaded(migrated) = outcome else {
+    let LoadOutcome::Loaded {
+        document: migrated, ..
+    } = outcome
+    else {
         panic!("migrated globals must load")
     };
     assert_eq!(*migrated, *document);

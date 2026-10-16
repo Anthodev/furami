@@ -3,7 +3,7 @@ import QtQuick.Controls
 import dev.antho.furami
 
 // Plain-text Brume label. Untrusted strings (device, output, diagnostics,
-// loaded filter labels, recovery text) must go through this or any Text with
+// recovery text) must go through this or any Text with
 // textFormat: Text.PlainText so they can never be interpreted as markup.
 Label {
     id: control

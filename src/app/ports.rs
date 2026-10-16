@@ -267,15 +267,13 @@ mod tests {
         },
         render::RendererSettings,
         state::{
-            ApplyId, AttemptKey, AttemptPurpose, FilterConfirmation, FilterTreatmentProof,
-            InitialPlayback, RendererConfirmation, TreatmentAttemptKey, TreatmentConfirmation,
-            TreatmentPass,
+            ApplyId, AttemptKey, AttemptPurpose, InitialPlayback, RendererConfirmation,
+            TreatmentAttemptKey, TreatmentConfirmation, TreatmentPass,
         },
     };
 
     fn settings() -> DraftSettings {
         DraftSettings {
-            filters: crate::domain::filters::FilterChain::default(),
             video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                 identity: DeviceIdentity::new(
                     0x32ed,
@@ -313,23 +311,9 @@ mod tests {
             attempt: open.attempt,
             pass: TreatmentPass::Open,
         };
-        let (vf_changed, filters) = match playback {
-            InitialPlayback::Live => (
-                true,
-                FilterTreatmentProof::Reconfigured(
-                    FilterConfirmation::checked(treatment, 0.0, 2.0, 32).unwrap(),
-                ),
-            ),
-            InitialPlayback::Paused => (
-                false,
-                FilterTreatmentProof::PreparedPaused { key: treatment },
-            ),
-        };
         TreatmentConfirmation::checked(
             treatment,
             playback,
-            vf_changed,
-            filters,
             RendererConfirmation::checked(treatment, settings().renderer.clone()),
         )
         .unwrap()

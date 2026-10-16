@@ -3,6 +3,10 @@
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QProcess>
+#include <QProcessEnvironment>
+#include <QStandardPaths>
+#include <QUrl>
 #include <QGuiApplication>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
@@ -24,6 +28,11 @@
 #include <clocale>
 #include <cerrno>
 #include <cstdlib>
+#include <cmath>
+#include <initializer_list>
+#include <type_traits>
+#include <charconv>
+#include <cstring>
 #include <limits>
 #include <utility>
 
@@ -68,26 +77,149 @@ QString phaseName(GatePhase phase)
     return QStringLiteral("Unknown");
 }
 
-QString statusName(SubmitStatus status)
+// Never inspect the message/context or retain a Qt object. Rust's process-global
+// destination remains valid through Qt cleanup and the final worker drain.
+void safeQtMessage(QtMsgType severity, const QMessageLogContext &, const QString &)
 {
-    switch (status) {
-    case SubmitStatus::Accepted: return QStringLiteral("Accepted");
-    case SubmitStatus::StaleGeneration: return QStringLiteral("StaleGeneration");
-    case SubmitStatus::NotReady: return QStringLiteral("NotReady");
-    case SubmitStatus::Closing: return QStringLiteral("Closing");
-    case SubmitStatus::CapacityExceeded: return QStringLiteral("CapacityExceeded");
-    }
-    return QStringLiteral("Unknown");
+    diagnostics_qt_message(static_cast<std::int32_t>(severity));
 }
 
-QString boolean(bool value)
+struct NativeField {
+    enum class Kind { Boolean, Signed, Unsigned, Real, Token };
+    const char *name;
+    Kind kind;
+    union {
+        bool boolean;
+        std::int64_t signedValue;
+        std::uint64_t unsignedValue;
+        double real;
+        const char *token;
+    };
+    NativeField(const char *key, bool value) : name(key), kind(Kind::Boolean), boolean(value) {}
+    template<typename T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>, int> = 0>
+    NativeField(const char *key, T value) : name(key),
+        kind(std::is_signed_v<T> ? Kind::Signed : Kind::Unsigned)
+    {
+        if constexpr (std::is_signed_v<T>)
+            signedValue = value;
+        else
+            unsignedValue = value;
+    }
+    NativeField(const char *key, double value) : name(key), kind(Kind::Real), real(value) {}
+    // Only finite constants/control classes reach this constructor.
+    NativeField(const char *key, const char *value) : name(key), kind(Kind::Token), token(value) {}
+};
+
+void emitNativeDiagnostic(const char *code, std::initializer_list<NativeField> fields = {}, int severity = 4)
 {
-    return value ? QStringLiteral("true") : QStringLiteral("false");
+    // Stack-only, bounded JSON encoding. Integer IDs never pass through a
+    // floating-point Qt JSON value; to_chars preserves every u64 including MAX.
+    char payload[2048];
+    char *cursor = payload;
+    char *const end = payload + sizeof(payload);
+    bool valid = true;
+    const auto append = [&](const char *text) {
+        const auto length = std::strlen(text);
+        if (length > static_cast<std::size_t>(end - cursor)) {
+            valid = false;
+            return;
+        }
+        std::memcpy(cursor, text, length);
+        cursor += length;
+    };
+    const auto number = [&](auto value) {
+        const auto result = std::to_chars(cursor, end, value);
+        if (result.ec == std::errc())
+            cursor = result.ptr;
+        else
+            valid = false;
+    };
+    append("{");
+    bool first = true;
+    for (const auto &field : fields) {
+        if (!valid)
+            break;
+        if (!first)
+            append(",");
+        first = false;
+        append("\"");
+        append(field.name);
+        append("\":");
+        switch (field.kind) {
+        case NativeField::Kind::Boolean: append(field.boolean ? "true" : "false"); break;
+        case NativeField::Kind::Signed: number(field.signedValue); break;
+        case NativeField::Kind::Unsigned: number(field.unsignedValue); break;
+        case NativeField::Kind::Real:
+            if (std::isfinite(field.real))
+                number(field.real);
+            else
+                append("null");
+            break;
+        case NativeField::Kind::Token:
+            append("\""); append(field.token); append("\"");
+            break;
+        }
+    }
+    append("}");
+    // An impossible-for-current-schemas overflow still reaches the existing
+    // rejection boundary, never a truncated JSON record or alternate channel.
+    diagnostics_native_event(rust::Str(code), severity,
+        valid ? rust::Str(payload, static_cast<std::size_t>(cursor - payload)) : rust::Str(""));
+    // Keep Qt's existing fatal-warning/critical environment semantics. The
+    // installed handler sees only severity; these fixed markers carry no data.
+    if (severity == 1)
+        qWarning("native_warning");
+    else if (severity == 2)
+        qCritical("native_critical");
+}
+
+const char *controlClass(const QString &name)
+{
+    // Never serialize dynamic model keys. Geometry uses a traversal ordinal.
+    static const char *classes[] = {
+        "sourceRow_", "outputRow_", "sizeRow_", "rateRow_",
+        "captureFormatSelector_row_", "audioInputSelector_row_", "audioOutputSelector_row_",
+        "renderChoice_scale_row_", "renderChoice_cscale_row_", "renderChoice_dscale_row_",
+        "renderChoice_scale_antiring_row_", "renderChoice_dither_row_", "renderChoice_deband_row_",
+        "renderChoice_deband_iterations_row_", "renderChoice_deband_grain_row_", "renderChoice_interpolation_row_"
+    };
+    for (const auto *value : classes)
+        if (name.startsWith(QLatin1String(value)))
+            return value;
+    static const char *controls[] = {
+        "menuOpenLogs", "contextDiagnosticsError",
+        "furamiRoot", "videoHost", "topChromeWindow", "volumeChromeWindow", "bottomChromeWindow",
+        "videoContainer", "topChromeRoot", "volumeChromeRoot", "bottomChromeRoot",
+        "ribbonSource", "ribbonOutput", "ribbonResolution", "ribbonRate", "ribbonFullscreen",
+        "volumeSlider", "volumeMute", "optionsTrigger",
+        "menuOpenCapture", "menuPauseResume", "menuRestart", "menuReconnect", "menuSettings", "menuCloseCapture",
+        "menuBack", "menuBackSection", "menuIntentError", "settingsCaptureEntry", "settingsAudioEntry",
+        "settingsRendererEntry", "settingsPreferencesEntry",
+        "contextIntentError", "contextDiagnostic", "contextOutputAction", "contextRecoveryStage", "recoveryUse",
+        "sourceRefresh", "captureFormatSelector", "captureRefresh", "audioCaptureEnabled", "audioInputSelector",
+        "audioMute", "audioOutputSelector", "audioOutputMute",
+        "sizeWidthField", "sizeHeightField", "rateExactField", "sizeRateCatalogError",
+        "rendererNotice", "preferencesStatus", "preferencesStartup",
+        "preferencesPath", "preferencesImmediate", "preferencesReset", "preferencesRefused",
+        "sourceCatalogError", "sourceCapability", "outputMissing", "outputStatus",
+        "saveFailureRetry", "saveFailureClose", "resetCancel", "resetConfirm",
+        "backdropTitle", "backdropDetail", "backdropDiagnostic",
+        "renderChoice_scale", "renderChoice_cscale", "renderChoice_dscale", "renderChoice_scale_antiring",
+        "renderChoice_dither", "renderChoice_deband", "renderChoice_deband_iterations", "renderChoice_deband_grain", "renderChoice_interpolation",
+        "renderToggle_scale", "renderToggle_cscale", "renderToggle_dscale", "renderToggle_scale_antiring",
+        "renderToggle_dither", "renderToggle_deband", "renderToggle_deband_iterations", "renderToggle_deband_grain", "renderToggle_interpolation",
+        "renderValue_scale", "renderValue_cscale", "renderValue_dscale", "renderValue_scale_antiring",
+        "renderValue_dither", "renderValue_deband", "renderValue_deband_iterations", "renderValue_deband_grain", "renderValue_interpolation"
+    };
+    for (const auto *value : controls)
+        if (name == QLatin1String(value))
+            return value;
+    return "UnknownControl";
 }
 
 LaunchResult launchFailure(const QString &diagnostic)
 {
-    qCritical().noquote() << "native_startup_failure" << diagnostic;
+    emitNativeDiagnostic("native_startup_failure", {}, 2);
     const auto bytes = diagnostic.toUtf8();
     return LaunchResult{1, rust::String(bytes.constData(), static_cast<std::size_t>(bytes.size()))};
 }
@@ -124,23 +256,18 @@ protected:
             }
         }
         if (event->type() == QEvent::FocusIn || event->type() == QEvent::FocusOut) {
-            qInfo().noquote() << QStringLiteral("input_focus_window source=host event=%1 generation=%2")
-                .arg(event->type() == QEvent::FocusIn ? QStringLiteral("FocusIn") : QStringLiteral("FocusOut"))
-                .arg(m_generation);
+            emitNativeDiagnostic("input_focus_window", {{"generation", m_generation}, {"active", event->type() == QEvent::FocusIn}});
         }
         if (event->type() == QEvent::PlatformSurface) {
             auto *surface = static_cast<QPlatformSurfaceEvent *>(event);
             if (surface->surfaceEventType() == QPlatformSurfaceEvent::SurfaceCreated) {
-                qInfo().noquote() << QStringLiteral("native_surface_created generation=%1 poisoned=%2")
-                    .arg(m_generation).arg(boolean(m_poisoned));
+                emitNativeDiagnostic("native_surface_created", {{"generation", m_generation}, {"poisoned", m_poisoned}});
                 if (!m_poisoned && !m_authorized && m_bridge)
                     m_bridge->schedulePublication(m_generation);
                 else
-                    qWarning().noquote() << QStringLiteral("native_surface_rejected generation=%1 reason=poisoned_or_releasing")
-                        .arg(m_generation);
+                    emitNativeDiagnostic("native_surface_rejected", {{"generation", m_generation}}, 1);
             } else {
-                qInfo().noquote() << QStringLiteral("native_surface_about_to_destroy generation=%1 host=%2 authorized=%3")
-                    .arg(m_generation).arg(m_previousXid).arg(boolean(m_authorized));
+                emitNativeDiagnostic("native_surface_about_to_destroy", {{"generation", m_generation}, {"host", m_previousXid}, {"authorized", m_authorized}});
                 if (!m_authorized && !m_poisoned) {
                     // No winId, reparent, or nested event loop is allowed here.
                     // The exceptional owner barrier completes before Qt destroys this parent.
@@ -187,9 +314,7 @@ protected:
 
     void mousePressEvent(QMouseEvent *event) override
     {
-        qInfo().noquote() << QStringLiteral("input_event source=host kind=mouse_press generation=%1 button=%2 x=%3 y=%4")
-            .arg(m_generation).arg(static_cast<int>(event->button()))
-            .arg(event->position().x()).arg(event->position().y());
+        emitNativeDiagnostic("input_mouse_press", {{"generation", m_generation}, {"button", static_cast<int>(event->button())}, {"x", event->position().x()}, {"y", event->position().y()}});
         if (!m_poisoned && m_bridge) {
             m_bridge->noteNativePointerActivity(true);
             if (m_bridge->popupOpen()) {
@@ -215,12 +340,12 @@ private:
     bool m_poisoned = false;
 };
 
-FuramiBridge::FuramiBridge(rust::Box<RuntimeCoordinator> gate)
+FuramiBridge::FuramiBridge(rust::Box<RuntimeCoordinator> gate, UiUpdate nativeEnvironment)
     : m_gate(std::move(gate))
 {
     assertGuiThread();
     QQmlEngine::setObjectOwnership(this, QQmlEngine::CppOwnership);
-    applyUpdate(gate_poll(*m_gate));
+    applyUpdate(std::move(nativeEnvironment));
     // X11 may never acknowledge a WM state request. This deadline abandons
     // intent/focus hooks only: it proves neither rejection nor success.
     m_fullscreenChoiceDeadline.setSingleShot(true);
@@ -253,7 +378,7 @@ FuramiBridge::~FuramiBridge()
         delete m_qualificationInput.data();
     }
     if (m_stdinFlags != -1 && ::fcntl(STDIN_FILENO, F_SETFL, m_stdinFlags) == -1)
-        qWarning() << "qualification_stdin_restore_failed errno=" << errno;
+        emitNativeDiagnostic("qualification_stdin_restore_failed", {{"errno", errno}}, 1);
     Q_ASSERT(m_nativeGeneration == 0);
 }
 
@@ -261,6 +386,85 @@ void FuramiBridge::assertGuiThread() const
 {
     Q_ASSERT(qGuiApp && QThread::currentThread() == qGuiApp->thread());
     Q_ASSERT(QThread::currentThread() == thread());
+}
+
+// The folder is opened through the system xdg-open, which must not inherit the
+// bundled AppRun's Qt search-path overrides: they would aim a system process at
+// Furami's private Qt build. Exactly those five variables are dropped; every
+// other inherited value (PATH, LD_PRELOAD, FURAMI_MEDIA_PREFIX, display/bus/
+// session, XDG/HOME) reaches xdg-open unchanged.
+void FuramiBridge::launchLogFolderOpener(const QString &path, std::uint64_t request)
+{
+    assertGuiThread();
+    const QPointer<FuramiBridge> bridge(this);
+    const auto acknowledge = [bridge, request](bool accepted) {
+        if (!bridge)
+            return;
+        emitNativeDiagnostic("log_folder_dispatched", {{"request_id", request}, {"accepted", accepted}});
+        // Startup and terminal results use the same receiver and normal-priority
+        // queued metacalls. started posts first, so its ACK precedes finished.
+        QMetaObject::invokeMethod(bridge.data(), [bridge, request, accepted] {
+            if (bridge)
+                bridge->applyUpdate(gate_log_folder_result(*bridge->m_gate, request, accepted));
+        }, Qt::QueuedConnection);
+    };
+    const QString program = QStandardPaths::findExecutable(QStringLiteral("xdg-open"));
+    if (program.isEmpty()) {
+        acknowledge(false);
+        return;
+    }
+    static const char *const appRunOverrides[] = {
+        "LD_LIBRARY_PATH",
+        "QT_PLUGIN_PATH",
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QML_IMPORT_PATH",
+        "QML2_IMPORT_PATH",
+    };
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    for (const char *name : appRunOverrides)
+        environment.remove(QString::fromLatin1(name));
+    // No parent/member owns this process: destroying it while Starting/Running
+    // kills and waits. Only terminal signals retire it. If Furami exits first,
+    // OS cleanup reclaims the watcher without cancelling the independent child.
+    auto *process = new QProcess;
+    process->setProgram(program);
+    process->setArguments({QUrl::fromLocalFile(path).toString(QUrl::FullyEncoded)});
+    process->setProcessEnvironment(environment);
+    // Null streams avoid unbounded buffering and keep launcher output private.
+    process->setStandardInputFile(QProcess::nullDevice());
+    process->setStandardOutputFile(QProcess::nullDevice());
+    process->setStandardErrorFile(QProcess::nullDevice());
+#ifdef Q_OS_UNIX
+    process->setUnixProcessParameters(QProcess::UnixProcessFlag::CreateNewSession
+        | QProcess::UnixProcessFlag::DisconnectControllingTerminal);
+#endif
+    connect(process, &QProcess::started, process, [acknowledge] {
+        acknowledge(true);
+    });
+    connect(process, &QProcess::errorOccurred, process, [process, acknowledge](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart) {
+            acknowledge(false);
+            process->deleteLater();
+        }
+        // Crashed is followed by finished(CrashExit); handle that outcome once.
+    });
+    connect(process, &QProcess::finished, process, [process, bridge, request](int exitCode, QProcess::ExitStatus exitStatus) {
+        const bool failed = exitStatus == QProcess::CrashExit || exitCode != 0;
+        if (bridge) {
+            if (exitStatus == QProcess::NormalExit)
+                emitNativeDiagnostic("log_folder_finished", {{"request_id", request}, {"failed", failed}, {"exit_code", exitCode}}, failed ? 1 : 4);
+            else
+                emitNativeDiagnostic("log_folder_finished", {{"request_id", request}, {"failed", failed}}, 1);
+            // Never enter Rust/applyUpdate from a native signal or an unfinished
+            // outer update. Destruction of the bridge cancels queued delivery.
+            QMetaObject::invokeMethod(bridge.data(), [bridge, request, failed] {
+                if (bridge)
+                    bridge->applyUpdate(gate_log_folder_finished(*bridge->m_gate, request, failed));
+            }, Qt::QueuedConnection);
+        }
+        process->deleteLater();
+    });
+    process->start();
 }
 
 QWindow *FuramiBridge::hostWindow() const { assertGuiThread(); return m_host.data(); }
@@ -313,6 +517,7 @@ QString FuramiBridge::closeDialog() const { assertGuiThread(); return m_closeDia
 QString FuramiBridge::resetToken() const { assertGuiThread(); return QString::number(m_resetToken); }
 bool FuramiBridge::fullscreenPreference() const { assertGuiThread(); return m_fullscreenPreference; }
 bool FuramiBridge::statsHiddenPreference() const { assertGuiThread(); return m_statsHiddenPreference; }
+bool FuramiBridge::loggingEnabledPreference() const { assertGuiThread(); return m_loggingEnabledPreference; }
 bool FuramiBridge::closing() const { assertGuiThread(); return m_closing; }
 int FuramiBridge::screenAvailableWidth() const
 {
@@ -430,7 +635,7 @@ void FuramiBridge::failChrome(const QString &diagnostic)
         if (window)
             window->hide();
     }
-    qCritical().noquote() << "native_chrome_failure" << diagnostic;
+    emitNativeDiagnostic("native_chrome_failure", {}, 2);
     emit stateChanged();
     // A failed UI association is fatal to bootstrap, not permission to tear
     // down the permanent video parent ahead of the existing owner barrier.
@@ -488,8 +693,7 @@ void FuramiBridge::registerChromeWindows(QWindow *top, QWindow *volume, QWindow 
         });
         connect(window, &QWindow::visibleChanged, this, [this](bool) { scheduleGeometryLog(); });
     }
-    qInfo().noquote() << QStringLiteral("native_chrome_registered root=%1 count=3 native_parent=null flags=Tool_Frameless")
-        .arg(m_rootXid);
+    emitNativeDiagnostic("native_chrome_registered", {{"root", m_rootXid}, {"count", 3}});
     scheduleChromeGeometry();
 }
 
@@ -555,9 +759,7 @@ void FuramiBridge::focusNextChrome(const QString &region, bool backward)
         return;
     }
     target->requestActivate();
-    qInfo().noquote() << QStringLiteral("input_focus_handoff source=%1 direction=%2 target=%3 root=%4 generation=%5")
-        .arg(region, backward ? QStringLiteral("backward") : QStringLiteral("forward"), target->objectName())
-        .arg(m_rootXid).arg(m_generation);
+    emitNativeDiagnostic("input_focus_handoff", {{"object_name", controlClass(target->objectName())}, {"backward", backward}, {"root", m_rootXid}, {"generation", m_generation}});
 }
 
 void FuramiBridge::setTextEntryActive(bool active)
@@ -566,8 +768,7 @@ void FuramiBridge::setTextEntryActive(bool active)
     if (m_textEntryActive == active)
         return;
     m_textEntryActive = active;
-    qInfo().noquote() << QStringLiteral("input_text_focus active=%1 generation=%2")
-        .arg(boolean(active)).arg(m_generation);
+    emitNativeDiagnostic("input_text_focus", {{"active", active}, {"generation", m_generation}});
     emit textEntryActiveChanged();
 }
 
@@ -577,8 +778,7 @@ void FuramiBridge::setPopupOpen(bool open)
     if (m_popupOpen == open)
         return;
     m_popupOpen = open;
-    qInfo().noquote() << QStringLiteral("qt_chrome_popup open=%1 policy=bounded_tool_local_popup root=%2")
-        .arg(boolean(open)).arg(m_rootXid);
+    emitNativeDiagnostic("qt_chrome_popup", {{"open", open}, {"root", m_rootXid}});
     emit popupOpenChanged();
     scheduleGeometryLog();
 }
@@ -600,8 +800,7 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
     refreshChromeFamilyActive(QGuiApplication::focusWindow());
     root->setCursor(Qt::ArrowCursor);
     m_fullscreenObserved = root->visibility() == QWindow::FullScreen;
-    qInfo().noquote() << QStringLiteral("native_root root=%1 container=videoContainer generation=0")
-        .arg(m_rootXid);
+    emitNativeDiagnostic("native_root", {{"root", m_rootXid}});
     connect(root, &QWindow::widthChanged, this, [this] { scheduleGeometryLog(); scheduleChromeGeometry(); });
     connect(root, &QWindow::heightChanged, this, [this] { scheduleGeometryLog(); scheduleChromeGeometry(); });
     connect(root, &QWindow::xChanged, this, [this] { scheduleChromeGeometry(); });
@@ -612,11 +811,7 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
         if (!m_root)
             return;
         const auto *item = m_root->activeFocusItem();
-        const auto *window = QGuiApplication::focusWindow();
-        qInfo().noquote() << QStringLiteral("input_focus_observed root=%1 root_active=%2 item=%3 native_window=%4 generation=%5")
-            .arg(m_rootXid).arg(boolean(m_root->isActive()))
-            .arg(item ? item->objectName() : QStringLiteral("none"))
-            .arg(window ? window->objectName() : QStringLiteral("none")).arg(m_generation);
+        emitNativeDiagnostic("input_focus_observed", {{"root", m_rootXid}, {"active", m_root->isActive()}, {"object_name", controlClass(item ? item->objectName() : QString())}, {"generation", m_generation}});
     });
     connect(container, &QQuickItem::widthChanged, this, [this] { scheduleGeometryLog(); });
     connect(container, &QQuickItem::heightChanged, this, [this] { scheduleGeometryLog(); });
@@ -631,8 +826,7 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
         m_root.clear();
         m_container.clear();
         refreshChromeFamilyActive(QGuiApplication::focusWindow());
-        qInfo().noquote() << QStringLiteral("native_root_destroyed root=%1 generation=%2 authorized=%3")
-            .arg(m_rootXid).arg(m_generation).arg(boolean(m_quitAuthorized));
+        emitNativeDiagnostic("native_root_destroyed", {{"root", m_rootXid}, {"generation", m_generation}, {"authorized", m_quitAuthorized}});
         if (!m_quitAuthorized) {
             // Root loss is a failed bootstrap even when no media owner exists.
             // Active owners still follow their real stop acknowledgement protocol.
@@ -642,8 +836,7 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
             m_diagnostic = m_nativeDiagnostic;
             m_contextDiagnostic = m_nativeDiagnostic;
             emit stateChanged();
-            qCritical().noquote() << QStringLiteral("native_root_destroyed_uncontrolled root=%1 generation=%2")
-                .arg(m_rootXid).arg(m_generation);
+            emitNativeDiagnostic("native_root_destroyed_uncontrolled", {{"root", m_rootXid}, {"generation", m_generation}}, 2);
             if (m_nativeGeneration)
                 failNative(m_nativeGeneration, QStringLiteral("application root was destroyed before owner acknowledgement"));
             applyUpdate(gate_quit(*m_gate));
@@ -680,7 +873,7 @@ bool FuramiBridge::enableQualificationInput(QString &diagnostic)
     m_qualificationInput = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read, this);
     connect(m_qualificationInput.data(), &QSocketNotifier::activated, this,
         [this](QSocketDescriptor, QSocketNotifier::Type) { readQualificationInput(); });
-    qInfo().noquote() << "qualification_stdin_enabled grammar=snapshot|draft-video|draft-identity|draft-audio|draft-source|draft-filters|draft-renderer|open|apply|restart|reconnect|volume|mute|close|quit|fullscreen|application-close|reset-confirm|open-close-during-opening|force-surface-loss draft_video=revision,auto_or_FourCC,WIDTHxHEIGHT,N/D state=phase,apply,attempt,cleanup revision=required_for_draft_apply filter_json=strict_FilterChain limits=legacy:256,filter:65536_bytes";
+    emitNativeDiagnostic("qualification_stdin_enabled");
     return true;
 }
 
@@ -694,9 +887,9 @@ void FuramiBridge::readQualificationInput()
     if (count <= 0) {
         m_qualificationInput->setEnabled(false);
         if (count == -1)
-            qWarning() << "qualification_stdin_read_failed errno=" << errno;
+            emitNativeDiagnostic("qualification_stdin_read_failed", {{"errno", errno}}, 1);
         else
-            qInfo() << "qualification_stdin_eof";
+            emitNativeDiagnostic("qualification_stdin_eof");
         m_qualificationLine.clear();
         return;
     }
@@ -707,10 +900,9 @@ void FuramiBridge::readQualificationInput()
         if (byte == '\n') {
             if (!m_dropQualificationLine && !m_qualificationLine.isEmpty()) {
                 if (!m_qualificationLine.isValidUtf8()) {
-                    qWarning() << "qualification_command_rejected reason=invalid_utf8" << m_qualificationLine;
+                    emitNativeDiagnostic("qualification_invalid_utf8", {}, 1);
                 } else {
                     const auto &command = m_qualificationLine;
-                    qInfo() << "qualification_command" << command;
                     if (command == "fullscreen") toggleFullscreen();
                     else if (command == "application-close") requestApplicationClose();
                     else if (command == "reset-confirm") decideSettingsReset(QString::number(m_resetToken), true);
@@ -719,6 +911,8 @@ void FuramiBridge::readQualificationInput()
                     else {
                         if (command == "close-discard" || command.startsWith("quit ")) observeFullscreenChoice();
                         applyUpdate(gate_qualification_command(*m_gate, asRust(command)));
+                        if (command == "snapshot")
+                            scheduleGeometryLog();
                     }
                 }
             }
@@ -728,7 +922,7 @@ void FuramiBridge::readQualificationInput()
             if (m_qualificationLine.size() == 65'536) {
                 m_dropQualificationLine = true;
                 m_qualificationLine.clear();
-                qWarning() << "qualification_command_rejected reason=line_exceeds_65536_bytes";
+                emitNativeDiagnostic("qualification_line_oversized", {}, 1);
             } else {
                 m_qualificationLine.append(byte);
             }
@@ -741,8 +935,14 @@ void FuramiBridge::openCapture()
     assertGuiThread();
     if (!m_canOpen || m_bootstrapFailed)
         return;
-    qInfo().noquote() << "input_intent action=OpenCapture source=panel";
+    emitNativeDiagnostic("intent_open_capture");
     applyUpdate(gate_open(*m_gate));
+}
+
+void FuramiBridge::openLogFolder()
+{
+    assertGuiThread();
+    applyUpdate(gate_open_log_folder(*m_gate));
 }
 
 void FuramiBridge::refreshCatalogs()
@@ -797,48 +997,6 @@ void FuramiBridge::selectAudioInput(const QString &selectionRevision, const QStr
 {
     assertGuiThread();
     applyUpdate(gate_select_audio_input(*m_gate, asRust(selectionRevision.toUtf8()), asRust(catalogRevision.toUtf8()), asRust(rowKey.toUtf8())));
-}
-
-void FuramiBridge::setFilterEnabled(const QString &selectionRevision, const QString &entryKey, bool enabled)
-{
-    assertGuiThread();
-    applyUpdate(gate_set_filter_enabled(*m_gate, asRust(selectionRevision.toUtf8()), asRust(entryKey.toUtf8()), enabled));
-}
-
-void FuramiBridge::addFilter(const QString &selectionRevision, const QString &kind)
-{
-    assertGuiThread();
-    applyUpdate(gate_add_filter(*m_gate, asRust(selectionRevision.toUtf8()), asRust(kind.toUtf8())));
-}
-
-void FuramiBridge::removeFilter(const QString &selectionRevision, const QString &entryKey)
-{
-    assertGuiThread();
-    applyUpdate(gate_remove_filter(*m_gate, asRust(selectionRevision.toUtf8()), asRust(entryKey.toUtf8())));
-}
-
-void FuramiBridge::setFilterNumber(const QString &revision, const QString &entry, const QString &parameter, double value)
-{
-    assertGuiThread();
-    applyUpdate(gate_set_filter_number(*m_gate, asRust(revision.toUtf8()), asRust(entry.toUtf8()), asRust(parameter.toUtf8()), value));
-}
-
-void FuramiBridge::setFilterChoice(const QString &revision, const QString &entry, const QString &parameter, const QString &value)
-{
-    assertGuiThread();
-    applyUpdate(gate_set_filter_choice(*m_gate, asRust(revision.toUtf8()), asRust(entry.toUtf8()), asRust(parameter.toUtf8()), asRust(value.toUtf8())));
-}
-
-void FuramiBridge::moveFilter(const QString &revision, const QString &entry, const QString &direction)
-{
-    assertGuiThread();
-    applyUpdate(gate_move_filter(*m_gate, asRust(revision.toUtf8()), asRust(entry.toUtf8()), asRust(direction.toUtf8())));
-}
-
-void FuramiBridge::clearFilters(const QString &revision)
-{
-    assertGuiThread();
-    applyUpdate(gate_clear_filters(*m_gate, asRust(revision.toUtf8())));
 }
 
 void FuramiBridge::setScale(const QString &selectionRevision, const QString &kernel)
@@ -902,8 +1060,7 @@ void FuramiBridge::restartCapture(const QString &expectedGeneration)
     const auto generation = expectedGeneration.toULongLong(&valid);
     if (!valid || !m_canRestart || m_bootstrapFailed)
         return;
-    qInfo().noquote() << QStringLiteral("input_intent action=RestartCapture source=ui generation=%1 current_attempt=%2 can_restart=%3")
-        .arg(generation).arg(m_restartGeneration).arg(boolean(m_canRestart));
+    emitNativeDiagnostic("intent_restart_capture", {{"generation", generation}, {"attempt_id", m_restartGeneration}, {"accepted", m_canRestart}});
     applyUpdate(gate_restart(*m_gate, generation));
 }
 
@@ -914,8 +1071,7 @@ void FuramiBridge::reconnectCapture(const QString &expectedGeneration)
     const auto generation = expectedGeneration.toULongLong(&valid);
     if (!valid || m_bootstrapFailed)
         return;
-    qInfo().noquote() << QStringLiteral("input_intent action=ReconnectCapture source=ui generation=%1 current_attempt=%2")
-        .arg(generation).arg(m_restartGeneration);
+    emitNativeDiagnostic("intent_reconnect_capture", {{"generation", generation}, {"attempt_id", m_restartGeneration}});
     applyUpdate(gate_reconnect(*m_gate, generation));
 }
 
@@ -935,16 +1091,14 @@ void FuramiBridge::chooseRecovery(const QString &expectedGeneration, const QStri
     const auto candidate = identity.value(2).toULongLong(&validCandidate);
     if (!validGeneration || !validWatch || !validEpoch || !validCandidate || m_bootstrapFailed)
         return;
-    qInfo().noquote() << QStringLiteral("input_intent action=ChooseRecovery source=ui generation=%1 watch=%2 epoch=%3 candidate=%4")
-        .arg(generation).arg(watch).arg(epoch).arg(candidate);
+    emitNativeDiagnostic("intent_choose_recovery", {{"generation", generation}, {"watch", watch}, {"epoch", epoch}, {"candidate", candidate}});
     applyUpdate(gate_choose_recovery(*m_gate, generation, watch, epoch, candidate));
 }
 
 void FuramiBridge::closeCapture()
 {
     assertGuiThread();
-    qInfo().noquote() << QStringLiteral("input_intent action=CloseSession source=ui generation=%1 phase=%2")
-        .arg(m_generation).arg(m_actualPhase);
+    emitNativeDiagnostic("intent_close_session", {{"generation", m_generation}});
     applyUpdate(gate_close(*m_gate, m_generation, false));
 }
 
@@ -954,8 +1108,7 @@ void FuramiBridge::togglePause()
     if (!m_canTogglePause || m_bootstrapFailed)
         return;
     const auto status = gate_pause(*m_gate, m_generation);
-    qInfo().noquote() << QStringLiteral("input_intent action=TogglePause generation=%1 status=%2")
-        .arg(m_generation).arg(statusName(status));
+    emitNativeDiagnostic("intent_toggle_pause", {{"generation", m_generation}, {"accepted", status == SubmitStatus::Accepted}});
     applyUpdate(gate_poll(*m_gate));
 }
 
@@ -963,8 +1116,7 @@ void FuramiBridge::setVolume(int percent)
 {
     assertGuiThread();
     const auto status = gate_set_volume(*m_gate, percent);
-    qInfo().noquote() << QStringLiteral("input_intent action=SetVolume percent=%1 status=%2")
-        .arg(percent).arg(statusName(status));
+    emitNativeDiagnostic("intent_set_volume", {{"volume_percent", percent}, {"accepted", status == SubmitStatus::Accepted}});
     // Every admission outcome publishes the authoritative retained preference.
     applyUpdate(gate_poll(*m_gate));
 }
@@ -973,8 +1125,7 @@ void FuramiBridge::setMuted(bool muted)
 {
     assertGuiThread();
     const auto status = gate_set_muted(*m_gate, muted);
-    qInfo().noquote() << QStringLiteral("input_intent action=SetMuted muted=%1 status=%2")
-        .arg(boolean(muted)).arg(statusName(status));
+    emitNativeDiagnostic("intent_set_muted", {{"muted", muted}, {"accepted", status == SubmitStatus::Accepted}});
     applyUpdate(gate_poll(*m_gate));
 }
 
@@ -984,13 +1135,11 @@ void FuramiBridge::selectOutput(const QString &rowKey, const QString &catalogRev
     bool revisionValid = false;
     const auto revision = catalogRevision.toULongLong(&revisionValid);
     if (!revisionValid) {
-        qInfo().noquote() << QStringLiteral("input_intent action=SelectOutput row=%1 status=RejectedRevision")
-            .arg(rowKey);
+        emitNativeDiagnostic("intent_select_output", {{"accepted", false}});
         return;
     }
     const auto status = gate_select_output(*m_gate, asRust(rowKey.toUtf8()), revision);
-    qInfo().noquote() << QStringLiteral("input_intent action=SelectOutput row=%1 revision=%2 status=%3")
-        .arg(rowKey).arg(revision).arg(statusName(status));
+    emitNativeDiagnostic("intent_select_output", {{"revision", revision}, {"accepted", status == SubmitStatus::Accepted}});
     // Every admission outcome republishes the authoritative projection,
     // including the unchanged selection after a stale/failed attempt.
     applyUpdate(gate_poll(*m_gate));
@@ -1001,7 +1150,7 @@ void FuramiBridge::openAndCloseDuringOpeningForProof()
     assertGuiThread();
     if (!m_qualificationInput || !m_canOpen || m_bootstrapFailed)
         return;
-    qInfo().noquote() << "input_intent action=OpenAndCloseDuringOpening source=qualification";
+    emitNativeDiagnostic("intent_open_close_during_opening");
     m_closeOnNextOpening = true;
     applyUpdate(gate_open(*m_gate));
 }
@@ -1011,8 +1160,7 @@ void FuramiBridge::forceSurfaceLossForProof()
     assertGuiThread();
     if (!m_qualificationInput || m_actualPhase != QStringLiteral("Ready") || m_failed || !m_host || m_poisoned)
         return;
-    qInfo().noquote() << QStringLiteral("input_intent action=ForceSurfaceLoss source=qualification root=%1 host=%2 generation=%3")
-        .arg(m_rootXid).arg(m_lastHostXid).arg(m_generation);
+    emitNativeDiagnostic("intent_force_surface_loss", {{"root", m_rootXid}, {"host", m_lastHostXid}, {"generation", m_generation}});
     // This is deliberately unauthorized. Only the real platform event reports loss.
     m_host->destroy();
 }
@@ -1022,8 +1170,7 @@ void FuramiBridge::requestApplicationClose()
     assertGuiThread();
     if (m_quitAuthorized)
         return;
-    qInfo().noquote() << QStringLiteral("input_intent action=ApplicationClose root=%1 generation=%2 phase=%3")
-        .arg(m_rootXid).arg(m_generation).arg(m_actualPhase);
+    emitNativeDiagnostic("intent_application_close", {{"root", m_rootXid}, {"generation", m_generation}});
     // Only an already-observed and synchronized transition may commit here.
     // Otherwise shutdown retains the last confirmed preference, not a request.
     observeFullscreenChoice();
@@ -1056,8 +1203,7 @@ void FuramiBridge::observeFullscreenChoice()
     m_fullscreenChoicePending = false;
     if (!m_fullscreenFocusRestorePending)
         m_fullscreenChoiceDeadline.stop();
-    qInfo().noquote() << QStringLiteral("fullscreen_preference_readback effective=%1 root=%2 transition=%3")
-        .arg(boolean(m_fullscreenObserved)).arg(m_rootXid).arg(m_fullscreenTransition);
+    emitNativeDiagnostic("fullscreen_preference_readback", {{"effective", m_fullscreenObserved}, {"root", m_rootXid}, {"transition", m_fullscreenTransition}});
     applyUpdate(gate_set_fullscreen(*m_gate, m_fullscreenObserved));
 }
 
@@ -1111,10 +1257,7 @@ void FuramiBridge::cancelFullscreenChoice(const char *reason)
 {
     assertGuiThread();
     if (m_fullscreenChoicePending || m_fullscreenFocusRestorePending) {
-        qInfo().noquote() << QStringLiteral("fullscreen_transition_cancelled reason=%1 requested=%2 observed=%3 retained_preference=%4 root=%5 transition=%6 focus_restore_pending=%7")
-            .arg(QString::fromLatin1(reason)).arg(boolean(m_fullscreenRequested))
-            .arg(boolean(m_fullscreenObserved)).arg(boolean(m_fullscreenPreference))
-            .arg(m_rootXid).arg(m_fullscreenTransition).arg(boolean(m_fullscreenFocusRestorePending));
+        emitNativeDiagnostic("fullscreen_transition_cancelled", {{"reason", reason}, {"requested", m_fullscreenRequested}, {"observed", m_fullscreenObserved}, {"retained_preference", m_fullscreenPreference}, {"root", m_rootXid}, {"transition", m_fullscreenTransition}, {"focus_restore_pending", m_fullscreenFocusRestorePending}});
     }
     m_fullscreenChoiceDeadline.stop();
     ++m_fullscreenTransition;
@@ -1132,6 +1275,12 @@ void FuramiBridge::setStatsHidden(bool hidden)
     applyUpdate(gate_set_stats_hidden(*m_gate, hidden));
 }
 
+void FuramiBridge::setLoggingEnabled(bool enabled)
+{
+    assertGuiThread();
+    applyUpdate(gate_set_logging_enabled(*m_gate, enabled));
+}
+
 void FuramiBridge::toggleFullscreen()
 {
     assertGuiThread();
@@ -1147,8 +1296,7 @@ void FuramiBridge::toggleFullscreen()
     m_fullscreenRequested = !wasFullscreen;
     m_fullscreenChoicePending = true;
     m_fullscreenChoiceDeadline.start();
-    qInfo().noquote() << QStringLiteral("input_intent action=ToggleFullscreen root=%1 generation=%2 fullscreen=%3")
-        .arg(m_rootXid).arg(m_generation).arg(boolean(!wasFullscreen));
+    emitNativeDiagnostic("intent_toggle_fullscreen", {{"root", m_rootXid}, {"generation", m_generation}, {"fullscreen", !wasFullscreen}});
     if (wasFullscreen) {
         m_fullscreenFocusRestorePending = true;
         m_fullscreenNativeTransitionObserved = false;
@@ -1211,9 +1359,7 @@ void FuramiBridge::restoreFullscreenFocus()
         && !m_poisoned && !m_host->poisoned() && m_host->parent() == m_root.data()
         && m_container && m_container->property("window").value<QWindow *>() == m_host.data())
         m_host->requestActivate();
-    qInfo().noquote() << QStringLiteral("fullscreen_focus_restored root=%1 item=%2 native_previously_focused=%3 generation=%4")
-        .arg(m_rootXid).arg(target ? target->objectName() : QStringLiteral("none"))
-        .arg(boolean(m_fullscreenNativeFocus)).arg(m_generation);
+    emitNativeDiagnostic("fullscreen_focus_restored", {{"root", m_rootXid}, {"object_name", controlClass(target ? target->objectName() : QString())}, {"native_previously_focused", m_fullscreenNativeFocus}, {"generation", m_generation}});
 }
 
 void FuramiBridge::focusVideo()
@@ -1231,16 +1377,13 @@ void FuramiBridge::focusVideo()
         m_host->requestActivate();
     else
         m_root->requestActivate();
-    qInfo().noquote() << QStringLiteral("input_intent action=FocusVideo root=%1 host=%2 generation=%3 cursor=Qt_ArrowCursor")
-        .arg(m_rootXid).arg(m_lastHostXid).arg(m_generation);
+    emitNativeDiagnostic("intent_focus_video", {{"root", m_rootXid}, {"host", m_lastHostXid}, {"generation", m_generation}});
 }
 
 bool FuramiBridge::handleKey(QKeyEvent *event, const char *source)
 {
     assertGuiThread();
-    qInfo().noquote() << QStringLiteral("input_event source=%1 kind=key_press key=%2 repeat=%3 text_entry=%4 popup=%5 generation=%6")
-        .arg(QString::fromLatin1(source)).arg(event->key()).arg(boolean(event->isAutoRepeat()))
-        .arg(boolean(m_textEntryActive)).arg(boolean(m_popupOpen)).arg(m_generation);
+    emitNativeDiagnostic("input_key_press", {{"source", source}, {"repeat", event->isAutoRepeat()}, {"text_entry", m_textEntryActive}, {"popup", m_popupOpen}, {"generation", m_generation}});
     const int key = event->key();
     const bool videoFocus = m_root && m_container
         && (qstrcmp(source, "host") == 0
@@ -1297,9 +1440,7 @@ void FuramiBridge::forwardToRoot(QEvent *event, const char *source)
         event->ignore();
         return;
     }
-    qInfo().noquote() << QStringLiteral("input_forward source=%1 event=%2 text_entry=%3 generation=%4")
-        .arg(QString::fromLatin1(source)).arg(static_cast<int>(event->type()))
-        .arg(boolean(m_textEntryActive)).arg(m_generation);
+    emitNativeDiagnostic("input_forward", {{"source", source}, {"event_type", static_cast<int>(event->type())}, {"text_entry", m_textEntryActive}, {"generation", m_generation}});
     QCoreApplication::sendEvent(m_root, event);
 }
 
@@ -1307,7 +1448,7 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
 {
     assertGuiThread();
     if (event->type() == QEvent::Quit && watched == qGuiApp && !m_quitAuthorized) {
-        qInfo().noquote() << "qt_quit_veto";
+        emitNativeDiagnostic("qt_quit_veto");
         requestApplicationClose();
         return true;
     }
@@ -1316,10 +1457,7 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
         : watched == m_bottomChromeWindow ? m_bottomChromeWindow.data() : nullptr;
     if (chrome) {
         if (event->type() == QEvent::FocusIn || event->type() == QEvent::FocusOut) {
-            qInfo().noquote() << QStringLiteral("input_focus_window source=%1 event=%2 root=%3 generation=%4")
-                .arg(chrome->objectName(), event->type() == QEvent::FocusIn
-                    ? QStringLiteral("FocusIn") : QStringLiteral("FocusOut"))
-                .arg(m_rootXid).arg(m_generation);
+            emitNativeDiagnostic("input_focus_window", {{"object_name", controlClass(chrome->objectName())}, {"active", event->type() == QEvent::FocusIn}, {"root", m_rootXid}, {"generation", m_generation}});
         }
         if (event->type() == QEvent::WindowStateChange) {
             if (!m_root || !m_root->isVisible() || m_root->visibility() == QWindow::Minimized)
@@ -1368,14 +1506,11 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
             }
         }
         if (event->type() == QEvent::FocusIn || event->type() == QEvent::FocusOut) {
-            qInfo().noquote() << QStringLiteral("input_focus_window source=root event=%1 root=%2 generation=%3")
-                .arg(event->type() == QEvent::FocusIn ? QStringLiteral("FocusIn") : QStringLiteral("FocusOut"))
-                .arg(m_rootXid).arg(m_generation);
+            emitNativeDiagnostic("input_focus_window", {{"object_name", "furamiRoot"}, {"active", event->type() == QEvent::FocusIn}, {"root", m_rootXid}, {"generation", m_generation}});
         }
         if (event->type() == QEvent::Close && !m_quitAuthorized) {
             event->ignore();
-            qInfo().noquote() << QStringLiteral("qt_root_close_veto root=%1 generation=%2")
-                .arg(m_rootXid).arg(m_generation);
+            emitNativeDiagnostic("qt_root_close_veto", {{"root", m_rootXid}, {"generation", m_generation}});
             requestApplicationClose();
             return true;
         }
@@ -1408,9 +1543,7 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
                 }
                 if (m_fullscreenChoicePending) {
                     m_fullscreenNativeTransitionObserved = m_fullscreenObserved == m_fullscreenRequested;
-                    qInfo().noquote() << QStringLiteral("fullscreen_native_state_observed requested=%1 effective=%2 matched=%3 root=%4 transition=%5")
-                        .arg(boolean(m_fullscreenRequested)).arg(boolean(m_fullscreenObserved))
-                        .arg(boolean(m_fullscreenNativeTransitionObserved)).arg(m_rootXid).arg(m_fullscreenTransition);
+                    emitNativeDiagnostic("fullscreen_native_state_observed", {{"requested", m_fullscreenRequested}, {"effective", m_fullscreenObserved}, {"matched", m_fullscreenNativeTransitionObserved}, {"root", m_rootXid}, {"transition", m_fullscreenTransition}});
                     if (m_fullscreenNativeTransitionObserved)
                         synchronizeFullscreenChoice();
                 }
@@ -1432,6 +1565,13 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     assertGuiThread();
     if (!update.changed)
         return;
+    const bool productStateChanged = m_actualPhase != phaseName(update.phase)
+        || m_generation != update.generation || m_restartGeneration != update.restart_generation
+        || m_failed != (update.failed || m_bootstrapFailed) || m_paused != update.paused
+        || m_volumePercent != update.volume_percent || m_muted != update.muted
+        || m_canRestart != (update.can_restart && !m_bootstrapFailed)
+        || m_canTogglePause != (update.can_toggle_pause && !m_bootstrapFailed)
+        || m_canSetGain != (update.can_set_gain && !m_bootstrapFailed);
     if (update.restart_generation != m_restartGeneration && !m_bootstrapFailed)
         m_nativeDiagnostic.clear();
     m_actualPhase = phaseName(update.phase);
@@ -1480,6 +1620,7 @@ void FuramiBridge::applyUpdate(UiUpdate update)
     m_resetToken = update.reset_token;
     m_fullscreenPreference = update.fullscreen;
     m_statsHiddenPreference = update.stats_hidden;
+    m_loggingEnabledPreference = update.logging_enabled;
     m_closing = update.closing;
     m_outputRows = fromRust(update.output_rows);
     m_outputCatalogRevision = update.output_catalog_revision;
@@ -1498,22 +1639,17 @@ void FuramiBridge::applyUpdate(UiUpdate update)
         m_contextDiagnostic = m_contextDiagnostic.isEmpty() ? m_nativeDiagnostic
             : m_nativeDiagnostic + QStringLiteral("; ") + m_contextDiagnostic;
     }
-    qInfo().noquote() << QStringLiteral("ui_phase phase=%1 visible_phase=%2 product_phase=%3 generation=%4 failed=%5 paused=%6 restart_generation=%7 can_restart=%8 audio_status=%9 audio_source=%10 audio_desired=%11 audio_diagnostic=%12 recovery_evidence=%13 recovery_stage=%14 diagnostic=%15 playback_status=%16 volume=%17 muted=%18 can_toggle_pause=%19 can_set_gain=%20")
-        .arg(m_actualPhase, phase(), m_productPhase).arg(m_generation).arg(boolean(m_failed))
-        .arg(boolean(m_paused))
-        .arg(m_restartGeneration).arg(boolean(m_canRestart)).arg(m_audioStatus)
-        .arg(m_audioSource, m_audioDesired, m_audioDiagnostic)
-        .arg(m_recoveryEvidence, m_recoveryStage, m_diagnostic)
-        .arg(m_playbackStatus).arg(m_volumePercent).arg(boolean(m_muted))
-        .arg(boolean(m_canTogglePause)).arg(boolean(m_canSetGain));
+    // Diagnostic health/counters alone must never enqueue another event.
+    if (productStateChanged)
+        emitNativeDiagnostic("ui_phase", {{"gate_phase", static_cast<int>(update.phase)}, {"generation", m_generation}, {"restart_generation", m_restartGeneration}, {"failed", m_failed}, {"paused", m_paused}, {"volume_percent", m_volumePercent}, {"muted", m_muted}, {"can_restart", m_canRestart}, {"can_toggle_pause", m_canTogglePause}, {"can_set_gain", m_canSetGain}});
     emit stateChanged();
-    scheduleGeometryLog();
+    if (productStateChanged)
+        scheduleGeometryLog();
     // The reducer emits effects in this order. Native effects never invent an ack.
     if (update.create_native)
         createNative(update.generation);
     if (update.release_native) {
-        qInfo().noquote() << QStringLiteral("ui_stop_ack generation=%1 root=%2 host=%3")
-            .arg(update.generation).arg(m_rootXid).arg(m_lastHostXid);
+        emitNativeDiagnostic("ui_stop_ack", {{"generation", update.generation}, {"root", m_rootXid}, {"host", m_lastHostXid}});
         if (m_insideSurfaceCallback) {
             const auto generation = update.generation;
             QTimer::singleShot(0, this, [this, generation] { releaseNative(generation); });
@@ -1525,9 +1661,12 @@ void FuramiBridge::applyUpdate(UiUpdate update)
         Q_ASSERT(m_nativeGeneration == 0);
         m_quitAuthorized = true;
         hideChromeWindows();
-        qInfo().noquote() << QStringLiteral("qt_quit_authorized generation=%1 root=%2")
-            .arg(update.generation).arg(m_rootXid);
+        emitNativeDiagnostic("qt_quit_authorized", {{"generation", update.generation}, {"root", m_rootXid}});
         QTimer::singleShot(0, qGuiApp, &QCoreApplication::quit);
+    }
+    if (update.log_folder_request != 0
+        && gate_claim_log_folder_dispatch(*m_gate, update.log_folder_request)) {
+        launchLogFolderOpener(fromRust(update.log_folder_path), update.log_folder_request);
     }
 }
 
@@ -1552,8 +1691,7 @@ void FuramiBridge::createNative(std::uint64_t generation)
     refreshChromeFamilyActive(QGuiApplication::focusWindow());
     connect(host, &QObject::destroyed, this, [this, generation] {
         assertGuiThread();
-        qInfo().noquote() << QStringLiteral("native_object_destroyed generation=%1 host=%2 authorized=%3")
-            .arg(generation).arg(m_lastHostXid).arg(boolean(m_releasing));
+        emitNativeDiagnostic("native_object_destroyed", {{"generation", generation}, {"host", m_lastHostXid}, {"authorized", m_releasing}});
         if (!m_releasing && generation == m_nativeGeneration) {
             m_host.clear();
             refreshChromeFamilyActive(QGuiApplication::focusWindow());
@@ -1563,8 +1701,7 @@ void FuramiBridge::createNative(std::uint64_t generation)
                 failNative(generation, QStringLiteral("host QObject was destroyed before owner acknowledgement"));
         }
     });
-    qInfo().noquote() << QStringLiteral("native_create generation=%1 root=%2")
-        .arg(generation).arg(m_rootXid);
+    emitNativeDiagnostic("native_create", {{"generation", generation}, {"root", m_rootXid}});
     emit hostWindowChanged();
     if (m_presentationSuppressed) {
         // A hidden WindowContainer still owns parent/geometry, but does not
@@ -1592,8 +1729,7 @@ void FuramiBridge::publishNative(std::uint64_t generation)
     assertGuiThread();
     if (generation != m_nativeGeneration || generation != m_generation || m_published || m_poisoned
         || m_failed || m_actualPhase != QStringLiteral("WaitingSurface")) {
-        qInfo().noquote() << QStringLiteral("native_publication_rejected generation=%1 current=%2 phase=%3 poisoned=%4")
-            .arg(generation).arg(m_generation).arg(m_actualPhase).arg(boolean(m_poisoned));
+        emitNativeDiagnostic("native_publication_rejected", {{"generation", generation}, {"current", m_generation}, {"poisoned", m_poisoned}});
         return;
     }
     if (!m_host || !m_root || !m_container) {
@@ -1634,16 +1770,14 @@ void FuramiBridge::publishNative(std::uint64_t generation)
     m_published = true;
     m_lastHostXid = xid;
     m_host->rememberXid(xid);
-    qInfo().noquote() << QStringLiteral("native_publish root=%1 host=%2 generation=%3 x11_parent=%4")
-        .arg(m_rootXid).arg(xid).arg(generation).arg(static_cast<std::uint64_t>(parent));
+    emitNativeDiagnostic("native_publish", {{"root", m_rootXid}, {"host", xid}, {"generation", generation}, {"x11_parent", static_cast<std::uint64_t>(parent)}});
     auto update = gate_surface_ready(*m_gate, generation, xid);
     const bool closeDuringOpening = m_closeDuringOpening == generation && update.phase == GatePhase::Opening;
     applyUpdate(std::move(update));
     if (closeDuringOpening) {
         m_closeDuringOpening = 0;
         auto close = gate_close(*m_gate, generation, false);
-        qInfo().noquote() << QStringLiteral("proof_close_during_opening generation=%1 observed_phase=Opening accepted=%2")
-            .arg(generation).arg(boolean(close.phase == GatePhase::Stopping && !close.failed));
+        emitNativeDiagnostic("proof_close_during_opening", {{"generation", generation}, {"accepted", close.phase == GatePhase::Stopping && !close.failed}});
         applyUpdate(std::move(close));
     }
     scheduleGeometryLog();
@@ -1661,21 +1795,16 @@ void FuramiBridge::surfaceLost(std::uint64_t generation, std::uint64_t previousX
     m_closeDuringOpening = 0;
     m_nativeDiagnostic = QStringLiteral("uncontrolled native surface loss for generation %1, previous XID %2")
         .arg(generation).arg(previousXid);
-    qCritical().noquote() << QStringLiteral("native_surface_loss generation=%1 host=%2 root=%3 phase=%4 controlled=false")
-        .arg(generation).arg(previousXid).arg(m_rootXid).arg(m_actualPhase);
+    emitNativeDiagnostic("native_surface_loss", {{"generation", generation}, {"host", previousXid}, {"root", m_rootXid}, {"controlled", false}}, 2);
     m_insideSurfaceCallback = true;
     applyUpdate(gate_surface_lost(*m_gate, generation));
-    qInfo().noquote() << QStringLiteral("native_loss_barrier_begin generation=%1 host=%2")
-        .arg(generation).arg(previousXid);
+    emitNativeDiagnostic("native_loss_barrier_begin", {{"generation", generation}, {"host", previousXid}});
     const QString diagnostic = fromRust(gate_wait_for_owner_ack(*m_gate, generation));
     if (!diagnostic.isEmpty()) {
-        const QByteArray failure = diagnostic.toUtf8();
-        qFatal("native_loss_barrier_failed generation=%llu host=%llu diagnostic=%s",
-            static_cast<unsigned long long>(generation),
-            static_cast<unsigned long long>(previousXid), failure.constData());
+        emitNativeDiagnostic("native_loss_barrier_failed", {{"generation", generation}, {"host", previousXid}}, 3);
+        qFatal("native_loss_barrier_failed");
     }
-    qInfo().noquote() << QStringLiteral("native_loss_barrier_complete generation=%1 host=%2")
-        .arg(generation).arg(previousXid);
+    emitNativeDiagnostic("native_loss_barrier_complete", {{"generation", generation}, {"host", previousXid}});
     m_insideSurfaceCallback = false;
 }
 
@@ -1686,8 +1815,7 @@ void FuramiBridge::failNative(std::uint64_t generation, const QString &diagnosti
         m_host->poison();
     m_poisoned = true;
     m_nativeDiagnostic = diagnostic;
-    qCritical().noquote() << QStringLiteral("native_failure generation=%1 root=%2 host=%3 diagnostic=%4")
-        .arg(generation).arg(m_rootXid).arg(m_lastHostXid).arg(diagnostic);
+    emitNativeDiagnostic("native_failure", {{"generation", generation}, {"root", m_rootXid}, {"host", m_lastHostXid}}, 2);
     applyUpdate(gate_surface_lost(*m_gate, generation));
 }
 
@@ -1695,17 +1823,14 @@ void FuramiBridge::releaseNative(std::uint64_t generation)
 {
     assertGuiThread();
     if (!generation || generation != m_nativeGeneration || m_actualPhase != QStringLiteral("Releasing") || m_releasing) {
-        qCritical().noquote() << QStringLiteral("native_release_rejected generation=%1 current=%2 phase=%3")
-            .arg(generation).arg(m_nativeGeneration).arg(m_actualPhase);
+        emitNativeDiagnostic("native_release_rejected", {{"generation", generation}, {"current", m_nativeGeneration}}, 2);
         return;
     }
     m_releasing = true;
     QPointer<HostWindow> surviving = m_host;
     if (surviving) {
         surviving->authorizeDestruction();
-        qInfo().noquote() << QStringLiteral("native_destroy_begin generation=%1 host=%2 root=%3 parent_preserved=%4")
-            .arg(generation).arg(m_lastHostXid).arg(m_rootXid)
-            .arg(boolean(surviving->parent() == m_root.data()));
+        emitNativeDiagnostic("native_destroy_begin", {{"generation", generation}, {"host", m_lastHostXid}, {"root", m_rootXid}, {"parent_preserved", surviving->parent() == m_root.data()}});
         if (surviving->handle()) {
             surviving->hide();
             surviving->destroy();
@@ -1719,8 +1844,7 @@ void FuramiBridge::releaseNative(std::uint64_t generation)
         m_container->setProperty("window", QVariant::fromValue<QWindow *>(nullptr));
     if (surviving)
         delete surviving.data();
-    qInfo().noquote() << QStringLiteral("native_destroy generation=%1 host=%2 root=%3 authorized=true poisoned=%4")
-        .arg(generation).arg(m_lastHostXid).arg(m_rootXid).arg(boolean(m_poisoned));
+    emitNativeDiagnostic("native_destroy", {{"generation", generation}, {"host", m_lastHostXid}, {"root", m_rootXid}, {"authorized", true}, {"poisoned", m_poisoned}});
     m_nativeGeneration = 0;
     m_releasing = false;
     m_published = false;
@@ -1749,29 +1873,21 @@ void FuramiBridge::logGeometry()
         return;
     const auto video = m_container->mapRectToScene(QRectF(0, 0, m_container->width(), m_container->height()));
     const qreal dpr = m_root->devicePixelRatio();
-    qInfo().noquote() << QStringLiteral("qt_geometry root=%1 generation=%2 root_width=%3 root_height=%4 video_x=%5 video_y=%6 video_width=%7 video_height=%8 dpr=%9")
-        .arg(m_rootXid).arg(m_generation).arg(m_root->width()).arg(m_root->height())
-        .arg(video.x()).arg(video.y()).arg(video.width()).arg(video.height()).arg(dpr);
+    emitNativeDiagnostic("qt_geometry", {{"root", m_rootXid}, {"generation", m_generation}, {"root_width", m_root->width()}, {"root_height", m_root->height()}, {"video_x", video.x()}, {"video_y", video.y()}, {"video_width", video.width()}, {"video_height", video.height()}, {"dpr", dpr}});
     for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
         if (!window)
             continue;
         const auto local = m_root->mapFromGlobal(window->position());
-        qInfo().noquote() << QStringLiteral("qt_chrome_geometry object=%1 root=%2 x=%3 y=%4 global_x=%5 global_y=%6 width=%7 height=%8 visible=%9 native_parent_null=%10 transient_root=%11")
-            .arg(window->objectName()).arg(m_rootXid).arg(local.x()).arg(local.y())
-            .arg(window->x()).arg(window->y()).arg(window->width()).arg(window->height())
-            .arg(boolean(window->isVisible())).arg(boolean(window->parent() == nullptr))
-            .arg(boolean(window->transientParent() == m_root.data()));
+        emitNativeDiagnostic("qt_chrome_geometry", {{"object_name", controlClass(window->objectName())}, {"root", m_rootXid}, {"x", local.x()}, {"y", local.y()}, {"global_x", window->x()}, {"global_y", window->y()}, {"width", window->width()}, {"height", window->height()}, {"visible", window->isVisible()}, {"native_parent_null", window->parent() == nullptr}, {"transient_root", window->transientParent() == m_root.data()}});
     }
+    std::uint64_t controlOrdinal = 0;
     const auto logControl = [&](const QString &name, QQuickItem *item) {
         if (!item || !item->window())
             return;
         const auto scene = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
         const auto origin = m_root->mapFromGlobal(item->window()->mapToGlobal(scene.topLeft()));
         const QRectF rect(origin, scene.size());
-        qInfo().noquote() << QStringLiteral("ui_control object=%1 x=%2 y=%3 width=%4 height=%5 visible=%6 enabled=%7")
-            .arg(name).arg(qRound(rect.x() * dpr)).arg(qRound(rect.y() * dpr))
-            .arg(qRound(rect.width() * dpr)).arg(qRound(rect.height() * dpr))
-            .arg(boolean(item->isVisible() && item->window()->isVisible())).arg(boolean(item->isEnabled()));
+        emitNativeDiagnostic("ui_control", {{"object_name", controlClass(name)}, {"ordinal", controlOrdinal++}, {"x", qRound(rect.x() * dpr)}, {"y", qRound(rect.y() * dpr)}, {"width", qRound(rect.width() * dpr)}, {"height", qRound(rect.height() * dpr)}, {"visible", item->isVisible() && item->window()->isVisible()}, {"enabled", item->isEnabled()}});
     };
     const char *names[] = {
         "videoContainer", "topChromeRoot", "volumeChromeRoot", "bottomChromeRoot",
@@ -1779,8 +1895,9 @@ void FuramiBridge::logGeometry()
         "volumeSlider", "volumeMute", "optionsTrigger",
         "menuOpenCapture", "menuPauseResume", "menuRestart", "menuReconnect", "menuSettings", "menuCloseCapture",
         "menuBack", "menuBackSection", "menuIntentError",
-        "settingsCaptureEntry", "settingsAudioEntry", "settingsFiltersEntry", "settingsRendererEntry", "settingsPreferencesEntry",
+        "settingsCaptureEntry", "settingsAudioEntry", "settingsRendererEntry", "settingsPreferencesEntry",
         "contextIntentError", "contextDiagnostic",
+        "menuOpenLogs", "contextDiagnosticsError",
         "contextOutputAction", "contextRecoveryStage", "recoveryUse",
         "sourceRefresh", "captureFormatSelector", "captureRefresh",
         "audioCaptureEnabled", "audioInputSelector", "audioMute", "audioOutputSelector", "audioOutputMute",
@@ -1791,7 +1908,7 @@ void FuramiBridge::logGeometry()
         "renderValue_scale", "renderValue_cscale", "renderValue_dscale", "renderValue_scale_antiring",
         "renderValue_dither", "renderValue_deband", "renderValue_deband_iterations", "renderValue_deband_grain", "renderValue_interpolation",
         "sizeWidthField", "sizeHeightField", "rateExactField", "sizeRateCatalogError",
-        "filtersError", "rendererNotice", "filterClear",
+        "rendererNotice",
         "preferencesStatus", "preferencesStartup", "preferencesPath", "preferencesImmediate",
         "preferencesReset", "preferencesRefused",
         "sourceCatalogError", "sourceCapability", "outputMissing", "outputStatus",
@@ -1850,6 +1967,7 @@ void FuramiBridge::logGeometry()
 
 LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, bool qualificationStdin)
 {
+    qInstallMessageHandler(safeQtMessage);
     const QByteArray captured(display.data(), static_cast<qsizetype>(display.size()));
     if (captured.isEmpty() || qgetenv("DISPLAY").isEmpty())
         return launchFailure(QStringLiteral("missing X11 DISPLAY; Furami requires XWayland/xcb"));
@@ -1870,12 +1988,13 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
     char *argv[] = {program, nullptr};
     QGuiApplication application(argc, argv);
     QObject::connect(&application, &QObject::destroyed, [] {
-        qInfo().noquote() << "qt_application_destroy";
+        emitNativeDiagnostic("qt_application_destroy");
     });
     application.setApplicationName(QStringLiteral("Furami"));
     application.setQuitOnLastWindowClosed(false);
     if (QString::fromLatin1(qVersion()) != QStringLiteral("6.11.2"))
         return launchFailure(QStringLiteral("runtime Qt version differs from frozen 6.11.2: %1").arg(QString::fromLatin1(qVersion())));
+    UiUpdate nativeEnvironment;
 #if QT_CONFIG(xcb)
     auto *native = application.nativeInterface<QNativeInterface::QX11Application>();
     if (!native || !native->display() || !native->connection())
@@ -1896,18 +2015,22 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
     std::free(shape);
     if (!shapeValid)
         return launchFailure(QStringLiteral("X11 SHAPE >=1.1 is required for mpv cursor/input passthrough"));
-    qInfo().noquote() << QStringLiteral("native_startup qt=%1 platform=%2 captured_display=%3 qt_display=%4 current_display=%5 shape=%6.%7")
-        .arg(QString::fromLatin1(qVersion()), QString::fromUtf8(platform), QString::fromUtf8(captured),
-             QString::fromUtf8(qtDisplay), QString::fromUtf8(current)).arg(major).arg(minor);
+    emitNativeDiagnostic("native_startup", {{"shape_major", major}, {"shape_minor", minor}});
+    const QByteArray qtVersion(qVersion());
+    const QByteArray xVendor(XServerVendor(native->display()));
+    nativeEnvironment = gate_native_environment(*gate, asRust(qtVersion), asRust(platform), asRust(xVendor),
+        static_cast<std::uint32_t>(XVendorRelease(native->display())),
+        static_cast<std::uint32_t>(ProtocolVersion(native->display())),
+        static_cast<std::uint32_t>(ProtocolRevision(native->display())), major, minor);
 #else
     return launchFailure(QStringLiteral("Qt was built without the required xcb native interface"));
 #endif
 
     // Construction order keeps bridge/timer alive until after the QML engine/root dies.
-    FuramiBridge bridge(std::move(gate));
+    FuramiBridge bridge(std::move(gate), std::move(nativeEnvironment));
     QQmlApplicationEngine engine;
     QObject::connect(&engine, &QObject::destroyed, &application, [] {
-        qInfo().noquote() << "qt_engine_destroy";
+        emitNativeDiagnostic("qt_engine_destroy");
     });
     // Keep Tools hidden until bindRoot creates their permanent native transient parent.
     engine.setInitialProperties({{QStringLiteral("bridge"), QVariant::fromValue(&bridge)},
@@ -1939,13 +2062,12 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
     int exitCode = application.exec();
     if (!bridge.quitAuthorized()) {
         // An unsolicited loop exit cannot discard a live owner or its native parent.
-        qCritical().noquote() << "qt_uncontrolled_event_loop_exit requesting_owner_cleanup";
+        emitNativeDiagnostic("qt_uncontrolled_event_loop_exit", {}, 2);
         bridge.requestApplicationClose();
         application.exec();
         exitCode = 1;
     }
-    qInfo().noquote() << QStringLiteral("qt_event_loop_exit code=%1 owner_cleanup_authorized=%2")
-        .arg(exitCode).arg(boolean(bridge.quitAuthorized()));
+    emitNativeDiagnostic("qt_event_loop_exit", {{"exit_code", exitCode}, {"owner_cleanup_authorized", bridge.quitAuthorized()}});
     if (bridge.launchFailed())
         return launchFailure(bridge.diagnostic());
     if (exitCode)

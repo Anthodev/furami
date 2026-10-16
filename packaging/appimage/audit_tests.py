@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavioral regression tests for generated Qt QML attribution."""
+"""Behavioral tests for payload attribution, required entries and program closure."""
 import hashlib
 import importlib.util
 import json
@@ -100,6 +100,95 @@ class QtAttributionTests(unittest.TestCase):
         self.backend.write_bytes(b'changed backend')
         with self.assertRaisesRegex(ValueError, 'Qt vendor SBOM checksum mismatch'):
             audit.qt_evidence(self.media, self.owners(), self.media)
+
+
+class MediaProgramAttributionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.media = Path(temporary.name)
+        self.prefix = self.media / 'prefix'
+        self.prefix.mkdir()
+        self.file('bin/mpv', b'\x7fELF provider mpv program')
+        self.file('lib/libmpv.so.2', b'checked provider shared library')
+        for name in ('qtbase', 'qtdeclarative', 'qtsvg', 'qtshadertools'):
+            self.file('sbom/' + name + '-6.11.2.spdx.json',
+                      json.dumps({'name': name, 'packages': [], 'files': [], 'relationships': []}).encode())
+
+    def file(self, relative, content):
+        path = self.prefix / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def test_seeded_provider_program_shares_checked_mpv_component(self):
+        owners = {'usr/bin/mpv': {'owner': 'media', 'source': 'bin/mpv'},
+                  'usr/lib/libmpv.so.2': {'owner': 'media', 'source': 'lib/libmpv.so.2'}}
+        audit.qt_evidence(self.media, owners, self.media)
+        for owner in owners.values():
+            component = owner['components'][0]
+            self.assertEqual(component['component_id'], 'mpv')
+            self.assertEqual(component['license_expression'], 'GPL-2.0-or-later')
+
+    def test_unrelated_or_inexact_provider_programs_remain_refused(self):
+        for source in ('bin/ffmpeg', 'bin/ffprobe', 'bin/mpv-tool', 'mpv', 'usr/bin/mpv'):
+            owners = {'usr/bin/mpv': {'owner': 'media', 'source': source}}
+            with self.assertRaisesRegex(ValueError, 'media owner lacks component mapping'):
+                audit.qt_evidence(self.media, owners, self.media)
+
+    def test_required_executables_include_staged_provider_program(self):
+        root = self.media / 'AppDir'
+        (root / 'usr/bin').mkdir(parents=True)
+        (root / 'AppRun').write_bytes(b'#!/bin/sh\n')
+        (root / 'usr/bin/furami').write_bytes(b'\x7fELF application')
+        for relative in ('AppRun', 'usr/bin/furami'):
+            (root / relative).chmod(0o755)
+        with self.assertRaisesRegex(ValueError, 'not executable by recipients: usr/bin/mpv'):
+            audit.verify_executables(root, audit.REQUIRED_EXECUTABLES)
+        program = root / 'usr/bin/mpv'
+        program.write_bytes(b'\x7fELF provider mpv program')
+        with self.assertRaisesRegex(ValueError, 'not executable by recipients: usr/bin/mpv'):
+            audit.verify_executables(root, audit.REQUIRED_EXECUTABLES)
+        program.chmod(0o755)
+        audit.verify_executables(root, audit.REQUIRED_EXECUTABLES)
+
+
+class MediaProgramClosureTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name) / 'payload'
+        self.root.mkdir()
+
+    def file(self, relative, data=b'ELF contents'):
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return target
+
+    def metadata(self, path, needed=(), runpath=None):
+        return {'path': path, 'needed': list(needed), 'runpath': runpath, 'rpath': None,
+                'class': 'ELF64', 'machine': 'Advanced Micro Devices X86-64'}
+
+    def hashes(self, *targets):
+        return {relative: hashlib.sha256((self.root / relative).read_bytes()).hexdigest()
+                for relative in targets}
+
+    def test_seeded_program_missing_unsearched_and_escaped_paths_are_reported(self):
+        self.file('usr/bin/mpv')
+        self.file('usr/private/libstaged.so.9')
+        entries = [self.metadata('usr/bin/mpv', needed=['libabsent.so.9', 'libstaged.so.9'],
+                                 runpath='$ORIGIN/../lib'),
+                   self.metadata('usr/private/libstaged.so.9')]
+        warnings = []
+        dependencies = audit.inventory.resolve_dependency_closure(
+            str(self.root), entries, self.hashes('usr/bin/mpv', 'usr/private/libstaged.so.9'),
+            [], ['../outside', 'usr/missing-lib'], warnings)
+        self.assertEqual({entry['resolution']['kind'] for entry in dependencies}, {'missing'})
+        self.assertIn('missing dependency: libabsent.so.9 (required by usr/bin/mpv)', warnings)
+        self.assertTrue(any('not in loader search paths' in warning for warning in warnings))
+        self.assertTrue(any('escapes staged root' in warning for warning in warnings))
+        self.assertTrue(any('library search path absent' in warning for warning in warnings))
 
 
 if __name__ == '__main__':

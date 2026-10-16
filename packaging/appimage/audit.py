@@ -25,6 +25,10 @@ def load(name):
 stage = load('stage')
 inventory = load('inventory')
 
+# Launch entries every extracted payload must carry executable: AppRun, the
+# application, and the media provider's own renderer program seeded by stage.py.
+REQUIRED_EXECUTABLES = ('AppRun', 'usr/bin/furami', 'usr/bin/mpv')
+
 
 def dump(path, value):
     Path(path).write_text(json.dumps(value, sort_keys=True, indent=2) + '\n')
@@ -176,7 +180,11 @@ def qt_evidence(media, owners, root):
                                      'evidence': source}]
         else:
             name = Path(source).name
-            component = 'mpv' if name.startswith('libmpv') else 'libplacebo' if name.startswith('libplacebo') else 'ffmpeg' if name.startswith(('libav', 'libsw')) else None
+            # The seeded provider program is mapped by its exact manifest source,
+            # never by basename; other provider programs stay refused.
+            component = ('mpv' if source == 'bin/mpv' or name.startswith('libmpv')
+                         else 'libplacebo' if name.startswith('libplacebo')
+                         else 'ffmpeg' if name.startswith(('libav', 'libsw')) else None)
             if component:
                 owner['components'] = [{'component_id': component,
                                         'license_expression': {'mpv': 'GPL-2.0-or-later', 'ffmpeg': 'GPL-2.0-or-later', 'libplacebo': 'LGPL-2.1-or-later'}[component],
@@ -184,6 +192,13 @@ def qt_evidence(media, owners, root):
             else:
                 raise ValueError(f'media owner lacks component mapping: {relative} <- {source}')
     return documents
+
+
+def verify_executables(root, relatives):
+    for relative in relatives:
+        executable = root / relative
+        if not executable.is_file() or executable.stat().st_mode & 0o111 != 0o111:
+            raise ValueError(f'AppImage launch entry is not executable by recipients: {relative}')
 
 
 def audit(image, provenance, output):
@@ -207,10 +222,7 @@ def audit(image, provenance, output):
     actual = stage.snapshot(root)
     if actual != receipt['appdir']['artifacts']:
         raise ValueError('actual image file/mode/symlink manifest differs from staging receipt')
-    for relative in ('AppRun', 'usr/bin/furami'):
-        executable = root / relative
-        if not executable.is_file() or executable.stat().st_mode & 0o111 != 0o111:
-            raise ValueError(f'AppImage launch entry is not executable by recipients: {relative}')
+    verify_executables(root, REQUIRED_EXECUTABLES)
     files, symlinks = inventory.walk_tree(str(root))
     if any('error' in item for item in files):
         raise ValueError('unreadable final image file')
@@ -257,6 +269,8 @@ def audit(image, provenance, output):
         item['symbol_versions'] = versions(path)
         requirements.update(item['symbol_versions']['required'])
         provided.update(item['symbol_versions']['provided'])
+    if 'usr/bin/mpv' not in {item['path'] for item in elf}:
+        raise ValueError('seeded media program is not an inspected ELF: usr/bin/mpv')
     missing_cpp = {name for name in requirements if name.startswith(('GLIBCXX_', 'CXXABI_'))} - provided
     if missing_cpp:
         raise ValueError(f'bundled C++ providers lack symbols: {sorted(missing_cpp)}')

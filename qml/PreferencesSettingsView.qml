@@ -70,6 +70,24 @@ Item {
                 Projection.bridge.setStatsHidden(checked)
         }
 
+        BrumeToggle {
+            objectName: "preferencesLoggingEnabled"
+            Layout.fillWidth: true
+            label: "Activer les journaux de diagnostic"
+            checked: Projection.bridge
+                && Projection.bridge.loggingEnabledPreference
+            enabled: Projection.ready && !view.profile.closing
+            Accessible.name: "Activer les journaux de diagnostic"
+            onToggled: if (Projection.bridge)
+                Projection.bridge.setLoggingEnabled(checked)
+        }
+
+        BrumeLabel {
+            Layout.fillWidth: true
+            variant: "note"
+            text: "Active les fichiers journaux et les traces techniques du terminal. Les journaux existants sont conservés en cas de désactivation."
+        }
+
         BrumeButton {
             objectName: "preferencesReset"
             Layout.fillWidth: true

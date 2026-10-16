@@ -1326,7 +1326,6 @@ mod tests {
         let requested = crate::domain::state::DraftSettings {
             video: auto_request(),
             audio: crate::domain::capture::AudioSelection::default(),
-            filters: crate::domain::filters::FilterChain::default(),
             renderer: crate::domain::render::RendererSettings::default(),
         };
         let stamp = crate::domain::capture::WatchStamp {

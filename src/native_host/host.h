@@ -71,13 +71,14 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(QString resetToken READ resetToken NOTIFY stateChanged)
     Q_PROPERTY(bool fullscreenPreference READ fullscreenPreference NOTIFY stateChanged)
     Q_PROPERTY(bool statsHiddenPreference READ statsHiddenPreference NOTIFY stateChanged)
+    Q_PROPERTY(bool loggingEnabledPreference READ loggingEnabledPreference NOTIFY stateChanged)
     Q_PROPERTY(QString contextDiagnostic READ contextDiagnostic NOTIFY stateChanged)
     Q_PROPERTY(bool closing READ closing NOTIFY stateChanged)
     Q_PROPERTY(int screenAvailableWidth READ screenAvailableWidth NOTIFY screenGeometryChanged)
     Q_PROPERTY(int screenAvailableHeight READ screenAvailableHeight NOTIFY screenGeometryChanged)
 
 public:
-    explicit FuramiBridge(rust::Box<RuntimeCoordinator> gate);
+    explicit FuramiBridge(rust::Box<RuntimeCoordinator> gate, UiUpdate nativeEnvironment);
     ~FuramiBridge() override;
 
     QWindow *hostWindow() const;
@@ -122,6 +123,7 @@ public:
     QString resetToken() const;
     bool fullscreenPreference() const;
     bool statsHiddenPreference() const;
+    bool loggingEnabledPreference() const;
     bool closing() const;
     int screenAvailableWidth() const;
     int screenAvailableHeight() const;
@@ -134,6 +136,7 @@ public:
     bool launchFailed() const;
 
     Q_INVOKABLE void openCapture();
+    Q_INVOKABLE void openLogFolder();
     Q_INVOKABLE void refreshCatalogs();
     Q_INVOKABLE void selectCapture(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey);
     Q_INVOKABLE void selectSize(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey);
@@ -143,13 +146,6 @@ public:
     Q_INVOKABLE void selectFormat(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey);
     Q_INVOKABLE void setAudioEnabled(const QString &selectionRevision, bool enabled);
     Q_INVOKABLE void selectAudioInput(const QString &selectionRevision, const QString &catalogRevision, const QString &rowKey);
-    Q_INVOKABLE void setFilterEnabled(const QString &selectionRevision, const QString &entryKey, bool enabled);
-    Q_INVOKABLE void addFilter(const QString &selectionRevision, const QString &kind);
-    Q_INVOKABLE void removeFilter(const QString &selectionRevision, const QString &entryKey);
-    Q_INVOKABLE void setFilterNumber(const QString &revision, const QString &entry, const QString &parameter, double value);
-    Q_INVOKABLE void setFilterChoice(const QString &revision, const QString &entry, const QString &parameter, const QString &value);
-    Q_INVOKABLE void moveFilter(const QString &revision, const QString &entry, const QString &direction);
-    Q_INVOKABLE void clearFilters(const QString &revision);
     Q_INVOKABLE void setScale(const QString &selectionRevision, const QString &kernel);
     Q_INVOKABLE void setCscale(const QString &selectionRevision, const QString &kernel);
     Q_INVOKABLE void setDscale(const QString &selectionRevision, const QString &kernel);
@@ -176,6 +172,7 @@ public:
     Q_INVOKABLE void decideSettingsReset(const QString &token, bool confirmed);
     Q_INVOKABLE void toggleFullscreen();
     Q_INVOKABLE void setStatsHidden(bool hidden);
+    Q_INVOKABLE void setLoggingEnabled(bool enabled);
     Q_INVOKABLE void focusVideo();
     Q_INVOKABLE void registerChromeWindows(QWindow *top, QWindow *volume, QWindow *bottom);
     Q_INVOKABLE void focusNextChrome(const QString &region, bool backward);
@@ -204,6 +201,7 @@ protected:
 private:
     void assertGuiThread() const;
     void applyUpdate(UiUpdate update);
+    void launchLogFolderOpener(const QString &path, std::uint64_t request);
     void createNative(std::uint64_t generation);
     void publishNative(std::uint64_t generation);
     void releaseNative(std::uint64_t generation);
@@ -303,6 +301,7 @@ private:
     std::uint64_t m_resetToken = 0;
     bool m_fullscreenPreference = false;
     bool m_statsHiddenPreference = false;
+    bool m_loggingEnabledPreference = false;
     bool m_fullscreenChoicePending = false;
     bool m_closing = false;
     bool m_textEntryActive = false;

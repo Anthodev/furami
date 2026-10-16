@@ -10,7 +10,6 @@ use super::{
         RecoveryWatchTarget, SelectionToken, VideoPresence, VideoRequest, WatchId, WatchStamp,
     },
     failure::ApplyFailure,
-    filters::FilterChain,
     render::RendererSettings,
 };
 
@@ -18,14 +17,12 @@ use super::{
 pub struct DraftSettings {
     pub video: VideoRequest,
     pub audio: AudioSelection,
-    pub filters: FilterChain,
     pub renderer: RendererSettings,
 }
 impl DraftSettings {
     pub fn same_request(&self, other: &Self) -> bool {
         self.video.same_request(&other.video)
             && self.audio == other.audio
-            && self.filters == other.filters
             && self.renderer == other.renderer
     }
 }
@@ -121,96 +118,6 @@ impl ApplyAdmission {
         }
     }
 }
-/// Attests bounded media observation, not physical display or future frames.
-/// Only media observation may construct this value; it is never deserialized.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-pub struct FilterConfirmation {
-    key: TreatmentAttemptKey,
-    baseline: f64,
-    last_position: f64,
-    advances: u16,
-}
-
-impl FilterConfirmation {
-    pub const REQUIRED_ADVANCES: u16 = 32;
-    pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
-    pub const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-
-    pub fn key(&self) -> TreatmentAttemptKey {
-        self.key
-    }
-    pub fn baseline(&self) -> f64 {
-        self.baseline
-    }
-    pub fn last_position(&self) -> f64 {
-        self.last_position
-    }
-    pub fn advances(&self) -> u16 {
-        self.advances
-    }
-
-    /// The owner must first witness a matching successful command reply,
-    /// in-window reconfiguration, 50-ms sampling with at most one read pending,
-    /// and a final clean drain without failure/evidence loss within DEADLINE.
-    /// `advances` counts strictly increasing post-baseline observations, not
-    /// reads or elapsed intervals. This boundary checks the numeric summary;
-    /// the keyed media observer owns the event-ordering proof.
-    pub(crate) fn checked(
-        key: TreatmentAttemptKey,
-        baseline: f64,
-        last_position: f64,
-        advances: u16,
-    ) -> Result<Self, super::failure::FilterConfirmationFailure> {
-        use super::failure::FilterConfirmationFailure;
-        if !baseline.is_finite() || !last_position.is_finite() {
-            return Err(FilterConfirmationFailure::ProgressUnavailable);
-        }
-        if last_position <= baseline {
-            return Err(FilterConfirmationFailure::TimeDiscontinuity);
-        }
-        if advances < Self::REQUIRED_ADVANCES {
-            return Err(FilterConfirmationFailure::Deadline);
-        }
-        Ok(Self {
-            key,
-            baseline,
-            last_position,
-            advances,
-        })
-    }
-}
-
-/// Native vf provenance survives renderer-only treatment commits.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-pub enum FilterEvidence {
-    Confirmed(FilterConfirmation),
-    PreparedPaused { key: TreatmentAttemptKey },
-}
-impl FilterEvidence {
-    pub fn key(&self) -> TreatmentAttemptKey {
-        match self {
-            Self::Confirmed(confirmation) => confirmation.key(),
-            Self::PreparedPaused { key } => *key,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-pub enum FilterTreatmentProof {
-    Reconfigured(FilterConfirmation),
-    Preserved { origin: FilterEvidence },
-    PreparedPaused { key: TreatmentAttemptKey },
-}
-impl FilterTreatmentProof {
-    pub fn origin(&self) -> FilterEvidence {
-        match self {
-            Self::Reconfigured(confirmation) => FilterEvidence::Confirmed(*confirmation),
-            Self::Preserved { origin } => *origin,
-            Self::PreparedPaused { key } => FilterEvidence::PreparedPaused { key: *key },
-        }
-    }
-}
-
 /// Constructed by media only after all nine native readbacks and a clean drain.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RendererConfirmation {
@@ -229,12 +136,11 @@ impl RendererConfirmation {
     }
 }
 
-/// One indivisible applied result; neither constituent proof commits alone.
+/// One indivisible renderer result tied to the exact owner and playback state.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct TreatmentConfirmation {
     key: TreatmentAttemptKey,
     playback: InitialPlayback,
-    filters: FilterTreatmentProof,
     renderer: RendererConfirmation,
 }
 impl TreatmentConfirmation {
@@ -244,52 +150,21 @@ impl TreatmentConfirmation {
     pub fn playback(&self) -> InitialPlayback {
         self.playback
     }
-    pub fn filters(&self) -> &FilterTreatmentProof {
-        &self.filters
-    }
     pub fn renderer(&self) -> &RendererConfirmation {
         &self.renderer
     }
     pub(crate) fn checked(
         key: TreatmentAttemptKey,
         playback: InitialPlayback,
-        vf_changed: bool,
-        filters: FilterTreatmentProof,
         renderer: RendererConfirmation,
     ) -> Result<Self, super::failure::TreatmentConfirmationFailure> {
         use super::failure::TreatmentConfirmationFailure::ProofMismatch;
         if renderer.key() != key {
             return Err(ProofMismatch);
         }
-        let valid = match &filters {
-            FilterTreatmentProof::Reconfigured(confirmation) => {
-                vf_changed && playback == InitialPlayback::Live && confirmation.key() == key
-            }
-            FilterTreatmentProof::Preserved { origin } => {
-                !vf_changed
-                    && key.pass != TreatmentPass::Open
-                    && origin.key().attempt == key.attempt
-                    && match origin {
-                        FilterEvidence::Confirmed(_) => true,
-                        FilterEvidence::PreparedPaused { key: origin } => {
-                            origin.pass == TreatmentPass::Open
-                                && playback == InitialPlayback::Paused
-                        }
-                    }
-            }
-            FilterTreatmentProof::PreparedPaused { key: prepared } => {
-                *prepared == key
-                    && key.pass == TreatmentPass::Open
-                    && playback == InitialPlayback::Paused
-            }
-        };
-        if !valid {
-            return Err(ProofMismatch);
-        }
         Ok(Self {
             key,
             playback,
-            filters,
             renderer,
         })
     }
@@ -474,7 +349,7 @@ pub enum CommandRejection {
     PlaybackBusy,
     #[error("playback control unavailable")]
     PlaybackUnavailable,
-    #[error("filter-only Apply cannot change video or audio")]
+    #[error("renderer-only Apply cannot change video or audio")]
     CaptureDraftChanged,
     #[error("shutdown is latched")]
     ShuttingDown,
@@ -806,11 +681,6 @@ impl ProductModel {
     pub fn confirmed_treatments(&self) -> Option<&TreatmentConfirmation> {
         self.confirmed_treatments.as_ref()
     }
-    pub fn confirmed_filter_origin(&self) -> Option<TreatmentAttemptKey> {
-        self.confirmed_treatments
-            .as_ref()
-            .map(|confirmation| confirmation.filters().origin().key())
-    }
     pub fn has_pending_user_apply(&self, apply: ApplyId) -> bool {
         if self.quitting || matches!(self.cleanup, CleanupStatus::Blocked { .. }) {
             return false;
@@ -976,7 +846,6 @@ impl ProductModel {
                 .as_ref()
                 .is_some_and(|node| pinned_node.as_ref() != Some(node))
             || settings.audio != request.settings.audio
-            || settings.filters != request.settings.filters
             || settings.renderer != request.settings.renderer
         {
             return None;
@@ -1528,7 +1397,7 @@ impl ProductModel {
             CleanupStatus::Complete => Ok(()),
         }
     }
-    /// Freeze a complete LIVE treatment request before compilation/submission.
+    /// Freeze a complete live or paused renderer request before compilation/submission.
     pub fn apply_treatments(
         &mut self,
         expected: StateIdentity,
@@ -1539,10 +1408,7 @@ impl ProductModel {
             return Err(CommandRejection::StaleRevision);
         }
         let active = self.active().ok_or(CommandRejection::PlaybackUnavailable)?;
-        if !matches!(active.playback, PlaybackState::Live | PlaybackState::Paused)
-            || (active.playback == PlaybackState::Paused
-                && active.applied.settings.filters != self.draft.settings.filters)
-        {
+        if !matches!(active.playback, PlaybackState::Live | PlaybackState::Paused) {
             return Err(CommandRejection::PlaybackUnavailable);
         }
         if self.prepared_pause.is_some() {
@@ -1612,13 +1478,6 @@ impl ProductModel {
                             | (PlaybackState::Paused, InitialPlayback::Paused)
                     )
             })
-            || matches!(
-                confirmation.filters(),
-                FilterTreatmentProof::Preserved { origin }
-                    if self.confirmed_treatments.as_ref().is_none_or(
-                        |current| current.filters().origin() != *origin
-                    )
-            )
         {
             return false;
         }
@@ -1746,7 +1605,7 @@ impl ProductModel {
             transition.failures.incumbent = Some(failure);
         }
     }
-    /// A late native fault restores the then-last-verified chain once, never
+    /// A late native fault restores the then-last-verified renderer once, never
     /// older history. The poisoned owner is always physically retired first.
     pub fn late_treatment_failed(
         &mut self,
@@ -2842,28 +2701,12 @@ mod tests {
         CaptureMode, CapturedFourCc, DeviceIdentity, FrameRate, FrameSize, ModeRequest, UsbTopology,
     };
 
-    fn treatments() -> FilterChain {
-        use crate::domain::filters::{
-            ColorLevels, Filter, FilterEntry, FormatParams, SdrGamma, SdrMatrix,
-        };
-        FilterChain::new(vec![FilterEntry::new(
-            "inert\nlabel".into(),
-            Filter::Format(FormatParams::new(
-                SdrMatrix::Auto,
-                ColorLevels::Auto,
-                SdrGamma::Auto,
-            )),
-            false,
-        )])
-        .unwrap()
-    }
-
     #[test]
-    fn live_filter_request_freezes_complete_state_and_phase_identity() {
+    fn live_renderer_request_freezes_complete_state_and_phase_identity() {
         let mut model = ProductModel::new(settings(60));
         let owner = initial_active(&mut model);
         let mut candidate = settings(60);
-        candidate.filters = treatments();
+        candidate.renderer = altered_renderer(&candidate.renderer);
         let revision = model
             .edit_draft(model.draft().revision, candidate.clone())
             .unwrap();
@@ -2874,7 +2717,7 @@ mod tests {
             .apply_treatments(model.state_identity(), revision)
             .unwrap()
         else {
-            panic!("filter admission")
+            panic!("renderer admission")
         };
         assert_eq!(key.attempt, owner.attempt);
         assert_eq!(admitted_revision, revision);
@@ -2907,11 +2750,10 @@ mod tests {
     }
 
     #[test]
-    fn complete_proof_rejects_key_attempt_renderer_playback_and_vf_provenance_mismatch() {
+    fn complete_proof_rejects_key_attempt_renderer_and_playback_mismatch() {
         let mut model = ProductModel::new(settings(60));
         let owner = initial_active(&mut model);
         let mut candidate = settings(60);
-        candidate.filters = treatments();
         candidate.renderer = altered_renderer(&candidate.renderer);
         let revision = model
             .edit_draft(model.draft().revision, candidate.clone())
@@ -2920,22 +2762,14 @@ mod tests {
             .apply_treatments(model.state_identity(), revision)
             .unwrap()
         else {
-            panic!("filter admission")
+            panic!("renderer admission")
         };
         assert_eq!(key.attempt, owner.attempt);
 
-        let reconfirmed = |proof_key: TreatmentAttemptKey| {
-            FilterTreatmentProof::Reconfigured(
-                FilterConfirmation::checked(proof_key, 0.0, 2.0, 32).unwrap(),
-            )
-        };
-        let build = |pass, playback, vf_changed, filters, renderer| {
-            let proof_key = TreatmentAttemptKey { pass, ..key };
+        let build = |proof_key, playback, renderer| {
             TreatmentConfirmation::checked(
                 proof_key,
                 playback,
-                vf_changed,
-                filters,
                 RendererConfirmation::checked(proof_key, renderer),
             )
             .unwrap()
@@ -2951,56 +2785,50 @@ mod tests {
             TreatmentConfirmation::checked(
                 restore_key,
                 InitialPlayback::Live,
-                true,
-                reconfirmed(key),
-                RendererConfirmation::checked(restore_key, candidate.renderer.clone()),
+                RendererConfirmation::checked(key, candidate.renderer.clone()),
             )
             .is_err()
         );
 
         // A different pass is not the frozen candidate identity.
         let wrong_pass = build(
-            TreatmentPass::Restore,
+            restore_key,
             InitialPlayback::Live,
-            true,
-            reconfirmed(restore_key),
             candidate.renderer.clone(),
         );
         assert!(!model.treatment_confirmed(wrong_pass));
 
         // A renderer proof for anything but the frozen candidate is refused.
-        let wrong_renderer = build(
-            TreatmentPass::Candidate,
-            InitialPlayback::Live,
-            true,
-            reconfirmed(key),
-            settings(60).renderer.clone(),
-        );
+        let wrong_renderer = build(key, InitialPlayback::Live, settings(60).renderer.clone());
         assert!(!model.treatment_confirmed(wrong_renderer));
 
-        // Preserved vf provenance that no committed transaction ever established.
-        let unprovenanced = build(
-            TreatmentPass::Candidate,
+        let wrong_owner = TreatmentAttemptKey {
+            attempt: AttemptId::new(key.attempt.get() + 1).unwrap(),
+            ..key
+        };
+        assert!(!model.treatment_confirmed(build(
+            wrong_owner,
             InitialPlayback::Live,
-            false,
-            FilterTreatmentProof::Preserved {
-                origin: FilterEvidence::Confirmed(
-                    FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap(),
-                ),
-            },
             candidate.renderer.clone(),
-        );
-        assert!(!model.treatment_confirmed(unprovenanced));
+        )));
+        let wrong_apply = TreatmentAttemptKey {
+            apply: ApplyId::new(key.apply.get() + 1).unwrap(),
+            ..key
+        };
+        assert!(!model.treatment_confirmed(build(
+            wrong_apply,
+            InitialPlayback::Live,
+            candidate.renderer.clone(),
+        )));
+        assert!(!model.treatment_confirmed(build(
+            key,
+            InitialPlayback::Paused,
+            candidate.renderer.clone(),
+        )));
         assert!(model.treating().is_some(), "refusals never commit");
 
         // Only the exact frozen aggregate commits, exactly once.
-        let proof = build(
-            TreatmentPass::Candidate,
-            InitialPlayback::Live,
-            true,
-            reconfirmed(key),
-            candidate.renderer.clone(),
-        );
+        let proof = build(key, InitialPlayback::Live, candidate.renderer.clone());
         assert!(model.treatment_confirmed(proof.clone()));
         assert!(!model.treatment_confirmed(proof));
         assert_eq!(model.last_valid().unwrap().settings(), &candidate);
@@ -3018,7 +2846,7 @@ mod tests {
             panic!("open effect missing");
         };
         let open_key = key;
-        let build = |target: AttemptKey, playback, vf_changed, filters, renderer| {
+        let build = |target: AttemptKey, playback, renderer| {
             let treatment = TreatmentAttemptKey {
                 apply: target.apply,
                 attempt: target.attempt,
@@ -3027,33 +2855,11 @@ mod tests {
             TreatmentConfirmation::checked(
                 treatment,
                 playback,
-                vf_changed,
-                filters,
                 RendererConfirmation::checked(treatment, renderer),
             )
             .unwrap()
         };
-        let live = |target: AttemptKey, renderer| {
-            build(
-                target,
-                InitialPlayback::Live,
-                true,
-                FilterTreatmentProof::Reconfigured(
-                    FilterConfirmation::checked(
-                        TreatmentAttemptKey {
-                            apply: target.apply,
-                            attempt: target.attempt,
-                            pass: TreatmentPass::Open,
-                        },
-                        0.0,
-                        2.0,
-                        32,
-                    )
-                    .unwrap(),
-                ),
-                renderer,
-            )
-        };
+        let live = |target: AttemptKey, renderer| build(target, InitialPlayback::Live, renderer);
 
         // A renderer proof that disagrees with the requested renderer cannot open.
         model.open_verified(
@@ -3066,14 +2872,6 @@ mod tests {
         let paused = build(
             open_key,
             InitialPlayback::Paused,
-            false,
-            FilterTreatmentProof::PreparedPaused {
-                key: TreatmentAttemptKey {
-                    apply: open_key.apply,
-                    attempt: open_key.attempt,
-                    pass: TreatmentPass::Open,
-                },
-            },
             request.settings.renderer.clone(),
         );
         model.open_verified(open_key, paused);
@@ -3117,7 +2915,7 @@ mod tests {
     }
 
     #[test]
-    fn live_filter_admission_checks_capture_pause_and_recovery_counter_capacity() {
+    fn renderer_admission_checks_capture_pause_and_recovery_counter_capacity() {
         for (apply_counter, attempt_counter) in [(u64::MAX, 1), (1, u64::MAX - 1)] {
             let mut model = ProductModel::new(settings(60));
             initial_active(&mut model);
@@ -3150,47 +2948,47 @@ mod tests {
         );
         assert!(model.pause_admitted(owner.attempt, pause));
         assert!(model.pause_observed(owner.attempt, pause, true));
-        // PAUSED with unchanged capture/audio and vf is now admitted as a
-        // no-op treatment route (renderer-only), not rejected.
+        // Stable pause admits a no-op renderer transaction without a new owner.
         assert!(matches!(
             model.apply_treatments(model.state_identity(), model.draft().revision),
             Ok(ApplyAdmission::Treatments { .. })
         ));
 
-        // PAUSED with a changed filter chain keeps the dedicated vf Open
-        // boundary: the aggregate treatment route stays unavailable.
+        // A changed renderer likewise stays on the paused incumbent.
         let mut model = ProductModel::new(settings(60));
         let owner = initial_active(&mut model);
         let pause = model.prepare_pause(owner.attempt).unwrap();
         assert!(model.pause_admitted(owner.attempt, pause));
         assert!(model.pause_observed(owner.attempt, pause, true));
         let mut altered = settings(60);
-        altered.filters = treatments();
+        altered.renderer = altered_renderer(&altered.renderer);
         model.edit_draft(model.draft().revision, altered).unwrap();
-        assert_eq!(
+        assert!(matches!(
             model.apply_treatments(model.state_identity(), model.draft().revision),
-            Err(CommandRejection::PlaybackUnavailable)
-        );
+            Ok(ApplyAdmission::Treatments { .. })
+        ));
     }
 
     #[test]
     fn prepared_capture_cannot_drop_or_change_complete_treatments() {
         let mut submitted = settings(60);
-        submitted.filters = treatments();
+        submitted.renderer = altered_renderer(&submitted.renderer);
         let mut model = ProductModel::new(submitted.clone());
         model
             .apply(model.state_identity(), model.draft().revision)
             .unwrap();
         let request = model.validation_request().unwrap().clone();
         let mut dropped = submitted.clone();
-        dropped.filters = FilterChain::default();
+        dropped.renderer = RendererSettings::default();
         assert!(
             model
                 .accept_prepared(&request, dropped, request.watch, None)
                 .is_none()
         );
         let mut changed = submitted.clone();
-        changed.filters.set_enabled(0, true).unwrap();
+        let mut values = changed.renderer.values();
+        values.scale = super::super::render::ScalerKernel::Nearest;
+        changed.renderer = RendererSettings::new(values).unwrap();
         assert!(
             model
                 .accept_prepared(&request, changed, request.watch, None)
@@ -3198,7 +2996,7 @@ mod tests {
         );
         let mut rerendered = submitted.clone();
         let mut values = rerendered.renderer.values();
-        values.interpolation = true;
+        values.interpolation = !values.interpolation;
         rerendered.renderer = RendererSettings::new(values).unwrap();
         assert_ne!(rerendered.renderer, submitted.renderer);
         assert!(
@@ -3209,15 +3007,15 @@ mod tests {
         );
         assert_eq!(model.validation_request(), Some(&request));
         let accepted = model
-            .accept_prepared(&request, submitted, request.watch, None)
+            .accept_prepared(&request, submitted.clone(), request.watch, None)
             .unwrap();
-        assert_eq!(accepted.settings.filters, treatments());
+        assert_eq!(accepted.settings, submitted);
     }
 
     #[test]
-    fn applied_and_recovery_targets_retain_disabled_treatments() {
+    fn applied_and_recovery_targets_retain_renderer_settings() {
         let mut submitted = settings(60);
-        submitted.filters = treatments();
+        submitted.renderer = altered_renderer(&submitted.renderer);
         let mut model = ProductModel::new(submitted.clone());
         let key = initial_active(&mut model);
         assert_eq!(model.active().unwrap().applied().settings(), &submitted);
@@ -3227,47 +3025,12 @@ mod tests {
         model
             .edit_draft(model.draft().revision, settings(30))
             .unwrap();
-        assert_eq!(model.last_valid().unwrap().settings().filters, treatments());
+        assert_eq!(model.last_valid().unwrap().settings(), &submitted);
         assert_eq!(model.active().unwrap().attempt(), key.attempt);
     }
 
-    #[test]
-    fn confirmation_requires_finite_forward_progress_and_full_margin() {
-        use crate::domain::failure::FilterConfirmationFailure;
-        let key = TreatmentAttemptKey {
-            apply: ApplyId::new(1).unwrap(),
-            attempt: AttemptId::new(2).unwrap(),
-            pass: TreatmentPass::Candidate,
-        };
-        for (baseline, last) in [
-            (f64::NAN, 1.0),
-            (0.0, f64::INFINITY),
-            (f64::NEG_INFINITY, 1.0),
-        ] {
-            assert_eq!(
-                FilterConfirmation::checked(key, baseline, last, 32),
-                Err(FilterConfirmationFailure::ProgressUnavailable)
-            );
-        }
-        for last in [0.0, -1.0] {
-            assert_eq!(
-                FilterConfirmation::checked(key, 0.0, last, 32),
-                Err(FilterConfirmationFailure::TimeDiscontinuity)
-            );
-        }
-        assert_eq!(
-            FilterConfirmation::checked(key, 0.0, 1.0, 31),
-            Err(FilterConfirmationFailure::Deadline)
-        );
-        let confirmation = FilterConfirmation::checked(key, 0.0, 1.0, 32).unwrap();
-        assert_eq!(confirmation.key(), key);
-        assert_eq!(confirmation.baseline(), 0.0);
-        assert_eq!(confirmation.last_position(), 1.0);
-        assert_eq!(confirmation.advances(), 32);
-    }
-
     /// Complete Open aggregate a media owner returns after nine native renderer
-    /// readbacks plus its vf proof, keyed to the exact opening.
+    /// readbacks, keyed to the exact opening.
     fn open_confirmation(model: &ProductModel, key: AttemptKey) -> TreatmentConfirmation {
         let request = model.opening_request().expect("opening request for proof");
         let playback = request.playback;
@@ -3277,20 +3040,7 @@ mod tests {
             pass: TreatmentPass::Open,
         };
         let renderer = RendererConfirmation::checked(treatment, request.settings.renderer.clone());
-        let filters = match playback {
-            InitialPlayback::Live => FilterTreatmentProof::Reconfigured(
-                FilterConfirmation::checked(treatment, 0.0, 2.0, 32).unwrap(),
-            ),
-            InitialPlayback::Paused => FilterTreatmentProof::PreparedPaused { key: treatment },
-        };
-        TreatmentConfirmation::checked(
-            treatment,
-            playback,
-            playback == InitialPlayback::Live,
-            filters,
-            renderer,
-        )
-        .unwrap()
+        TreatmentConfirmation::checked(treatment, playback, renderer).unwrap()
     }
 
     fn verify_open(model: &mut ProductModel, key: AttemptKey) {
@@ -3311,16 +3061,7 @@ mod tests {
             .candidate()
             .clone();
         let renderer = RendererConfirmation::checked(key, candidate.renderer.clone());
-        TreatmentConfirmation::checked(
-            key,
-            InitialPlayback::Live,
-            true,
-            FilterTreatmentProof::Reconfigured(
-                FilterConfirmation::checked(key, 0.0, 2.0, 32).unwrap(),
-            ),
-            renderer,
-        )
-        .unwrap()
+        TreatmentConfirmation::checked(key, InitialPlayback::Live, renderer).unwrap()
     }
 
     fn altered_renderer(base: &RendererSettings) -> RendererSettings {
@@ -3331,7 +3072,6 @@ mod tests {
 
     pub(super) fn settings(rate: u32) -> DraftSettings {
         DraftSettings {
-            filters: crate::domain::filters::FilterChain::default(),
             video: crate::domain::capture::VideoRequest::manual(ModeRequest {
                 identity: DeviceIdentity::new(
                     0x32ed,
@@ -3395,7 +3135,6 @@ mod tests {
     #[test]
     fn selected_capture_first_effect_and_frozen_candidate_share_complete_physical_binding() {
         let mut candidate = settings(60);
-        candidate.filters = treatments();
         candidate.renderer = altered_renderer(&candidate.renderer);
         let mut model = ProductModel::new(candidate.clone());
         let binding = (

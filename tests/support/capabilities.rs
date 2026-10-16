@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 /// Content and status read from one manifest command. Callers read raw transcript
 /// bytes; this module performs no I/O and never trusts manifest `notes`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ProbeRun {
     pub argv: Vec<String>,
     pub executable_sha256: String,
@@ -17,7 +17,7 @@ pub struct ProbeRun {
 
 /// Identity is the SHA-256 of the stack inventory, not a version-string guess.
 /// Each command must also match its pinned executable's digest.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ProbeCollection {
     pub stack_sha256: String,
     pub mpv_sha256: String,

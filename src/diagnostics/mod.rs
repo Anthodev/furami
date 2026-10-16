@@ -1,36 +1,15 @@
-//! Responsibility: Logs, versions and capabilities, errors.
-//! Allowed dependencies: Cross-cutting instrumentation, never audio/video data.
+//! Cross-cutting, bounded diagnostics. Never owns audio/video data or changes
+//! playback admission, media readiness, or owner-thread teardown.
+pub mod inventory;
+mod logging;
+pub mod report;
 
-use crate::domain::{
-    failure::{
-        FilterAttemptDiagnostics, FilterDiagnosticRecord, FilterEntryMetadata, FilterFailure,
-    },
-    state::{FilterConfirmation, TreatmentAttemptKey},
+pub use logging::{
+    DiagnosticsCode, DiagnosticsConfig, DiagnosticsError, DiagnosticsHandle, DiagnosticsHealth,
+    DiagnosticsOperation, DiagnosticsRuntime, EventLevel, FolderHealth, FolderPreparation,
+    FolderRequestId, FolderState, IoKind, LogLimits, LogLocation, LogOrigin, SafeField, SinkStatus,
+    diagnostics_native_event, diagnostics_qt_message,
 };
 
-/// Structured serialization escapes inert labels and native log controls.
-pub(crate) fn filter_begin(key: TreatmentAttemptKey, entries: &[FilterEntryMetadata]) {
-    let event = serde_json::json!({"key": key, "entries": entries});
-    tracing::info!(event = %event, "filter_attempt_begin");
-}
-
-pub(crate) fn filter_record(key: TreatmentAttemptKey, record: &FilterDiagnosticRecord) {
-    let event = serde_json::json!({"key": key, "record": record});
-    tracing::info!(event = %event, "filter_mpv_record");
-}
-
-pub(crate) fn filter_end(
-    key: TreatmentAttemptKey,
-    result: Result<&FilterConfirmation, &FilterFailure>,
-    diagnostics: &FilterAttemptDiagnostics,
-) {
-    let event = match result {
-        Ok(confirmation) => serde_json::json!({
-            "key": key, "confirmation": confirmation, "diagnostics": diagnostics,
-        }),
-        Err(failure) => serde_json::json!({
-            "key": key, "failure": failure, "diagnostics": diagnostics,
-        }),
-    };
-    tracing::info!(event = %event, "filter_attempt_end");
-}
+#[cfg(test)]
+mod logging_tests;

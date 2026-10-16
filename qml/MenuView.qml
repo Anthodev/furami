@@ -11,7 +11,7 @@ import dev.antho.furami
 Item {
     id: menu
 
-    // root | settings | capture | audio | filters | renderer | prefs
+    // root | settings | capture | audio | renderer | prefs
     property string section: "root"
     property bool editorActive: false
 
@@ -53,15 +53,6 @@ Item {
         menu.section = target
     }
 
-    function filterSummary() {
-        const list = menu.profile.filters.entries
-        let enabled = 0
-        for (let i = 0; i < list.length; ++i) {
-            if (list[i].enabled === true)
-                ++enabled
-        }
-        return list.length + " filtre(s) · " + enabled + " actif(s)"
-    }
 
     ColumnLayout {
         id: layout
@@ -79,7 +70,6 @@ Item {
                     : menu.section === "settings" ? "Réglages"
                     : menu.section === "capture" ? "Capture — format"
                     : menu.section === "audio" ? "Audio"
-                    : menu.section === "filters" ? "Filtres"
                     : menu.section === "renderer" ? "Rendu"
                     : "Préférences"
                 variant: "title"
@@ -159,6 +149,22 @@ Item {
                 onClicked: menu.chooseSettings("settings")
             }
             BrumeButton {
+                objectName: "menuOpenLogs"
+                Layout.fillWidth: true
+                label: "Ouvrir le dossier des journaux"
+                // The entry only exists once diagnostic logging is opted in;
+                // when shown, the action is available with no capture and
+                // with an unavailable sink; only an in-flight preparation or
+                // the application close disables it.
+                visible: Projection.ready && Projection.bridge
+                    && Projection.bridge.loggingEnabledPreference
+                enabled: !menu.profile.closing
+                    && menu.profile.diagnostics.folderState !== "Preparing"
+                Accessible.name: label
+                onClicked: if (Projection.bridge)
+                    Projection.bridge.openLogFolder()
+            }
+            BrumeButton {
                 objectName: "menuCloseCapture"
                 Layout.fillWidth: true
                 icon.source: Brume.icon("x")
@@ -207,15 +213,6 @@ Item {
                 onClicked: menu.chooseSettings("audio")
             }
             BrumeButton {
-                objectName: "settingsFiltersEntry"
-                Layout.fillWidth: true
-                implicitHeight: 52
-                icon.source: Brume.icon("filter")
-                label: "Filtres\n" + menu.filterSummary()
-                Accessible.name: "Réglages des filtres"
-                onClicked: menu.chooseSettings("filters")
-            }
-            BrumeButton {
                 objectName: "settingsRendererEntry"
                 Layout.fillWidth: true
                 implicitHeight: 52
@@ -227,14 +224,54 @@ Item {
                 onClicked: menu.chooseSettings("renderer")
             }
             BrumeButton {
+                id: preferencesEntry
                 objectName: "settingsPreferencesEntry"
                 Layout.fillWidth: true
+                Layout.minimumWidth: 0
                 implicitHeight: 52
                 icon.source: Brume.icon("adjustments")
                 label: "Préférences\n" + (menu.profile.settings.status.length > 0
                     ? menu.profile.settings.status : "—")
                 Accessible.name: "Préférences"
                 onClicked: menu.chooseSettings("prefs")
+                contentItem: RowLayout {
+                    spacing: preferencesEntry.spacing
+                    BrumeIcon {
+                        source: preferencesEntry.icon.source
+                        iconSize: preferencesEntry.icon.width
+                        tint: preferencesEntry.icon.color
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        Layout.alignment: Qt.AlignVCenter
+                        spacing: 0
+                        BrumeLabel {
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            text: "Préférences"
+                            font: preferencesEntry.font
+                            color: preferencesEntry.enabled ? Brume.foreground : Brume.disabledText
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.NoWrap
+                            maximumLineCount: 1
+                            elide: Text.ElideRight
+                        }
+                        BrumeLabel {
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            text: menu.profile.settings.status.length > 0
+                                ? menu.profile.settings.status.replace(/[\r\n]+/g, " ") : "—"
+                            font: preferencesEntry.font
+                            color: preferencesEntry.enabled ? Brume.foreground : Brume.disabledText
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.NoWrap
+                            maximumLineCount: 1
+                            elide: Text.ElideRight
+                        }
+                    }
+                }
             }
         }
 
@@ -273,8 +310,6 @@ Item {
                             return captureSection
                         case "audio":
                             return audioSection
-                        case "filters":
-                            return filtersSection
                         case "renderer":
                             return rendererSection
                         case "prefs":
@@ -306,13 +341,6 @@ Item {
     Component {
         id: audioSection
         AudioSettingsView {}
-    }
-    Component {
-        id: filtersSection
-        FiltersSettingsView {
-            editorActive: menu.editorActive && menu.visible && menu.section === "filters"
-                && !sectionBack.pressed && Chrome.rootAvailable && Chrome.popup === "menu"
-        }
     }
     Component {
         id: rendererSection

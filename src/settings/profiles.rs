@@ -175,13 +175,11 @@ impl SourceProfiles {
                 .settings
                 .audio
                 .clone_from(preserved_audio.unwrap_or(&settings.audio));
-            profile.settings.filters.clone_from(&settings.filters);
             profile.settings.renderer.clone_from(&settings.renderer);
         } else {
             let settings = DraftSettings {
                 video: settings.video.clone(),
                 audio: preserved_audio.unwrap_or(&settings.audio).clone(),
-                filters: settings.filters.clone(),
                 renderer: settings.renderer.clone(),
             };
             self.entries.push(SourceProfile { binding, settings });

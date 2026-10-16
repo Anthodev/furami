@@ -22,7 +22,11 @@ Item {
     readonly property bool hasRecovery: profile.recovery.candidates.length > 0
         || profile.recovery.stage.length > 0
     readonly property bool hasNotice: profile.settings.refused || profile.output.needsAction
-    readonly property bool visibleContent: context.hasError || context.hasRecovery || context.hasNotice
+    // A logging/diagnostics fault must reach the user on its own, independent
+    // of the stats preference and of the popup state; it is not a capture error.
+    readonly property bool hasDiagnosticsProblem: profile.diagnostics.hasProblem
+    readonly property bool visibleContent: context.hasError || context.hasRecovery
+        || context.hasNotice || context.hasDiagnosticsProblem
 
     implicitWidth: content.implicitWidth
     implicitHeight: context.visibleContent ? content.implicitHeight : 0
@@ -55,6 +59,14 @@ Item {
             visible: Projection.failureText.length > 0
             variant: "error"
             text: Projection.failureText
+        }
+
+        BrumeLabel {
+            objectName: "contextDiagnosticsError"
+            Layout.fillWidth: true
+            visible: context.hasDiagnosticsProblem
+            variant: "error"
+            text: context.profile.diagnostics.message
         }
 
         BrumeLabel {

@@ -71,6 +71,8 @@ If the original audit failed before delivery, the image remains under `OUTPUT/st
 
 Qt, QML, libmpv and other application libraries are bundled. X11/XCB/xkbcommon libraries come from the pinned application closure. An exact allowlist keeps glibc/loader and host Vulkan/GL/EGL/DRM/GBM providers outside the image; GPU drivers and ICD manifests are never bundled. See [portability prerequisites](PORTABILITY.md).
 
+The media provider's own `mpv` program is staged at `usr/bin/mpv` from the same frozen prefix manifest as its shared libraries, and enters the same recursive ELF closure/RPATH relocation and audit as every other shipped object. That is the program the renderer qualification runs through `FURAMI_MEDIA_PREFIX`; no other provider program (`bin/ffmpeg`, `bin/ffprobe`) is shipped.
+
 FUSE-free extraction is supported by the type-2 runtime:
 
 ```sh

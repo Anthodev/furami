@@ -72,12 +72,40 @@ class AppBuildContractTests(unittest.TestCase):
         lock = json.loads(app_build.APP_LOCK.read_text())
         closure = json.loads((app_build.STACK_LOCK.parent / "build-apt-closure.json").read_text())
         linker_map = """
-  2fc 2fc 20 4 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/Scrt1.o:(.note.ABI-tag)
-  92c80 92c80 26 16 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/Scrt1.o:(.text)
-  92cb0 92cb0 b9 16 /usr/lib/gcc/x86_64-linux-gnu/13/crtbeginS.o:(.text)
-  2074b4 2074b4 16 4 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crti.o:(.init)
-  2074ca 2074ca 5 1 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crtn.o:(.init)
-  219720 219720 0 8 /usr/lib/gcc/x86_64-linux-gnu/13/crtendS.o:(.tm_clone_table)
+Merging program properties
+
+Discarded input sections
+
+ .data          0x0000000000000000        0x4 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/Scrt1.o
+ .bss           0x0000000000000000        0x0 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/Scrt1.o
+
+Memory Configuration
+
+Name             Origin             Length             Attributes
+*default*        0x0000000000000000 0xffffffffffffffff
+
+Linker script and memory map
+
+LOAD /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/Scrt1.o
+LOAD /usr/lib/gcc/x86_64-linux-gnu/13/crtbeginS.o
+LOAD /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a
+
+.note.ABI-tag   0x00000000000002fc       0x20
+ .note.ABI-tag  0x00000000000002fc       0x20 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/Scrt1.o
+
+.init           0x000000000000033c       0x1b
+ *(.init)
+ .init          0x000000000000033c       0x16 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crti.o
+ .init          0x0000000000000352        0x5 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crtn.o
+
+.text           0x0000000000000380       0xf4
+ *(.text.unlikely .text.*_unlikely .text.unlikely.*)
+ .text          0x0000000000000380       0xb9 /usr/lib/gcc/x86_64-linux-gnu/13/crtbeginS.o
+ .text          0x0000000000000800       0x26 /build/target/release/deps/furami.o
+
+.tm_clone_table 0x0000000000003008        0x0
+ .tm_clone_table
+                0x0000000000003008        0x8 /usr/lib/gcc/x86_64-linux-gnu/13/crtendS.o
 """
         objects = app_build.retained_direct_objects(linker_map, lock, closure)
         self.assertEqual({record["path"] for record in objects}, {
@@ -96,11 +124,16 @@ class AppBuildContractTests(unittest.TestCase):
         closure = json.loads((app_build.STACK_LOCK.parent / "build-apt-closure.json").read_text())
         with self.assertRaisesRegex(ValueError, "unattributed linker object.*unexpected.o"):
             app_build.retained_direct_objects(
-                "  2fc 2fc 20 4 /usr/lib/gcc/x86_64-linux-gnu/13/unexpected.o:(.text)\n",
+                "Linker script and memory map\n"
+                " .text          0x0000000000000380       0x26"
+                " /usr/lib/gcc/x86_64-linux-gnu/13/unexpected.o\n",
                 lock, closure)
         with self.assertRaisesRegex(ValueError, "no retained direct objects"):
             app_build.retained_direct_objects(
-                "  2fc 2fc 20 4 /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a(foo.o):(.text)\n",
+                "Linker script and memory map\n"
+                "LOAD /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a\n"
+                " .text          0x0000000000000380       0x26"
+                " /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a(foo.o)\n",
                 lock, closure)
 
     def test_rust_standard_library_closure_uses_distinct_archive_source_licenses(self):

@@ -38,6 +38,11 @@ XCB_PLUGINS = (
     "plugins/imageformats/libqsvg.so",
     "plugins/iconengines/libqsvgicon.so",
 )
+# Provider programs seeded into the AppDir at their packaged path. The renderer
+# runs this exact program through FURAMI_MEDIA_PREFIX=$HERE/usr, so it must come
+# from the same prefix manifest as the shared libraries; no other provider
+# program (bin/ffmpeg, bin/ffprobe, any bin/*) is shipped.
+MEDIA_PROGRAMS = (("bin/mpv", "usr/bin/mpv"),)
 # Exact host ABI contract. X11/XCB/xkbcommon belong to pinned application closure.
 HOST_LIBS = frozenset({
     "ld-linux-x86-64.so.2", "libc.so.6", "libm.so.6", "libdl.so.2",
@@ -327,6 +332,12 @@ def copy_prefix(prefix, manifest, src_rel, appdir, dest_rel, owners):
         if src_rel not in manifest:
             raise ValueError(f"symlink target unrecorded: {src_rel}")
         item = prefix / src_rel
+
+
+def stage_media_programs(prefix, manifest, appdir, owners):
+    """Seed the provider's real programs; bytes came from the same prefix manifest."""
+    for source, destination in MEDIA_PROGRAMS:
+        copy_prefix(prefix, manifest, source, appdir, destination, owners)
 
 
 def stage_xcb_plugins(prefix, manifest, appdir, owners):
@@ -892,6 +903,7 @@ def internal(media_root, app_root, runtime_root, out, version):
         for match in matches:
             rel = match.relative_to(prefix).as_posix()
             copy_prefix(prefix, media["artifacts"], rel, appdir, "usr/" + rel, owners)
+    stage_media_programs(prefix, media["artifacts"], appdir, owners)
     stage_xcb_plugins(prefix, media["artifacts"], appdir, owners)
     qml = scan_qml(prefix, appdir, media["artifacts"], owners)
     for name in ("mpv", "ffmpeg", "libplacebo"):

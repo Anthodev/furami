@@ -5,6 +5,8 @@ compile_error!("Furami requires Qt 6.8 or newer");
 extern crate furami as _;
 
 mod profiles;
+use furami::diagnostics::report::{ReportSnapshot, StartupFailure, StartupTuple};
+use furami::diagnostics::{DiagnosticsConfig, DiagnosticsHandle, DiagnosticsRuntime};
 use furami::{
     app::settings::{PersistenceSession, decide_startup, resolve_settings_path},
     capture::{
@@ -19,16 +21,10 @@ use furami::{
 };
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
-use tracing_subscriber::EnvFilter;
+use std::process::ExitCode;
 
 #[derive(Debug, thiserror::Error)]
 enum StartupError {
-    #[error("RUST_LOG must be valid UTF-8")]
-    InvalidLogEnvironment(#[source] std::env::VarError),
-    #[error("invalid RUST_LOG filter: {0}")]
-    InvalidLogFilter(#[source] tracing_subscriber::filter::ParseError),
-    #[error("failed to install tracing subscriber: {0}")]
-    SubscriberInstallation(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(
         "missing or empty DISPLAY: install/enable XWayland in your Wayland session, or set DISPLAY to a reachable X11 display"
     )]
@@ -43,15 +39,15 @@ enum StartupError {
     NativeLaunch(#[from] furami::native_host::NativeLaunchError),
     #[error(transparent)]
     CaptureArguments(#[from] CaptureArgumentError),
-    #[error("capture startup Prevalidation requested {request}: {source}")]
+    #[error("capture startup discovery failed")]
     CaptureDiscovery {
-        request: String,
+        request: furami::domain::capture::CaptureModeRequest,
         #[source]
         source: linux::CaptureError,
     },
-    #[error("capture startup Prevalidation requested {request}: {source}")]
+    #[error("capture startup selection failed")]
     CaptureSelection {
-        request: String,
+        request: furami::domain::capture::CaptureModeRequest,
         #[source]
         source: SelectionError,
     },
@@ -61,6 +57,12 @@ enum StartupError {
         "capture audio needs PULSE_PROP_node.dont-fallback=true in this process: re-exec failed: {0}"
     )]
     NoFallbackExec(#[source] std::io::Error),
+    #[error("capture startup failed")]
+    WithRequest {
+        request: furami::domain::capture::CaptureModeRequest,
+        #[source]
+        source: Box<StartupError>,
+    },
 }
 
 /// The capture process must run with the process-local PulseAudio client
@@ -91,24 +93,87 @@ fn no_fallback_already_set(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("true"))
 }
 
-fn main() -> anyhow::Result<()> {
-    ensure_capture_no_fallback_environment()?;
-    initialize_logging()?;
-    run()?;
-    Ok(())
+fn main() -> ExitCode {
+    if ensure_capture_no_fallback_environment().is_err() {
+        eprintln!("furami: startup failed (NoFallbackExec)");
+        return ExitCode::FAILURE;
+    }
+    let persistence = PersistenceSession::load(resolve_settings_path(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    ));
+    let diagnostics = DiagnosticsRuntime::start(DiagnosticsConfig {
+        logging_enabled: persistence.preferences().logging_enabled,
+        ..DiagnosticsConfig::default()
+    });
+    diagnostics.install_tracing();
+    let handle = diagnostics.handle();
+    if let Some(report) = initial_report(&handle) {
+        handle.publish_report(report);
+    }
+    let result = run(handle.clone(), persistence);
+    if let Err(error) = &result {
+        let failure = error.diagnostic();
+        let code = failure.code;
+        let stage = failure.stage;
+        eprintln!("furami: startup failed ({code} at {stage})");
+        if let Some(mut report) = initial_report(&handle) {
+            report.session.phase = "StartupFailed".into();
+            report.session.startup_failure = Some(failure);
+            handle.publish_report(report);
+        }
+        tracing::error!(event_code = "startup_failed", code, stage);
+    }
+    // Qt returns only after its existing owner acknowledgement/teardown barrier.
+    diagnostics.begin_shutdown();
+    diagnostics.finish_shutdown(std::time::Duration::from_millis(250));
+    if result.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
-fn initialize_logging() -> Result<(), StartupError> {
-    let directives = match std::env::var("RUST_LOG") {
-        Ok(value) if !value.is_empty() => value,
-        Ok(_) | Err(std::env::VarError::NotPresent) => "info".to_owned(),
-        Err(error) => return Err(StartupError::InvalidLogEnvironment(error)),
-    };
-    let filter = EnvFilter::try_new(directives).map_err(StartupError::InvalidLogFilter)?;
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init()
-        .map_err(StartupError::SubscriberInstallation)
+fn initial_report(diagnostics: &DiagnosticsHandle) -> Option<ReportSnapshot> {
+    let revision = diagnostics.reserve_report_revision()?;
+    let mut report = ReportSnapshot::initial();
+    report.revision = revision;
+    report.environment.os = diagnostics.os_report();
+    report.environment.log_location = diagnostics.health();
+    Some(report)
+}
+
+impl StartupError {
+    fn diagnostic(&self) -> StartupFailure {
+        let (code, stage, requested) = match self {
+            Self::WithRequest { request, source } => {
+                let mut diagnostic = source.diagnostic();
+                diagnostic.requested = Some(StartupTuple::from(*request));
+                return diagnostic;
+            }
+            Self::CaptureDiscovery { request, .. } => {
+                ("CaptureDiscovery", "Discovery", Some(*request))
+            }
+            Self::CaptureSelection { request, .. } => {
+                ("CaptureSelection", "Discovery", Some(*request))
+            }
+            Self::CaptureArguments(_) => ("CaptureArguments", "Arguments", None),
+            Self::Audio(_) => ("AudioUnavailable", "Discovery", None),
+            Self::NoDisplay => ("NoDisplay", "NativeStartup", None),
+            Self::InvalidDisplayEnvironment(_) => {
+                ("InvalidDisplayEnvironment", "NativeStartup", None)
+            }
+            Self::MediaPrefixEnvironment(_) => ("MediaPrefixEnvironment", "MediaStartup", None),
+            Self::InvalidMediaPrefix => ("InvalidMediaPrefix", "MediaStartup", None),
+            Self::NativeLaunch(_) => ("NativeLaunch", "NativeStartup", None),
+            Self::NoFallbackExec(_) => ("NoFallbackExec", "Reexec", None),
+        };
+        StartupFailure {
+            code,
+            stage,
+            requested: requested.map(StartupTuple::from),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -224,18 +289,32 @@ impl StartupArguments {
     }
 }
 
-fn run() -> Result<(), StartupError> {
+fn run(
+    diagnostics: DiagnosticsHandle,
+    persistence: PersistenceSession,
+) -> Result<(), StartupError> {
     let arguments = StartupArguments::parse(std::env::args_os().skip(1))?;
+    let request = arguments.video.as_ref().map(|video| video.mode);
+    run_with_arguments(arguments, diagnostics, persistence).map_err(|source| match request {
+        Some(request) => StartupError::WithRequest {
+            request,
+            source: Box::new(source),
+        },
+        None => source,
+    })
+}
+
+fn run_with_arguments(
+    arguments: StartupArguments,
+    diagnostics: DiagnosticsHandle,
+    mut persistence: PersistenceSession,
+) -> Result<(), StartupError> {
     if arguments.list_audio_sources {
         for source in audio::discover()? {
             println!("{}\t{}", source.identity.name(), source.description);
         }
         return Ok(());
     }
-    let mut persistence = PersistenceSession::load(resolve_settings_path(
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    ));
     let mut saved = persistence.saved_selection();
     let restore_audio = !arguments.audio_off
         && arguments.audio_source.is_none()
@@ -254,7 +333,7 @@ fn run() -> Result<(), StartupError> {
                 restore_audio_error = Some(format!(
                     "Cannot establish saved audio source inventory: {error}"
                 ));
-                tracing::warn!(%error, "startup_audio_catalog_unavailable");
+                tracing::warn!(event_code = "startup_audio_catalog_unavailable");
                 Vec::new()
             }
             Err(error) => return Err(error.into()),
@@ -274,12 +353,12 @@ fn run() -> Result<(), StartupError> {
         .video
         .map(|args| {
             let snapshot = linux::discover().map_err(|source| StartupError::CaptureDiscovery {
-                request: args.to_string(),
+                request: args.mode,
                 source,
             })?;
             let video = CaptureSelection::request_from_snapshot(&snapshot, &args.node, args.mode)
                 .map_err(|source| StartupError::CaptureSelection {
-                request: args.to_string(),
+                request: args.mode,
                 source,
             })?;
             persistence.observe_profile_identities(
@@ -300,7 +379,6 @@ fn run() -> Result<(), StartupError> {
                     == 1;
             startup_binding = Some(persistence.profile_binding(identity, serial_unique));
             Ok::<_, StartupError>(DraftSettings {
-                filters: furami::domain::filters::FilterChain::default(),
                 video,
                 audio: audio.clone(),
                 renderer: furami::domain::render::RendererSettings::default(),
@@ -378,12 +456,8 @@ fn run() -> Result<(), StartupError> {
     // Query once, before Qt starts. Apply uses only this immutable typed result;
     // a query refusal remains visible without pretending capabilities exist.
     let treatment_capabilities =
-        furami::media::render_catalog::QualifiedTreatmentCapabilities::query(prefix);
-    tracing::info!(
-        x11_display = x11_display.as_str(),
-        media_prefix = media_prefix.as_str(),
-        "starting Qt application"
-    );
+        furami::media::render_catalog::query_qualified_capabilities(prefix);
+    tracing::info!(event_code = "application_starting");
     furami::native_host::run_application(
         &media_prefix,
         treatment_capabilities,
@@ -392,14 +466,89 @@ fn run() -> Result<(), StartupError> {
         persistence,
         sources,
         arguments.qualification_stdin,
+        diagnostics,
     )?;
-    tracing::info!("Qt application exited");
+    tracing::info!(event_code = "application_exited");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_reports_reserve_unique_revisions_across_runtime_publications() {
+        let runtime = DiagnosticsRuntime::start(DiagnosticsConfig {
+            logging_enabled: false,
+            xdg_state_home: None,
+            home: None,
+            limits: Default::default(),
+        });
+        let diagnostics = runtime.handle();
+        let initial = initial_report(&diagnostics).unwrap();
+        let runtime_revision = diagnostics.reserve_report_revision().unwrap();
+        let failed = initial_report(&diagnostics).unwrap();
+        assert!(initial.revision < runtime_revision);
+        assert!(runtime_revision < failed.revision);
+        runtime.begin_shutdown();
+        runtime.finish_shutdown(std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn invalid_cli_failure_is_classified_without_exposing_argument_content() {
+        for argument in [
+            "--private-startup-marker",
+            "/home/private-startup-marker\nuntrusted argument text",
+        ] {
+            let error = StartupArguments::parse(args(&[argument])).unwrap_err();
+            let failure = error.diagnostic();
+            assert_eq!(failure.code, "CaptureArguments");
+            assert_eq!(failure.stage, "Arguments");
+            assert!(failure.requested.is_none());
+            let encoded = serde_json::to_string(&failure).unwrap();
+            assert!(!encoded.contains("private-startup-marker"));
+            assert!(!encoded.contains("untrusted argument text"));
+        }
+    }
+
+    #[test]
+    fn startup_failure_report_does_not_publish_request_path_or_error_text() {
+        let error = StartupError::NativeLaunch(furami::native_host::NativeLaunchError {
+            exit_code: 1,
+            diagnostic: "/dev/private-startup-marker personal backend text".into(),
+        });
+        let encoded = serde_json::to_string(&error.diagnostic()).unwrap();
+        assert!(!encoded.contains("private-startup-marker"));
+        assert!(!encoded.contains("/dev/"));
+        assert!(encoded.contains("NativeLaunch"));
+    }
+
+    #[test]
+    fn startup_native_failure_retains_only_requested_tuple() {
+        let arguments = StartupArguments::parse(args(&[
+            "--capture-node",
+            "/dev/private-startup-marker",
+            "--capture-size",
+            "1920x1080",
+            "--capture-rate",
+            "60000/1001",
+        ]))
+        .unwrap();
+        let error = StartupError::WithRequest {
+            request: arguments.video.unwrap().mode,
+            source: Box::new(StartupError::NoDisplay),
+        };
+        let report = error.diagnostic();
+        let tuple = report.requested.unwrap();
+        assert_eq!(report.code, "NoDisplay");
+        assert_eq!((tuple.width, tuple.height), (1920, 1080));
+        assert_eq!(
+            (tuple.rate_numerator, tuple.rate_denominator),
+            (60000, 1001)
+        );
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains("private-startup-marker"));
+    }
 
     fn saved_with_audio(audio: AudioSelection) -> DraftSettings {
         use furami::domain::capture::{
@@ -426,7 +575,6 @@ mod tests {
                 },
             }),
             audio,
-            filters: Default::default(),
             renderer: Default::default(),
         }
     }
