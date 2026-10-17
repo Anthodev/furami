@@ -20,6 +20,7 @@ QtObject {
     // "" | source | size | rate | output | menu | save | reset
     property string popup: ""
     property int popupEpoch: 0
+    property string menuInitialSection: "root"
     property bool rootAvailable: false
     // Mirror of the native family-focus property. The bridge notifies only on a
     // real bool transition; chrome never maps while the Furami family is
@@ -63,7 +64,7 @@ QtObject {
     readonly property bool chromeShowing: chrome.mode !== "hidden"
     readonly property bool popupOpen: chrome.popup !== ""
 
-    // Text entry inside a chrome tool disables the global Space shortcut.
+    // Native routing gives text entry priority over Space, F11 and Escape.
     property int textEntryCount: 0
     readonly property bool textEntryActive: chrome.textEntryCount > 0
 
@@ -207,13 +208,14 @@ QtObject {
     }
 
 
-    function openPopup(name) {
+    function openPopup(name, initialMenuSection) {
         if (!chrome.rootAvailable || (chrome.mandatoryPopupOpen && name !== chrome.mandatoryPopup))
             return
         if (chrome.popup === name) {
             chrome.closePopup()
             return
         }
+        chrome.menuInitialSection = (name === "menu" && initialMenuSection === "settings") ? "settings" : "root"
         chrome.popupEpoch += 1
         chrome.popup = name
         if (name === "source" || name === "size" || name === "rate")
