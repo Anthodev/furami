@@ -4,68 +4,110 @@
 
 First release candidate for `1.0.0`, prepared for local evaluation. Furami is not stable and this candidate carries no certification: no tag, release or remote CI run has been published for it, and the qualified AppImage remains `0.1.0-rc.4` because no artifact was rebuilt for this version. Publication stays gated on the source and license clearance for every public artifact, stable or pre-release.
 
-### Fixes
+### 🐛 Fixes
+
+**Interface**
 
 - Prevent compositor borders and shadows around the three transparent control windows under XWayland, and explicitly activate clicked or touched controls so subsequent keyboard input reaches them ([#25](https://github.com/Anthodev/furami/issues/25), uncommitted local work).
 
 ## [0.1.0-rc.4] - 2026-10-17
 
-Fourth release candidate, prepared for local evaluation. Furami is not stable and this candidate carries no certification. Publication stays gated on the source and license clearance for every public artifact, stable or pre-release. No production behavior changes in this candidate.
+### 🐛 Fixes
 
-### Fixes
-
-- Keep the driver channel alive through cleanup in the captured-renderer regression test so the asynchronous owner can no longer fail sending its terminal message, removing an intermittent `SendError` in CI and leaving strict sender assertions, product code and workflow unchanged ([#25](https://github.com/Anthodev/furami/issues/25), uncommitted local work).
+- Fix an intermittent `SendError` in the captured-renderer CI regression test by keeping its driver channel alive through cleanup. Product behavior is unchanged ([#25](https://github.com/Anthodev/furami/issues/25)).
 
 ## [0.1.0-rc.3] - 2026-10-17
 
-Third release candidate, prepared for local evaluation. Furami is not stable and this candidate carries no certification. Publication stays gated on the source and license clearance for every public artifact, stable or pre-release. The clean-checkout AppImage build repair is prepared locally; a successful fresh CI build remains unverified.
+### 🐛 Fixes
 
-### Fixes
-
-- Build the AppImage application from a private writable copy of the verified source snapshot instead of the read-only checkout, so CXX-Qt can generate its QML language-server configuration on clean CI checkouts without importing ignored developer files or touching the checkout ([#25](https://github.com/Anthodev/furami/issues/25), uncommitted local work).
+- Build the AppImage application from a private writable copy of the verified source snapshot instead of the read-only checkout, so CXX-Qt can generate its QML language-server configuration on clean CI checkouts without importing ignored developer files or touching the checkout. A successful fresh CI build was not established for this candidate ([#25](https://github.com/Anthodev/furami/issues/25)).
 
 ## [0.1.0-rc.2] - 2026-10-17
 
-Second release candidate, prepared for local evaluation. Furami is not stable and this candidate carries no certification: no tag, release or remote CI run has been published, and publication stays gated on the source and license clearance for every public artifact, stable or pre-release. The primary AppImage build failure behind this candidate is still unresolved.
+The primary AppImage build failure behind this candidate was still unresolved.
 
-### Fixes
+### 🐛 Fixes
 
-- A failed AppImage CI build now preserves its diagnostic logs instead of aborting evidence collection ([#25](https://github.com/Anthodev/furami/issues/25), uncommitted local work).
+- A failed AppImage CI build now preserves its diagnostic logs instead of aborting evidence collection ([#25](https://github.com/Anthodev/furami/issues/25)).
 
 ## [0.1.0-rc.1] - 2026-10-17
 
-First release candidate, prepared for local evaluation. Furami is not stable: this candidate carries no certification, and no tag, release or remote CI run has been published. Publication stays gated on the `release-ready.json` source and license clearance for every public artifact, stable or pre-release. The entries below combine the feature work merged into `develop` with the release-candidate chain that is still uncommitted local work of [#25](https://github.com/Anthodev/furami/issues/25).
+Entries combine the feature work merged into `develop` with the release-candidate chain tracked in [#25](https://github.com/Anthodev/furami/issues/25).
 
-### Features
+### ✨ New Features
 
-- Add read-only UVC discovery with physical USB identities and exact rational capture-mode validation, and play the selected stream through the shared libmpv owner with requested-versus-observed verification and typed errors that never retry or fall back to another mode ([#34](https://github.com/Anthodev/furami/pull/34), [#35](https://github.com/Anthodev/furami/pull/35)).
-- Capture console audio through one Furami-owned PipeWire loopback: explicit source selection without fallback, capture enablement kept separate from playback volume and mute, and **Auto** or pinned **Manual** output routing that goes silent when its sink disappears ([#37](https://github.com/Anthodev/furami/pull/37), [#42](https://github.com/Anthodev/furami/pull/42)).
-- Select everything in the window and apply it immediately, with no separate Apply step: real source, resolution, exact Framerate, input-format policy (Auto ranks `YUYV`, then `NV12`, then `MJPG`, with manual overrides kept) and optional capture audio ([#38](https://github.com/Anthodev/furami/pull/38), [#47](https://github.com/Anthodev/furami/pull/47), [#48](https://github.com/Anthodev/furami/pull/48)).
-- Replace the adjacent control panel with the soft Brume ribbon: hover volume/mute, contextual Options, Catppuccin Macchiato-inspired default palette, stream statistics at the bottom left, and controls that hide when idle and while another application has focus ([#48](https://github.com/Anthodev/furami/pull/48)).
-- Add playback controls: a confirmed pause that freezes the picture and silences output, a resume that shows the console's current scene without replaying the pause, immediate volume and mute on Furami's own output, and fullscreen with previous geometry and focus restored ([#39](https://github.com/Anthodev/furami/pull/39)).
-- Remember an automatic profile per capture source — resolution, exact rational Framerate, input-format policy, renderer settings and capture input audio — while output routing, volume, mute, fullscreen, statistics visibility and diagnostic logging stay global ([#41](https://github.com/Anthodev/furami/pull/41), [#48](https://github.com/Anthodev/furami/pull/48)).
-- Add typed SDR renderer settings applied as one whole-treatment transaction with correlated read-back and a single restoration on failure ([#45](https://github.com/Anthodev/furami/pull/45)).
-- Recover capture after device loss from the last successfully applied selection, keeping video running silently when only audio is lost and asking for your choice on ambiguous matches ([#40](https://github.com/Anthodev/furami/pull/40)).
-- Add bounded diagnostic logs and a sanitized environment/session report, off by default and enabled only by explicit opt-in ([#50](https://github.com/Anthodev/furami/pull/50)).
-- Enforce keyboard-shortcut precedence — `Space`, `F11` and `Esc` stay safe in text entry and popups — and add five-point wheel volume over the video or the volume rail ([#51](https://github.com/Anthodev/furami/pull/51)).
-- feat(packaging): build and audit portable AppImage artifacts ([326ad30](https://github.com/Anthodev/furami/commit/326ad30)) — the image carries bundled Qt/QML and media libraries, checked build inputs, an actual-image linkage manifest and a source/relink inventory.
+**Capture and playback**
+
+- Detect capture cards read-only over UVC, with their physical USB identities, and validate the exact capture mode you pick. The selected mode is checked against the observations that are actually available and contradictions are reported as typed errors, so nothing is silently retried or replaced by another mode; the captured FourCC and the measured cadence are not verified ([#34](https://github.com/Anthodev/furami/pull/34), [#35](https://github.com/Anthodev/furami/pull/35)).
+- Pick source, resolution, exact frame rate, input format and optional capture audio in the window, with changes applied immediately and no Apply step. **Auto** ranks `YUYV`, then `NV12`, then `MJPG`; manual overrides are kept ([#38](https://github.com/Anthodev/furami/pull/38), [#47](https://github.com/Anthodev/furami/pull/47), [#48](https://github.com/Anthodev/furami/pull/48)).
+- Pause with a confirmed freeze and silence, resume on the console's live scene, adjust volume and mute on Furami's own output, and go fullscreen with the previous geometry and focus restored ([#39](https://github.com/Anthodev/furami/pull/39)).
+- Recover the stream from the last applied selection after a device loss, keep video running silently when only audio is lost, and ask when a device match is ambiguous ([#40](https://github.com/Anthodev/furami/pull/40)).
+
+**Audio**
+
+- Capture console audio through one Furami-owned PipeWire loopback: the input source is explicit with no fallback, capture is separate from playback volume and mute, and output routing is either **Auto**, which picks one eligible EasyEffects sink and otherwise the default output and re-resolves as that list changes, or a pinned **Manual** sink that is never replaced — if it disappears, the audio stays silent until you select another output ([#37](https://github.com/Anthodev/furami/pull/37), [#42](https://github.com/Anthodev/furami/pull/42)).
+
+**Video**
+
+- Apply SDR renderer settings as a single all-or-nothing change, verified by read-back and restored once if it fails ([#45](https://github.com/Anthodev/furami/pull/45)).
+
+**Settings and profiles**
+
+- Remember a profile per capture source — resolution, exact frame rate, input format, renderer settings and capture input audio — while output routing, volume, mute, fullscreen, statistics and diagnostic logging stay global ([#41](https://github.com/Anthodev/furami/pull/41), [#48](https://github.com/Anthodev/furami/pull/48)).
+
+**Controls**
+
+- Keep `Space`, `F11` and `Esc` safe in text entry and popups, and step the volume by five points with the wheel over the video or the volume rail ([#51](https://github.com/Anthodev/furami/pull/51)).
+
+**Diagnostics**
+
+- Record bounded diagnostic logs and a sanitized environment and session report, off by default and enabled only by explicit opt-in ([#50](https://github.com/Anthodev/furami/pull/50)).
+
+**Application icon**
+
+- Show the Furami mark as the application icon, embedded in the binary for every window and shipped as the packaged scalable desktop icon with its `.DirIcon` ([#25](https://github.com/Anthodev/furami/issues/25)).
+
+### 🔄 Changes
+
+**Interface**
+
+- Replace the adjacent control panel with the soft Brume ribbon: hover volume and mute, contextual Options, a Catppuccin Macchiato-inspired palette, stream statistics at the bottom left, and controls that hide when idle or another application has focus ([#48](https://github.com/Anthodev/furami/pull/48)).
+
+**Video filters**
+
+- Remove the product video-filter system: catalog discovery, the chain editor and its parameters, filter commands, VF application and proofs, and active/requested filter diagnostics. Renderer settings and their verified changes remain ([#50](https://github.com/Anthodev/furami/pull/50)).
+- Migrate saved settings lazily from format 1 and 2 to strict format 3: other profiles and preferences load unchanged, only the retired filter chains are dropped, and the file is rewritten only at the next verified apply or safe close. Older builds refuse format 3 — there is no automatic downgrade, and switching binaries cannot recover the removed chains ([#50](https://github.com/Anthodev/furami/pull/50)).
+
+**Packaging and release**
+
+- feat(packaging): build and audit portable AppImage artifacts ([326ad30](https://github.com/Anthodev/furami/commit/326ad30)) — the image bundles Qt/QML and media libraries, checked build inputs, an actual-image linkage manifest and a source/relink inventory.
 - build(packaging): version frozen AppImage runtime recipes ([44605aa](https://github.com/Anthodev/furami/commit/44605aa)).
 - ci(packaging): add manual and tag-driven AppImage workflows ([75905ec](https://github.com/Anthodev/furami/commit/75905ec)) — a manual dispatch uploads an unpublished artifact only.
-- Show the Furami mark as the application icon: the window icon is embedded in the binary and every window inherits it, and the same mark ships as the packaged scalable desktop icon with its `.DirIcon` (uncommitted local work of [#25](https://github.com/Anthodev/furami/issues/25)).
-- Prepare the stable and release-candidate publication chain for [#25](https://github.com/Anthodev/furami/issues/25) (uncommitted local work): the application version is `0.1.0-rc.1`, the release-note extractor and tag workflow accept `vX.Y.Z` stable and `vX.Y.Z-rc.N` pre-release tags while requiring the exact tag/version match, the published asset is renamed to `Furami-v<version>-Linux-x64.AppImage`, stable tags are marked GitHub **Latest** and pre-releases are not, the pinned Ubuntu terms lock and the Qt module-terms rule feed the source and license guard, the two-build comparator decides reproducibility from its accepted-criteria predicate, and a dedicated `--qualification-video` route lets the packaged smoke run without a capture card. The pinned Alpine runtime inputs move to an authenticated refresh: the public candidate materials carry the corresponding runtime/Furami/Qt sources and the linked Alpine source closure, while the Alpine binary bootstrap packages and base image are excluded and retained only in a private authenticated cache — those public assets are therefore **not** a complete offline bootstrap, and the excluded tooling is neither distributed nor declared license-cleared. No tag, release, remote CI run or certification has occurred, and the rename adds no embedded AppImage update information or `.zsync`.
+- Prepare the stable and pre-release publication chain for [#25](https://github.com/Anthodev/furami/issues/25): the application version is `0.1.0-rc.1`; the tag workflow accepts `vX.Y.Z` stable and `vX.Y.Z-rc.N` pre-release tags and requires an exact tag/version match; the published asset is named `Furami-v<version>-Linux-x64.AppImage`; and stable tags are marked GitHub **Latest** while pre-releases are not.
+- Gate publication on source and license clearance: the pinned Ubuntu terms lock and the Qt module-terms rule feed the source and license guard. The pinned Alpine runtime inputs move to an authenticated refresh — public candidate materials carry the runtime, Furami and Qt sources plus the linked Alpine source closure, while the Alpine binary bootstrap packages and base image stay in a private authenticated cache. Those public assets are therefore **not** a complete offline bootstrap, and the excluded tooling is neither distributed nor declared license-cleared.
+- Decide reproducibility with the two-build comparator and its accepted-criteria predicate.
+- Let the packaged smoke run without a capture card through a dedicated `--qualification-video` route.
+- The asset rename adds no embedded AppImage update information and no `.zsync`.
 
-### Fixes
+### 🐛 Fixes
 
-- Keep `--capture-audio-off` and `--capture-audio-source` session-only when startup adapts an incompatible video mode, preserve the admitted physical node/USB binding across Restart, Resume, Recovery and Reconnect, and reject malformed Auto settings whose concrete FourCC is outside the ranked formats ([#47](https://github.com/Anthodev/furami/pull/47), [#48](https://github.com/Anthodev/furami/pull/48)).
-- Bind the permanent native root before showing its chrome windows, keep choice rows clear of their radio indicators and long ribbon captions elided, and show frame rates as rounded human labels while the exact rational stays the selected value ([#48](https://github.com/Anthodev/furami/pull/48)).
-- Require fresh decoded-video readiness within a 10-second bound instead of treating ordinary pre-proof native log errors as lost renderer evidence ([#50](https://github.com/Anthodev/furami/pull/50)).
-- Ship the verified provider `mpv` inside the existing recursive ELF closure and relocation audit ([#50](https://github.com/Anthodev/furami/pull/50)).
-- Open the diagnostics log folder through an isolated child `xdg-open` and report launcher failures after startup without blocking the window ([#50](https://github.com/Anthodev/furami/pull/50)).
-- Stage an executable AppRun and reject non-executable launch entries in the final-image audit, parse empty Deb822 checksum headers correctly, and attribute built-in QML generated metadata through verified vendor backing modules ([326ad30](https://github.com/Anthodev/furami/commit/326ad30), [75905ec](https://github.com/Anthodev/furami/commit/75905ec)).
+**Startup and capture**
+
 - fix(startup): report unavailable X11 displays before Qt initialization ([d0754ed](https://github.com/Anthodev/furami/commit/d0754ed)).
-- Keep CI and its tests honest: select the GNU BFD linker for the pinned toolchain and wait for real worker retirement in the owner-disconnection regression tests ([#42](https://github.com/Anthodev/furami/pull/42)), run `cargo fmt --all -- --check` as the first Cargo step ([#43](https://github.com/Anthodev/furami/pull/43)), and fix(ci): isolate Rust toolchain state per job ([24fb784](https://github.com/Anthodev/furami/commit/24fb784)).
+- Keep `--capture-audio-off` and `--capture-audio-source` session-only when startup has to adapt an incompatible video mode, keep the admitted physical node and USB binding across Restart, Resume, Recovery and Reconnect, and reject malformed Auto settings whose concrete FourCC falls outside the ranked formats ([#47](https://github.com/Anthodev/furami/pull/47), [#48](https://github.com/Anthodev/furami/pull/48)).
+- Bind the native root before showing its chrome windows, keep choice rows clear of their radio indicators and long ribbon captions elided, and show frame rates as rounded labels while the exact value stays selected ([#48](https://github.com/Anthodev/furami/pull/48)).
 
-### Removed
+**Renderer and diagnostics**
 
-- Remove the product video-filter system: catalog discovery, chain editor and parameters, filter commands, VF application and proofs, and active/requested filter diagnostics. Renderer settings and their verified transactions remain ([#50](https://github.com/Anthodev/furami/pull/50)).
-- Migrate saved settings lazily from format 1 and 2 to strict format 3: every other profile and preference loads unchanged, only the retired filter chains are ignored, the file is rewritten only at the next verified apply or safe close, and older builds refuse format 3 — there is no automatic downgrade and no way to recover removed chains by switching binaries ([#50](https://github.com/Anthodev/furami/pull/50)).
+- Require decoded video to become ready within 10 seconds instead of treating ordinary pre-proof log errors as lost renderer evidence ([#50](https://github.com/Anthodev/furami/pull/50)).
+- Open the diagnostics log folder through an isolated `xdg-open` child and report launcher failures after startup without blocking the window ([#50](https://github.com/Anthodev/furami/pull/50)).
+
+**Packaging**
+
+- Ship the verified provider `mpv` inside the existing recursive ELF closure and relocation audit ([#50](https://github.com/Anthodev/furami/pull/50)).
+- Stage an executable AppRun, reject non-executable launch entries in the final-image audit, parse empty Deb822 checksum headers, and attribute built-in QML generated metadata through verified vendor backing modules ([326ad30](https://github.com/Anthodev/furami/commit/326ad30), [75905ec](https://github.com/Anthodev/furami/commit/75905ec)).
+
+**CI**
+
+- Keep CI honest: select the GNU BFD linker for the pinned toolchain, wait for real worker retirement in the owner-disconnection regression tests ([#42](https://github.com/Anthodev/furami/pull/42)), and run `cargo fmt --all -- --check` as the first Cargo step ([#43](https://github.com/Anthodev/furami/pull/43)).
+- fix(ci): isolate Rust toolchain state per job ([24fb784](https://github.com/Anthodev/furami/commit/24fb784)).
