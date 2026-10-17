@@ -747,9 +747,10 @@ void FuramiBridge::registerChromeWindows(QWindow *top, QWindow *volume, QWindow 
                 || window->parent() || window->transientParent() != m_root.data()
                 || (window->flags() & Qt::WindowType_Mask) != Qt::Tool
                 || !window->flags().testFlag(Qt::FramelessWindowHint)
+                || !window->flags().testFlag(Qt::X11BypassWindowManagerHint)
                 || !content || content->window() != window
                 || content->metaObject()->indexOfMethod("focusBoundary(QVariant)") < 0) {
-                diagnostic = QStringLiteral("invalid fixed chrome window %1: expected named transient top-level frameless Tool and focusBoundary(QVariant) content")
+                diagnostic = QStringLiteral("invalid fixed chrome window %1: expected named transient top-level unmanaged frameless Tool and focusBoundary(QVariant) content")
                     .arg(QString::fromLatin1(names[i]));
                 break;
             }
@@ -792,8 +793,9 @@ void FuramiBridge::scheduleChromeGeometry()
         for (auto *window : {m_topChromeWindow.data(), m_volumeChromeWindow.data(), m_bottomChromeWindow.data()}) {
             if (!window || window->parent() || window->transientParent() != m_root.data()
                 || (window->flags() & Qt::WindowType_Mask) != Qt::Tool
-                || !window->flags().testFlag(Qt::FramelessWindowHint)) {
-                failChrome(QStringLiteral("registered chrome lost its fixed transient top-level Tool association"));
+                || !window->flags().testFlag(Qt::FramelessWindowHint)
+                || !window->flags().testFlag(Qt::X11BypassWindowManagerHint)) {
+                failChrome(QStringLiteral("registered chrome lost its fixed transient top-level unmanaged Tool association"));
                 return;
             }
         }
@@ -1615,6 +1617,13 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
         if (chrome == m_volumeChromeWindow.data() && event->type() == QEvent::Wheel
             && handleVolumeWheel(static_cast<QWheelEvent *>(event), chrome))
             return true;
+        // An unmanaged window gets no compositor click-to-focus, so perform the
+        // activation the WM would have done before the still-delivered event.
+        if ((event->type() == QEvent::MouseButtonPress || event->type() == QEvent::TouchBegin)
+            && QGuiApplication::focusWindow() != chrome && m_chromeFamilyActive && m_root && m_root->isVisible()
+            && m_root->visibility() != QWindow::Minimized && !m_closing && !m_bootstrapFailed
+            && !m_quitAuthorized)
+            chrome->requestActivate();
         if (event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonPress
             || event->type() == QEvent::Wheel || event->type() == QEvent::TouchBegin
             || event->type() == QEvent::TouchUpdate)

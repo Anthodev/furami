@@ -306,7 +306,7 @@ ApplicationWindow {
     Window {
         id: topChromeWindow
         objectName: "topChromeWindow"
-        flags: Qt.Tool | Qt.FramelessWindowHint
+        flags: Qt.Tool | Qt.FramelessWindowHint | Qt.X11BypassWindowManagerHint
         transientParent: root
         color: "transparent"
         visible: root.chromeAvailable
@@ -325,7 +325,7 @@ ApplicationWindow {
     Window {
         id: volumeChromeWindow
         objectName: "volumeChromeWindow"
-        flags: Qt.Tool | Qt.FramelessWindowHint
+        flags: Qt.Tool | Qt.FramelessWindowHint | Qt.X11BypassWindowManagerHint
         transientParent: root
         color: "transparent"
         visible: root.chromeAvailable
@@ -343,7 +343,7 @@ ApplicationWindow {
     Window {
         id: bottomChromeWindow
         objectName: "bottomChromeWindow"
-        flags: Qt.Tool | Qt.FramelessWindowHint
+        flags: Qt.Tool | Qt.FramelessWindowHint | Qt.X11BypassWindowManagerHint
         transientParent: root
         color: "transparent"
         visible: root.chromeAvailable

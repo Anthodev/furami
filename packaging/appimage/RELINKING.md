@@ -12,10 +12,10 @@ Verify a candidate offline — no network, token or real remote tag — before d
 
 ```sh
 python3 scripts/publish_candidate.py --check-only --require-reproducibility \
-  --event-name push --tag v0.1.0-rc.4 --candidate /absolute/candidate/release
+  --event-name push --tag v1.0.0-rc.1 --candidate /absolute/candidate/release
 ```
 
-A prepared stable tag (`--tag v0.1.0`) uses the same check with no other change. `--check-only` re-verifies the real files (exact non-empty image, regular non-symlink assets, a complete `SHA256SUMS`, a true readiness gate whose fingerprints match the bytes, and a `reproducibility.json` bound to that image) and lists the verified assets without writing anything. Publication is a separate, explicit run of the same script without `--check-only`, performed only by the protected tag job.
+A prepared stable tag (`--tag v1.0.0`) uses the same check with no other change. `--check-only` re-verifies the real files (exact non-empty image, regular non-symlink assets, a complete `SHA256SUMS`, a true readiness gate whose fingerprints match the bytes, and a `reproducibility.json` bound to that image) and lists the verified assets without writing anything. Publication is a separate, explicit run of the same script without `--check-only`, performed only by the protected tag job.
 
 The candidate can be exercised without a capture card through the dedicated qualification video; see the [AppImage recipe](README.md#qualification-video) for the fixture generator and the `--qualification-video` entry.
 
@@ -54,7 +54,7 @@ The public set carries corresponding sources, not the Alpine binary bootstrap. T
 Qt, libmpv, libplacebo, FFmpeg and bundled application dependencies are ordinary separate ELF shared libraries under `usr/lib/`. Extract the image without FUSE:
 
 ```sh
-./Furami-v0.1.0-rc.4-Linux-x64.AppImage --appimage-extract
+./Furami-v1.0.0-rc.1-Linux-x64.AppImage --appimage-extract
 ```
 
 Replace the appropriate shared object with an ABI-compatible modified build. Preserve its SONAME and relative symlink chain. Rebuild Qt from the supplied module sources using the vendor configuration evidence when modifying Qt, and retain corresponding compatible plugins/QML. Do not mix unrelated Qt major/minor versions or host Qt plugins into the bundle.
