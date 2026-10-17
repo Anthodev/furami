@@ -251,6 +251,8 @@ QtObject {
             || (typeof row.min === "number" && typeof row.max === "number"))
     }
     function snapshotError(s) {
+        if (s.session_kind !== "capture" && s.session_kind !== "qualification-video")
+            return "session_kind"
         if (!projection.strings(s, ["stateToken", "generation", "productPhase", "gatePhase",
                 "selectionRevision"]) || s.stateToken.indexOf("state:") !== 0
                 || !projection.u64(s.stateToken.slice(6)) || !projection.u64(s.generation)
@@ -596,6 +598,7 @@ QtObject {
 
     readonly property var emptyView: ({
         schema: 0,
+        session_kind: "capture",
         stateToken: "",
         generation: "",
         productPhase: "",
@@ -647,6 +650,7 @@ QtObject {
         if (!s) return projection.emptyView
         return {
             schema: projection.number(s.schema, 0),
+            session_kind: projection.text(s.session_kind),
             stateToken: projection.text(s.stateToken),
             generation: projection.text(s.generation),
             productPhase: projection.text(s.productPhase),

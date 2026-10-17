@@ -581,7 +581,14 @@ mod tests {
         let ready = owner.take_snapshot().unwrap();
         assert!(ready.playback_started);
         assert_eq!(
-            ready.session.unwrap().verification.nominal_rate,
+            ready
+                .session
+                .as_ref()
+                .unwrap()
+                .capture()
+                .unwrap()
+                .verification
+                .nominal_rate,
             VerificationStatus::Approximate
         );
         driver.set_observed(observed(1920, Some(60.0)));
@@ -598,15 +605,17 @@ mod tests {
         first_driver.set_observed(observed(2560, Some(60.0)));
         first_driver.send(BackendEvent::PlaybackRestart);
         first_driver.fence();
-        let first_facts = first.take_snapshot().unwrap().session.unwrap();
+        let first_snapshot = first.take_snapshot().unwrap();
+        let first_facts = first_snapshot.session.as_ref().unwrap().capture().unwrap();
         close(&mut first, &first_driver, 1);
         let (mut second, second_driver) = start(2);
         second_driver.set_observed(observed(2560, Some(59.94)));
         second_driver.send(BackendEvent::PlaybackRestart);
         second_driver.fence();
-        let second_facts = second.take_snapshot().unwrap().session.unwrap();
+        let second_snapshot = second.take_snapshot().unwrap();
+        let second_facts = second_snapshot.session.as_ref().unwrap().capture().unwrap();
         assert_eq!(first_facts.requested, second_facts.requested);
-        assert!(first_facts.comparable_to(&second_facts));
+        assert!(first_facts.comparable_to(second_facts));
         assert_eq!(
             second.submit(
                 Generation::new(1).unwrap(),

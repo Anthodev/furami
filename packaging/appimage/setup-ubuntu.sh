@@ -43,6 +43,7 @@ python3 /workspace/packaging/appimage/tool-closure.py \
   --phase installed --output /out/stage-tool-closure.json
 python3 /workspace/packaging/appimage/stage.py \
   --media-output /media --app-build /app --runtime-build /runtime \
-  --output /out --version "$FURAMI_VERSION" --media-source-cache /media-sources --in-container
+  --output /out --version "$FURAMI_VERSION" --media-source-cache /media-sources \
+  --runtime-linked-sources /runtime-linked-sources --in-container
 exec python3 /workspace/packaging/appimage/sources.py --capture-ubuntu \
   --stage /out --app /app --output /out

@@ -481,6 +481,29 @@ mod startup_option_tests {
         }
         assert!(!SafeField::token("arbitrary", "force-window").permitted());
     }
+    #[test]
+    fn qualification_telemetry_preserves_finite_privacy_contract() {
+        assert_eq!(
+            known_code("qualification_state"),
+            Some("qualification_state")
+        );
+        for phase in [
+            "Idle",
+            "WaitingSurface",
+            "Opening",
+            "Ready",
+            "Stopping",
+            "Releasing",
+            "QuitReady",
+        ] {
+            assert!(SafeField::token("phase", phase).permitted());
+        }
+        assert!(SafeField::bool("gpu_next", true).permitted());
+        assert!(SafeField::bool("x11vk", true).permitted());
+        assert!(!SafeField::token("phase", "/private/fixture.y4m").permitted());
+        assert!(!SafeField::token("snapshot", "private data").permitted());
+        assert!(!SafeField::token("backend", "arbitrary backend name").permitted());
+    }
 }
 fn token_name(name: &str) -> bool {
     matches!(
@@ -545,6 +568,13 @@ fn token_allowed(name: &str, value: &str) -> bool {
                 | "Verify"
                 | "Live"
                 | "Running"
+                | "Idle"
+                | "WaitingSurface"
+                | "Opening"
+                | "Ready"
+                | "Releasing"
+                | "Failed"
+                | "QuitReady"
         ),
         "stage" => matches!(
             value,
@@ -699,6 +729,11 @@ fn token_allowed(name: &str, value: &str) -> bool {
                 | "demuxer-lavf-o"
                 | "audio"
                 | "wid"
+                | "terminal"
+                | "demuxer"
+                | "loop-file"
+                | "sub-auto"
+                | "audio-file-auto"
                 | "Unknown"
         ),
         "code" => matches!(
@@ -713,6 +748,14 @@ fn token_allowed(name: &str, value: &str) -> bool {
                 | "InvalidMediaPrefix"
                 | "NativeLaunch"
                 | "NoFallbackExec"
+                | "qualification_arguments"
+                | "qualification_path"
+                | "qualification_format"
+                | "qualification_renderer"
+                | "qt_plugin_missing"
+                | "qt_plugin_invalid"
+                | "qt_plugin_load"
+                | "qualification"
         ),
         "format_policy" => matches!(value, "Auto" | "Manual"),
         "fourcc" | "format" => matches!(value, "YUYV" | "NV12" | "MJPG" | "BGR3" | "RGB3" | "UYVY"),
@@ -800,6 +843,8 @@ fn numeric_name(name: &str) -> bool {
             | "shape_minor"
             | "exit_code"
             | "owner_cleanup_authorized"
+            | "gpu_next"
+            | "x11vk"
     ) {
         return true;
     }
@@ -916,6 +961,8 @@ fn known_code(code: &str) -> Option<&'static str> {
         "qualification_command_rejected",
         "qualification_request_received",
         "qualification_request_parsed",
+        "qualification_state",
+        "qualification_backend",
         "qualification_volume",
         "qualification_mute",
         "reconnect_admitted",

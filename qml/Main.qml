@@ -21,6 +21,7 @@ ApplicationWindow {
     color: Brume.window
 
     readonly property var profile: Projection.view
+    readonly property bool qualificationVideo: root.profile.session_kind === "qualification-video"
     // Chrome maps only while the Furami window family owns the foreground
     // focus. This single outer gate covers all three tool windows, their
     // opacity fade tails and toolVisible.
@@ -53,15 +54,16 @@ ApplicationWindow {
 
     // The producer emits a null selection for an empty or genuinely incomplete
     // bootstrap, so `selection.present` already means a complete capture tuple.
-    readonly property bool sessionReady: root.profile.applied.present
-        || root.profile.lastValid.present
-        || root.profile.selection.present
+    readonly property bool sessionReady: root.qualificationVideo || root.profile.applied.present
+        || root.profile.lastValid.present || root.profile.selection.present
 
     readonly property string backdropTitle: {
         if (Projection.failureText.length > 0)
             return "Interface indisponible"
         if (!Projection.ready)
             return "Préparation de l'interface…"
+        if (root.qualificationVideo)
+            return root.profile.opening ? "Ouverture de la vidéo de qualification…" : "Vidéo de qualification"
         if (root.profile.productPhase === "Disconnected")
             return "Capture déconnectée"
         if (root.profile.opening)
@@ -78,6 +80,8 @@ ApplicationWindow {
             return Projection.failureText
         if (!Projection.ready)
             return ""
+        if (root.qualificationVideo)
+            return root.profile.opening ? "Préparation de la lecture du fichier local." : ""
         if (root.profile.productPhase === "Disconnected")
             return root.profile.recovery.evidence.length > 0
                 ? root.profile.recovery.evidence
@@ -144,7 +148,7 @@ ApplicationWindow {
     function toggleChromeSettings() {
         if (!Chrome.rootAvailable || !Projection.ready || Chrome.popupOpen || Chrome.mandatoryPopupOpen)
             return
-        Chrome.openPopup("menu", "settings")
+        Chrome.openPopup("menu", root.qualificationVideo ? "root" : "settings")
     }
 
     function moveTool(window, localX, localY) {
@@ -171,6 +175,8 @@ ApplicationWindow {
         if (activity < 0)
             return false
         if (!root.chromeAvailable)
+            return false
+        if (region === "volume" && root.qualificationVideo)
             return false
         if (!Chrome.chromeShowing)
             return false

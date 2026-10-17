@@ -74,6 +74,7 @@ def qml_backing_evidence(media, mapping, documents):
             file_ids = {row['relatedSpdxElement'] for row in contains}
             backends = [item for item in mapping.values()
                         if item['evidence'] == document['path'] and item['file_spdx_id'] in file_ids]
+            backends = [item for item in backends if item.get('checksum_verified')]
             original = media / 'prefix' / qmldir
             if not backends or not original.is_file():
                 continue
@@ -87,6 +88,7 @@ def qml_backing_evidence(media, mapping, documents):
                 'component_id': backends[0]['component_id'],
                 'module_license_expression': package.get('licenseConcluded'),
                 'evidence': {'SPDX_document': document['path'], 'package': package,
+                             'SPDX_document_sha256': document['sha256'],
                              'Qt_vendor_version': package['versionInfo'], 'relationships': contains,
                              'backend_files': backends, 'qml_module_uri': uri,
                              'CMake_export': {'path': path.relative_to(media).as_posix(), 'sha256': stage.digest(path)},
@@ -109,6 +111,7 @@ def qt_evidence(media, owners, root):
             original = media / 'prefix' / relative
             if not original.is_file():
                 continue
+            verified = False
             for checksum in file.get('checksums', []):
                 algorithm = checksum['algorithm'].lower()
                 if algorithm not in ('sha1', 'sha256'):
@@ -117,9 +120,11 @@ def qt_evidence(media, owners, root):
                     actual = hashlib.file_digest(stream, algorithm).hexdigest()
                 if actual != checksum['checksumValue']:
                     raise ValueError(f'Qt vendor SBOM checksum mismatch: {relative}')
+                verified = True
             mapping[relative] = {'component_id': 'qt:' + path.name.split('-6.11.2')[0],
                                  'file_spdx_id': file['SPDXID'], 'license_expression': file.get('licenseConcluded'),
-                                 'evidence': path.relative_to(media).as_posix()}
+                                 'evidence': path.relative_to(media).as_posix(), 'checksum_verified': verified,
+                                 'path': 'prefix/' + relative, 'sha256': stage.digest(original)}
     if len(documents) != 4:
         raise ValueError('four frozen Qt vendor SBOM documents required')
     qml_backends = qml_backing_evidence(media, mapping, documents)
@@ -138,6 +143,16 @@ def qt_evidence(media, owners, root):
         elif source.startswith('qml/'):
             module = qml_backends.get(str(Path(source).parent))
             if module and Path(source).name in module['generated_files']:
+                linked_files = [module['evidence']['CMake_export'], module['evidence']['qmldir'],
+                                {'path': module['evidence']['SPDX_document'],
+                                 'sha256': module['evidence']['SPDX_document_sha256']},
+                                {'path': 'prefix/' + source, 'sha256': stage.digest(original)},
+                                *module['evidence']['backend_files']]
+                for linked in linked_files:
+                    expected = read_json(media / 'manifest.json').get('artifacts', {}).get(
+                        linked['path'].removeprefix('prefix/'), {}).get('sha256')
+                    if expected != linked['sha256']:
+                        raise ValueError('Qt QML provenance hash mismatch: ' + linked['path'])
                 evidence = {**module['evidence'], 'generated_metadata': {
                     'path': 'prefix/' + source, 'sha256': stage.digest(original),
                     'terms_basis': 'vendor module provenance; generated-file terms not asserted by binary SBOM'}}
@@ -150,7 +165,16 @@ def qt_evidence(media, owners, root):
                             if package.get('name') == generator[1]]}
                 owner['components'] = [{'component_id': module['component_id'], 'license_expression': None,
                                          'module_license_expression': module['module_license_expression'],
-                                         'evidence': evidence, 'role': 'generated-QML-metadata'}]
+                                         'evidence': evidence, 'role': 'generated-QML-metadata',
+                                         'terms_rule': 'qt-qml-metadata-inherits-module-terms',
+                                         'terms_basis': 'explicit FUR-025 module-terms rule; hash-linked module/URI/backing target/SBOM; no individual file license asserted'}]
+                continue
+            if Path(source).name == 'qmldir' or source.endswith('.qmltypes'):
+                owner['components'] = [{'component_id': 'qt:unresolved', 'license_expression': None,
+                                         'module_license_expression': None,
+                                         'evidence': {'generated_metadata': {'path': 'prefix/' + source,
+                                                                          'sha256': stage.digest(original)}},
+                                         'role': 'generated-QML-metadata'}]
                 continue
             directory = str(Path(source).parent)
             candidates = [entry for name, entry in mapping.items() if str(Path(name).parent) == directory]

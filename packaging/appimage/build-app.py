@@ -296,7 +296,9 @@ def rust_std_closure(output, linked_archives, app_lock, cache=None):
 def input_hashes():
     inputs = [APP_LOCK, STACK_LOCK, REPOSITORY / "Cargo.lock", REPOSITORY / "Cargo.toml",
               REPOSITORY / "build.rs", REPOSITORY / "rust-toolchain.toml",
-              REPOSITORY / "LICENSE", HERE / "build-app.py", HERE / "app-container-build.sh",
+              REPOSITORY / "LICENSE", REPOSITORY / "assets/logo.ico", REPOSITORY / "assets/logo.png",
+              REPOSITORY / "assets/logo.svg",
+              HERE / "build-app.py", HERE / "app-container-build.sh",
               HERE / "rcc-wrapper.sh",
               *sorted((REPOSITORY / "src").rglob("*")),
               *sorted((REPOSITORY / "qml").rglob("*"))]

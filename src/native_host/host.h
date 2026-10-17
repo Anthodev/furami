@@ -79,7 +79,7 @@ class FuramiBridge : public QObject {
     Q_PROPERTY(int screenAvailableHeight READ screenAvailableHeight NOTIFY screenGeometryChanged)
 
 public:
-    explicit FuramiBridge(rust::Box<RuntimeCoordinator> gate, UiUpdate nativeEnvironment);
+    explicit FuramiBridge(rust::Box<RuntimeCoordinator> gate, UiUpdate nativeEnvironment, bool qualificationVideo);
     ~FuramiBridge() override;
 
     QWindow *hostWindow() const;
@@ -225,6 +225,7 @@ private:
     void refreshChromeFamilyActive(QWindow *focused);
 
     rust::Box<RuntimeCoordinator> m_gate;
+    const bool m_qualificationVideo;
     QTimer m_pollTimer;
     QTimer m_chromeIdleTimer;
     QPointer<HostWindow> m_host;
@@ -314,11 +315,12 @@ private:
     bool m_poisoned = false;
     bool m_releasing = false;
     bool m_quitAuthorized = false;
+    bool m_qualificationFailure = false;
     bool m_geometryLogPending = false;
     bool m_insideSurfaceCallback = false;
 };
 
-LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, bool qualificationStdin);
+LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, rust::Str mediaPrefix, bool qualificationStdin, bool qualificationVideo);
 
 } // namespace furami::bridge
 

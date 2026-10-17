@@ -1,11 +1,14 @@
 //! Responsibility: Small Qt/C++ bridge for the native parent and its events.
 //! Allowed dependencies: Qt, typed XID/generation/intent exchanges.
+pub use crate::ui::bridge::ffi::NativeFailureKind;
 
 #[derive(Debug, thiserror::Error)]
 #[error("Qt launch failed with status {exit_code}: {diagnostic}")]
 pub struct NativeLaunchError {
     pub exit_code: i32,
     pub diagnostic: String,
+    pub failure_kind: NativeFailureKind,
+    pub safe_detail: String,
 }
 
 // Local exception: the Qt launch bootstrap keeps its eight values positional in
@@ -35,13 +38,54 @@ pub fn run_application(
         sources,
         diagnostics,
     ));
-    let result = crate::ui::bridge::ffi::run_qt_application(gate, display, qualification_stdin);
+    let result = crate::ui::bridge::ffi::run_qt_application(
+        gate,
+        display,
+        media_prefix,
+        qualification_stdin,
+        false,
+    );
     if result.exit_code == 0 {
         Ok(())
     } else {
         Err(NativeLaunchError {
             exit_code: result.exit_code,
             diagnostic: result.diagnostic,
+            failure_kind: result.failure_kind,
+            safe_detail: result.safe_detail,
+        })
+    }
+}
+
+pub fn run_qualification_application(
+    media_prefix: &str,
+    display: &str,
+    video: crate::media::qualification::QualificationVideo,
+    renderer: crate::media::render_catalog::CompiledRendererSettings,
+    qualification_stdin: bool,
+    diagnostics: crate::diagnostics::DiagnosticsHandle,
+) -> Result<(), NativeLaunchError> {
+    let runtime = crate::ui::runtime::RuntimeCoordinator::new_qualification(
+        media_prefix.to_owned(),
+        video,
+        renderer,
+        diagnostics,
+    );
+    let result = crate::ui::bridge::ffi::run_qt_application(
+        Box::new(runtime),
+        display,
+        media_prefix,
+        qualification_stdin,
+        true,
+    );
+    if result.exit_code == 0 {
+        Ok(())
+    } else {
+        Err(NativeLaunchError {
+            exit_code: result.exit_code,
+            diagnostic: result.diagnostic,
+            failure_kind: result.failure_kind,
+            safe_detail: result.safe_detail,
         })
     }
 }

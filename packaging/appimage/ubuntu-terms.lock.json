@@ -1,0 +1,1782 @@
+{
+  "custom_license_evidence": {
+    "LicenseRef-ubuntu-gsm-tu-berlin": {
+      "line_ranges": [
+        [
+          531459,
+          531467
+        ]
+      ],
+      "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad"
+    },
+    "LicenseRef-ubuntu-janik-permissive": {
+      "line_ranges": [
+        [
+          6413,
+          6427
+        ]
+      ],
+      "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad"
+    },
+    "LicenseRef-ubuntu-kerberos-collective": {
+      "line_ranges": [
+        [
+          522871,
+          522873
+        ],
+        [
+          522885,
+          524188
+        ]
+      ],
+      "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad"
+    },
+    "LicenseRef-ubuntu-mit-sipb": [
+      {
+        "header_encoding": "ISO-8859-1",
+        "sha256": "bf0589587982ca7db1172a26181d44e18bdc4bbbde966aa69370b83f548c1bf6",
+        "url": "https://raw.githubusercontent.com/tytso/e2fsprogs/v1.47.0/lib/et/error_message.c"
+      },
+      {
+        "header_encoding": "ISO-8859-1",
+        "sha256": "80f5684d5d807446e73800e65d537885a4c9554cecdc4278356c888f6b53d3bb",
+        "url": "https://raw.githubusercontent.com/tytso/e2fsprogs/v1.47.0/lib/et/et_name.c"
+      },
+      {
+        "header_encoding": "ISO-8859-1",
+        "sha256": "a3778ab4ed4a3fdae15aaeb4ab2020b706770c8782928532ad0969c33ead009c",
+        "url": "https://raw.githubusercontent.com/tytso/e2fsprogs/v1.47.0/lib/et/init_et.c"
+      },
+      {
+        "header_encoding": "ISO-8859-1",
+        "sha256": "53023a7ab28c50461dd2ecab85d518a0ecd439e176fdb1f047e24781d63a90c8",
+        "url": "https://raw.githubusercontent.com/tytso/e2fsprogs/v1.47.0/lib/et/com_err.c"
+      },
+      {
+        "header_encoding": "ISO-8859-1",
+        "sha256": "5e16ddcf7784ac5e33db6bf60d8bd23ebc1505178ada57a5f9a3624e34178a6b",
+        "url": "https://raw.githubusercontent.com/tytso/e2fsprogs/v1.47.0/lib/et/com_right.c"
+      }
+    ],
+    "LicenseRef-ubuntu-ntp-ucb": {
+      "line_ranges": [
+        [
+          272,
+          279
+        ]
+      ],
+      "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad"
+    },
+    "LicenseRef-ubuntu-nvidia-apple-mit": {
+      "notice": "glslang-dev.copyright",
+      "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+      "section": "License: Apple-MIT-license"
+    },
+    "LicenseRef-ubuntu-opengroup-mit": {
+      "line_ranges": [
+        [
+          517045,
+          517047
+        ],
+        [
+          517127,
+          517201
+        ]
+      ],
+      "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad"
+    },
+    "LicenseRef-ubuntu-public-domain": {
+      "line_ranges": [
+        [
+          529280,
+          529281
+        ],
+        [
+          529735,
+          529739
+        ],
+        [
+          529758,
+          529758
+        ],
+        [
+          776,
+          777
+        ],
+        [
+          516556,
+          516578
+        ],
+        [
+          516978,
+          516982
+        ],
+        [
+          6410,
+          6411
+        ],
+        [
+          6429,
+          6432
+        ],
+        [
+          6493,
+          6497
+        ],
+        [
+          533481,
+          533483
+        ]
+      ],
+      "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad"
+    },
+    "LicenseRef-ubuntu-pulse-permissive-variants": {
+      "line_ranges": [
+        [
+          530872,
+          530890
+        ],
+        [
+          530896,
+          530901
+        ],
+        [
+          530982,
+          530989
+        ],
+        [
+          531131,
+          531149
+        ]
+      ],
+      "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad"
+    },
+    "LicenseRef-ubuntu-sun-g72x": {
+      "line_ranges": [
+        [
+          531481,
+          531503
+        ]
+      ],
+      "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad"
+    }
+  },
+  "custom_license_texts": {
+    "LicenseRef-ubuntu-gsm-tu-berlin": "  Any use of this software is permitted provided that this notice is not\n  removed and that neither the authors nor the Technische Universitaet Berlin\n  are deemed to have made any representations as to the suitability of this\n  software for any purpose nor are held responsible for any defects of\n  this software.  THERE IS ABSOLUTELY NO WARRANTY FOR THIS SOFTWARE.\n  .\n  As a matter of courtesy, the authors request to be informed about uses\n  this software has found, about bugs in this software, and about any\n  improvements that may be of general interest.",
+    "LicenseRef-ubuntu-janik-permissive": "License: Janik-permissive\n This software is provided \"as is\"; redistribution and modification\n is permitted, provided that the following disclaimer is retained.\n .\n This software is distributed in the hope that it will be useful,\n but WITHOUT ANY WARRANTY; without even the implied warranty of\n MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n In no event shall the authors or contributors be liable for any\n direct, indirect, incidental, special, exemplary, or consequential\n damages (including, but not limited to, procurement of substitute\n goods or services; loss of use, data, or profits; or business\n interruption) however caused and on any theory of liability, whether\n in contract, strict liability, or tort (including negligence or\n otherwise) arising in any way out of the use of this software, even\n if advised of the possibility of such damage.",
+    "LicenseRef-ubuntu-kerberos-collective": "Individual source code files are copyright MIT, Cygnus Support,\nNovell, OpenVision Technologies, Oracle, Red Hat, Sun Microsystems,\nFundsXpress, and others.\n\n======================================================================\n\nThe following copyright and permission notice applies to the\nOpenVision Kerberos Administration system located in \"kadmin/create\",\n\"kadmin/dbutil\", \"kadmin/passwd\", \"kadmin/server\", \"lib/kadm5\", and\nportions of \"lib/rpc\":\n\n   Copyright, OpenVision Technologies, Inc., 1993-1996, All Rights\n   Reserved\n\n   WARNING:  Retrieving the OpenVision Kerberos Administration system\n   source code, as described below, indicates your acceptance of the\n   following terms.  If you do not agree to the following terms, do\n   not retrieve the OpenVision Kerberos administration system.\n\n   You may freely use and distribute the Source Code and Object Code\n   compiled from it, with or without modification, but this Source\n   Code is provided to you \"AS IS\" EXCLUSIVE OF ANY WARRANTY,\n   INCLUDING, WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY OR\n   FITNESS FOR A PARTICULAR PURPOSE, OR ANY OTHER WARRANTY, WHETHER\n   EXPRESS OR IMPLIED. IN NO EVENT WILL OPENVISION HAVE ANY LIABILITY\n   FOR ANY LOST PROFITS, LOSS OF DATA OR COSTS OF PROCUREMENT OF\n   SUBSTITUTE GOODS OR SERVICES, OR FOR ANY SPECIAL, INDIRECT, OR\n   CONSEQUENTIAL DAMAGES ARISING OUT OF THIS AGREEMENT, INCLUDING,\n   WITHOUT LIMITATION, THOSE RESULTING FROM THE USE OF THE SOURCE\n   CODE, OR THE FAILURE OF THE SOURCE CODE TO PERFORM, OR FOR ANY\n   OTHER REASON.\n\n   OpenVision retains all copyrights in the donated Source Code.\n   OpenVision also retains copyright to derivative works of the Source\n   Code, whether created by OpenVision or by a third party. The\n   OpenVision copyright notice must be preserved if derivative works\n   are made based on the donated Source Code.\n\n   OpenVision Technologies, Inc. has donated this Kerberos\n   Administration system to MIT for inclusion in the standard Kerberos\n   5 distribution. This donation underscores our commitment to\n   continuing Kerberos technology development and our gratitude for\n   the valuable work which has been performed by MIT and the Kerberos\n   community.\n\n======================================================================\n\n   Portions contributed by Matt Crawford \"crawdad@fnal.gov\" were work\n   performed at Fermi National Accelerator Laboratory, which is\n   operated by Universities Research Association, Inc., under contract\n   DE-AC02-76CHO3000 with the U.S. Department of Energy.\n\n======================================================================\n\nPortions of \"src/lib/crypto\" have the following copyright:\n\n   Copyright (C) 1998 by the FundsXpress, INC.\n\n   All rights reserved.\n\n      Export of this software from the United States of America may\n      require a specific license from the United States Government.\n      It is the responsibility of any person or organization\n      contemplating export to obtain such a license before exporting.\n\n   WITHIN THAT CONSTRAINT, permission to use, copy, modify, and\n   distribute this software and its documentation for any purpose and\n   without fee is hereby granted, provided that the above copyright\n   notice appear in all copies and that both that copyright notice and\n   this permission notice appear in supporting documentation, and that\n   the name of FundsXpress. not be used in advertising or publicity\n   pertaining to distribution of the software without specific,\n   written prior permission.  FundsXpress makes no representations\n   about the suitability of this software for any purpose.  It is\n   provided \"as is\" without express or implied warranty.\n\n   THIS SOFTWARE IS PROVIDED \"AS IS\" AND WITHOUT ANY EXPRESS OR\n   IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED\n   WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.\n\n======================================================================\n\nThe implementation of the AES encryption algorithm in\n\"src/lib/crypto/builtin/aes\" has the following copyright:\n\n   Copyright (C) 1998-2013, Brian Gladman, Worcester, UK.\n   All rights reserved.\n\n   The redistribution and use of this software (with or without\n   changes) is allowed without the payment of fees or royalties\n   provided that:\n\n      source code distributions include the above copyright notice,\n      this list of conditions and the following disclaimer;\n\n      binary distributions include the above copyright notice, this\n      list of conditions and the following disclaimer in their\n      documentation.\n\n   This software is provided 'as is' with no explicit or implied\n   warranties in respect of its operation, including, but not limited\n   to, correctness and fitness for purpose.\n\n======================================================================\n\nPortions contributed by Red Hat, including the pre-authentication\nplug-in framework and the NSS crypto implementation, contain the\nfollowing copyright:\n\n   Copyright (C) 2006 Red Hat, Inc.\n   Portions copyright (C) 2006 Massachusetts Institute of Technology\n   All Rights Reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   * Redistributions of source code must retain the above copyright\n     notice, this list of conditions and the following disclaimer.\n\n   * Redistributions in binary form must reproduce the above\n     copyright notice, this list of conditions and the following\n     disclaimer in the documentation and/or other materials provided\n     with the distribution.\n\n   * Neither the name of Red Hat, Inc., nor the names of its\n     contributors may be used to endorse or promote products derived\n     from this software without specific prior written permission.\n\n   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n   \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS\n   FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE\n   COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,\n   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n   (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR\n   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)\n   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,\n   STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED\n   OF THE POSSIBILITY OF SUCH DAMAGE.\n\n======================================================================\n\nThe bundled verto source code is subject to the following license:\n\n   Copyright 2011 Red Hat, Inc.\n\n   Permission is hereby granted, free of charge, to any person\n   obtaining a copy of this software and associated documentation\n   files (the \"Software\"), to deal in the Software without\n   restriction, including without limitation the rights to use, copy,\n   modify, merge, publish, distribute, sublicense, and/or sell copies\n   of the Software, and to permit persons to whom the Software is\n   furnished to do so, subject to the following conditions:\n\n   The above copyright notice and this permission notice shall be\n   included in all copies or substantial portions of the Software.\n\n   THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND\n   NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT\n   HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,\n   WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER\n   DEALINGS IN THE SOFTWARE.\n\n======================================================================\n\nThe MS-KKDCP client implementation has the following copyright:\n\n   Copyright 2013,2014 Red Hat, Inc.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n      1. Redistributions of source code must retain the above\n         copyright notice, this list of conditions and the following\n         disclaimer.\n\n      2. Redistributions in binary form must reproduce the above\n         copyright notice, this list of conditions and the following\n         disclaimer in the documentation and/or other materials\n         provided with the distribution.\n\n   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n   \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS\n   FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE\n   COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,\n   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n   (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR\n   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)\n   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,\n   STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED\n   OF THE POSSIBILITY OF SUCH DAMAGE.\n\n======================================================================\n\nThe implementations of GSSAPI mechglue in GSSAPI-SPNEGO in\n\"src/lib/gssapi\", including the following files:\n\n   lib/gssapi/generic/gssapi_err_generic.et\n   lib/gssapi/mechglue/g_accept_sec_context.c\n   lib/gssapi/mechglue/g_acquire_cred.c\n   lib/gssapi/mechglue/g_canon_name.c\n   lib/gssapi/mechglue/g_compare_name.c\n   lib/gssapi/mechglue/g_context_time.c\n   lib/gssapi/mechglue/g_delete_sec_context.c\n   lib/gssapi/mechglue/g_dsp_name.c\n   lib/gssapi/mechglue/g_dsp_status.c\n   lib/gssapi/mechglue/g_dup_name.c\n   lib/gssapi/mechglue/g_exp_sec_context.c\n   lib/gssapi/mechglue/g_export_name.c\n   lib/gssapi/mechglue/g_glue.c\n   lib/gssapi/mechglue/g_imp_name.c\n   lib/gssapi/mechglue/g_imp_sec_context.c\n   lib/gssapi/mechglue/g_init_sec_context.c\n   lib/gssapi/mechglue/g_initialize.c\n   lib/gssapi/mechglue/g_inquire_context.c\n   lib/gssapi/mechglue/g_inquire_cred.c\n   lib/gssapi/mechglue/g_inquire_names.c\n   lib/gssapi/mechglue/g_process_context.c\n   lib/gssapi/mechglue/g_rel_buffer.c\n   lib/gssapi/mechglue/g_rel_cred.c\n   lib/gssapi/mechglue/g_rel_name.c\n   lib/gssapi/mechglue/g_rel_oid_set.c\n   lib/gssapi/mechglue/g_seal.c\n   lib/gssapi/mechglue/g_sign.c\n   lib/gssapi/mechglue/g_store_cred.c\n   lib/gssapi/mechglue/g_unseal.c\n   lib/gssapi/mechglue/g_userok.c\n   lib/gssapi/mechglue/g_utils.c\n   lib/gssapi/mechglue/g_verify.c\n   lib/gssapi/mechglue/gssd_pname_to_uid.c\n   lib/gssapi/mechglue/mglueP.h\n   lib/gssapi/mechglue/oid_ops.c\n   lib/gssapi/spnego/gssapiP_spnego.h\n   lib/gssapi/spnego/spnego_mech.c\n\nand the initial implementation of incremental propagation, including\nthe following new or changed files:\n\n   include/iprop_hdr.h\n   kadmin/server/ipropd_svc.c\n   lib/kdb/iprop.x\n   lib/kdb/kdb_convert.c\n   lib/kdb/kdb_log.c\n   lib/kdb/kdb_log.h\n   lib/krb5/error_tables/kdb5_err.et\n   kprop/kpropd_rpc.c\n   kprop/kproplog.c\n\nare subject to the following license:\n\n   Copyright (C) 2004 Sun Microsystems, Inc.\n\n   Permission is hereby granted, free of charge, to any person\n   obtaining a copy of this software and associated documentation\n   files (the \"Software\"), to deal in the Software without\n   restriction, including without limitation the rights to use, copy,\n   modify, merge, publish, distribute, sublicense, and/or sell copies\n   of the Software, and to permit persons to whom the Software is\n   furnished to do so, subject to the following conditions:\n\n   The above copyright notice and this permission notice shall be\n   included in all copies or substantial portions of the Software.\n\n   THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND\n   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS\n   BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN\n   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN\n   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\n   SOFTWARE.\n\n======================================================================\n\nKerberos V5 includes documentation and software developed at the\nUniversity of California at Berkeley, which includes this copyright\nnotice:\n\n   Copyright (C) 1983 Regents of the University of California.\n   All rights reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   1. Redistributions of source code must retain the above\n      copyright notice, this list of conditions and the following\n      disclaimer.\n\n   2. Redistributions in binary form must reproduce the above\n      copyright notice, this list of conditions and the following\n      disclaimer in the documentation and/or other materials provided\n      with the distribution.\n\n   3. Neither the name of the University nor the names of its\n      contributors may be used to endorse or promote products derived\n      from this software without specific prior written permission.\n\n   THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS \"AS IS\"\n   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED\n   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A\n   PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS\n   OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,\n   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT\n   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF\n   USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND\n   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,\n   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT\n   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF\n   SUCH DAMAGE.\n\n======================================================================\n\nPortions contributed by Novell, Inc., including the LDAP database\nbackend, are subject to the following license:\n\n   Copyright (C) 2004-2005, Novell, Inc.\n   All rights reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   * Redistributions of source code must retain the above copyright\n     notice, this list of conditions and the following disclaimer.\n\n   * Redistributions in binary form must reproduce the above\n     copyright notice, this list of conditions and the following\n     disclaimer in the documentation and/or other materials provided\n     with the distribution.\n\n   * The copyright holder's name is not used to endorse or promote\n     products derived from this software without specific prior\n     written permission.\n\n   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n   \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS\n   FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE\n   COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,\n   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n   (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR\n   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)\n   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,\n   STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED\n   OF THE POSSIBILITY OF SUCH DAMAGE.\n\n======================================================================\n\nPortions funded by Sandia National Laboratory and developed by the\nUniversity of Michigan's Center for Information Technology\nIntegration, including the PKINIT implementation, are subject to the\nfollowing license:\n\n   COPYRIGHT (C) 2006-2007\n   THE REGENTS OF THE UNIVERSITY OF MICHIGAN\n   ALL RIGHTS RESERVED\n\n   Permission is granted to use, copy, create derivative works and\n   redistribute this software and such derivative works for any\n   purpose, so long as the name of The University of Michigan is not\n   used in any advertising or publicity pertaining to the use of\n   distribution of this software without specific, written prior\n   authorization.  If the above copyright notice or any other\n   identification of the University of Michigan is included in any\n   copy of any portion of this software, then the disclaimer below\n   must also be included.\n\n   THIS SOFTWARE IS PROVIDED AS IS, WITHOUT REPRESENTATION FROM THE\n   UNIVERSITY OF MICHIGAN AS TO ITS FITNESS FOR ANY PURPOSE, AND\n   WITHOUT WARRANTY BY THE UNIVERSITY OF MICHIGAN OF ANY KIND, EITHER\n   EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION THE IMPLIED\n   WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.\n   THE REGENTS OF THE UNIVERSITY OF MICHIGAN SHALL NOT BE LIABLE FOR\n   ANY DAMAGES, INCLUDING SPECIAL, INDIRECT, INCIDENTAL, OR\n   CONSEQUENTIAL DAMAGES, WITH RESPECT TO ANY CLAIM ARISING OUT OF OR\n   IN CONNECTION WITH THE USE OF THE SOFTWARE, EVEN IF IT HAS BEEN OR\n   IS HEREAFTER ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.\n\n======================================================================\n\nThe pkcs11.h file included in the PKINIT code has the following\nlicense:\n\n   Copyright 2006 g10 Code GmbH\n   Copyright 2006 Andreas Jellinghaus\n\n   This file is free software; as a special exception the author gives\n   unlimited permission to copy and/or distribute it, with or without\n   modifications, as long as this notice is preserved.\n\n   This file is distributed in the hope that it will be useful, but\n   WITHOUT ANY WARRANTY, to the extent permitted by law; without even\n   the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR\n   PURPOSE.\n\n======================================================================\n\nPortions contributed by Apple Inc. are subject to the following\nlicense:\n\n   Copyright 2004-2008 Apple Inc.  All Rights Reserved.\n\n      Export of this software from the United States of America may\n      require a specific license from the United States Government.\n      It is the responsibility of any person or organization\n      contemplating export to obtain such a license before exporting.\n\n   WITHIN THAT CONSTRAINT, permission to use, copy, modify, and\n   distribute this software and its documentation for any purpose and\n   without fee is hereby granted, provided that the above copyright\n   notice appear in all copies and that both that copyright notice and\n   this permission notice appear in supporting documentation, and that\n   the name of Apple Inc. not be used in advertising or publicity\n   pertaining to distribution of the software without specific,\n   written prior permission.  Apple Inc. makes no representations\n   about the suitability of this software for any purpose.  It is\n   provided \"as is\" without express or implied warranty.\n\n   THIS SOFTWARE IS PROVIDED \"AS IS\" AND WITHOUT ANY EXPRESS OR\n   IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED\n   WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.\n\n======================================================================\n\nThe implementations of UTF-8 string handling in src/util/support and\nsrc/lib/krb5/unicode are subject to the following copyright and\npermission notice:\n\n   The OpenLDAP Public License\n   Version 2.8, 17 August 2003\n\n   Redistribution and use of this software and associated\n   documentation (\"Software\"), with or without modification, are\n   permitted provided that the following conditions are met:\n\n   1. Redistributions in source form must retain copyright\n      statements and notices,\n\n   2. Redistributions in binary form must reproduce applicable\n      copyright statements and notices, this list of conditions, and\n      the following disclaimer in the documentation and/or other\n      materials provided with the distribution, and\n\n   3. Redistributions must contain a verbatim copy of this\n      document.\n\n   The OpenLDAP Foundation may revise this license from time to time.\n   Each revision is distinguished by a version number.  You may use\n   this Software under terms of this license revision or under the\n   terms of any subsequent revision of the license.\n\n   THIS SOFTWARE IS PROVIDED BY THE OPENLDAP FOUNDATION AND ITS\n   CONTRIBUTORS \"AS IS\" AND ANY EXPRESSED OR IMPLIED WARRANTIES,\n   INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF\n   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE\n   DISCLAIMED.  IN NO EVENT SHALL THE OPENLDAP FOUNDATION, ITS\n   CONTRIBUTORS, OR THE AUTHOR(S) OR OWNER(S) OF THE SOFTWARE BE\n   LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR\n   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT\n   OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR\n   BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF\n   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT\n   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE\n   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH\n   DAMAGE.\n\n   The names of the authors and copyright holders must not be used in\n   advertising or otherwise to promote the sale, use or other dealing\n   in this Software without specific, written prior permission.  Title\n   to copyright in this Software shall at all times remain with\n   copyright holders.\n\n   OpenLDAP is a registered trademark of the OpenLDAP Foundation.\n\n   Copyright 1999-2003 The OpenLDAP Foundation, Redwood City,\n   California, USA.  All Rights Reserved.  Permission to copy and\n   distribute verbatim copies of this document is granted.\n\n======================================================================\n\nMarked test programs in src/lib/krb5/krb have the following copyright:\n\n   Copyright (C) 2006 Kungliga Tekniska H\u00f6gskola\n   (Royal Institute of Technology, Stockholm, Sweden).\n   All rights reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   1. Redistributions of source code must retain the above\n      copyright notice, this list of conditions and the following\n      disclaimer.\n\n   2. Redistributions in binary form must reproduce the above\n      copyright notice, this list of conditions and the following\n      disclaimer in the documentation and/or other materials provided\n      with the distribution.\n\n   3. Neither the name of KTH nor the names of its contributors may\n      be used to endorse or promote products derived from this\n      software without specific prior written permission.\n\n   THIS SOFTWARE IS PROVIDED BY KTH AND ITS CONTRIBUTORS \"AS IS\" AND\n   ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,\n   THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A\n   PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL KTH OR ITS\n   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,\n   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT\n   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF\n   USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND\n   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,\n   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT\n   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF\n   SUCH DAMAGE.\n\n======================================================================\n\nThe KCM Mach RPC definition file used on macOS has the following\ncopyright:\n\n      Copyright (C) 2009 Kungliga Tekniska H\u00f6gskola\n      (Royal Institute of Technology, Stockholm, Sweden).\n      All rights reserved.\n\n   Portions Copyright (C) 2009 Apple Inc. All rights reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   1. Redistributions of source code must retain the above\n      copyright notice, this list of conditions and the following\n      disclaimer.\n\n   2. Redistributions in binary form must reproduce the above\n      copyright notice, this list of conditions and the following\n      disclaimer in the documentation and/or other materials provided\n      with the distribution.\n\n   3. Neither the name of the Institute nor the names of its\n      contributors may be used to endorse or promote products derived\n      from this software without specific prior written permission.\n\n   THIS SOFTWARE IS PROVIDED BY THE INSTITUTE AND CONTRIBUTORS \"AS IS\"\n   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED\n   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A\n   PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE INSTITUTE\n   OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,\n   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT\n   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF\n   USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND\n   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,\n   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT\n   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF\n   SUCH DAMAGE.\n\n======================================================================\n\nPortions of the RPC implementation in src/lib/rpc and\nsrc/include/gssrpc have the following copyright and permission notice:\n\n   Copyright (C) 2010, Oracle America, Inc.\n\n   All rights reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   1. Redistributions of source code must retain the above\n      copyright notice, this list of conditions and the following\n      disclaimer.\n\n   2. Redistributions in binary form must reproduce the above\n      copyright notice, this list of conditions and the following\n      disclaimer in the documentation and/or other materials provided\n      with the distribution.\n\n   3. Neither the name of the \"Oracle America, Inc.\" nor the names\n      of its contributors may be used to endorse or promote products\n      derived from this software without specific prior written\n      permission.\n\n   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n   \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS\n   FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE\n   COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,\n   INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n   (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR\n   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)\n   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,\n   STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED\n   OF THE POSSIBILITY OF SUCH DAMAGE.\n\n======================================================================\n\n   Copyright (C) 2006,2007,2009 NTT (Nippon Telegraph and Telephone\n   Corporation).  All rights reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   1. Redistributions of source code must retain the above\n      copyright notice, this list of conditions and the following\n      disclaimer as the first lines of this file unmodified.\n\n   2. Redistributions in binary form must reproduce the above\n      copyright notice, this list of conditions and the following\n      disclaimer in the documentation and/or other materials provided\n      with the distribution.\n\n   THIS SOFTWARE IS PROVIDED BY NTT \"AS IS\" AND ANY EXPRESS OR IMPLIED\n   WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES\n   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE\n   DISCLAIMED. IN NO EVENT SHALL NTT BE LIABLE FOR ANY DIRECT,\n   INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n   (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR\n   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)\n   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,\n   STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED\n   OF THE POSSIBILITY OF SUCH DAMAGE.\n\n======================================================================\n\n   Copyright 2000 by Carnegie Mellon University\n\n   All Rights Reserved\n\n   Permission to use, copy, modify, and distribute this software and\n   its documentation for any purpose and without fee is hereby\n   granted, provided that the above copyright notice appear in all\n   copies and that both that copyright notice and this permission\n   notice appear in supporting documentation, and that the name of\n   Carnegie Mellon University not be used in advertising or publicity\n   pertaining to distribution of the software without specific,\n   written prior permission.\n\n   CARNEGIE MELLON UNIVERSITY DISCLAIMS ALL WARRANTIES WITH REGARD TO\n   THIS SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY\n   AND FITNESS, IN NO EVENT SHALL CARNEGIE MELLON UNIVERSITY BE LIABLE\n   FOR ANY SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES\n   WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN\n   AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING\n   OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS\n   SOFTWARE.\n\n======================================================================\n\n   Copyright (C) 2002 Naval Research Laboratory (NRL/CCS)\n\n   Permission to use, copy, modify and distribute this software and\n   its documentation is hereby granted, provided that both the\n   copyright notice and this permission notice appear in all copies of\n   the software, derivative works or modified versions, and any\n   portions thereof.\n\n   NRL ALLOWS FREE USE OF THIS SOFTWARE IN ITS \"AS IS\" CONDITION AND\n   DISCLAIMS ANY LIABILITY OF ANY KIND FOR ANY DAMAGES WHATSOEVER\n   RESULTING FROM THE USE OF THIS SOFTWARE.\n\n======================================================================\n\n   Copyright (C) 1991, 1992, 1994 by Cygnus Support.\n\n   Permission to use, copy, modify, and distribute this software and\n   its documentation for any purpose and without fee is hereby\n   granted, provided that the above copyright notice appear in all\n   copies and that both that copyright notice and this permission\n   notice appear in supporting documentation. Cygnus Support makes no\n   representations about the suitability of this software for any\n   purpose.  It is provided \"as is\" without express or implied\n   warranty.\n\n======================================================================\n\n   Copyright (C) 2006 Secure Endpoints Inc.\n\n   Permission is hereby granted, free of charge, to any person\n   obtaining a copy of this software and associated documentation\n   files (the \"Software\"), to deal in the Software without\n   restriction, including without limitation the rights to use, copy,\n   modify, merge, publish, distribute, sublicense, and/or sell copies\n   of the Software, and to permit persons to whom the Software is\n   furnished to do so, subject to the following conditions:\n\n   The above copyright notice and this permission notice shall be\n   included in all copies or substantial portions of the Software.\n\n   THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND\n   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS\n   BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN\n   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN\n   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\n   SOFTWARE.\n\n======================================================================\n\nPortions of the implementation of the Fortuna-like PRNG are subject to\nthe following notice:\n\n   Copyright (C) 2005 Marko Kreen\n   All rights reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   1. Redistributions of source code must retain the above\n      copyright notice, this list of conditions and the following\n      disclaimer.\n\n   2. Redistributions in binary form must reproduce the above\n      copyright notice, this list of conditions and the following\n      disclaimer in the documentation and/or other materials provided\n      with the distribution.\n\n   THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS \"AS IS\"\n   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED\n   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A\n   PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR\n   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,\n   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT\n   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF\n   USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND\n   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,\n   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT\n   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF\n   SUCH DAMAGE.\n\n   Copyright (C) 1994 by the University of Southern California\n\n      EXPORT OF THIS SOFTWARE from the United States of America may\n      require a specific license from the United States Government. It\n      is the responsibility of any person or organization\n      contemplating export to obtain such a license before exporting.\n\n   WITHIN THAT CONSTRAINT, permission to copy, modify, and distribute\n   this software and its documentation in source and binary forms is\n   hereby granted, provided that any documentation or other materials\n   related to such distribution or use acknowledge that the software\n   was developed by the University of Southern California.\n\n   DISCLAIMER OF WARRANTY.  THIS SOFTWARE IS PROVIDED \"AS IS\".  The\n   University of Southern California MAKES NO REPRESENTATIONS OR\n   WARRANTIES, EXPRESS OR IMPLIED.  By way of example, but not\n   limitation, the University of Southern California MAKES NO\n   REPRESENTATIONS OR WARRANTIES OF MERCHANTABILITY OR FITNESS FOR ANY\n   PARTICULAR PURPOSE. The University of Southern California shall not\n   be held liable for any liability nor for any direct, indirect, or\n   consequential damages with respect to any claim by the user or\n   distributor of the ksu software.\n\n======================================================================\n\n   Copyright (C) 1995\n   The President and Fellows of Harvard University\n\n   This code is derived from software contributed to Harvard by Jeremy\n   Rassen.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   1. Redistributions of source code must retain the above\n      copyright notice, this list of conditions and the following\n      disclaimer.\n\n   2. Redistributions in binary form must reproduce the above\n      copyright notice, this list of conditions and the following\n      disclaimer in the documentation and/or other materials provided\n      with the distribution.\n\n   3. All advertising materials mentioning features or use of this\n      software must display the following acknowledgement:\n\n         This product includes software developed by the University of\n         California, Berkeley and its contributors.\n\n   4. Neither the name of the University nor the names of its\n      contributors may be used to endorse or promote products derived\n      from this software without specific prior written permission.\n\n   THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS \"AS IS\"\n   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED\n   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A\n   PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS\n   OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,\n   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT\n   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF\n   USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND\n   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,\n   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT\n   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF\n   SUCH DAMAGE.\n\n======================================================================\n\n   Copyright (C) 2008 by the Massachusetts Institute of Technology.\n   Copyright 1995 by Richard P. Basch.  All Rights Reserved.\n   Copyright 1995 by Lehman Brothers, Inc.  All Rights Reserved.\n\n      Export of this software from the United States of America may\n      require a specific license from the United States Government. It\n      is the responsibility of any person or organization\n      contemplating export to obtain such a license before exporting.\n\n   WITHIN THAT CONSTRAINT, permission to use, copy, modify, and\n   distribute this software and its documentation for any purpose and\n   without fee is hereby granted, provided that the above copyright\n   notice appear in all copies and that both that copyright notice and\n   this permission notice appear in supporting documentation, and that\n   the name of Richard P. Basch, Lehman Brothers and M.I.T. not be\n   used in advertising or publicity pertaining to distribution of the\n   software without specific, written prior permission.  Richard P.\n   Basch, Lehman Brothers and M.I.T. make no representations about the\n   suitability of this software for any purpose.  It is provided \"as\n   is\" without express or implied warranty.\n\n======================================================================\n\nThe following notice applies to \"src/lib/krb5/krb/strptime.c\" and\n\"src/include/k5-queue.h\".\n\n   Copyright (C) 1997, 1998 The NetBSD Foundation, Inc.\n   All rights reserved.\n\n   This code was contributed to The NetBSD Foundation by Klaus Klein.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   1. Redistributions of source code must retain the above\n      copyright notice, this list of conditions and the following\n      disclaimer.\n\n   2. Redistributions in binary form must reproduce the above\n      copyright notice, this list of conditions and the following\n      disclaimer in the documentation and/or other materials provided\n      with the distribution.\n\n   3. All advertising materials mentioning features or use of this\n      software must display the following acknowledgement:\n\n         This product includes software developed by the NetBSD\n         Foundation, Inc. and its contributors.\n\n   4. Neither the name of The NetBSD Foundation nor the names of\n      its contributors may be used to endorse or promote products\n      derived from this software without specific prior written\n      permission.\n\n   THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND\n   CONTRIBUTORS \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES,\n   INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF\n   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE\n   DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS BE\n   LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR\n   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT\n   OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR\n   BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF\n   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT\n   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE\n   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH\n   DAMAGE.\n\n======================================================================\n\nThe following notice applies to Unicode library files in\n\"src/lib/krb5/unicode\":\n\n   Copyright 1997, 1998, 1999 Computing Research Labs,\n   New Mexico State University\n\n   Permission is hereby granted, free of charge, to any person\n   obtaining a copy of this software and associated documentation\n   files (the \"Software\"), to deal in the Software without\n   restriction, including without limitation the rights to use, copy,\n   modify, merge, publish, distribute, sublicense, and/or sell copies\n   of the Software, and to permit persons to whom the Software is\n   furnished to do so, subject to the following conditions:\n\n   The above copyright notice and this permission notice shall be\n   included in all copies or substantial portions of the Software.\n\n   THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND\n   NONINFRINGEMENT.  IN NO EVENT SHALL THE COMPUTING RESEARCH LAB OR\n   NEW MEXICO STATE UNIVERSITY BE LIABLE FOR ANY CLAIM, DAMAGES OR\n   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR\n   OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE\n   OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n\n======================================================================\n\nThe following notice applies to \"src/util/support/strlcpy.c\":\n\n   Copyright (C) 1998 Todd C. Miller \"Todd.Miller@courtesan.com\"\n\n   Permission to use, copy, modify, and distribute this software for\n   any purpose with or without fee is hereby granted, provided that\n   the above copyright notice and this permission notice appear in all\n   copies.\n\n   THE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL\n   WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED\n   WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE\n   AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR\n   CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS\n   OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,\n   NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN\n   CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.\n\n======================================================================\n\nThe following notice applies to \"src/util/profile/argv_parse.c\" and\n\"src/util/profile/argv_parse.h\":\n\n   Copyright 1999 by Theodore Ts'o.\n\n   Permission to use, copy, modify, and distribute this software for\n   any purpose with or without fee is hereby granted, provided that\n   the above copyright notice and this permission notice appear in all\n   copies.  THE SOFTWARE IS PROVIDED \"AS IS\" AND THEODORE TS'O (THE\n   AUTHOR) DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,\n   INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN\n   NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,\n   INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER\n   RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION\n   OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR\n   IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.  (Isn't\n   it sick that the U.S. culture of lawsuit-happy lawyers requires\n   this kind of disclaimer?)\n\n======================================================================\n\nThe following notice applies to SWIG-generated code in\n\"src/util/profile/profile_tcl.c\":\n\n   Copyright (C) 1999-2000, The University of Chicago\n\n   This file may be freely redistributed without license or fee\n   provided this copyright message remains intact.\n\n======================================================================\n\nThe following notice applies to portiions of \"src/lib/rpc\" and\n\"src/include/gssrpc\":\n\n   Copyright (C) 2000 The Regents of the University of Michigan. All\n   rights reserved.\n\n   Copyright (C) 2000 Dug Song \"dugsong@UMICH.EDU\". All rights\n   reserved, all wrongs reversed.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   1. Redistributions of source code must retain the above\n      copyright notice, this list of conditions and the following\n      disclaimer.\n\n   2. Redistributions in binary form must reproduce the above\n      copyright notice, this list of conditions and the following\n      disclaimer in the documentation and/or other materials provided\n      with the distribution.\n\n   3. Neither the name of the University nor the names of its\n      contributors may be used to endorse or promote products derived\n      from this software without specific prior written permission.\n\n   THIS SOFTWARE IS PROVIDED \"AS IS\" AND ANY EXPRESS OR IMPLIED\n   WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES\n   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE\n   DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE\n   FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR\n   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT\n   OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR\n   BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF\n   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT\n   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE\n   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH\n   DAMAGE.\n\n======================================================================\n\nImplementations of the MD4 algorithm are subject to the following\nnotice:\n\n   Copyright (C) 1990, RSA Data Security, Inc. All rights reserved.\n\n   License to copy and use this software is granted provided that it\n   is identified as the \"RSA Data Security, Inc. MD4 Message Digest\n   Algorithm\" in all material mentioning or referencing this software\n   or this function.\n\n   License is also granted to make and use derivative works provided\n   that such works are identified as \"derived from the RSA Data\n   Security, Inc. MD4 Message Digest Algorithm\" in all material\n   mentioning or referencing the derived work.\n\n   RSA Data Security, Inc. makes no representations concerning either\n   the merchantability of this software or the suitability of this\n   software for any particular purpose.  It is provided \"as is\"\n   without express or implied warranty of any kind.\n\n   These notices must be retained in any copies of any part of this\n   documentation and/or software.\n\n======================================================================\n\nImplementations of the MD5 algorithm are subject to the following\nnotice:\n\n   Copyright (C) 1990, RSA Data Security, Inc. All rights reserved.\n\n   License to copy and use this software is granted provided that it\n   is identified as the \"RSA Data Security, Inc. MD5 Message- Digest\n   Algorithm\" in all material mentioning or referencing this software\n   or this function.\n\n   License is also granted to make and use derivative works provided\n   that such works are identified as \"derived from the RSA Data\n   Security, Inc. MD5 Message-Digest Algorithm\" in all material\n   mentioning or referencing the derived work.\n\n   RSA Data Security, Inc. makes no representations concerning either\n   the merchantability of this software or the suitability of this\n   software for any particular purpose.  It is provided \"as is\"\n   without express or implied warranty of any kind.\n\n   These notices must be retained in any copies of any part of this\n   documentation and/or software.\n\n======================================================================\n\nThe following notice applies to\n\"src/lib/crypto/crypto_tests/t_mddriver.c\":\n\n   Copyright (C) 1990-2, RSA Data Security, Inc. Created 1990. All\n   rights reserved.\n\n   RSA Data Security, Inc. makes no representations concerning either\n   the merchantability of this software or the suitability of this\n   software for any particular purpose. It is provided \"as is\" without\n   express or implied warranty of any kind.\n\n   These notices must be retained in any copies of any part of this\n   documentation and/or software.\n\n======================================================================\n\nPortions of \"src/lib/krb5\" are subject to the following notice:\n\n   Copyright (C) 1994 CyberSAFE Corporation.\n   Copyright 1990,1991,2007,2008 by the Massachusetts Institute of Technology.\n   All Rights Reserved.\n\n      Export of this software from the United States of America may\n      require a specific license from the United States Government. It\n      is the responsibility of any person or organization\n      contemplating export to obtain such a license before exporting.\n\n   WITHIN THAT CONSTRAINT, permission to use, copy, modify, and\n   distribute this software and its documentation for any purpose and\n   without fee is hereby granted, provided that the above copyright\n   notice appear in all copies and that both that copyright notice and\n   this permission notice appear in supporting documentation, and that\n   the name of M.I.T. not be used in advertising or publicity\n   pertaining to distribution of the software without specific,\n   written prior permission.  Furthermore if you modify this software\n   you must label your software as modified software and not\n   distribute it in such a fashion that it might be confused with the\n   original M.I.T. software. Neither M.I.T., the Open Computing\n   Security Group, nor CyberSAFE Corporation make any representations\n   about the suitability of this software for any purpose.  It is\n   provided \"as is\" without express or implied warranty.\n\n======================================================================\n\nPortions contributed by PADL Software are subject to the following\nlicense:\n\n   Copyright (c) 2011, PADL Software Pty Ltd. All rights reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   1. Redistributions of source code must retain the above\n      copyright notice, this list of conditions and the following\n      disclaimer.\n\n   2. Redistributions in binary form must reproduce the above\n      copyright notice, this list of conditions and the following\n      disclaimer in the documentation and/or other materials provided\n      with the distribution.\n\n   3. Neither the name of PADL Software nor the names of its\n      contributors may be used to endorse or promote products derived\n      from this software without specific prior written permission.\n\n   THIS SOFTWARE IS PROVIDED BY PADL SOFTWARE AND CONTRIBUTORS \"AS IS\"\n   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED\n   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A\n   PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL PADL SOFTWARE\n   OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,\n   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT\n   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF\n   USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND\n   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,\n   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT\n   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF\n   SUCH DAMAGE.\n\n======================================================================\n\nThe bundled libev source code is subject to the following license:\n\n   All files in libev are Copyright (C)2007,2008,2009 Marc Alexander\n   Lehmann.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   * Redistributions of source code must retain the above copyright\n     notice, this list of conditions and the following disclaimer.\n\n   * Redistributions in binary form must reproduce the above\n     copyright notice, this list of conditions and the following\n     disclaimer in the documentation and/or other materials provided\n     with the distribution.\n\n   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n   \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS\n   FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE\n   COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,\n   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n   (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR\n   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)\n   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,\n   STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED\n   OF THE POSSIBILITY OF SUCH DAMAGE.\n\n   Alternatively, the contents of this package may be used under the\n   terms of the GNU General Public License (\"GPL\") version 2 or any\n   later version, in which case the provisions of the GPL are\n   applicable instead of the above. If you wish to allow the use of\n   your version of this package only under the terms of the GPL and\n   not to allow others to use your version of this file under the BSD\n   license, indicate your decision by deleting the provisions above\n   and replace them with the notice and other provisions required by\n   the GPL in this and the other files of this package. If you do not\n   delete the provisions above, a recipient may use your version of\n   this file under either the BSD or the GPL.\n\n   On Debian systems, the complete text of the GNU General Public License\n   version 2 can be found in `/usr/share/common-licenses/GPL-2'.\n\n======================================================================\n\nFiles copied from the Intel AESNI Sample Library are subject to the\nfollowing license:\n\n   Copyright (C) 2010, Intel Corporation\n   All rights reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n      * Redistributions of source code must retain the above\n        copyright notice, this list of conditions and the following\n        disclaimer.\n\n      * Redistributions in binary form must reproduce the above\n        copyright notice, this list of conditions and the following\n        disclaimer in the documentation and/or other materials\n        provided with the distribution.\n\n      * Neither the name of Intel Corporation nor the names of its\n        contributors may be used to endorse or promote products\n        derived from this software without specific prior written\n        permission.\n\n   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n   \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS\n   FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE\n   COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,\n   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n   (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR\n   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)\n   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,\n   STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED\n   OF THE POSSIBILITY OF SUCH DAMAGE.\n\n======================================================================\n\nThe following notice applies to\n\"src/ccapi/common/win/OldCC/autolock.hxx\":\n\n   Copyright (C) 1998 by Danilo Almeida.  All rights reserved.\n\n   Redistribution and use in source and binary forms, with or without\n   modification, are permitted provided that the following conditions\n   are met:\n\n   * Redistributions of source code must retain the above copyright\n     notice, this list of conditions and the following disclaimer.\n\n   * Redistributions in binary form must reproduce the above\n     copyright notice, this list of conditions and the following\n     disclaimer in the documentation and/or other materials provided\n     with the distribution.\n\n   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n   \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS\n   FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE\n   COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,\n   INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n   (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR\n   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)\n   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,\n   STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED\n   OF THE POSSIBILITY OF SUCH DAMAGE.\n\n======================================================================\n\nThe following notice applies to portions of\n\"src/plugins/preauth/spake/edwards25519.c\" and\n\"src/plugins/preauth/spake/edwards25519_tables.h\":\n\nThe MIT License (MIT)\n\nCopyright (c) 2015-2016 the fiat-crypto authors (see the AUTHORS\nfile).\n\nPermission is hereby granted, free of charge, to any person obtaining\na copy of this software and associated documentation files (the\n\"Software\"), to deal in the Software without restriction, including\nwithout limitation the rights to use, copy, modify, merge, publish,\ndistribute, sublicense, and/or sell copies of the Software, and to\npermit persons to whom the Software is furnished to do so, subject to\nthe following conditions:\n\nThe above copyright notice and this permission notice shall be\nincluded in all copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\nEXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\nMERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.\nIN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY\nCLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,\nTORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE\nSOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n\n======================================================================\n\nThe following notice applies to portions of\n\"src/plugins/preauth/spake/edwards25519.c\":\n\nCopyright (c) 2015-2016, Google Inc.\n\nPermission to use, copy, modify, and/or distribute this software for\nany purpose with or without fee is hereby granted, provided that the\nabove copyright notice and this permission notice appear in all\ncopies.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL\nWARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED\nWARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE\nAUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL\nDAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR\nPROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER\nTORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR\nPERFORMANCE OF THIS SOFTWARE.\n\n======================================================================\n\nThe Debian Packaging is licensed under the same terms as MIT Kerberos.\n",
+    "LicenseRef-ubuntu-mit-sipb": "/*\n * $Header$\n * $Source$\n * $Locker$\n *\n * Copyright 1987 by the Student Information Processing Board\n * of the Massachusetts Institute of Technology\n *\n * Permission to use, copy, modify, and distribute this software and\n * its documentation for any purpose is hereby granted, provided that\n * the names of M.I.T. and the M.I.T. S.I.P.B. not be used in\n * advertising or publicity pertaining to distribution of the software\n * without specific, written prior permission.  M.I.T. and the\n * M.I.T. S.I.P.B. make no representations about the suitability of\n * this software for any purpose.  It is provided \"as is\" without\n * express or implied warranty.\n */\n\n/*\n * Copyright 1987 by MIT Student Information Processing Board\n *\n * Permission to use, copy, modify, and distribute this software and\n * its documentation for any purpose is hereby granted, provided that\n * the names of M.I.T. and the M.I.T. S.I.P.B. not be used in\n * advertising or publicity pertaining to distribution of the software\n * without specific, written prior permission.  M.I.T. and the\n * M.I.T. S.I.P.B. make no representations about the suitability of\n * this software for any purpose.  It is provided \"as is\" without\n * express or implied warranty.\n */\n\n/*\n * $Header$\n * $Source$\n * $Locker$\n *\n * Copyright 1986, 1987, 1988 by MIT Information Systems and\n *\tthe MIT Student Information Processing Board.\n *\n * Permission to use, copy, modify, and distribute this software and\n * its documentation for any purpose is hereby granted, provided that\n * the names of M.I.T. and the M.I.T. S.I.P.B. not be used in\n * advertising or publicity pertaining to distribution of the software\n * without specific, written prior permission.  M.I.T. and the\n * M.I.T. S.I.P.B. make no representations about the suitability of\n * this software for any purpose.  It is provided \"as is\" without\n * express or implied warranty.\n */\n\n/*\n * Copyright 1987, 1988 by MIT Student Information Processing Board.\n *\n * Permission to use, copy, modify, and distribute this software and\n * its documentation for any purpose is hereby granted, provided that\n * the names of M.I.T. and the M.I.T. S.I.P.B. not be used in\n * advertising or publicity pertaining to distribution of the software\n * without specific, written prior permission.  M.I.T. and the\n * M.I.T. S.I.P.B. make no representations about the suitability of\n * this software for any purpose.  It is provided \"as is\" without\n * express or implied warranty.\n */\n\n/*\n * com_right.c -- provide Heimdall / Kerberos4kth com_err interfaces\n * \tfor backwards compatibility\n *\n * Copyright (c) 2003 by Theodore Ts'o\n *\n * Taken from lib/com_err/error.c from Kerberos4kth distribution.\n *\n * Copyright (c) 1997, 1998, 2001 Kungliga Tekniska H\u00f6gskolan\n * (Royal Institute of Technology, Stockholm, Sweden).\n * All rights reserved.\n *\n * Redistribution and use in source and binary forms, with or without\n * modification, are permitted provided that the following conditions\n * are met:\n *\n * 1. Redistributions of source code must retain the above copyright\n *    notice, this list of conditions and the following disclaimer.\n *\n * 2. Redistributions in binary form must reproduce the above copyright\n *    notice, this list of conditions and the following disclaimer in the\n *    documentation and/or other materials provided with the distribution.\n *\n * 3. Neither the name of the Institute nor the names of its contributors\n *    may be used to endorse or promote products derived from this software\n *    without specific prior written permission.\n *\n * THIS SOFTWARE IS PROVIDED BY THE INSTITUTE AND CONTRIBUTORS ``AS IS'' AND\n * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE\n * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE\n * ARE DISCLAIMED.  IN NO EVENT SHALL THE INSTITUTE OR CONTRIBUTORS BE LIABLE\n * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL\n * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS\n * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)\n * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT\n * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY\n * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF\n * SUCH DAMAGE.\n */",
+    "LicenseRef-ubuntu-ntp-ucb": "License: NTP\n Permission to use, copy, modify, and distribute this\n software and its documentation for any purpose and without\n fee is hereby granted, provided that the above copyright\n notice appear in all copies.  The University of California\n makes no representations about the suitability of this\n software for any purpose.  It is provided \"as is\" without\n express or implied warranty.",
+    "LicenseRef-ubuntu-nvidia-apple-mit": "License: Apple-MIT-license\n NVIDIA Corporation(\"NVIDIA\") supplies this software to you in\n consideration of your agreement to the following terms, and your use,\n installation, modification or redistribution of this NVIDIA software\n constitutes acceptance of these terms.  If you do not agree with these\n terms, please do not use, install, modify or redistribute this NVIDIA\n software.\n .\n In consideration of your agreement to abide by the following terms, and\n subject to these terms, NVIDIA grants you a personal, non-exclusive\n license, under NVIDIA's copyrights in this original NVIDIA software (the\n \"NVIDIA Software\"), to use, reproduce, modify and redistribute the\n NVIDIA Software, with or without modifications, in source and/or binary\n forms; provided that if you redistribute the NVIDIA Software, you must\n retain the copyright notice of NVIDIA, this notice and the following\n text and disclaimers in all such redistributions of the NVIDIA Software.\n Neither the name, trademarks, service marks nor logos of NVIDIA\n Corporation may be used to endorse or promote products derived from the\n NVIDIA Software without specific prior written permission from NVIDIA.\n Except as expressly stated in this notice, no other rights or licenses\n express or implied, are granted by NVIDIA herein, including but not\n limited to any patent rights that may be infringed by your derivative\n works or by other works in which the NVIDIA Software may be\n incorporated. No hardware is licensed hereunder.\n .\n THE NVIDIA SOFTWARE IS BEING PROVIDED ON AN \"AS IS\" BASIS, WITHOUT\n WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED,\n INCLUDING WITHOUT LIMITATION, WARRANTIES OR CONDITIONS OF TITLE,\n NON-INFRINGEMENT, MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR\n ITS USE AND OPERATION EITHER ALONE OR IN COMBINATION WITH OTHER\n PRODUCTS.\n .\n IN NO EVENT SHALL NVIDIA BE LIABLE FOR ANY SPECIAL, INDIRECT,\n INCIDENTAL, EXEMPLARY, CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED\n TO, LOST PROFITS; PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF\n USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) OR ARISING IN ANY WAY\n OUT OF THE USE, REPRODUCTION, MODIFICATION AND/OR DISTRIBUTION OF THE\n NVIDIA SOFTWARE, HOWEVER CAUSED AND WHETHER UNDER THEORY OF CONTRACT,\n TORT (INCLUDING NEGLIGENCE), STRICT LIABILITY OR OTHERWISE, EVEN IF\n NVIDIA HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.",
+    "LicenseRef-ubuntu-opengroup-mit": "Files: src/pcf/pcfutil.c\nCopyright: 1990, 1994, 1998 The Open Group\nLicense: OpenGroup-MIT\n\nLicense: BSD-3-Clause\n  Redistribution and use in source and binary forms, with or without\n  modification, are permitted provided that the following conditions are met:\n .\n  1. Redistributions of source code must retain the above copyright notice,\n     this list of conditions and the following disclaimer.\n .\n  2. Redistributions in binary form must reproduce the above copyright notice,\n     this list of conditions and the following disclaimer in the documentation\n     and/or other materials provided with the distribution.\n .\n  3. Neither the name of the copyright holder nor the names of its contributors\n     may be used to endorse or promote products derived from this software\n     without specific prior written permission.\n .\n  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\"\n  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE\n  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE\n  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE\n  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR\n  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF\n  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS\n  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN\n  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF\n  THE POSSIBILITY OF SUCH DAMAGE.\n\nLicense: BSL-1.0\n  Permission is hereby granted, free of charge, to any person or organization\n  obtaining a copy of the software and accompanying documentation covered by\n  this license (the \"Software\") to use, reproduce, display, distribute,\n  execute, and transmit the Software, and to prepare derivative works of the\n  Software, and to permit third-parties to whom the Software is furnished to\n  do so, all subject to the following:\n .\n  The copyright notices in the Software and this entire statement, including\n  the above license grant, this restriction and the following disclaimer,\n  must be included in all copies of the Software, in whole or in part, and\n  all derivative works of the Software, unless such copies or derivative\n  works are solely in the form of machine-executable object code generated by\n  a source language processor.\n .\n  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n  FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT\n  SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE\n  FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,\n  ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER\n  DEALINGS IN THE SOFTWARE.\n\nLicense: Expat\n  Permission is hereby granted, free of charge, to any person obtaining a copy\n  of this software and associated documentation files (the \"Software\"), to deal\n  in the Software without restriction, including without limitation the rights\n  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell\n  copies of the Software, and to permit persons to whom the Software is\n  furnished to do so, subject to the following conditions:\n .\n  The above copyright notice and this permission notice shall be included in\n  all copies or substantial portions of the Software.\n .\n  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\n  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\n  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\n  SOFTWARE.\n\nLicense: FSFAP\n  Copying and distribution of this file, with or without modification,\n  are permitted in any medium without royalty provided the copyright\n  notice and this notice are preserved. This file is offered as-is,\n  without any warranty.\n",
+    "LicenseRef-ubuntu-public-domain": " This file has been put in the public domain.\n You can do whatever you want with this file.\n\n This code implements the MD4 message-digest algorithm.\n The algorithm is due to Ron Rivest.  This code was\n written by Colin Plumb in 1993, no copyright is claimed.\n This code is in the public domain; do with it what you wish.\n Todd C. Miller modified the MD5 code to do MD4 based on RFC 1186.\n\n 100% Public Domain\n\nLicense: public-domain\n Public domain.\n\nLicense: Public-domain\n * This is the header file for the MD5 message-digest algorithm.\n * The algorithm is due to Ron Rivest.  This code was\n * written by Colin Plumb in 1993, no copyright is claimed.\n * This code is in the public domain; do with it what you wish.\n *\n * Equivalent code is available from RSA Data Security, Inc.\n * This code has been tested against that, and is equivalent,\n * except that you don't need to include two pages of legalese\n * with every copy.\n *\n * To compute the message digest of a chunk of bytes, declare an\n * MD5Context structure, pass it to MD5Init, call MD5Update as\n * needed on buffers full of bytes, and then call MD5Final, which\n * will fill a supplied 16-byte array with the digest.\n *\n * Changed so as no longer to depend on Colin Plumb's `usual.h'\n * header definitions; now uses stuff from dpkg's config.h\n *  - Ian Jackson <ijackson@nyx.cs.du.edu>.\n * Still in the public domain.\n *\n * Josh Coalson: made some changes to integrate with libFLAC.\n * Still in the public domain, with no warranty.\n\n       src/base/md5.h\nCopyright: None\nLicense: Public-Domain\n         \"No copyright is claimed, and the software is hereby placed in the public domain.\"\n\n\nLicense: Iconv-PD\n This file is placed in the public domain.\n\nLicense: Kuchling-PD\n Distribute and use freely; there are no restrictions on further\n dissemination and usage except those imposed by the laws of your\n country of residence.\n\nLicense: Plumb-PD\n The algorithm is due to Ron Rivest.  This code was\n written by Colin Plumb in 1993, no copyright is claimed.\n This code is in the public domain; do with it what you wish.\n\n\nLicense: public-domain\n You can use this free for any purpose. It's in the public domain. It has no\n warranty.",
+    "LicenseRef-ubuntu-pulse-permissive-variants": " This source code is a product of Sun Microsystems, Inc. and is provided\n for unrestricted use.  Users may copy or modify this source code without\n charge.\n .\n SUN SOURCE CODE IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING\n THE WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR\n PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.\n .\n Sun source code is provided with no support and without any obligation on\n the part of Sun Microsystems, Inc. to assist in its use, correction,\n modification or enhancement.\n .\n SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE\n INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY THIS SOFTWARE\n OR ANY PART THEREOF.\n .\n In no event will Sun Microsystems, Inc. be liable for any lost revenue\n or profits or other special, indirect and consequential damages, even if\n Sun has been advised of the possibility of such damages.\n\n Permission to use, copy, modify, and distribute this software and its\n documentation for any purpose and without fee is hereby granted, provided\n that the above copyright notice appear in all copies and that both that\n copyright notice and this permission notice appear in supporting\n documentation.  This software is provided \"as is\" without express or\n implied warranty.\n\n You are allowed to use this source code in any open source or closed\n source software you want. You are allowed to use the algorithms for a\n hardware solution. You are allowed to modify the source code.\n You are not allowed to remove the name of the author from this memo or\n from the source code files. You are not allowed to monopolize the\n source code or the algorithms behind the source code as your\n intellectual property. This source code is free of royalty and comes\n with no warranty.\n\n  Permission is hereby granted, free of charge, to any person\n  obtaining a copy of this software and associated documentation files\n  (the \"Software\"), to deal in the Software without restriction,\n  including without limitation the rights to use, copy, modify, merge,\n  publish, distribute, sublicense, and/or sell copies of the Software,\n  and to permit persons to whom the Software is furnished to do so,\n  subject to the following conditions:\n .\n  The above copyright notice and this permission notice shall be\n  included in all copies or substantial portions of the Software.\n .\n  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND\n  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS\n  BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN\n  ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN\n  CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\n  SOFTWARE.",
+    "LicenseRef-ubuntu-sun-g72x": "  This source code is a product of Sun Microsystems, Inc. and is provided\n  for unrestricted use.  Users may copy or modify this source code without\n  charge.\n  .\n  SUN SOURCE CODE IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING\n  THE WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR\n  PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.\n  .\n  Sun source code is provided with no support and without any obligation on\n  the part of Sun Microsystems, Inc. to assist in its use, correction,\n  modification or enhancement.\n  .\n  SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE\n  INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY THIS SOFTWARE\n  OR ANY PART THEREOF.\n  .\n  In no event will Sun Microsystems, Inc. be liable for any lost revenue\n  or profits or other special, indirect and consequential damages, even if\n  Sun has been advised of the possibility of such damages.\n  .\n  Sun Microsystems, Inc.\n  2550 Garcia Avenue\n  Mountain View, California  94043"
+  },
+  "evidence": {
+    "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+    "scope": "FUR-025 normative Ubuntu determinations; original notices retained; static source scope does not assert every source file linked"
+  },
+  "packages": {
+    "glslang-dev@15.1.0-2~ubuntu0.24.04.2": {
+      "license_exception": null,
+      "license_expression": "BSD-3-Clause AND MIT AND GPL-3.0-or-later AND LicenseRef-ubuntu-nvidia-apple-mit",
+      "notice": {
+        "path": "glslang-dev.copyright",
+        "sha256": "c9b0641e1b752ec1ee888ecd1327d7b74120fcd12f3756544e7a268aeb6a3582"
+      },
+      "shipped_objects": [],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "glslang-dev.copyright"
+      },
+      "source_package": {
+        "name": "glslang",
+        "version": "15.1.0-2~ubuntu0.24.04.2"
+      },
+      "source_required": true
+    },
+    "libapparmor1@4.0.1really4.0.1-0ubuntu0.24.04.7": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later",
+      "notice": {
+        "path": "libapparmor1.copyright",
+        "sha256": "52b7cf37d674ca47296cf6270a95ecda0ecbef976cc090d702acbd741e36b3b4"
+      },
+      "shipped_objects": [
+        "usr/lib/libapparmor.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libapparmor1.copyright"
+      },
+      "source_package": {
+        "name": "apparmor",
+        "version": "4.0.1really4.0.1-0ubuntu0.24.04.7"
+      },
+      "source_required": true
+    },
+    "libasound2t64@1.2.11-1ubuntu0.3": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later",
+      "notice": {
+        "path": "libasound2t64.copyright",
+        "sha256": "9b356b4fae53b5d5e7668e048f085d68a5039de7b6afbf465f50e81513334062"
+      },
+      "shipped_objects": [
+        "usr/lib/libasound.so.2"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libasound2t64.copyright"
+      },
+      "source_package": {
+        "name": "alsa-lib",
+        "version": "1.2.11-1ubuntu0.3"
+      },
+      "source_required": true
+    },
+    "libass9@1:0.17.1-2build1": {
+      "license_exception": null,
+      "license_expression": "ISC AND LicenseRef-ubuntu-ntp-ucb AND Unlicense",
+      "notice": {
+        "path": "libass9.copyright",
+        "sha256": "40312a3dac31cea3c1c2e715ddb0ee49ab8a8e59d0d56893c417941f94ba18b3"
+      },
+      "shipped_objects": [
+        "usr/lib/libass.so.9"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libass9.copyright"
+      },
+      "source_package": {
+        "name": "libass",
+        "version": "1:0.17.1-2build1"
+      },
+      "source_required": true
+    },
+    "libasyncns0@0.8-6build4": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later",
+      "notice": {
+        "path": "libasyncns0.copyright",
+        "sha256": "26f98be71539b8f1038fbaf51551598d0e2eb16f98db9a62094fc85db5f1c25d"
+      },
+      "shipped_objects": [
+        "usr/lib/libasyncns.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libasyncns0.copyright"
+      },
+      "source_package": {
+        "name": "libasyncns",
+        "version": "0.8-6build4"
+      },
+      "source_required": true
+    },
+    "libbrotli1@1.1.0-2build2": {
+      "license_exception": null,
+      "license_expression": "MIT",
+      "notice": {
+        "path": "libbrotli1.copyright",
+        "sha256": "24a64e5bb83d0960d1835696a1e23c0896ad6055b0ca47c66ab0eb9a766324b1"
+      },
+      "shipped_objects": [
+        "usr/lib/libbrotlicommon.so.1",
+        "usr/lib/libbrotlidec.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libbrotli1.copyright"
+      },
+      "source_package": {
+        "name": "brotli",
+        "version": "1.1.0-2build2"
+      },
+      "source_required": true
+    },
+    "libbsd0@0.12.1-1build1.1": {
+      "custom_license_texts": {"LicenseRef-ubuntu-public-domain": "License: public-domain\n Public domain."},
+      "license_exception": null,
+      "license_expression": "BSD-2-Clause AND BSD-3-Clause AND ISC AND Beerware AND LicenseRef-ubuntu-public-domain",
+      "notice": {
+        "path": "libbsd0.copyright",
+        "sha256": "978426553ab7b9cfb4503d98e578a77b8c3142c099100aa9791fd21be5a95f97"
+      },
+      "shipped_objects": [
+        "usr/lib/libbsd.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libbsd0.copyright"
+      },
+      "source_package": {
+        "name": "libbsd",
+        "version": "0.12.1-1build1.1"
+      },
+      "source_required": true
+    },
+    "libbz2-1.0@1.0.8-5.1ubuntu0.1": {
+      "license_exception": null,
+      "license_expression": "bzip2-1.0.6",
+      "notice": {
+        "path": "libbz2-1.0.copyright",
+        "sha256": "832ed535ff3c3d025a8d2348eb1b697b89addcf2eaadbc17650262040b9145e2"
+      },
+      "shipped_objects": [
+        "usr/lib/libbz2.so.1.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libbz2-1.0.copyright"
+      },
+      "source_package": {
+        "name": "bzip2",
+        "version": "1.0.8-5.1ubuntu0.1"
+      },
+      "source_required": true
+    },
+    "libc6-dev@2.39-0ubuntu8.9": {
+      "license_exception": "GNU C Library startup object source headers grant unlimited permission to link compiled version with other programs and distribute those programs without restriction from use of these files; LGPL restrictions still apply to modification and other distribution.",
+      "license_expression": "LGPL-2.1-or-later",
+      "notice": {
+        "path": "libc6-dev.copyright",
+        "sha256": "d3c95b56fa33e28b57860580f0baf4e4f4de2a268a2b80f1d031a5191bade265"
+      },
+      "shipped_objects": [],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libc6-dev.copyright"
+      },
+      "source_package": {
+        "name": "glibc",
+        "version": "2.39-0ubuntu8.9"
+      },
+      "source_required": true
+    },
+    "libcap2@1:2.66-5ubuntu2.4": {
+      "license_exception": null,
+      "license_expression": "BSD-3-Clause",
+      "notice": {
+        "path": "libcap2.copyright",
+        "sha256": "e60a5642e12e340060e4e519a65b2eb0330be2917854841c644e36268f607d54"
+      },
+      "shipped_objects": [
+        "usr/lib/libcap.so.2"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libcap2.copyright"
+      },
+      "source_package": {
+        "name": "libcap2",
+        "version": "1:2.66-5ubuntu2.4"
+      },
+      "source_required": true
+    },
+    "libcom-err2@1.47.0-2.4~exp1ubuntu4.1": {
+      "license_exception": null,
+      "license_expression": "LicenseRef-ubuntu-mit-sipb AND BSD-3-Clause",
+      "notice": {
+        "path": "libcom-err2.copyright",
+        "sha256": "1ca415a294c0e56958c4f795b3f1f69ea3479bca53d7811f5cdd020a258949db"
+      },
+      "shipped_objects": [
+        "usr/lib/libcom_err.so.2"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libcom-err2.copyright"
+      },
+      "source_package": {
+        "name": "e2fsprogs",
+        "version": "1.47.0-2.4~exp1ubuntu4.1"
+      },
+      "source_required": true
+    },
+    "libdbus-1-3@1.14.10-4ubuntu4.1": {
+      "license_exception": null,
+      "license_expression": "GPL-2.0-or-later AND MIT AND TCL",
+      "notice": {
+        "path": "libdbus-1-3.copyright",
+        "sha256": "20d4fee565b0a0910670b8202c15f040ed5dd488a685a3008eb04b65d987f89c"
+      },
+      "shipped_objects": [
+        "usr/lib/libdbus-1.so.3"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libdbus-1-3.copyright"
+      },
+      "source_package": {
+        "name": "dbus",
+        "version": "1.14.10-4ubuntu4.1"
+      },
+      "source_required": true
+    },
+    "libexpat1@2.6.1-2ubuntu0.4": {
+      "license_exception": null,
+      "license_expression": "MIT",
+      "notice": {
+        "path": "libexpat1.copyright",
+        "sha256": "60919fe1a156395ff14511bb6ff79756c50ade2fff59ac60c9bae1d8a7fe6292"
+      },
+      "shipped_objects": [
+        "usr/lib/libexpat.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libexpat1.copyright"
+      },
+      "source_package": {
+        "name": "expat",
+        "version": "2.6.1-2ubuntu0.4"
+      },
+      "source_required": true
+    },
+    "libflac12t64@1.4.3+ds-2.1ubuntu2": {
+      "custom_license_texts": {"LicenseRef-ubuntu-public-domain": "License: Public-domain\n * This is the header file for the MD5 message-digest algorithm.\n * The algorithm is due to Ron Rivest.  This code was\n * written by Colin Plumb in 1993, no copyright is claimed.\n * This code is in the public domain; do with it what you wish.\n *\n * Equivalent code is available from RSA Data Security, Inc.\n * This code has been tested against that, and is equivalent,\n * except that you don't need to include two pages of legalese\n * with every copy.\n *\n * To compute the message digest of a chunk of bytes, declare an\n * MD5Context structure, pass it to MD5Init, call MD5Update as\n * needed on buffers full of bytes, and then call MD5Final, which\n * will fill a supplied 16-byte array with the digest.\n *\n * Changed so as no longer to depend on Colin Plumb's `usual.h'\n * header definitions; now uses stuff from dpkg's config.h\n *  - Ian Jackson <ijackson@nyx.cs.du.edu>.\n * Still in the public domain.\n *\n * Josh Coalson: made some changes to integrate with libFLAC.\n * Still in the public domain, with no warranty."},
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later AND BSD-3-Clause AND LGPL-2.0-or-later AND ISC AND LicenseRef-ubuntu-public-domain",
+      "notice": {
+        "path": "libflac12t64.copyright",
+        "sha256": "b09e581d4a200e49d0c5e032777a3f9c5cfd164b3dfc90f5071f285df9543f18"
+      },
+      "shipped_objects": [
+        "usr/lib/libFLAC.so.12"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libflac12t64.copyright"
+      },
+      "source_package": {
+        "name": "flac",
+        "version": "1.4.3+ds-2.1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libfontconfig1@2.15.0-1.1ubuntu2": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libfontconfig1.copyright",
+        "sha256": "b215a61cdd3e62b5b17cc28b1852c78acb3dd38be0fb30706f7efc050dba91db"
+      },
+      "shipped_objects": [
+        "usr/lib/libfontconfig.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libfontconfig1.copyright"
+      },
+      "source_package": {
+        "name": "fontconfig",
+        "version": "2.15.0-1.1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libfreetype6@2.13.2+dfsg-1ubuntu0.1": {
+      "custom_license_texts": {"LicenseRef-ubuntu-public-domain": "       src/base/md5.h\nCopyright: None\nLicense: Public-Domain\n         \"No copyright is claimed, and the software is hereby placed in the public domain.\"\n"},
+      "license_exception": null,
+      "license_expression": "FTL AND MIT AND Zlib AND BSL-1.0 AND MIT-Modern-Variant AND BSD-3-Clause AND LicenseRef-ubuntu-public-domain AND LicenseRef-ubuntu-opengroup-mit",
+      "notice": {
+        "path": "libfreetype6.copyright",
+        "sha256": "ce6d766883ea111e7f47acc09e9d49be8827daa6a03f2c2707243a425d41f0e9"
+      },
+      "shipped_objects": [
+        "usr/lib/libfreetype.so.6"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libfreetype6.copyright"
+      },
+      "source_package": {
+        "name": "freetype",
+        "version": "2.13.2+dfsg-1ubuntu0.1"
+      },
+      "source_required": true
+    },
+    "libfribidi0@1.0.13-3build1": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later",
+      "notice": {
+        "path": "libfribidi0.copyright",
+        "sha256": "39000badbcd15a4a144cfa2d2f0d906d4d9183f42350e8193ac775baded86b7c"
+      },
+      "shipped_objects": [
+        "usr/lib/libfribidi.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libfribidi0.copyright"
+      },
+      "source_package": {
+        "name": "fribidi",
+        "version": "1.0.13-3build1"
+      },
+      "source_required": true
+    },
+    "libgcc-13-dev@13.3.0-6ubuntu2~24.04.1": {
+      "license_exception": "GCC-exception-3.1",
+      "license_expression": "GPL-3.0-or-later WITH GCC-exception-3.1",
+      "notice": {
+        "path": "libgcc-13-dev.copyright",
+        "sha256": "08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+      },
+      "shipped_objects": [],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libgcc-13-dev.copyright"
+      },
+      "source_package": {
+        "name": "gcc-13",
+        "version": "13.3.0-6ubuntu2~24.04.1"
+      },
+      "source_required": true
+    },
+    "libgcc-s1@14.2.0-4ubuntu2~24.04.1": {
+      "license_exception": "GCC-exception-3.1",
+      "license_expression": "GPL-3.0-or-later WITH GCC-exception-3.1",
+      "notice": {
+        "path": "libgcc-s1.copyright",
+        "sha256": "20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+      },
+      "shipped_objects": [
+        "usr/lib/libgcc_s.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libgcc-s1.copyright"
+      },
+      "source_package": {
+        "name": "gcc-14",
+        "version": "14.2.0-4ubuntu2~24.04.1"
+      },
+      "source_required": true
+    },
+    "libgcrypt20@1.10.3-2ubuntu0.2": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later",
+      "notice": {
+        "path": "libgcrypt20.copyright",
+        "sha256": "40162167dff80843a4b24aa8d0a4ffc50be5338d004ebe38f86ae3397ba9de3e"
+      },
+      "shipped_objects": [
+        "usr/lib/libgcrypt.so.20"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libgcrypt20.copyright"
+      },
+      "source_package": {
+        "name": "libgcrypt20",
+        "version": "1.10.3-2ubuntu0.2"
+      },
+      "source_required": true
+    },
+    "libglib2.0-0t64@2.80.0-6ubuntu3.8": {
+      "custom_license_texts": {"LicenseRef-ubuntu-public-domain": "License: Iconv-PD\n This file is placed in the public domain.\n\nLicense: Kuchling-PD\n Distribute and use freely; there are no restrictions on further\n dissemination and usage except those imposed by the laws of your\n country of residence.\n\nLicense: Plumb-PD\n The algorithm is due to Ron Rivest.  This code was\n written by Colin Plumb in 1993, no copyright is claimed.\n This code is in the public domain; do with it what you wish.\n"},
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later AND LGPL-2.0-or-later AND FSFULLR AND Unicode-DFS-2016 AND bzip2-1.0.6 AND CC0-1.0 AND LicenseRef-ubuntu-public-domain AND LicenseRef-ubuntu-janik-permissive",
+      "notice": {
+        "path": "libglib2.0-0t64.copyright",
+        "sha256": "b52574b109fb876dfa71dea7a98b8aee1bb583f6aa90c327d1e4dc0a1d59f211"
+      },
+      "shipped_objects": [
+        "usr/lib/libglib-2.0.so.0",
+        "usr/lib/libgthread-2.0.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libglib2.0-0t64.copyright"
+      },
+      "source_package": {
+        "name": "glib2.0",
+        "version": "2.80.0-6ubuntu3.8"
+      },
+      "source_required": true
+    },
+    "libgpg-error0@1.47-3build2.1": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later AND BSD-3-Clause",
+      "notice": {
+        "path": "libgpg-error0.copyright",
+        "sha256": "0250e9e7cbf6c68c2bd05b6db1ea684988f91cd95da69f2936064cf302729fe5"
+      },
+      "shipped_objects": [
+        "usr/lib/libgpg-error.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libgpg-error0.copyright"
+      },
+      "source_package": {
+        "name": "libgpg-error",
+        "version": "1.47-3build2.1"
+      },
+      "source_required": true
+    },
+    "libgraphite2-3@1.3.14-2ubuntu0.24.04.1": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later",
+      "notice": {
+        "path": "libgraphite2-3.copyright",
+        "sha256": "a33017ba0308c41bdbde4751bff349ab7b26af45fadbb1e3e7ac67c372985572"
+      },
+      "shipped_objects": [
+        "usr/lib/libgraphite2.so.3"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libgraphite2-3.copyright"
+      },
+      "source_package": {
+        "name": "graphite2",
+        "version": "1.3.14-2ubuntu0.24.04.1"
+      },
+      "source_required": true
+    },
+    "libgssapi-krb5-2@1.20.1-6ubuntu2.10": {
+      "license_exception": null,
+      "license_expression": "MIT AND BSD-2-Clause AND BSD-3-Clause AND OpenLDAP-2.8 AND RSA-MD AND LicenseRef-ubuntu-kerberos-collective",
+      "notice": {
+        "path": "libgssapi-krb5-2.copyright",
+        "sha256": "936728f4181718f42951b881c1e8f1386bf6b2723c4fbc533c374d6f42c71816"
+      },
+      "shipped_objects": [
+        "usr/lib/libgssapi_krb5.so.2"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libgssapi-krb5-2.copyright"
+      },
+      "source_package": {
+        "name": "krb5",
+        "version": "1.20.1-6ubuntu2.10"
+      },
+      "source_required": true
+    },
+    "libharfbuzz0b@8.3.0-2build2": {
+      "license_exception": null,
+      "license_expression": "MIT AND ISC AND Unicode-TOU",
+      "notice": {
+        "path": "libharfbuzz0b.copyright",
+        "sha256": "6ffcef5a169fca847bc886b052bbe9a478754850621d8661ae4ea424b7eeb26e"
+      },
+      "shipped_objects": [
+        "usr/lib/libharfbuzz.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libharfbuzz0b.copyright"
+      },
+      "source_package": {
+        "name": "harfbuzz",
+        "version": "8.3.0-2build2"
+      },
+      "source_required": true
+    },
+    "libk5crypto3@1.20.1-6ubuntu2.10": {
+      "license_exception": null,
+      "license_expression": "MIT AND BSD-2-Clause AND BSD-3-Clause AND OpenLDAP-2.8 AND RSA-MD AND LicenseRef-ubuntu-kerberos-collective",
+      "notice": {
+        "path": "libk5crypto3.copyright",
+        "sha256": "936728f4181718f42951b881c1e8f1386bf6b2723c4fbc533c374d6f42c71816"
+      },
+      "shipped_objects": [
+        "usr/lib/libk5crypto.so.3"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libk5crypto3.copyright"
+      },
+      "source_package": {
+        "name": "krb5",
+        "version": "1.20.1-6ubuntu2.10"
+      },
+      "source_required": true
+    },
+    "libkeyutils1@1.6.3-3build1": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.0-or-later",
+      "notice": {
+        "path": "libkeyutils1.copyright",
+        "sha256": "c62fe37d22203046611112bc10a9e03a39a7f73bec1b061e7c615326166d9ff5"
+      },
+      "shipped_objects": [
+        "usr/lib/libkeyutils.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libkeyutils1.copyright"
+      },
+      "source_package": {
+        "name": "keyutils",
+        "version": "1.6.3-3build1"
+      },
+      "source_required": true
+    },
+    "libkrb5-3@1.20.1-6ubuntu2.10": {
+      "license_exception": null,
+      "license_expression": "MIT AND BSD-2-Clause AND BSD-3-Clause AND OpenLDAP-2.8 AND RSA-MD AND LicenseRef-ubuntu-kerberos-collective",
+      "notice": {
+        "path": "libkrb5-3.copyright",
+        "sha256": "936728f4181718f42951b881c1e8f1386bf6b2723c4fbc533c374d6f42c71816"
+      },
+      "shipped_objects": [
+        "usr/lib/libkrb5.so.3"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libkrb5-3.copyright"
+      },
+      "source_package": {
+        "name": "krb5",
+        "version": "1.20.1-6ubuntu2.10"
+      },
+      "source_required": true
+    },
+    "libkrb5support0@1.20.1-6ubuntu2.10": {
+      "license_exception": null,
+      "license_expression": "MIT AND BSD-2-Clause AND BSD-3-Clause AND OpenLDAP-2.8 AND RSA-MD AND LicenseRef-ubuntu-kerberos-collective",
+      "notice": {
+        "path": "libkrb5support0.copyright",
+        "sha256": "936728f4181718f42951b881c1e8f1386bf6b2723c4fbc533c374d6f42c71816"
+      },
+      "shipped_objects": [
+        "usr/lib/libkrb5support.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libkrb5support0.copyright"
+      },
+      "source_package": {
+        "name": "krb5",
+        "version": "1.20.1-6ubuntu2.10"
+      },
+      "source_required": true
+    },
+    "liblz4-1@1.9.4-1build1.1": {
+      "license_exception": null,
+      "license_expression": "BSD-2-Clause",
+      "notice": {
+        "path": "liblz4-1.copyright",
+        "sha256": "d3be0f43fe14da244f97c451bbae789c0acf868612598a69f5f22a289abeca40"
+      },
+      "shipped_objects": [
+        "usr/lib/liblz4.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "liblz4-1.copyright"
+      },
+      "source_package": {
+        "name": "lz4",
+        "version": "1.9.4-1build1.1"
+      },
+      "source_required": true
+    },
+    "liblzma5@5.6.1+really5.4.5-1ubuntu0.3": {
+      "custom_license_texts": {"LicenseRef-ubuntu-public-domain": " This file has been put in the public domain.\n You can do whatever you want with this file."},
+      "license_exception": null,
+      "license_expression": "LicenseRef-ubuntu-public-domain",
+      "notice": {
+        "path": "liblzma5.copyright",
+        "sha256": "a2dc8fac0f496e1c58aff67018cf0c6b88336316afa5642f9335b71642e28aa8"
+      },
+      "shipped_objects": [
+        "usr/lib/liblzma.so.5"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "liblzma5.copyright"
+      },
+      "source_package": {
+        "name": "xz-utils",
+        "version": "5.6.1+really5.4.5-1ubuntu0.3"
+      },
+      "source_required": true
+    },
+    "libmd0@1.1.0-2build1.1": {
+      "custom_license_texts": {"LicenseRef-ubuntu-public-domain": " This code implements the MD4 message-digest algorithm.\n The algorithm is due to Ron Rivest.  This code was\n written by Colin Plumb in 1993, no copyright is claimed.\n This code is in the public domain; do with it what you wish.\n Todd C. Miller modified the MD5 code to do MD4 based on RFC 1186.\n\n 100% Public Domain"},
+      "license_exception": null,
+      "license_expression": "BSD-2-Clause AND BSD-3-Clause AND ISC AND Beerware AND LicenseRef-ubuntu-public-domain",
+      "notice": {
+        "path": "libmd0.copyright",
+        "sha256": "4365ef6255ad553fce69dd4bc0e093472c5d0e41b8ea493a545cc926ce171aa6"
+      },
+      "shipped_objects": [
+        "usr/lib/libmd.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libmd0.copyright"
+      },
+      "source_package": {
+        "name": "libmd",
+        "version": "1.1.0-2build1.1"
+      },
+      "source_required": true
+    },
+    "libmp3lame0@3.100-6build1": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.0-or-later AND GPL-1.0-or-later",
+      "notice": {
+        "path": "libmp3lame0.copyright",
+        "sha256": "f0e4c5098ffedad31473eec38810c26409223858fb8d63dd7685bf225f96bc5d"
+      },
+      "shipped_objects": [
+        "usr/lib/libmp3lame.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libmp3lame0.copyright"
+      },
+      "source_package": {
+        "name": "lame",
+        "version": "3.100-6build1"
+      },
+      "source_required": true
+    },
+    "libmpg123-0t64@1.32.5-1ubuntu1.1": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-only",
+      "notice": {
+        "path": "libmpg123-0t64.copyright",
+        "sha256": "ba3657ec83ab9af9070bacccc6c9735d1856c8a5adab275708ba3d4c9e41b5f8"
+      },
+      "shipped_objects": [
+        "usr/lib/libmpg123.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libmpg123-0t64.copyright"
+      },
+      "source_package": {
+        "name": "mpg123",
+        "version": "1.32.5-1ubuntu1.1"
+      },
+      "source_required": true
+    },
+    "libogg0@1.3.5-3build1": {
+      "license_exception": null,
+      "license_expression": "BSD-3-Clause",
+      "notice": {
+        "path": "libogg0.copyright",
+        "sha256": "36bb02bf6a764f4fac0ca9d38d2563932513df6015d98bd162624b18feaf096c"
+      },
+      "shipped_objects": [
+        "usr/lib/libogg.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libogg0.copyright"
+      },
+      "source_package": {
+        "name": "libogg",
+        "version": "1.3.5-3build1"
+      },
+      "source_required": true
+    },
+    "libopus0@1.4-1build1": {
+      "license_exception": null,
+      "license_expression": "BSD-2-Clause AND BSD-3-Clause",
+      "notice": {
+        "path": "libopus0.copyright",
+        "sha256": "893be2dfc7b9d827675d69c43e1f172a89ef10d3745ffd15a48514c08470cace"
+      },
+      "shipped_objects": [
+        "usr/lib/libopus.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libopus0.copyright"
+      },
+      "source_package": {
+        "name": "opus",
+        "version": "1.4-1build1"
+      },
+      "source_required": true
+    },
+    "libpcre2-8-0@10.42-4ubuntu2.1": {
+      "license_exception": "License: BSD-3-clause-Cambridge with BINARY LIBRARY-LIKE PACKAGES exception\n Redistribution and use in source and binary forms, with or without\n modification, are permitted provided that the following conditions are met:\n .\n    * Redistributions of source code must retain the above copyright notice,\n      this list of conditions and the following disclaimer.\n .\n    * Redistributions in binary form must reproduce the above copyright\n      notice, this list of conditions and the following disclaimer in the\n      documentation and/or other materials provided with the distribution.\n .\n    * Neither the name of the University of Cambridge nor the names of any\n      contributors may be used to endorse or promote products derived from this\n      software without specific prior written permission.\n .\n THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\"\n AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE\n IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE\n ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE\n LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR\n CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF\n SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS\n INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN\n CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE\n POSSIBILITY OF SUCH DAMAGE.\n .\n .\n EXEMPTION FOR BINARY LIBRARY-LIKE PACKAGES\n ------------------------------------------\n .\n The second condition in the BSD licence (covering binary redistributions) does\n not apply all the way down a chain of software. If binary package A includes\n PCRE2, it must respect the condition, but if package B is software that\n includes package A, the condition is not imposed on package B unless it uses\n PCRE2 independently.",
+      "license_expression": "BSD-3-Clause AND BSD-2-Clause",
+      "notice": {
+        "path": "libpcre2-8-0.copyright",
+        "sha256": "030511beb4d9d620ad09914c369c36ec0528dcf301d1923cc643c948ee7c6a38"
+      },
+      "shipped_objects": [
+        "usr/lib/libpcre2-8.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libpcre2-8-0.copyright"
+      },
+      "source_package": {
+        "name": "pcre2",
+        "version": "10.42-4ubuntu2.1"
+      },
+      "source_required": true
+    },
+    "libpng16-16t64@1.6.43-5ubuntu0.6": {
+      "license_exception": null,
+      "license_expression": "Libpng",
+      "notice": {
+        "path": "libpng16-16t64.copyright",
+        "sha256": "4620d402b97601a910946acccbbe2e15bdffac11615bf9046520990d3b00f2b9"
+      },
+      "shipped_objects": [
+        "usr/lib/libpng16.so.16"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libpng16-16t64.copyright"
+      },
+      "source_package": {
+        "name": "libpng1.6",
+        "version": "1.6.43-5ubuntu0.6"
+      },
+      "source_required": true
+    },
+    "libpulse0@1:16.1+dfsg1-2ubuntu10.1": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later AND LicenseRef-ubuntu-pulse-permissive-variants",
+      "notice": {
+        "path": "libpulse0.copyright",
+        "sha256": "aff3f1d729168de06e34d940dc493cc305a6e4a6278f1ac38ee52ec0f69e342c"
+      },
+      "shipped_objects": [
+        "usr/lib/libpulse.so.0",
+        "usr/lib/pulseaudio/libpulsecommon-16.1.so"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libpulse0.copyright"
+      },
+      "source_package": {
+        "name": "pulseaudio",
+        "version": "1:16.1+dfsg1-2ubuntu10.1"
+      },
+      "source_required": true
+    },
+    "libsndfile1@1.2.2-1ubuntu5.24.04.1": {
+      "license_exception": null,
+      "license_expression": "LGPL-2.1-or-later AND BSD-3-Clause AND LGPL-2.0-or-later AND Apache-2.0 AND LicenseRef-ubuntu-gsm-tu-berlin AND LicenseRef-ubuntu-sun-g72x",
+      "notice": {
+        "path": "libsndfile1.copyright",
+        "sha256": "56bc3dae5803b8b2d59adf72fcd526eef2f4ac929d2442562d12248867222335"
+      },
+      "shipped_objects": [
+        "usr/lib/libsndfile.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libsndfile1.copyright"
+      },
+      "source_package": {
+        "name": "libsndfile",
+        "version": "1.2.2-1ubuntu5.24.04.1"
+      },
+      "source_required": true
+    },
+    "libstdc++6@14.2.0-4ubuntu2~24.04.1": {
+      "license_exception": "GCC-exception-3.1",
+      "license_expression": "GPL-3.0-or-later WITH GCC-exception-3.1",
+      "notice": {
+        "path": "libstdc++6.copyright",
+        "sha256": "20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+      },
+      "shipped_objects": [
+        "usr/lib/libstdc++.so.6"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libstdc++6.copyright"
+      },
+      "source_package": {
+        "name": "gcc-14",
+        "version": "14.2.0-4ubuntu2~24.04.1"
+      },
+      "source_required": true
+    },
+    "libsystemd0@255.4-1ubuntu8.17": {
+      "custom_license_texts": {"LicenseRef-ubuntu-public-domain": "License: public-domain\n You can use this free for any purpose. It's in the public domain. It has no\n warranty."},
+      "license_exception": " NOTE! This copyright does *not* cover user programs that use kernel services\n by normal system calls - this is merely considered normal use of the kernel,\n and does *not* fall under the heading of \"derived work\". Also note that the\n GPL below is copyrighted by the Free Software Foundation, but the instance of\n code that it refers to (the Linux kernel) is copyrighted by me and others who\n actually wrote it.\n .\n Also note that the only valid version of the GPL as far as the kernel is\n concerned is _this_ particular version of the license (ie v2, not v2.2 or v3.x\n or whatever), unless explicitly otherwise stated.\n .\n Linus Torvalds\n .",
+      "license_expression": "LGPL-2.1-or-later AND GPL-2.0-only WITH Linux-syscall-note AND MIT AND CC0-1.0 AND LicenseRef-ubuntu-public-domain",
+      "notice": {
+        "path": "libsystemd0.copyright",
+        "sha256": "a7d06854714a1ca99f6dbd1a1641dde5bcf28635be149f6554449618f8f427f3"
+      },
+      "shipped_objects": [
+        "usr/lib/libsystemd.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libsystemd0.copyright"
+      },
+      "source_package": {
+        "name": "systemd",
+        "version": "255.4-1ubuntu8.17"
+      },
+      "source_required": true
+    },
+    "libudev1@255.4-1ubuntu8.17": {
+      "custom_license_texts": {"LicenseRef-ubuntu-public-domain": "License: public-domain\n You can use this free for any purpose. It's in the public domain. It has no\n warranty."},
+      "license_exception": " NOTE! This copyright does *not* cover user programs that use kernel services\n by normal system calls - this is merely considered normal use of the kernel,\n and does *not* fall under the heading of \"derived work\". Also note that the\n GPL below is copyrighted by the Free Software Foundation, but the instance of\n code that it refers to (the Linux kernel) is copyrighted by me and others who\n actually wrote it.\n .\n Also note that the only valid version of the GPL as far as the kernel is\n concerned is _this_ particular version of the license (ie v2, not v2.2 or v3.x\n or whatever), unless explicitly otherwise stated.\n .\n Linus Torvalds\n .",
+      "license_expression": "LGPL-2.1-or-later AND GPL-2.0-only WITH Linux-syscall-note AND MIT AND CC0-1.0 AND LicenseRef-ubuntu-public-domain",
+      "notice": {
+        "path": "libudev1.copyright",
+        "sha256": "a7d06854714a1ca99f6dbd1a1641dde5bcf28635be149f6554449618f8f427f3"
+      },
+      "shipped_objects": [
+        "usr/lib/libudev.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libudev1.copyright"
+      },
+      "source_package": {
+        "name": "systemd",
+        "version": "255.4-1ubuntu8.17"
+      },
+      "source_required": true
+    },
+    "libunibreak5@5.1-2build1": {
+      "license_exception": null,
+      "license_expression": "Zlib AND Unicode-TOU",
+      "notice": {
+        "path": "libunibreak5.copyright",
+        "sha256": "c261edaa83b72e01116ede51f3a24a44c5dbd1b0ec446fdfb7c6a9e9dc028f04"
+      },
+      "shipped_objects": [
+        "usr/lib/libunibreak.so.5"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libunibreak5.copyright"
+      },
+      "source_package": {
+        "name": "libunibreak",
+        "version": "5.1-2build1"
+      },
+      "source_required": true
+    },
+    "libvorbis0a@1.3.7-1build3": {
+      "license_exception": null,
+      "license_expression": "BSD-3-Clause",
+      "notice": {
+        "path": "libvorbis0a.copyright",
+        "sha256": "47badad9f7f750f92cd12f44db08b6937e5b4d47935ba1cc60de0ea3a2adff9b"
+      },
+      "shipped_objects": [
+        "usr/lib/libvorbis.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libvorbis0a.copyright"
+      },
+      "source_package": {
+        "name": "libvorbis",
+        "version": "1.3.7-1build3"
+      },
+      "source_required": true
+    },
+    "libvorbisenc2@1.3.7-1build3": {
+      "license_exception": null,
+      "license_expression": "BSD-3-Clause",
+      "notice": {
+        "path": "libvorbisenc2.copyright",
+        "sha256": "47badad9f7f750f92cd12f44db08b6937e5b4d47935ba1cc60de0ea3a2adff9b"
+      },
+      "shipped_objects": [
+        "usr/lib/libvorbisenc.so.2"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libvorbisenc2.copyright"
+      },
+      "source_package": {
+        "name": "libvorbis",
+        "version": "1.3.7-1build3"
+      },
+      "source_required": true
+    },
+    "libx11-6@2:1.8.7-1build1": {
+      "license_exception": null,
+      "license_expression": "X11 AND MIT AND HPND AND HPND-sell-variant",
+      "notice": {
+        "path": "libx11-6.copyright",
+        "sha256": "0b380a7fd5b2228f26e9585e56f14812efd3350f3df307507d2bc055dfd8de3e"
+      },
+      "shipped_objects": [
+        "usr/lib/libX11.so.6"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libx11-6.copyright"
+      },
+      "source_package": {
+        "name": "libx11",
+        "version": "2:1.8.7-1build1"
+      },
+      "source_required": true
+    },
+    "libx11-xcb1@2:1.8.7-1build1": {
+      "license_exception": null,
+      "license_expression": "X11 AND MIT AND HPND AND HPND-sell-variant",
+      "notice": {
+        "path": "libx11-xcb1.copyright",
+        "sha256": "0b380a7fd5b2228f26e9585e56f14812efd3350f3df307507d2bc055dfd8de3e"
+      },
+      "shipped_objects": [
+        "usr/lib/libX11-xcb.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libx11-xcb1.copyright"
+      },
+      "source_package": {
+        "name": "libx11",
+        "version": "2:1.8.7-1build1"
+      },
+      "source_required": true
+    },
+    "libxau6@1:1.0.9-1build6": {
+      "license_exception": null,
+      "license_expression": "HPND-sell-variant",
+      "notice": {
+        "path": "libxau6.copyright",
+        "sha256": "118dd263a7b91c8f21c489f949bf13281dff9e766deea92b829dac4dce66601a"
+      },
+      "shipped_objects": [
+        "usr/lib/libXau.so.6"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxau6.copyright"
+      },
+      "source_package": {
+        "name": "libxau",
+        "version": "1:1.0.9-1build6"
+      },
+      "source_required": true
+    },
+    "libxcb-cursor0@0.1.4-1build1": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-cursor0.copyright",
+        "sha256": "8ee3b982784137d7e651d37c8c0978983984b0fe93ce2760013b0abbf6652bed"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-cursor.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-cursor0.copyright"
+      },
+      "source_package": {
+        "name": "xcb-util-cursor",
+        "version": "0.1.4-1build1"
+      },
+      "source_required": true
+    },
+    "libxcb-glx0@1.15-1ubuntu2": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-glx0.copyright",
+        "sha256": "4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-glx.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-glx0.copyright"
+      },
+      "source_package": {
+        "name": "libxcb",
+        "version": "1.15-1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libxcb-icccm4@0.4.1-1.1build3": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-icccm4.copyright",
+        "sha256": "b5b83faabe190515e7a5938aa00441204cd163e24191ef7bcf5e4ac690acd376"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-icccm.so.4"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-icccm4.copyright"
+      },
+      "source_package": {
+        "name": "xcb-util-wm",
+        "version": "0.4.1-1.1build3"
+      },
+      "source_required": true
+    },
+    "libxcb-image0@0.4.0-2build1": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-image0.copyright",
+        "sha256": "daf2d51e978ec64fc21f59b12d850c2efc907c15eae5c4ba2f3237ce946476de"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-image.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-image0.copyright"
+      },
+      "source_package": {
+        "name": "xcb-util-image",
+        "version": "0.4.0-2build1"
+      },
+      "source_required": true
+    },
+    "libxcb-keysyms1@0.4.0-1build4": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-keysyms1.copyright",
+        "sha256": "ec64999ff22c8cbba2aa1c88828cd51461efd74db3a6f4044ea81fbc0a6f6288"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-keysyms.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-keysyms1.copyright"
+      },
+      "source_package": {
+        "name": "xcb-util-keysyms",
+        "version": "0.4.0-1build4"
+      },
+      "source_required": true
+    },
+    "libxcb-randr0@1.15-1ubuntu2": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-randr0.copyright",
+        "sha256": "4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-randr.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-randr0.copyright"
+      },
+      "source_package": {
+        "name": "libxcb",
+        "version": "1.15-1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libxcb-render-util0@0.3.9-1build4": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-render-util0.copyright",
+        "sha256": "94e32edbc98a324a3c13cd7a1687406328a9a94c6fefe319d6ac43dd4cbf151c"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-render-util.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-render-util0.copyright"
+      },
+      "source_package": {
+        "name": "xcb-util-renderutil",
+        "version": "0.3.9-1build4"
+      },
+      "source_required": true
+    },
+    "libxcb-render0@1.15-1ubuntu2": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-render0.copyright",
+        "sha256": "4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-render.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-render0.copyright"
+      },
+      "source_package": {
+        "name": "libxcb",
+        "version": "1.15-1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libxcb-shape0@1.15-1ubuntu2": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-shape0.copyright",
+        "sha256": "4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-shape.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-shape0.copyright"
+      },
+      "source_package": {
+        "name": "libxcb",
+        "version": "1.15-1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libxcb-shm0@1.15-1ubuntu2": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-shm0.copyright",
+        "sha256": "4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-shm.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-shm0.copyright"
+      },
+      "source_package": {
+        "name": "libxcb",
+        "version": "1.15-1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libxcb-sync1@1.15-1ubuntu2": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-sync1.copyright",
+        "sha256": "4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-sync.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-sync1.copyright"
+      },
+      "source_package": {
+        "name": "libxcb",
+        "version": "1.15-1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libxcb-util1@0.4.0-1build3": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-util1.copyright",
+        "sha256": "1142dc404c2f6845a5e9a39ee569e670fd629b3a974a03bcd64f84e57e5acd90"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-util.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-util1.copyright"
+      },
+      "source_package": {
+        "name": "xcb-util",
+        "version": "0.4.0-1build3"
+      },
+      "source_required": true
+    },
+    "libxcb-xfixes0@1.15-1ubuntu2": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-xfixes0.copyright",
+        "sha256": "4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-xfixes.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-xfixes0.copyright"
+      },
+      "source_package": {
+        "name": "libxcb",
+        "version": "1.15-1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libxcb-xkb1@1.15-1ubuntu2": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb-xkb1.copyright",
+        "sha256": "4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb-xkb.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb-xkb1.copyright"
+      },
+      "source_package": {
+        "name": "libxcb",
+        "version": "1.15-1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libxcb1@1.15-1ubuntu2": {
+      "license_exception": null,
+      "license_expression": "X11",
+      "notice": {
+        "path": "libxcb1.copyright",
+        "sha256": "4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80"
+      },
+      "shipped_objects": [
+        "usr/lib/libxcb.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxcb1.copyright"
+      },
+      "source_package": {
+        "name": "libxcb",
+        "version": "1.15-1ubuntu2"
+      },
+      "source_required": true
+    },
+    "libxdmcp6@1:1.1.3-0ubuntu6": {
+      "license_exception": null,
+      "license_expression": "HPND-sell-variant",
+      "notice": {
+        "path": "libxdmcp6.copyright",
+        "sha256": "1bcbb50f8603fe8b86d330bfa460b772ea04fbd3c70e4499f0768b5340b9fd6e"
+      },
+      "shipped_objects": [
+        "usr/lib/libXdmcp.so.6"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxdmcp6.copyright"
+      },
+      "source_package": {
+        "name": "libxdmcp",
+        "version": "1:1.1.3-0ubuntu6"
+      },
+      "source_required": true
+    },
+    "libxext6@2:1.3.4-1build2": {
+      "license_exception": null,
+      "license_expression": "HPND-sell-variant AND MIT AND HPND",
+      "notice": {
+        "path": "libxext6.copyright",
+        "sha256": "bc57e445ca1d9fe082c8d54189dd411ff26caa8552c9c63d44ea06a982f32124"
+      },
+      "shipped_objects": [
+        "usr/lib/libXext.so.6"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxext6.copyright"
+      },
+      "source_package": {
+        "name": "libxext",
+        "version": "2:1.3.4-1build2"
+      },
+      "source_required": true
+    },
+    "libxfixes3@1:6.0.0-2build1": {
+      "license_exception": null,
+      "license_expression": "HPND-sell-variant AND MIT",
+      "notice": {
+        "path": "libxfixes3.copyright",
+        "sha256": "051ffe073ab38244c504bb379903b4ecda6081fb3d97d0d3dce44bc11712eef2"
+      },
+      "shipped_objects": [
+        "usr/lib/libXfixes.so.3"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxfixes3.copyright"
+      },
+      "source_package": {
+        "name": "libxfixes",
+        "version": "1:6.0.0-2build1"
+      },
+      "source_required": true
+    },
+    "libxkbcommon-x11-0@1.6.0-1build1": {
+      "license_exception": null,
+      "license_expression": "X11 AND HPND AND HPND-sell-variant",
+      "notice": {
+        "path": "libxkbcommon-x11-0.copyright",
+        "sha256": "5eeaeb1b6e029a0274e1573765bb0bae2926ef96a3679203faa4fd00fdaeaa88"
+      },
+      "shipped_objects": [
+        "usr/lib/libxkbcommon-x11.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxkbcommon-x11-0.copyright"
+      },
+      "source_package": {
+        "name": "libxkbcommon",
+        "version": "1.6.0-1build1"
+      },
+      "source_required": true
+    },
+    "libxkbcommon0@1.6.0-1build1": {
+      "license_exception": null,
+      "license_expression": "X11 AND HPND AND HPND-sell-variant",
+      "notice": {
+        "path": "libxkbcommon0.copyright",
+        "sha256": "5eeaeb1b6e029a0274e1573765bb0bae2926ef96a3679203faa4fd00fdaeaa88"
+      },
+      "shipped_objects": [
+        "usr/lib/libxkbcommon.so.0"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxkbcommon0.copyright"
+      },
+      "source_package": {
+        "name": "libxkbcommon",
+        "version": "1.6.0-1build1"
+      },
+      "source_required": true
+    },
+    "libxpresent1@1.0.0-2build2": {
+      "license_exception": null,
+      "license_expression": "HPND-sell-variant AND MIT",
+      "notice": {
+        "path": "libxpresent1.copyright",
+        "sha256": "6b2cf9acafd0d831c0b39952b5e2e0311dcf3c722a9e98b0050b230f8ed666b5"
+      },
+      "shipped_objects": [
+        "usr/lib/libXpresent.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxpresent1.copyright"
+      },
+      "source_package": {
+        "name": "libxpresent",
+        "version": "1.0.0-2build2"
+      },
+      "source_required": true
+    },
+    "libxrandr2@2:1.5.2-2build1": {
+      "license_exception": null,
+      "license_expression": "HPND-sell-variant",
+      "notice": {
+        "path": "libxrandr2.copyright",
+        "sha256": "6d8e6239cfe9dd25bbeef06dcf0610d802ebbdc8968db87cf5adf00ff98927d4"
+      },
+      "shipped_objects": [
+        "usr/lib/libXrandr.so.2"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxrandr2.copyright"
+      },
+      "source_package": {
+        "name": "libxrandr",
+        "version": "2:1.5.2-2build1"
+      },
+      "source_required": true
+    },
+    "libxrender1@1:0.9.10-1.1build1": {
+      "license_exception": null,
+      "license_expression": "HPND-sell-variant",
+      "notice": {
+        "path": "libxrender1.copyright",
+        "sha256": "ed2a78123a5076b4f11da38cb1ffb85b5cb9fdc26b5746c517b1d7e7a9029704"
+      },
+      "shipped_objects": [
+        "usr/lib/libXrender.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxrender1.copyright"
+      },
+      "source_package": {
+        "name": "libxrender",
+        "version": "1:0.9.10-1.1build1"
+      },
+      "source_required": true
+    },
+    "libxss1@1:1.2.3-1build3": {
+      "license_exception": null,
+      "license_expression": "X11 AND MIT",
+      "notice": {
+        "path": "libxss1.copyright",
+        "sha256": "3ebbe713ac6980aefc18dcf407c94f51bbf02852463294bbb6dc1ee1f9fad9c3"
+      },
+      "shipped_objects": [
+        "usr/lib/libXss.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libxss1.copyright"
+      },
+      "source_package": {
+        "name": "libxss",
+        "version": "1:1.2.3-1build3"
+      },
+      "source_required": true
+    },
+    "libzstd1@1.5.5+dfsg2-2build1.1": {
+      "license_exception": null,
+      "license_expression": "BSD-3-Clause AND MIT",
+      "notice": {
+        "path": "libzstd1.copyright",
+        "sha256": "35e85e8e9bbb71492c5f5dddf39ed65b68775a02ad8d710c25d097b497f06c49"
+      },
+      "shipped_objects": [
+        "usr/lib/libzstd.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "libzstd1.copyright"
+      },
+      "source_package": {
+        "name": "libzstd",
+        "version": "1.5.5+dfsg2-2build1.1"
+      },
+      "source_required": true
+    },
+    "spirv-tools@2025.1~rc1-1~ubuntu0.24.04.2": {
+      "license_exception": null,
+      "license_expression": "Apache-2.0",
+      "notice": {
+        "path": "spirv-tools.copyright",
+        "sha256": "96bf43b6c019d8a2912e2d9396511bb87a6bb950321dca1af806d3370548d457"
+      },
+      "shipped_objects": [],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "spirv-tools.copyright"
+      },
+      "source_package": {
+        "name": "spirv-tools",
+        "version": "2025.1~rc1-1~ubuntu0.24.04.2"
+      },
+      "source_required": true
+    },
+    "zlib1g@1:1.3.dfsg-3.1ubuntu2.2": {
+      "license_exception": null,
+      "license_expression": "Zlib",
+      "notice": {
+        "path": "zlib1g.copyright",
+        "sha256": "9e5b96d63773a5d177ba264254390f792be07e41748ebd94730981c6cac31cc6"
+      },
+      "shipped_objects": [
+        "usr/lib/libz.so.1"
+      ],
+      "source_mapping_basis": {
+        "decision": "FUR-025 normative appendix; exact binary/source identity and original notice hash",
+        "notice_sha256": "83caa6e2cff3a8995248450be46c06de938fb678febfa02300ded4d24f2725ad",
+        "original_notice": "zlib1g.copyright"
+      },
+      "source_package": {
+        "name": "zlib",
+        "version": "1:1.3.dfsg-3.1ubuntu2.2"
+      },
+      "source_required": true
+    }
+  },
+  "schema": 1
+}

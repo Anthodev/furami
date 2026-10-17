@@ -48,7 +48,17 @@ jobs:
             libx11-dev \
             libxcb1-dev \
             libxcb-shape0-dev \
-            python3
+            python3 podman crun binutils
+          podman info --format '{{.Host.Security.Rootless}}' | grep -qx true
+          readelf --version
+
+      - name: Run offline behavioral suites
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 -m unittest discover -s packaging/appimage -p '*_tests.py'
+          python3 -m unittest discover -s packaging/appimage -p 'test_*.py'
+          python3 -m unittest discover -s packaging/media -p build_tests.py
+          python3 -m unittest discover -s packaging/appimage-runtime -p build_tests.py
 
       - name: Derive version from Cargo.toml
         run: |
@@ -73,15 +83,40 @@ jobs:
           else
             python3 packaging/appimage/build.py \
               --version "$APP_VERSION" \
-              --output "$RUNNER_TEMP/appimage-out"
+              --output "$RUNNER_TEMP/appimage-out" --acquire-sources
           fi
 
       - name: Verify release directory
         run: |
-          cd "$RUNNER_TEMP/appimage-out/release"
-          test -s "Furami-$APP_VERSION-x86_64.AppImage" || { echo "missing AppImage" >&2; exit 1; }
-          test -s SHA256SUMS || { echo "missing SHA256SUMS" >&2; exit 1; }
-          sha256sum --check --strict SHA256SUMS
+          extra=()
+          if [ "${{ inputs.verify_reproducibility }}" = "true" ]; then extra+=(--require-reproducibility); fi
+          python3 scripts/publish_candidate.py --check-only "${extra[@]}" \
+            --event-name push --tag "v$APP_VERSION" --candidate "$RUNNER_TEMP/appimage-out/release"
+
+      - name: Collect candidate build evidence
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/appimage-evidence"
+          python3 - <<'PY'
+          import importlib.util, os, pathlib
+          repo = pathlib.Path.cwd()
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'appimage-out'
+          dest = pathlib.Path(os.environ['RUNNER_TEMP']) / 'appimage-evidence'
+          spec = importlib.util.spec_from_file_location('furami_candidate_build', repo / 'packaging/appimage/build.py')
+          builder = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(builder)
+          builder.collect_evidence(out, dest, os.environ['GITHUB_SHA'])
+          for path in dest.rglob('*.json'):
+              print(str(path), path.read_text())
+          PY
+
+      - name: Upload diagnostic evidence separately
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: appimage-evidence-manual-${{ github.run_id }}
+          path: ${{ runner.temp }}/appimage-evidence/
+          if-no-files-found: warn
 
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -119,11 +154,14 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          if [ "$RELEASE_TAG" != "v$cargo_version" ]; then
-            echo "Tag $RELEASE_TAG does not match Cargo.toml version $cargo_version" >&2
-            exit 1
-          fi
+          python3 - <<'PY'
+          import pathlib, sys, tomllib
+          sys.path.insert(0, 'scripts')
+          from publish_candidate import release_channel
+          import os
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          release_channel(os.environ['RELEASE_TAG'], version, 'push')
+          PY
 
       - name: Upload release notes
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -157,7 +195,17 @@ jobs:
             libx11-dev \
             libxcb1-dev \
             libxcb-shape0-dev \
-            python3
+            python3 podman crun binutils
+          podman info --format '{{.Host.Security.Rootless}}' | grep -qx true
+          readelf --version
+
+      - name: Run offline behavioral suites
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 -m unittest discover -s packaging/appimage -p '*_tests.py'
+          python3 -m unittest discover -s packaging/appimage -p 'test_*.py'
+          python3 -m unittest discover -s packaging/media -p build_tests.py
+          python3 -m unittest discover -s packaging/appimage-runtime -p build_tests.py
 
       - name: Run two-build reproducibility comparison
         env:
@@ -172,13 +220,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          cd "$RUNNER_TEMP/appimage-out/release"
-          test -s "Furami-${RELEASE_TAG#v}-x86_64.AppImage" || { echo "missing AppImage" >&2; exit 1; }
-          test -s SHA256SUMS || { echo "missing SHA256SUMS" >&2; exit 1; }
-          test -s audit.json || { echo "missing audit.json" >&2; exit 1; }
-          test -s NOTICE.txt || { echo "missing NOTICE.txt" >&2; exit 1; }
-          test -s RELINKING.md || { echo "missing RELINKING.md" >&2; exit 1; }
-          sha256sum --check --strict SHA256SUMS
+          python3 scripts/publish_candidate.py --check-only --require-reproducibility \
+            --event-name push --tag "$RELEASE_TAG" --candidate "$RUNNER_TEMP/appimage-out/release"
 
       - name: Summarize failure blockers
         if: failure()
@@ -203,6 +246,40 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Collect reproducible build evidence
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/appimage-evidence"
+          python3 - <<'PY'
+          import importlib.util, json, os, pathlib
+          repo = pathlib.Path.cwd()
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'appimage-out'
+          dest = pathlib.Path(os.environ['RUNNER_TEMP']) / 'appimage-evidence'
+          spec = importlib.util.spec_from_file_location('furami_candidate_build', repo / 'packaging/appimage/build.py')
+          builder = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(builder)
+          builder.collect_evidence(out, dest, os.environ['GITHUB_SHA'])
+          for path in dest.rglob('*.json'):
+              print(str(path), path.read_text())
+          receipt = out / 'reproducibility.json'
+          ready = out / 'release/release-ready.json'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write('## Local candidate gates\\nCommit: ' + os.environ['GITHUB_SHA'] + '\\n')
+              if receipt.is_file():
+                  value = json.loads(receipt.read_text())
+                  stream.write(json.dumps({key: value.get(key) for key in ('status', 'byte_identity', 'first_image_sha256', 'second_image_sha256')}) + '\\n')
+              if ready.is_file():
+                  stream.write('Clearance: ' + str(json.loads(ready.read_text()).get('ready')) + '\\n')
+          PY
+
+      - name: Upload diagnostic evidence separately
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: appimage-evidence-${{ github.ref_name }}
+          path: ${{ runner.temp }}/appimage-evidence/
+          if-no-files-found: warn
+
       - name: Upload release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -222,6 +299,10 @@ jobs:
     permissions:
       contents: write
     environment: release
+    concurrency:
+      group: appimage-publish
+      cancel-in-progress: false
+      queue: max
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -256,44 +337,15 @@ jobs:
             exit 1
           fi
 
-      - name: Verify artifact checksums and source clearance before publication
-        working-directory: candidate
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          test -s "Furami-${RELEASE_TAG#v}-x86_64.AppImage" || { echo "missing AppImage" >&2; exit 1; }
-          test -s release-ready.json || { echo "missing release-ready.json" >&2; exit 1; }
-          sha256sum --check --strict SHA256SUMS
-          python3 - <<'PYEOF'
-          import json, sys
 
-          with open("release-ready.json", encoding="utf-8") as handle:
-              report = json.load(handle)
-          if report.get("ready") is not True:
-              print("release-ready.json is not ready=true; refusing to publish", file=sys.stderr)
-              print(json.dumps(report.get("missing", report), indent=2), file=sys.stderr)
-              sys.exit(1)
-          PYEOF
-
-      # `gh release create` fails when the release already exists; this is
-      # intentional. Dispatch never reaches this job, and a rerun must not
-      # delete/move the release or its tag to succeed.
-      # Uploads every file in the verified candidate directory (image,
-      # SHA256SUMS, manifest/audit/notice/source/relink assets, including
-      # split source-materials-*.tar parts when used), so the asset set
-      # always matches SHA256SUMS instead of a hardcoded name list.
-      - name: Create GitHub release
-        working-directory: candidate
+      - name: Publish verified release
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "$RELEASE_TAG"
-          --repo "$GITHUB_REPOSITORY"
-          --title "$RELEASE_TAG"
-          --notes-file "$GITHUB_WORKSPACE/notes/release-notes.md"
-          --verify-tag
-          ./*
+        run: |
+          python3 scripts/publish_candidate.py --event-name "$GITHUB_EVENT_NAME" \
+            --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" \
+            --notes "$GITHUB_WORKSPACE/notes/release-notes.md" --candidate "$GITHUB_WORKSPACE/candidate"
 
       - name: Verify published notes match tagged section
         env:

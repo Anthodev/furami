@@ -694,10 +694,17 @@ struct AudioRetirement {
     epoch: AudioEpoch,
     reason: AudioSilence,
 }
+pub(crate) enum BackendInput {
+    Capture(InputSpec),
+    QualificationVideo {
+        video: super::qualification::QualificationVideo,
+        renderer: super::render_catalog::CompiledRendererSettings,
+    },
+}
 pub(crate) struct MpvBackend {
     prefix: String,
     handle: Option<Handle>,
-    input: InputSpec,
+    input: BackendInput,
     nominal_rate_source: Source,
     audio: AudioSelection,
     gain: PlaybackGain,
@@ -707,7 +714,7 @@ pub(crate) struct MpvBackend {
     owner_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     playback: InitialPlayback,
     paused: bool,
-    watch: WatchStamp,
+    watch: Option<WatchStamp>,
     generation: u64,
     epoch: Option<AudioEpoch>,
     last_audio_epoch: u64,
@@ -756,6 +763,45 @@ impl MpvBackend {
         gain: PlaybackGain,
         playback: InitialPlayback,
         watch: WatchStamp,
+        output: OutputPlan,
+    ) -> Self {
+        Self::from_input(
+            prefix,
+            BackendInput::Capture(input),
+            audio,
+            gain,
+            playback,
+            Some(watch),
+            output,
+        )
+    }
+
+    pub(crate) fn for_qualification(
+        prefix: String,
+        video: super::qualification::QualificationVideo,
+        renderer: super::render_catalog::CompiledRendererSettings,
+    ) -> Self {
+        Self::from_input(
+            prefix,
+            BackendInput::QualificationVideo { video, renderer },
+            AudioSelection::default(),
+            PlaybackGain::default(),
+            InitialPlayback::Live,
+            None,
+            OutputPlan::Silent {
+                revision: crate::domain::output::OutputRevision::first(),
+                reason: crate::domain::output::OutputSilence::NoAvailableOutput,
+            },
+        )
+    }
+
+    fn from_input(
+        prefix: String,
+        input: BackendInput,
+        audio: AudioSelection,
+        gain: PlaybackGain,
+        playback: InitialPlayback,
+        watch: Option<WatchStamp>,
         output: OutputPlan,
     ) -> Self {
         let audio_enabled = audio.enabled();
@@ -1157,8 +1203,9 @@ impl MpvBackend {
             || self.paused
             || self.terminal_audio
             || !matches!(&self.audio, AudioSelection::Enabled { source: selected } if selected == &source)
-            || stamp.watch != self.watch.watch
-            || stamp.epoch.get() < self.watch.epoch.get()
+            || !self.watch.is_some_and(|watch| {
+                stamp.watch == watch.watch && stamp.epoch.get() >= watch.epoch.get()
+            })
         {
             return Err(MediaError::new(
                 "audio_admission",
@@ -1169,7 +1216,7 @@ impl MpvBackend {
             // This epoch was already admitted by the app/gate. No resource was
             // created, but its superseded transaction must still be consumed.
             self.last_audio_epoch = epoch.get();
-            self.watch = stamp;
+            self.watch = Some(stamp);
             if let Some(reason) = self.output.silence() {
                 self.publish_audio(AudioAvailability::Silent {
                     reason: AudioSilence::Output(reason.clone()),
@@ -1199,7 +1246,7 @@ impl MpvBackend {
             gain: self.gain,
         };
         self.last_audio_epoch = epoch.get();
-        self.watch = stamp;
+        self.watch = Some(stamp);
         self.epoch = Some(epoch);
         self.publish_audio(AudioAvailability::Opening { epoch });
         match LoopbackOwner::begin(open, owner_cancel) {
@@ -1243,7 +1290,7 @@ impl MpvBackend {
         receipt.generation().get() == self.generation
             && receipt.attempt().get() == self.generation
             && self.epoch == Some(receipt.epoch())
-            && self.watch == receipt.watch()
+            && self.watch == Some(receipt.watch())
             && matches!(&self.audio, AudioSelection::Enabled { source } if source == receipt.source())
             && receipt.output_revision() == self.output.revision()
     }
@@ -1374,11 +1421,12 @@ impl MpvBackend {
         self.initial_audio_checked = true;
         if let AudioSelection::Enabled { source } = &self.audio
             && self.output.target().is_some()
+            && let Some(watch) = self.watch
         {
             return self.start_audio(
                 AudioEpoch::new(1).expect("initial epoch"),
                 source.clone(),
-                self.watch,
+                watch,
             );
         }
         Ok(())
@@ -1975,6 +2023,14 @@ fn check_stop(stop: &StopFlag) -> Result<(), MediaError> {
         Ok(())
     }
 }
+fn submit_loadfile(handle: &Handle, id: RequestId, path: &CStr) -> Result<(), MediaError> {
+    let argv = [c"loadfile".as_ptr(), path.as_ptr(), ptr::null()];
+    // SAFETY: Owner-only live handle, exact cookie and NUL-terminated argv;
+    // libmpv copies the command strings before returning.
+    let result =
+        unsafe { (handle.functions.command_async)(handle.raw.as_ptr(), id.get(), argv.as_ptr()) };
+    handle.checked(result, "loadfile")
+}
 impl OwnerBackend for MpvBackend {
     fn initialize(&mut self, token: SurfaceToken, stop: &StopFlag) -> Result<(), MediaError> {
         self.clear_diagnostics();
@@ -2005,6 +2061,8 @@ impl OwnerBackend for MpvBackend {
             (c"load-scripts", c"no"),
             (c"input-default-bindings", c"no"),
             (c"input-vo-keyboard", c"no"),
+            (c"input-terminal", c"no"),
+            (c"terminal", c"no"),
             (c"input-cursor", c"no"),
             (c"input-cursor-passthrough", c"yes"),
             (c"cursor-autohide", c"no"),
@@ -2013,9 +2071,6 @@ impl OwnerBackend for MpvBackend {
             (c"gpu-api", c"vulkan"),
             (c"gpu-context", c"x11vk"),
             (c"gpu-sw", c"no"),
-            (c"untimed", c"yes"),
-            (c"correct-pts", c"no"),
-            (c"video-latency-hacks", c"yes"),
             (c"cache", c"no"),
             (c"demuxer-readahead-secs", c"0"),
         ];
@@ -2024,20 +2079,42 @@ impl OwnerBackend for MpvBackend {
             handle.option(name, value)?;
         }
         check_stop(stop)?;
-        let rate = self.input.requested().mode.rate;
-        let fps = f64::from(rate.numerator()) / f64::from(rate.denominator());
-        handle.option_double(c"container-fps-override", fps)?;
-        check_stop(stop)?;
-        handle.option(
-            c"pause",
-            if self.playback == InitialPlayback::Paused {
-                c"yes"
-            } else {
-                c"no"
-            },
-        )?;
-        handle.option(c"demuxer-lavf-format", c"v4l2")?;
-        handle.option(c"demuxer-lavf-o", self.input.lavf_options())?;
+        match &self.input {
+            BackendInput::Capture(input) => {
+                handle.option(c"untimed", c"yes")?;
+                handle.option(c"correct-pts", c"no")?;
+                handle.option(c"video-latency-hacks", c"yes")?;
+                let rate = input.requested().mode.rate;
+                handle.option_double(
+                    c"container-fps-override",
+                    f64::from(rate.numerator()) / f64::from(rate.denominator()),
+                )?;
+                handle.option(
+                    c"pause",
+                    if self.playback == InitialPlayback::Paused {
+                        c"yes"
+                    } else {
+                        c"no"
+                    },
+                )?;
+                handle.option(c"demuxer-lavf-format", c"v4l2")?;
+                handle.option(c"demuxer-lavf-o", input.lavf_options())?;
+            }
+            BackendInput::QualificationVideo { .. } => {
+                for (name, value) in [
+                    (c"demuxer", c"lavf"),
+                    (c"demuxer-lavf-format", c"yuv4mpegpipe"),
+                    (c"untimed", c"no"),
+                    (c"correct-pts", c"yes"),
+                    (c"pause", c"no"),
+                    (c"loop-file", c"inf"),
+                    (c"sub-auto", c"no"),
+                    (c"audio-file-auto", c"no"),
+                ] {
+                    handle.option(name, value)?;
+                }
+            }
+        }
         handle.option(c"audio", c"no")?;
         check_stop(stop)?;
         let xid = CString::new(token.xid.get().to_string())
@@ -2069,7 +2146,10 @@ impl OwnerBackend for MpvBackend {
             generation = token.generation.get(),
             window_id = token.xid.get(),
         );
-        self.nominal_rate_source = Source::MpvConfiguredContainerFps;
+        self.nominal_rate_source = match &self.input {
+            BackendInput::Capture(_) => Source::MpvConfiguredContainerFps,
+            BackendInput::QualificationVideo { .. } => Source::MpvContainerFps,
+        };
         self.record_initialized_diagnostics(client_api, &version);
         Ok(())
     }
@@ -2101,13 +2181,13 @@ impl OwnerBackend for MpvBackend {
                 Ok(())
             }
             BackendCommand::SetPaused { request, paused } => {
-                if !paused {
+                if !paused && matches!(self.input, BackendInput::Capture(_)) {
                     return Err(MediaError::new(
                         "pause_admission",
                         "resume requires a fresh applied session",
                     ));
                 }
-                self.paused = true;
+                self.paused = paused;
                 self.retire_audio(AudioSilence::Paused);
                 self.set(
                     c"pause",
@@ -2198,7 +2278,7 @@ impl OwnerBackend for MpvBackend {
                 stamp,
             } => {
                 if self.epoch == Some(epoch)
-                    && self.watch == stamp
+                    && self.watch == Some(stamp)
                     && matches!(&self.audio, AudioSelection::Enabled { source: desired } if desired == &source)
                     && self.retirement.is_none()
                 {
@@ -2221,12 +2301,11 @@ impl OwnerBackend for MpvBackend {
                 tracing::info!(event_code = "mpv_loadfile_submit", request_id = id.get(),);
                 self.load_id = Some(id.get());
                 let handle = self.handle()?;
-                let argv = [c"loadfile".as_ptr(), self.input.url().as_ptr(), ptr::null()];
-                // SAFETY: Owner-only handle, exact cookie and copied argv.
-                let result = unsafe {
-                    (handle.functions.command_async)(handle.raw.as_ptr(), id.get(), argv.as_ptr())
+                let path = match &self.input {
+                    BackendInput::Capture(input) => input.url(),
+                    BackendInput::QualificationVideo { video, .. } => video.load_path(),
                 };
-                handle.checked(result, "loadfile")
+                submit_loadfile(handle, id, path)
             }
         }
     }
@@ -2397,7 +2476,7 @@ impl FixtureRecorder {
 #[cfg(test)]
 pub(crate) struct FixtureBackend {
     inner: MpvBackend,
-    fixture: CString,
+    fixture: super::qualification::QualificationVideo,
     recorder: Option<FixtureRecorder>,
     generation: Option<super::controller::Generation>,
 }
@@ -2415,18 +2494,12 @@ impl FixtureBackend {
         watch: WatchStamp,
         recorder: Option<FixtureRecorder>,
     ) -> Result<Self, MediaError> {
-        use std::os::unix::ffi::OsStrExt;
-        if !fixture.is_absolute() || !fixture.is_file() {
-            return Err(MediaError::new(
+        let fixture = super::qualification::QualificationVideo::open(&fixture).map_err(|_| {
+            MediaError::new(
                 "fixture_path",
-                "FURAMI_PLAYBACK_FIXTURE must be an absolute existing file",
-            ));
-        }
-        let fixture = fixture
-            .canonicalize()
-            .map_err(|error| MediaError::new("fixture_path", error.to_string()))?;
-        let fixture = CString::new(fixture.as_os_str().as_bytes())
-            .map_err(|error| MediaError::new("fixture_path", error.to_string()))?;
+                "finite fixture must be an absolute readable regular Y4M file",
+            )
+        })?;
         Ok(Self {
             inner: MpvBackend::new(
                 prefix,
@@ -2506,6 +2579,8 @@ impl OwnerBackend for FixtureBackend {
             (c"force-window", c"no"),
             (c"vo", c"null"),
             (c"audio", c"no"),
+            (c"demuxer", c"lavf"),
+            (c"demuxer-lavf-format", c"yuv4mpegpipe"),
         ];
         for &(name, value) in OPTIONS {
             check_stop(stop)?;
@@ -2568,15 +2643,9 @@ impl OwnerBackend for FixtureBackend {
         }
         self.inner.reset_startup();
         self.inner.load_id = Some(id.get());
-        self.inner.native_record(serde_json::json!({"event":"loadfile","request":id.get(),"fixture":self.fixture.to_string_lossy()}));
-        let handle = self.inner.handle()?;
-        let arguments = [c"loadfile".as_ptr(), self.fixture.as_ptr(), ptr::null()];
-        // SAFETY: Owner-only live handle, checked request ID and owned,
-        // NUL-terminated argv. libmpv copies the finite-file path on submission.
-        let result = unsafe {
-            (handle.functions.command_async)(handle.raw.as_ptr(), id.get(), arguments.as_ptr())
-        };
-        handle.checked(result, "fixture loadfile")
+        self.inner
+            .native_record(serde_json::json!({"event":"loadfile","request":id.get()}));
+        submit_loadfile(self.inner.handle()?, id, self.fixture.load_path())
     }
 
     fn next_event(&mut self) -> Result<BackendEvent, MediaError> {
@@ -3964,11 +4033,12 @@ mod reply_tests {
                 else {
                     panic!("completed metadata must reach the session consumer");
                 };
-                let facts = super::super::session::SessionFacts::verify(
-                    backend.input.requested().clone(),
-                    facts,
-                )
-                .unwrap();
+                let BackendInput::Capture(input) = &backend.input else {
+                    panic!("capture metadata fixture must retain a capture input");
+                };
+                let facts =
+                    super::super::session::SessionFacts::verify(input.requested().clone(), facts)
+                        .unwrap();
                 assert_eq!(
                     facts.verification.nominal_rate,
                     if error < 0 {
@@ -4344,7 +4414,7 @@ mod reply_tests {
         let revision = backend.output.revision();
         backend.epoch = Some(epoch);
         for wrong in 0..7 {
-            let mut stamp = backend.watch;
+            let mut stamp = backend.watch.unwrap();
             if wrong == 2 {
                 stamp.epoch = crate::domain::capture::ObservationEpoch::new(2).unwrap();
             }
@@ -4396,7 +4466,7 @@ mod reply_tests {
             generation,
             attempt,
             epoch,
-            backend.watch,
+            backend.watch.unwrap(),
             source.clone(),
             target,
             revision,
@@ -4518,7 +4588,7 @@ mod reply_tests {
         ));
         assert!(
             backend
-                .start_audio(AudioEpoch::new(3).unwrap(), source, backend.watch)
+                .start_audio(AudioEpoch::new(3).unwrap(), source, backend.watch.unwrap())
                 .is_err()
         );
         assert!(!backend.video_ended);
@@ -4544,7 +4614,10 @@ mod reply_tests {
             reason: crate::domain::output::OutputSilence::NoAvailableOutput,
         };
         audio.output = initial.clone();
-        let requested = audio.input.requested();
+        let BackendInput::Capture(input) = &audio.input else {
+            panic!("capture audio fixture must retain a capture input");
+        };
+        let requested = input.requested();
         let settings = crate::domain::state::DraftSettings {
             video: crate::domain::capture::VideoRequest::manual(
                 crate::domain::capture::ModeRequest {
@@ -4558,8 +4631,8 @@ mod reply_tests {
             renderer: crate::domain::render::RendererSettings::default(),
         };
         let prepared = crate::capture::apply::fixture_prepared(settings).unwrap();
-        audio.watch = prepared.stamp();
-        let stamp = audio.watch;
+        audio.watch = Some(prepared.stamp());
+        let stamp = audio.watch.unwrap();
         let (drivers_tx, drivers) = std::sync::mpsc::channel();
         let mut gate = GateRunner::with_spawner(
             Ok(crate::media::render_catalog::fixture_capabilities()),
@@ -4868,7 +4941,7 @@ mod reply_tests {
                 reason: AudioSilence::WaitingForSource(_)
             }
         ));
-        let mut returned = backend.watch;
+        let mut returned = backend.watch.unwrap();
         returned.epoch =
             crate::domain::capture::ObservationEpoch::new(returned.epoch.get() + 1).unwrap();
         // Keep the native-free output parked; the fresh same-source admission
@@ -4888,7 +4961,7 @@ mod reply_tests {
             )
             .unwrap();
         assert_eq!(backend.last_audio_epoch, 2);
-        assert_eq!(backend.watch, returned);
+        assert_eq!(backend.watch, Some(returned));
         assert_eq!(backend.gain, gain);
         assert_eq!(backend.generation, 1);
         assert!(!backend.video_ended);

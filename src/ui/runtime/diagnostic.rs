@@ -375,7 +375,7 @@ struct Inputs {
     failures: crate::app::diagnostic::DiagnosticFailureContexts,
     profile: Result<Option<dto::AppliedProfile>, dto::ProjectionOversized>,
 }
-impl RuntimeCoordinator {
+impl CaptureRuntime {
     pub(super) fn diagnostics_projection(&self) -> super::projection::Diagnostics {
         use crate::diagnostics::{FolderState, SinkStatus};
         let health = &self.report_cache.environment.log_location;

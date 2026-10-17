@@ -28,6 +28,7 @@ Item {
     }
 
     readonly property var profile: Projection.view
+    readonly property bool qualificationVideo: top.profile.session_kind === "qualification-video"
     readonly property bool popupActive: Chrome.popupRegion(Chrome.popup) === "top"
     readonly property bool fullscreen: Projection.bridge
         ? Projection.bridge.fullscreenPreference === true : false
@@ -69,7 +70,7 @@ Item {
             topPopup.focusBoundary(backward)
             return
         }
-        const target = backward ? fullscreenButton : sourceControl
+        const target = backward || top.qualificationVideo ? fullscreenButton : sourceControl
         if (target && target.enabled)
             target.forceActiveFocus(Qt.TabFocusReason)
     }
@@ -109,15 +110,16 @@ Item {
         y: 0
         width: parent.width
         enabled: Projection.ready
-        implicitHeight: Brume.ribbonHeight * (top.compactRibbon ? 2 : 1)
+        implicitHeight: Brume.ribbonHeight * (top.compactRibbon && !top.qualificationVideo ? 2 : 1)
         height: implicitHeight
-        columns: top.compactRibbon ? 3 : 5
+        columns: top.qualificationVideo ? 1 : top.compactRibbon ? 3 : 5
         rowSpacing: 0
         columnSpacing: 0
 
         RibbonControl {
             id: sourceControl
             objectName: "ribbonSource"
+            visible: !top.qualificationVideo
             Layout.fillWidth: true
             Layout.minimumWidth: 0
             Layout.preferredWidth: top.width / ribbon.columns
@@ -142,6 +144,7 @@ Item {
         RibbonControl {
             id: ribbonOutput
             objectName: "ribbonOutput"
+            visible: !top.qualificationVideo
             Layout.fillWidth: true
             Layout.minimumWidth: 0
             Layout.preferredWidth: top.width / ribbon.columns
@@ -160,6 +163,7 @@ Item {
         RibbonControl {
             id: resolutionControl
             objectName: "ribbonResolution"
+            visible: !top.qualificationVideo
             Layout.fillWidth: true
             Layout.minimumWidth: 0
             Layout.preferredWidth: top.width / ribbon.columns
@@ -176,6 +180,7 @@ Item {
         RibbonControl {
             id: rateControl
             objectName: "ribbonRate"
+            visible: !top.qualificationVideo
             Layout.fillWidth: true
             Layout.minimumWidth: 0
             Layout.preferredWidth: top.width / ribbon.columns

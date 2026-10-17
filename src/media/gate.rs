@@ -32,6 +32,9 @@ use crate::{
         },
     },
 };
+#[path = "qualification_gate.rs"]
+mod qualification;
+pub(crate) use qualification::{QualificationGate, QualificationUpdate};
 
 type Spawner = dyn FnMut(Generation, SessionConfig) -> Result<OwnerEndpoint, MediaError>;
 
@@ -579,7 +582,11 @@ impl GateRunner {
             });
             self.audio = snapshot.audio.clone();
         }
-        if let Some(session) = &snapshot.session {
+        if let Some(session) = snapshot
+            .session
+            .as_ref()
+            .and_then(super::controller::ReadinessFacts::capture)
+        {
             let report = session.summary();
             self.dirty |= self.report != report;
             self.report = report;
@@ -628,6 +635,7 @@ impl GateRunner {
                         observation: snapshot
                             .session
                             .as_ref()
+                            .and_then(super::controller::ReadinessFacts::capture)
                             .and_then(|session| session.observed.nominal_rate.as_ref())
                             .filter(|observation| {
                                 observation.value.is_finite()
@@ -1291,7 +1299,11 @@ fn verified_receipt(
     let Some(readiness) = snapshot.readiness else {
         return Ok(None);
     };
-    let Some(session) = snapshot.session.as_ref() else {
+    let Some(session) = snapshot
+        .session
+        .as_ref()
+        .and_then(super::controller::ReadinessFacts::capture)
+    else {
         return Ok(None);
     };
     if session.requested.identity != settings.video.identity
@@ -2487,8 +2499,9 @@ mod tests {
             initialized: true,
             file_loaded: true,
             playback_started: true,
-            session: Some(facts),
+            session: Some(super::super::controller::ReadinessFacts::Capture(facts)),
             pause: None,
+            pause_pending: false,
             stream_ended: None,
             readiness: Some(OpenReadiness::Live),
             load_complete: true,
@@ -2500,6 +2513,36 @@ mod tests {
             treatment_fault: None,
             diagnostics: None,
         }
+    }
+
+    #[test]
+    fn qualification_observations_cannot_authorize_a_capture_receipt() {
+        let settings = settings();
+        let mut snapshot = snapshot(&settings, AudioAvailability::Disabled);
+        snapshot.session = Some(
+            super::super::controller::ReadinessFacts::QualificationVideo(
+                super::super::session::ObservedFacts {
+                    decoded_size: Some(super::super::session::Observation {
+                        value: settings.video.mode.size,
+                        source: super::super::session::Source::MpvDecodedParams,
+                    }),
+                    nominal_rate: Some(super::super::session::Observation {
+                        value: 60.0,
+                        source: super::super::session::Source::MpvConfiguredContainerFps,
+                    }),
+                    ..Default::default()
+                },
+            ),
+        );
+        assert!(
+            verified_receipt(key(1), &settings, &snapshot)
+                .unwrap()
+                .is_none()
+        );
+        let (mut runner, _drivers) = runner_for_snapshot(&settings);
+        assert!(!verify_snapshot(&mut runner, &snapshot));
+        assert!(runner.receipt_timing_facts().is_none());
+        retire_snapshot_runner(&mut runner);
     }
 
     fn diagnostics_fixture(generation: u64) -> RuntimeMediaObservation {
@@ -2598,8 +2641,14 @@ mod tests {
             settings.video.mode.rate = FrameRate::new(60_000, 1001).unwrap();
             let (mut runner, _drivers) = runner_for_snapshot(&settings);
             let mut current = snapshot(&settings, AudioAvailability::Disabled);
-            current.session.as_mut().unwrap().observed.nominal_rate =
-                Some(Observation { value, source });
+            current
+                .session
+                .as_mut()
+                .unwrap()
+                .capture_mut()
+                .unwrap()
+                .observed
+                .nominal_rate = Some(Observation { value, source });
             assert!(verify_snapshot(&mut runner, &current));
             let timing = *runner.receipt_timing_facts().unwrap();
             assert_eq!(timing.key, key(1));
@@ -2654,11 +2703,17 @@ mod tests {
             let settings = settings();
             let (mut runner, _drivers) = runner_for_snapshot(&settings);
             let mut current = snapshot(&settings, AudioAvailability::Disabled);
-            current.session.as_mut().unwrap().observed.nominal_rate =
-                value.map(|value| Observation {
-                    value,
-                    source: Source::MpvConfiguredContainerFps,
-                });
+            current
+                .session
+                .as_mut()
+                .unwrap()
+                .capture_mut()
+                .unwrap()
+                .observed
+                .nominal_rate = value.map(|value| Observation {
+                value,
+                source: Source::MpvConfiguredContainerFps,
+            });
             assert!(verify_snapshot(&mut runner, &current));
             let timing = runner.receipt_timing_facts().unwrap();
             assert_eq!(timing.status, FactStatus::Unverified);
@@ -2668,7 +2723,15 @@ mod tests {
         let settings = settings();
         let (mut runner, _drivers) = runner_for_snapshot(&settings);
         let mut rejected = snapshot(&settings, AudioAvailability::Disabled);
-        rejected.session.as_mut().unwrap().requested.mode.rate = FrameRate::new(30, 1).unwrap();
+        rejected
+            .session
+            .as_mut()
+            .unwrap()
+            .capture_mut()
+            .unwrap()
+            .requested
+            .mode
+            .rate = FrameRate::new(30, 1).unwrap();
         assert!(!verify_snapshot(&mut runner, &rejected));
         assert!(runner.receipt_timing_facts().is_none());
         retire_snapshot_runner(&mut runner);
@@ -2752,16 +2815,28 @@ mod tests {
     fn contradictions_and_wrong_prepared_settings_never_get_receipt() {
         let settings = settings();
         let mut snapshot = snapshot(&settings, AudioAvailability::Disabled);
-        snapshot.session.as_mut().unwrap().observed.nominal_rate =
-            Some(super::super::session::Observation {
-                value: 60.0,
-                source: super::super::session::Source::MpvConfiguredContainerFps,
-            });
-        snapshot.session.as_mut().unwrap().observed.decoded_size =
-            Some(super::super::session::Observation {
-                value: FrameSize::new(1920, 1080).unwrap(),
-                source: super::super::session::Source::MpvDecodedParams,
-            });
+        snapshot
+            .session
+            .as_mut()
+            .unwrap()
+            .capture_mut()
+            .unwrap()
+            .observed
+            .nominal_rate = Some(super::super::session::Observation {
+            value: 60.0,
+            source: super::super::session::Source::MpvConfiguredContainerFps,
+        });
+        snapshot
+            .session
+            .as_mut()
+            .unwrap()
+            .capture_mut()
+            .unwrap()
+            .observed
+            .decoded_size = Some(super::super::session::Observation {
+            value: FrameSize::new(1920, 1080).unwrap(),
+            source: super::super::session::Source::MpvDecodedParams,
+        });
         assert_eq!(
             verified_receipt(key(1), &settings, &snapshot)
                 .unwrap_err()
@@ -2781,11 +2856,17 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.verification.decoded_size, FactStatus::Unverified);
         assert_eq!(receipt.verification.nominal_rate, FactStatus::Unverified);
-        snapshot.session.as_mut().unwrap().observed.nominal_rate =
-            Some(super::super::session::Observation {
-                value: 60.0,
-                source: super::super::session::Source::MpvContainerFps,
-            });
+        snapshot
+            .session
+            .as_mut()
+            .unwrap()
+            .capture_mut()
+            .unwrap()
+            .observed
+            .nominal_rate = Some(super::super::session::Observation {
+            value: 60.0,
+            source: super::super::session::Source::MpvContainerFps,
+        });
         assert_eq!(
             verified_receipt(key(1), &settings, &snapshot)
                 .unwrap()
@@ -2802,11 +2883,17 @@ mod tests {
             let mut settings = settings();
             settings.video.mode.rate = FrameRate::new(numerator, 1001).unwrap();
             let mut snapshot = snapshot(&settings, AudioAvailability::Disabled);
-            snapshot.session.as_mut().unwrap().observed.nominal_rate =
-                Some(super::super::session::Observation {
-                    value: f64::from(numerator) / 1001.0,
-                    source: super::super::session::Source::MpvConfiguredContainerFps,
-                });
+            snapshot
+                .session
+                .as_mut()
+                .unwrap()
+                .capture_mut()
+                .unwrap()
+                .observed
+                .nominal_rate = Some(super::super::session::Observation {
+                value: f64::from(numerator) / 1001.0,
+                source: super::super::session::Source::MpvConfiguredContainerFps,
+            });
             let receipt = verified_receipt(key(1), &settings, &snapshot)
                 .unwrap()
                 .unwrap();

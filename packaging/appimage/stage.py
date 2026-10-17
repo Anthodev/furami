@@ -20,6 +20,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 STACK_LOCK = REPO / "packaging/media/stack.lock.json"
+ALPINE_SOURCE_LOCK = REPO / "packaging/appimage-runtime/alpine-source.lock.json"
 TOOL_URL = "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
 TOOL_SHA256 = "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
 # The only non-prefix absolute loader path observed in 84 staged ELF objects.
@@ -73,7 +74,7 @@ def digest(path):
 
 def snapshot(root):
     """Record files, symlink text and permission bits; symlink targets never followed."""
-    result = {}
+    result = {".": {"type": "directory", "mode": oct(stat.S_IMODE(root.stat().st_mode))}}
     for parent, directories, files in os.walk(root, followlinks=False):
         for name in sorted(directories + files):
             item = Path(parent) / name
@@ -805,7 +806,69 @@ def rust_std_notices(app_root, app_manifest, appdir, owners):
             "source": source, "linked_archives": archives, "notices": results,
             "vendored_component_notices": component_notices}
 
-def copy_runtime_materials(runtime_root, manifest, appdir, owners, lock):
+def verify_runtime_linked_sources(runtime_root, manifest, lock, *, linked_source_root=None):
+    """Bind the producer's exact source proof to current locks and actual bytes."""
+    linked = manifest.get("linked_source_closure")
+    relink = manifest.get("relink_files", {})
+    pinned = digest(ALPINE_SOURCE_LOCK)
+    source_lock = runtime_root / "relink/alpine-source.lock.json"
+    if (not isinstance(linked, dict)
+            or lock.get("linked_source_closure", {}).get("sha256") != pinned
+            or linked.get("lock_sha256") != pinned
+            or relink.get("relink/alpine-source.lock.json") != pinned
+            or source_lock.is_symlink() or not source_lock.is_file()
+            or digest(source_lock) != pinned
+            or not isinstance(linked.get("local_cache_path"), str)
+            or not Path(linked["local_cache_path"]).is_absolute()
+            or linked.get("distribution_status") != "local qualification evidence only; full cache not bundled"):
+        raise ValueError("runtime linked source closure/local cache provenance incomplete")
+    # Reuse the producer's binary/source relationship and APKBUILD checksum-set
+    # validators without invoking downloads, authentication, or a provider build.
+    spec = importlib.util.spec_from_file_location(
+        "furami_staged_runtime_sources", REPO / "packaging/appimage-runtime/build.py")
+    recipe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recipe)
+    recipe.SOURCE_LOCK_FILE = ALPINE_SOURCE_LOCK
+    sources = recipe.alpine_sources(lock)
+    cache = Path(linked["local_cache_path"]) if linked_source_root is None else linked_source_root
+    if cache.is_symlink() or not cache.is_dir():
+        raise ValueError("runtime linked source cache must be a regular directory")
+    expected_inputs, expected_recipes = {}, {}
+    for name, source in sources.items():
+        relative = name + "/APKBUILD"
+        path = cache / relative
+        if (path.is_symlink() or not path.is_file()
+                or not path.resolve().is_relative_to(cache.resolve())
+                or digest(path) != source["apkbuild"]["sha256"]):
+            raise ValueError("runtime linked APKBUILD bytes mismatch: " + relative)
+        expected_recipes[relative] = source["apkbuild"]["sha256"]
+        for item in recipe.verify_alpine_recipe(name, source, path):
+            relative = name + "/" + item["file"]
+            path = cache / relative
+            if (relative in expected_inputs or path.is_symlink() or not path.is_file()
+                    or not path.resolve().is_relative_to(cache.resolve())
+                    or digest(path) != item["sha256"]):
+                raise ValueError("runtime linked source bytes mismatch: " + relative)
+            with path.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha512").hexdigest() != item["sha512"]:
+                    raise ValueError("runtime linked source SHA512 mismatch: " + relative)
+            expected_inputs[relative] = item["sha256"]
+    actual = set()
+    for path in cache.rglob("*"):
+        if path.is_symlink() or (not path.is_dir() and not path.is_file()):
+            raise ValueError("runtime linked source cache contains non-regular input")
+        if path.is_file():
+            actual.add(path.relative_to(cache).as_posix())
+    if actual != set(expected_inputs) | set(expected_recipes):
+        raise ValueError("runtime linked source cache input set differs from source lock")
+    if (type(linked.get("verified_input_count")) is not int
+            or linked["verified_input_count"] != len(expected_inputs)
+            or linked.get("verified_inputs") != expected_inputs
+            or linked.get("verified_apkbuilds") != expected_recipes):
+        raise ValueError("runtime linked source proof differs from exact locked inputs")
+
+
+def copy_runtime_materials(runtime_root, manifest, appdir, owners, lock, *, linked_source_root=None):
     notices = manifest.get("notice_files")
     relink = manifest.get("relink_files")
     recorded = manifest.get("files_sha256")
@@ -830,13 +893,7 @@ def copy_runtime_materials(runtime_root, manifest, appdir, owners, lock):
         if matched != [item["sha256"]]:
             raise ValueError(f"runtime source/patch archive unverified or absent: {item['archive']}")
     linked = manifest.get("linked_source_closure")
-    if (not isinstance(linked, dict)
-            or linked.get("lock_sha256") != relink.get("relink/alpine-source.lock.json")
-            or linked.get("verified_input_count") != 60
-            or not isinstance(linked.get("local_cache_path"), str)
-            or not Path(linked["local_cache_path"]).is_absolute()
-            or linked.get("distribution_status") != "local qualification evidence only; full cache not bundled"):
-        raise ValueError("runtime linked source closure/local cache provenance incomplete")
+    verify_runtime_linked_sources(runtime_root, manifest, lock, linked_source_root=linked_source_root)
     for category, entries in (("licenses", notices), ("relink", relink)):
         for relative, checksum in sorted(entries.items()):
             if not isinstance(relative, str) or not relative.startswith(category + "/") or ".." in Path(relative).parts:
@@ -857,7 +914,7 @@ def copy_runtime_materials(runtime_root, manifest, appdir, owners, lock):
             "destination": "usr/share/furami/runtime-compliance"}
 
 
-def internal(media_root, app_root, runtime_root, out, version):
+def internal(media_root, app_root, runtime_root, out, version, linked_source_root):
     ids, media = check_inputs(media_root, app_root, runtime_root)
     if {p.name for p in out.iterdir()} != {"ubuntu-apt.log", "base-image-provenance.json",
                                              "stage-tool-closure.json"}:
@@ -893,6 +950,7 @@ def internal(media_root, app_root, runtime_root, out, version):
             raise ValueError(f"packaging-only package copyright mismatch: {name}")
     appdir = out / "AppDir"
     appdir.mkdir()
+    appdir.chmod(0o755)
     owners = {}
     prefix = media_root / "prefix"
     copy_component(app_root, "bin/furami", appdir, "usr/bin/furami", owners, "app")
@@ -942,8 +1000,8 @@ def internal(media_root, app_root, runtime_root, out, version):
     owners[target.relative_to(appdir).as_posix()] = {
         "owner": "checked-ICU-notice", "source": icu["url"], "source_sha256": icu["sha256"]}
     for src, dest in ((HERE / "AppRun", "AppRun"), (HERE / "furami.desktop", "usr/share/applications/furami.desktop"),
-                      (HERE / "furami.svg", "usr/share/icons/hicolor/scalable/apps/furami.svg"),
-                      (HERE / "furami.png", "usr/share/icons/hicolor/256x256/apps/furami.png"),
+                      (REPO / "assets/logo.svg", "usr/share/icons/hicolor/scalable/apps/furami.svg"),
+                      (REPO / "assets/logo.png", "usr/share/icons/hicolor/1024x1024/apps/furami.png"),
                       (HERE / "qt.conf", "usr/bin/qt.conf"), (REPO / "LICENSE", "usr/share/licenses/furami/LICENSE"),
                       (HERE / "RELINKING.md", "usr/share/licenses/furami/RELINKING.md"),
                       (REPO / "packaging/media/LICENSE-AUDIT.md", "usr/share/licenses/furami/STACK-AUDIT.md")):
@@ -955,7 +1013,7 @@ def internal(media_root, app_root, runtime_root, out, version):
         owners[dest] = {"owner": "qualification-template", "source": str(src.relative_to(REPO)), "source_sha256": digest(src)}
     (appdir / "furami.desktop").symlink_to("usr/share/applications/furami.desktop")
     (appdir / "furami.svg").symlink_to("usr/share/icons/hicolor/scalable/apps/furami.svg")
-    (appdir / "furami.png").symlink_to("usr/share/icons/hicolor/256x256/apps/furami.png")
+    (appdir / "furami.png").symlink_to("usr/share/icons/hicolor/1024x1024/apps/furami.png")
     (appdir / ".DirIcon").symlink_to("furami.png")
     dependencies = stage_libraries(prefix, media["artifacts"], appdir, owners, base_origin)
     app_manifest, _ = read_manifest(app_root)
@@ -979,7 +1037,8 @@ def internal(media_root, app_root, runtime_root, out, version):
         raise ValueError("runtime must be static x86_64 ELF without interpreter")
     runtime_materials = copy_runtime_materials(
         runtime_root, runtime_manifest, appdir, owners,
-        json.loads((REPO / "packaging/appimage-runtime/runtime.lock.json").read_text()))
+        json.loads((REPO / "packaging/appimage-runtime/runtime.lock.json").read_text()),
+        linked_source_root=linked_source_root)
     source_offer = {"schema": 1, "scope": "build provenance; release-ready.json controls publication",
                     "media_sources": media["sources"], "media_lock_sha256": ids["stack_lock"],
                     "rust_crates": rust_crates, "rust_standard_library": rust_standard_library,
@@ -1024,7 +1083,7 @@ def internal(media_root, app_root, runtime_root, out, version):
                 raise ValueError(f"pinned appimagetool bundled executable unverified: {name}")
             bundled_tools[name] = {"sha256": expected_sha, "dt_needed": [],
                                    "role": "build-only; not shipped"}
-        image = out / f"Furami-{version}-x86_64.AppImage"
+        image = out / f"Furami-v{version}-Linux-x64.AppImage"
         env = {**os.environ, "ARCH": "x86_64", "SOURCE_DATE_EPOCH": str(json.loads(STACK_LOCK.read_text())["source_date_epoch"])}
         run([builder, "--no-appstream", "--runtime-file", runtime_root / "runtime-x86_64", appdir, image], env=env)
         image.chmod(0o755)
@@ -1078,14 +1137,23 @@ def main():
     parser.add_argument("--version", required=True)
     parser.add_argument("--tool-cache", type=Path, default=Path.home() / ".cache/furami-qualification")
     parser.add_argument("--in-container", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--runtime-linked-sources", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", args.version):
         raise ValueError("unsafe image version")
     media, app, runtime, out = (p.resolve() for p in (args.media_output, args.app_build, args.runtime_build, args.output))
     if args.in_container:
-        internal(media, app, runtime, out, args.version)
+        if args.runtime_linked_sources is None or not args.runtime_linked_sources.is_absolute():
+            raise ValueError("container staging requires the explicit source-only linked-input mount")
+        internal(media, app, runtime, out, args.version, args.runtime_linked_sources)
         return
     _, media_manifest = check_inputs(media, app, runtime)
+    runtime_manifest = json.loads((runtime / "manifest.json").read_text())
+    runtime_lock = json.loads((REPO / "packaging/appimage-runtime/runtime.lock.json").read_text())
+    verify_runtime_linked_sources(runtime, runtime_manifest, runtime_lock)
+    linked_sources = Path(runtime_manifest["linked_source_closure"]["local_cache_path"]).resolve()
+    if ":" in str(linked_sources):
+        raise ValueError("runtime linked source path must be mount-safe")
     if out.exists() and any(out.iterdir()):
         raise ValueError(f"qualification output must be empty: {out}")
     lock = json.loads(STACK_LOCK.read_text())
@@ -1108,6 +1176,7 @@ def main():
             "--security-opt", "label=disable", "--volume", f"{REPO}:/workspace:ro",
             "--volume", f"{media}:/media:ro", "--volume", f"{app}:/app:ro",
             "--volume", f"{runtime}:/runtime:ro", "--volume", f"{out}:/out",
+            "--volume", f"{linked_sources}:/runtime-linked-sources:ro",
             "--volume", f"{args.media_source_cache.resolve()}:/media-sources:ro",
             "--volume", f"{tool}:/tool/appimagetool:ro",
             "--volume", f"{kdab_dir}:/kdab-licenses:ro",

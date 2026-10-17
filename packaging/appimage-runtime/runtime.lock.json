@@ -1,15 +1,33 @@
 {
   "apk_indexes": {
     "community": {
-      "sha256": "a365093890fb40798ed350ade350d0596dcacb28f549202e8770184adc3910f5",
+      "sha256": "1d1cfd138850017707a41923163b55f75bcad486a6c054976dce6359ae8b9233",
       "url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/community/x86_64/APKINDEX.tar.gz"
     },
     "main": {
-      "sha256": "13cc793aea16f8f23ae5e7465f9a74965136939417d3d59d3566f3c73a78b54f",
+      "sha256": "697cc65873d8a32d0eb8c70ee0c438bb23f4875cfb761a0d52c9745576289b12",
       "url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz"
     }
   },
   "apk_packages": {
+    "libcrypto3": {
+      "aports_commit": "a254386dfe34f70a05bdb8b2a3d7a5b20b6f076e",
+      "archive": "libcrypto3-3.3.7-r2.apk",
+      "index_checksum": "Q1p96jiQJuxEScXqIJpS+LWrIENI0=",
+      "license": "Apache-2.0",
+      "repository": "main",
+      "sha256": "3c6fb1c90a974ef0fc83687868712340ca3df3ef5206cfc79fd81ff16f22596a",
+      "version": "3.3.7-r2"
+    },
+    "libssl3": {
+      "aports_commit": "a254386dfe34f70a05bdb8b2a3d7a5b20b6f076e",
+      "archive": "libssl3-3.3.7-r2.apk",
+      "index_checksum": "Q1/PSl/joySa7gfIuJuhfohzp+qWg=",
+      "license": "Apache-2.0",
+      "repository": "main",
+      "sha256": "00e674d00a80c9808580546dd388093c1c67f21628a9d70e27628bddc86a31e8",
+      "version": "3.3.7-r2"
+    },
     "abuild": {
       "aports_commit": "8fb34bb4a9520f9a6a3d1b1316907307c93fe333",
       "archive": "abuild-3.14.1-r4.apk",
@@ -902,13 +920,13 @@
       "version": "1.69.0-r0"
     },
     "openssl": {
-      "aports_commit": "9b59567ddd9ca9722deeedb5145506726b5c9389",
-      "archive": "openssl-3.3.7-r1.apk",
-      "index_checksum": "Q1LZq+pPqCx4TR0SS64He3QMjfnz4=",
+      "aports_commit": "a254386dfe34f70a05bdb8b2a3d7a5b20b6f076e",
+      "archive": "openssl-3.3.7-r2.apk",
+      "index_checksum": "Q1FHfi/twMe/79RognLMqAQvDdCF8=",
       "license": "Apache-2.0",
       "repository": "main",
-      "sha256": "675d3335229af672b7a710292973bdf6169f262529442059ca6880f31b863b7e",
-      "version": "3.3.7-r1"
+      "sha256": "a444f449e2993d6b37fd5c9d9928b4378bb33a2362c0d0084ac940f564aaeb97",
+      "version": "3.3.7-r2"
     },
     "partx": {
       "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",
@@ -974,40 +992,40 @@
       "version": "2.3.0-r0"
     },
     "pyc": {
-      "aports_commit": "1d63fc4da0e6ddeed22906b0e483e3a519810551",
-      "archive": "pyc-3.12.14-r0.apk",
-      "index_checksum": "Q1Fp3IOQHmZeDiMHt4wW/9Svo6A0A=",
+      "aports_commit": "73cda94eb86770bcf80392a179d7543ba805b0e8",
+      "archive": "pyc-3.12.15-r0.apk",
+      "index_checksum": "Q1F3wd/ZUZfYzZRwrljTG5gVxcH84=",
       "license": "PSF-2.0",
       "repository": "main",
-      "sha256": "a8dfd1599ca1a75e51bc02b8dadd56390c4bca4e42bdb63a37f4bdebab7835e4",
-      "version": "3.12.14-r0"
+      "sha256": "661667acc9b0bd37b076ebece5c9e7c55fd255b1e59fdc978186d008933d4f6a",
+      "version": "3.12.15-r0"
     },
     "python3": {
-      "aports_commit": "1d63fc4da0e6ddeed22906b0e483e3a519810551",
-      "archive": "python3-3.12.14-r0.apk",
-      "index_checksum": "Q1sk88rATKvlHmDVgO5m1waoheOyc=",
+      "aports_commit": "73cda94eb86770bcf80392a179d7543ba805b0e8",
+      "archive": "python3-3.12.15-r0.apk",
+      "index_checksum": "Q1ZpkrXVWDQvmwPUqcyhHm4VsYnQU=",
       "license": "PSF-2.0",
       "repository": "main",
-      "sha256": "fd3c107796c723259caa3ccf9c684875a77f2e57fa19a631e2d755c3cf21b0d4",
-      "version": "3.12.14-r0"
+      "sha256": "61d330a23002bd28c84062349d9c745fe90b2f0abc0ac83f4b26a70d8b4d49c7",
+      "version": "3.12.15-r0"
     },
     "python3-pyc": {
-      "aports_commit": "1d63fc4da0e6ddeed22906b0e483e3a519810551",
-      "archive": "python3-pyc-3.12.14-r0.apk",
-      "index_checksum": "Q1f0ifTIVV79Uk3w+C8AZQeNaszUw=",
+      "aports_commit": "73cda94eb86770bcf80392a179d7543ba805b0e8",
+      "archive": "python3-pyc-3.12.15-r0.apk",
+      "index_checksum": "Q1YjAEeWFzjWrtP9iwCrMwqdHga30=",
       "license": "PSF-2.0",
       "repository": "main",
-      "sha256": "1f058f0cd678f8d7865dc9492b106f6103a6afe435ff303eea7de36c2c0738ef",
-      "version": "3.12.14-r0"
+      "sha256": "a4c1957e4ac364b2bdd65f7951a9b201cd5154a6ccc91407ddb55678c03ba1a0",
+      "version": "3.12.15-r0"
     },
     "python3-pycache-pyc0": {
-      "aports_commit": "1d63fc4da0e6ddeed22906b0e483e3a519810551",
-      "archive": "python3-pycache-pyc0-3.12.14-r0.apk",
-      "index_checksum": "Q15vRJRxiFmGDNdYSoktrwWL7vAx0=",
+      "aports_commit": "73cda94eb86770bcf80392a179d7543ba805b0e8",
+      "archive": "python3-pycache-pyc0-3.12.15-r0.apk",
+      "index_checksum": "Q12bVIUu2mJU5nTf0drW05RlI77nQ=",
       "license": "PSF-2.0",
       "repository": "main",
-      "sha256": "2e8f919ef24ca2320ce13f86b0d1184d17d30b4d8e114671ea96b1822cda8d81",
-      "version": "3.12.14-r0"
+      "sha256": "5ae0774bccad92fe92b75076b3287e8486c7a8f84c6f25c13f2019bc46e238d5",
+      "version": "3.12.15-r0"
     },
     "readline": {
       "aports_commit": "7dff18068fb2ef6694db4f7bdc447755187e74ab",
@@ -1171,23 +1189,32 @@
       "sha256": "6f5303a049a23f68659205eda4840865370340905e0481ba5266c19e2f49b585",
       "version": "5.8.4-r0"
     },
-    "zlib-dev": {
-      "aports_commit": "2b38f55109add14f4f99a974c2fdf421b6b9e9e9",
-      "archive": "zlib-dev-1.3.2-r0.apk",
-      "index_checksum": "Q1ctbTKg6sZ0YPT/xVpX9I1ABISAY=",
+    "zlib": {
+      "aports_commit": "c973d294927355eac1d2a6e97d86e41fbab8ffda",
+      "archive": "zlib-1.3.2-r1.apk",
+      "index_checksum": "Q1UBcaybFIMUpU3mTAKmQBQmv6wjs=",
       "license": "Zlib",
       "repository": "main",
-      "sha256": "3569be1b98225e97a2cff5c1377553c26d2e643873186ea20117fa094a698447",
-      "version": "1.3.2-r0"
+      "sha256": "52ed3729bec11d63313f38ade503d40650bb57a36ec72a0050619391fb6bfd5e",
+      "version": "1.3.2-r1"
+    },
+    "zlib-dev": {
+      "aports_commit": "c973d294927355eac1d2a6e97d86e41fbab8ffda",
+      "archive": "zlib-dev-1.3.2-r1.apk",
+      "index_checksum": "Q1vDDGGfDMg5ozv2MQGdiwj0QeW5Q=",
+      "license": "Zlib",
+      "repository": "main",
+      "sha256": "f6cd9e9abcbf7e0b75c84d4b00f239ff790eb0a6ef7c7c01d43a35af1ba5d3a6",
+      "version": "1.3.2-r1"
     },
     "zlib-static": {
-      "aports_commit": "2b38f55109add14f4f99a974c2fdf421b6b9e9e9",
-      "archive": "zlib-static-1.3.2-r0.apk",
-      "index_checksum": "Q1yBU32V5wlfDrLgECda4RCU55GRU=",
+      "aports_commit": "c973d294927355eac1d2a6e97d86e41fbab8ffda",
+      "archive": "zlib-static-1.3.2-r1.apk",
+      "index_checksum": "Q1COcMZV1G7JSj4GUWELkXK2oUGWQ=",
       "license": "Zlib",
       "repository": "main",
-      "sha256": "25ddc9ad82e822afda4cb90cf1081e7530f38ec2c8d53dcc2898f08dae82cb88",
-      "version": "1.3.2-r0"
+      "sha256": "20dd85bd5b2fcdc714014ede97e4f18ea50c28468198332ad7305d369d55526c",
+      "version": "1.3.2-r1"
     },
     "zstd": {
       "aports_commit": "5c2ddf18f193dafdd25ae7391d96c7e30766eecd",
@@ -1309,7 +1336,7 @@
   "schema": 1,
   "linked_source_closure": {
     "file": "alpine-source.lock.json",
-    "sha256": "8a37946ce569fe1ec03123925af343b468115075bd039c98060ce97c38b1cf5c"
+    "sha256": "20a6ad921e1dc9d2b8946150d11325e0ae6d623b3345dacb7129b63eb4b7f989"
   },
   "source_date_epoch": 1782256868,
   "sources": {
