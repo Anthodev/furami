@@ -318,6 +318,9 @@ class UploadIsolationTests(unittest.TestCase):
             media, out = root / 'media', root / 'out'
             output = out / 'first/app'
             output.mkdir(parents=True)
+            (output / 'source-snapshot').mkdir()
+            (output / 'source-snapshot/Cargo.toml').write_bytes(b'fixture manifest')
+            inputs = {'Cargo.toml': hashlib.sha256(b'fixture manifest').hexdigest()}
             for name in ('bin/qmake6', 'libexec/rcc'):
                 tool = media / 'prefix' / name
                 tool.parent.mkdir(parents=True, exist_ok=True)
@@ -337,7 +340,7 @@ class UploadIsolationTests(unittest.TestCase):
             with patch.object(app.subprocess, 'run', side_effect=failed_container), \
                     contextlib.redirect_stderr(stderr), \
                     self.assertRaisesRegex(RuntimeError, 'container exited 23'):
-                app.run_build(media, output, root / 'sources', stack, 'first')
+                app.run_build(media, output, root / 'sources', stack, 'first', inputs)
             receipt = json.loads((output / 'first/evidence/container-command.json').read_text())
             self.assertEqual(receipt, {'schema': 1, 'command': commands[0]})
             self.assertIn('fixture compiler failure', stderr.getvalue())

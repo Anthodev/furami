@@ -294,7 +294,8 @@ def rust_std_closure(output, linked_archives, app_lock, cache=None):
 
 
 def input_hashes():
-    inputs = [APP_LOCK, STACK_LOCK, REPOSITORY / "Cargo.lock", REPOSITORY / "Cargo.toml",
+    inputs = [APP_LOCK, STACK_LOCK, STACK_LOCK.parent / "build-apt-closure.json",
+              REPOSITORY / "Cargo.lock", REPOSITORY / "Cargo.toml",
               REPOSITORY / "build.rs", REPOSITORY / "rust-toolchain.toml",
               REPOSITORY / "LICENSE", REPOSITORY / "assets/logo.ico", REPOSITORY / "assets/logo.png",
               REPOSITORY / "assets/logo.svg",
@@ -316,6 +317,43 @@ def snapshot_inputs(output, inputs):
         target = output / "source-snapshot" / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
+
+def verify_workspace_inputs(root: Path, inputs: dict[str, str]) -> None:
+    """Check recorded bytes without following symlinks, including parent directories."""
+    if any(path.is_symlink() for path in (root, *root.parents)) or not root.is_dir():
+        raise ValueError(f"workspace input root must be a nonsymlink directory: {root}")
+    for relative, expected in inputs.items():
+        if (not isinstance(relative, str) or not relative
+                or relative.startswith("/") or "\0" in relative
+                or any(part in ("", ".", "..") for part in relative.split("/"))):
+            raise ValueError(f"unsafe workspace input path: {relative!r}")
+        if not isinstance(expected, str) or not HEX.fullmatch(expected):
+            raise ValueError(f"invalid workspace input SHA256: {relative}")
+        path = root / relative
+        if (any(parent.is_symlink() for parent in (path, *path.parents))
+                or not path.is_file() or not path.resolve().is_relative_to(root.resolve())):
+            raise ValueError(f"workspace input must be a confined regular nonsymlink file: {relative}")
+        check_sha(path, expected, f"workspace input {relative}")
+
+
+def prepare_build_workspace(snapshot: Path, workspace: Path, inputs: dict[str, str]) -> None:
+    """Materialize only recorded source inputs in a fresh private writable tree."""
+    if workspace.exists() or any(path.is_symlink() for path in (workspace, *workspace.parents)):
+        raise ValueError(f"build workspace must be fresh without symlinks: {workspace}")
+    if (workspace.resolve().is_relative_to(snapshot.resolve())
+            or snapshot.resolve().is_relative_to(workspace.resolve())):
+        raise ValueError("build workspace and source snapshot must be separate trees")
+    verify_workspace_inputs(snapshot, inputs)
+    workspace.mkdir()
+    for relative in inputs:
+        target = workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(snapshot / relative, target)
+        if target.is_symlink() or not target.is_file():
+            raise ValueError(f"workspace copy is not a regular nonsymlink file: {relative}")
+        target.chmod(target.stat().st_mode | 0o200)
+    verify_workspace_inputs(workspace, inputs)
+
 
 
 def emit_failed_build_log(log_path):
@@ -343,9 +381,11 @@ def emit_failed_build_log(log_path):
             pass
 
 
-def run_build(media, output, cache, stack, label):
+def run_build(media, output, cache, stack, label, inputs):
     build = output / label
     build.mkdir()
+    workspace = build / "workspace"
+    prepare_build_workspace(output / "source-snapshot", workspace, inputs)
     wrapper = build / "wrappers/rcc"
     wrapper.parent.mkdir(exist_ok=True)
     epoch = stack["source_date_epoch"]
@@ -364,7 +404,7 @@ def run_build(media, output, cache, stack, label):
                      "binding": "single read-only container file bind; host provider unchanged"}}
     (evidence / "qt-build-tools.json").write_text(json.dumps(tools, indent=2, sort_keys=True) + "\n")
     command = ["podman", "run", "--rm", "--pull=always", "--platform", stack["platform"],
-               "--security-opt", "label=disable", "--volume", f"{REPOSITORY.resolve()}:/workspace:ro",
+               "--security-opt", "label=disable", "--volume", f"{workspace.resolve()}:/workspace:rw",
                "--volume", f"{media}:/out:ro", "--volume", f"{cache}:/sources:ro",
                "--volume", f"{media}:/frozen-provider:ro",
                "--volume", f"{wrapper}:/out/prefix/libexec/rcc:ro",
@@ -385,6 +425,7 @@ def run_build(media, output, cache, stack, label):
     if result.returncode:
         emit_failed_build_log(log_path)
         raise RuntimeError(f"{label} app container exited {result.returncode}; see {log_path}")
+    verify_workspace_inputs(workspace, inputs)
     binary = build / "bin/furami"
     if not binary.is_file() or not (build / "evidence/furami.link.map").is_file():
         raise ValueError(f"{label}: executable/link map missing")
@@ -431,7 +472,7 @@ def build_app(media, output, cache):
                "source_archives": {entry["archive"]: entry["sha256"] for entry in all_sources}}
     snapshot_inputs(output, before)
     receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    first = run_build(media, output, cache, stack, "first")
+    first = run_build(media, output, cache, stack, "first", before)
     if before != input_hashes() or media_before != sha256(media / "manifest.json"):
         raise ValueError("source inputs changed during build")
     for relative, expected in before.items():

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.0-rc.3] - 2026-10-17
+
+Third release candidate, prepared for local evaluation. Furami is not stable and this candidate carries no certification. Publication stays gated on the source and license clearance for every public artifact, stable or pre-release. The clean-checkout AppImage build repair is prepared locally; a successful fresh CI build remains unverified.
+
+### Fixes
+
+- Build the AppImage application from a private writable copy of the verified source snapshot instead of the read-only checkout, so CXX-Qt can generate its QML language-server configuration on clean CI checkouts without importing ignored developer files or touching the checkout ([#25](https://github.com/Anthodev/furami/issues/25), uncommitted local work).
+
 ## [0.1.0-rc.2] - 2026-10-17
 
 Second release candidate, prepared for local evaluation. Furami is not stable and this candidate carries no certification: no tag, release or remote CI run has been published, and publication stays gated on the source and license clearance for every public artifact, stable or pre-release. The primary AppImage build failure behind this candidate is still unresolved.

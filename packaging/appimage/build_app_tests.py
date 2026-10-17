@@ -19,6 +19,178 @@ app_build = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(app_build)
 
 
+class WorkspaceCopyIntegrityTests(unittest.TestCase):
+    def test_destination_copy_must_remain_regular_and_hash_matching(self):
+        for fault in ("changed", "symlink", "directory"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                snapshot = root / "snapshot"
+                snapshot.mkdir()
+                source = snapshot / "input"
+                source.write_bytes(b"recorded")
+                inputs = {"input": hashlib.sha256(b"recorded").hexdigest()}
+
+                def faulty_copy(source, target):
+                    if fault == "changed":
+                        target.write_bytes(b"corrupted copy")
+                    elif fault == "symlink":
+                        target.symlink_to(source)
+                    else:
+                        target.mkdir()
+
+                with patch.object(app_build.shutil, "copy2", side_effect=faulty_copy), \
+                        self.assertRaises(ValueError):
+                    app_build.prepare_build_workspace(snapshot, root / "workspace", inputs)
+                self.assertEqual(source.read_bytes(), b"recorded")
+
+
+class BuildWorkspaceTests(unittest.TestCase):
+    def fixture(self, root):
+        snapshot = root / "app/source-snapshot"
+        inputs = {}
+        for relative, content in {
+            "Cargo.toml": b"recorded manifest",
+            "src/main.rs": b"recorded source",
+            "packaging/media/build-apt-closure.json": b"recorded closure",
+        }.items():
+            path = snapshot / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            inputs[relative] = hashlib.sha256(content).hexdigest()
+        return snapshot, inputs
+
+    def test_clean_and_dirty_checkouts_build_only_recorded_snapshot_inputs(self):
+        for dirty in (False, True):
+            with self.subTest(dirty=dirty), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                snapshot, inputs = self.fixture(root)
+                checkout = root / "checkout"
+                checkout.mkdir()
+                if dirty:
+                    for relative in (".qmlls.ini", ".cargo/config.toml", "unrelated"):
+                        path = checkout / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("private developer artifact")
+                (snapshot / "unrecorded").write_text("not an input either")
+                media = root / "media"
+                for relative in ("bin/qmake6", "libexec/rcc"):
+                    path = media / "prefix" / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"tool")
+                stack = json.loads(app_build.STACK_LOCK.read_text())
+                workspace = root / "app/first/workspace"
+                checkout_before = {str(p.relative_to(checkout)): p.read_bytes()
+                                   for p in checkout.rglob("*") if p.is_file()}
+
+                def build(command, **kwargs):
+                    files = {p.relative_to(workspace).as_posix()
+                             for p in workspace.rglob("*") if p.is_file()}
+                    self.assertEqual(files, set(inputs))
+                    self.assertIn(f"{workspace}:/workspace:rw", command)
+                    self.assertNotIn(f"{checkout}:/workspace:ro", command)
+                    self.assertNotIn(f"{checkout}:/workspace:rw", command)
+                    for mount in (f"{media}:/out:ro", f"{media}:/frozen-provider:ro",
+                                  f"{root / 'sources'}:/sources:ro",
+                                  f"{root / 'app/first'}:/build",
+                                  f"{root / 'app/first/wrappers/rcc'}:/out/prefix/libexec/rcc:ro"):
+                        self.assertIn(mount, command)
+                    self.assertEqual(command[command.index("--workdir") + 1], "/workspace")
+                    (workspace / ".qmlls.ini").write_text(
+                        '[General]\nbuildDir="/build/target/qml_modules"\nno-cmake-calls=true\n')
+                    binary = root / "app/first/bin/furami"
+                    binary.parent.mkdir()
+                    binary.write_bytes(b"fixture executable")
+                    (root / "app/first/evidence/furami.link.map").write_text("map")
+                    return SimpleNamespace(returncode=0)
+
+                with patch.object(app_build, "REPOSITORY", checkout), \
+                        patch.object(app_build.subprocess, "run", side_effect=build):
+                    binary = app_build.run_build(
+                        media, root / "app", root / "sources", stack, "first", inputs)
+                self.assertEqual(binary.read_bytes(), b"fixture executable")
+                self.assertTrue((workspace / ".qmlls.ini").read_text())
+                self.assertFalse((snapshot / ".qmlls.ini").exists())
+                self.assertEqual(checkout_before, {
+                    str(p.relative_to(checkout)): p.read_bytes()
+                    for p in checkout.rglob("*") if p.is_file()})
+                for relative, expected in inputs.items():
+                    self.assertEqual(app_build.sha256(snapshot / relative), expected)
+
+    def test_bad_snapshot_inputs_fail_before_child(self):
+        for fault in ("missing", "changed", "file-symlink", "parent-symlink", "directory",
+                      "bad-hash", "absolute", "dot", "dot-part", "parent", "empty"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                snapshot, inputs = self.fixture(root)
+                path = snapshot / "src/main.rs"
+                if fault == "missing":
+                    path.unlink()
+                elif fault == "changed":
+                    path.write_bytes(b"changed")
+                elif fault == "file-symlink":
+                    path.unlink()
+                    path.symlink_to(snapshot / "Cargo.toml")
+                elif fault == "parent-symlink":
+                    path.unlink()
+                    path.parent.rmdir()
+                    path.parent.symlink_to(root, target_is_directory=True)
+                elif fault == "directory":
+                    path.unlink()
+                    path.mkdir()
+                elif fault == "bad-hash":
+                    inputs["src/main.rs"] = "not a digest"
+                else:
+                    relative = {"absolute": "/outside", "dot": ".", "dot-part": "src/./main.rs",
+                                "parent": "../outside", "empty": ""}[fault]
+                    inputs[relative] = "0" * 64
+                with patch.object(app_build.subprocess, "run") as child, \
+                        self.assertRaises(ValueError):
+                    app_build.run_build(root / "media", root / "app", root / "sources",
+                                        {}, "first", inputs)
+                child.assert_not_called()
+
+    def test_workspace_requires_fresh_nonsymlink_destination(self):
+        for fault in ("existing", "symlink", "parent-symlink"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                snapshot, inputs = self.fixture(root)
+                workspace = root / "build/workspace"
+                workspace.parent.mkdir()
+                if fault == "existing":
+                    workspace.mkdir()
+                elif fault == "symlink":
+                    workspace.symlink_to(root / "missing")
+                else:
+                    workspace.parent.rmdir()
+                    workspace.parent.symlink_to(snapshot, target_is_directory=True)
+                with self.assertRaises(ValueError):
+                    app_build.prepare_build_workspace(snapshot, workspace, inputs)
+
+    def test_successful_child_cannot_mutate_recorded_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot, inputs = self.fixture(root)
+            media = root / "media"
+            for relative in ("bin/qmake6", "libexec/rcc"):
+                path = media / "prefix" / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"tool")
+
+            def mutate(command, **kwargs):
+                (root / "app/first/workspace/src/main.rs").write_bytes(b"changed by child")
+                return SimpleNamespace(returncode=0)
+
+            with patch.object(app_build.subprocess, "run", side_effect=mutate), \
+                    self.assertRaisesRegex(ValueError, "workspace.*SHA256"):
+                app_build.run_build(media, root / "app", root / "sources",
+                                    json.loads(app_build.STACK_LOCK.read_text()), "first", inputs)
+
+    def test_input_allowlist_includes_locked_apt_closure(self):
+        inputs = app_build.input_hashes()
+        self.assertEqual(inputs["packaging/media/build-apt-closure.json"],
+                         app_build.sha256(app_build.STACK_LOCK.parent / "build-apt-closure.json"))
+
+
 class AppBuildContractTests(unittest.TestCase):
     def test_failed_build_tail_refuses_symlinked_log_or_parent(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -64,6 +236,9 @@ class AppBuildContractTests(unittest.TestCase):
             root = Path(temporary)
             media, output = root / "media", root / "app"
             output.mkdir()
+            (output / "source-snapshot").mkdir()
+            (output / "source-snapshot/Cargo.toml").write_bytes(b"fixture")
+            inputs = {"Cargo.toml": hashlib.sha256(b"fixture").hexdigest()}
             for name in ("bin/qmake6", "libexec/rcc"):
                 tool = media / "prefix" / name
                 tool.parent.mkdir(parents=True, exist_ok=True)
@@ -81,7 +256,7 @@ class AppBuildContractTests(unittest.TestCase):
             with patch.object(app_build.subprocess, "run", side_effect=fail), \
                     contextlib.redirect_stderr(ClosedStderr()), \
                     self.assertRaisesRegex(RuntimeError, "container exited 37"):
-                app_build.run_build(media, output, root / "sources", stack, "first")
+                app_build.run_build(media, output, root / "sources", stack, "first", inputs)
 
     def test_changed_prefix_artifact_is_rejected_before_build(self):
         with tempfile.TemporaryDirectory() as directory:
