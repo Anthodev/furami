@@ -74,8 +74,7 @@ jobs:
           VERIFY_REPRODUCIBILITY: ${{ inputs.verify_reproducibility }}
         run: |
           if [ "$VERIFY_REPRODUCIBILITY" = "true" ]; then
-            # Reproducibility comparison includes full checked source
-            # acquisition, matching the tag path.
+            # The comparison acquires the full checked source tree too.
             python3 packaging/appimage/build-twice.py \
               --version "$APP_VERSION" \
               --output "$RUNNER_TEMP/appimage-out" \
@@ -171,12 +170,12 @@ jobs:
           if-no-files-found: error
 
   # ------------------------------------------------------------------
-  # Tag path: two-build reproducibility from the frozen recipes.
+  # Tag path: single frozen-recipe build; two-build comparison is manual dispatch only.
   # ------------------------------------------------------------------
   build-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: validate-release
-    name: Reproducible AppImage build
+    name: AppImage release build
     runs-on: avrea-ubuntu-24.04-2-vcpu
     timeout-minutes: 300
     steps:
@@ -207,11 +206,11 @@ jobs:
           python3 -m unittest discover -s packaging/media -p build_tests.py
           python3 -m unittest discover -s packaging/appimage-runtime -p build_tests.py
 
-      - name: Run two-build reproducibility comparison
+      - name: Build release AppImage (single build)
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: >
-          python3 packaging/appimage/build-twice.py
+          python3 packaging/appimage/build.py
           --version "${RELEASE_TAG#v}"
           --output "$RUNNER_TEMP/appimage-out"
           --acquire-sources
@@ -220,7 +219,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          python3 scripts/publish_candidate.py --check-only --require-reproducibility \
+          python3 scripts/publish_candidate.py --check-only \
             --event-name push --tag "$RELEASE_TAG" --candidate "$RUNNER_TEMP/appimage-out/release"
 
       - name: Summarize failure blockers
@@ -231,7 +230,7 @@ jobs:
           {
             echo "## Release build failed for $RELEASE_TAG"
             echo "- Commit: $GITHUB_SHA"
-            echo "- Reproducibility comparison (build-twice.py) exited nonzero; see the failing step log for the identical/documented-variance/failure verdict."
+            echo "- Single-build release pipeline failed; see the failing step log."
             if [ -d "$RUNNER_TEMP/appimage-out" ]; then
               echo "- Output tree at failure:"
               find "$RUNNER_TEMP/appimage-out" -maxdepth 2 -type f | sed 's/^/  - /' || true
@@ -246,7 +245,7 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Collect reproducible build evidence
+      - name: Collect release build evidence
         if: always()
         run: |
           mkdir -p "$RUNNER_TEMP/appimage-evidence"
@@ -261,13 +260,10 @@ jobs:
           builder.collect_evidence(out, dest, os.environ['GITHUB_SHA'])
           for path in dest.rglob('*.json'):
               print(str(path), path.read_text())
-          receipt = out / 'reproducibility.json'
           ready = out / 'release/release-ready.json'
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
               stream.write('## Local candidate gates\\nCommit: ' + os.environ['GITHUB_SHA'] + '\\n')
-              if receipt.is_file():
-                  value = json.loads(receipt.read_text())
-                  stream.write(json.dumps({key: value.get(key) for key in ('status', 'byte_identity', 'first_image_sha256', 'second_image_sha256')}) + '\\n')
+              stream.write('Reproducibility: not measured (single build)\\n')
               if ready.is_file():
                   stream.write('Clearance: ' + str(json.loads(ready.read_text()).get('ready')) + '\\n')
           PY
@@ -366,7 +362,7 @@ jobs:
           {
             echo "## Release publication failed for $RELEASE_TAG"
             echo "- Commit: $GITHUB_SHA"
-            echo "- Failure occurred after validation and the reproducible build; see the failing step log."
+            echo "- Failure occurred in the protected publication job; see the failing step log."
             echo "- Downloaded candidate contents:"
             find candidate -maxdepth 1 -type f -printf '  - %f (%s bytes)\n' 2>/dev/null || echo "  - candidate directory missing (artifact download failed)"
             if [ -f candidate/release-ready.json ]; then

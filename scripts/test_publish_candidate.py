@@ -207,7 +207,7 @@ class CandidateTests(unittest.TestCase):
         mutations = ('manual', 'wrong-tag', 'malformed-tag', 'lock', 'duplicate-lock',
                     'notes-missing', 'notes-empty', 'old-only', 'mixed-names', 'no-v', 'empty-image',
                      'image', 'extra', 'symlink', 'directory', 'false', 'integer',
-                     'readiness-hash', 'receipt-image', 'receipt-source', 'missing-receipt',
+                     'readiness-hash', 'receipt-image', 'receipt-source',
                      'receipt-status', 'receipt-criteria', 'checksum-path', 'checksum-duplicate',
                      'checksum-coverage', 'public-source')
         for version in ('0.1.0', '0.1.0-rc.1'):
@@ -257,9 +257,6 @@ class CandidateTests(unittest.TestCase):
                         (root / 'link').symlink_to('audit.json')
                     elif mutation == 'directory':
                         (root / 'directory').mkdir()
-                    elif mutation == 'missing-receipt':
-                        (root / 'reproducibility.json').unlink()
-                        sums(root)
                     elif mutation.startswith('checksum'):
                         path = root / 'SHA256SUMS'
                         lines = path.read_text().splitlines(keepends=True)
@@ -305,6 +302,29 @@ class CandidateTests(unittest.TestCase):
                     if mutation in ('old-only', 'mixed-names', 'no-v'):
                         self.assertIn('unexpected public candidate asset', result.stderr)
                     self.assertFalse(capture.exists(), result.stderr)
+
+    def test_explicit_reproducibility_requirement_refuses_unmeasured_candidate(self):
+        for version in ('0.1.0', '0.1.0-rc.1'):
+            for publication in (False, True):
+                with self.subTest(version=version, publication=publication), tempfile.TemporaryDirectory() as temporary:
+                    parent = Path(temporary)
+                    self.configure_version(version)
+                    root = parent / 'candidate'
+                    fixture(root, version=version)
+                    (root / 'reproducibility.json').unlink()
+                    sums(root)
+                    notes = parent / 'notes'
+                    notes.write_text('Release notes\n')
+                    env, capture = self.fake_gh(parent)
+                    before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()}
+                    extra = ('--require-reproducibility',) if publication else (
+                        '--check-only', '--require-reproducibility')
+                    result = self.run_cli(root, notes, env, tag='v' + version, extra=extra)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn('reproducibility receipt required', result.stderr)
+                    self.assertFalse(capture.exists(), result.stderr)
+                    self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns)
+                                              for p in root.iterdir()})
 
     def test_public_scope_refuses_private_bytes_and_missing_actual_linked_sources(self):
         for mutation in ('apk', 'renamed-apk', 'unknown-apk', 'base-image', 'base-layer', 'flat-apk',
@@ -621,12 +641,16 @@ class CandidateTests(unittest.TestCase):
 
     def test_publication_cli_uses_tagged_notes_channel_and_exact_public_assets(self):
         for version in ('0.1.0', '0.1.0-rc.1'):
-            for variance in (False, True):
-                with self.subTest(version=version, variance=variance), tempfile.TemporaryDirectory() as temporary:
+            for mode in ('absent', 'identical', 'documented_metadata_variance'):
+                variance = mode == 'documented_metadata_variance'
+                with self.subTest(version=version, mode=mode), tempfile.TemporaryDirectory() as temporary:
                     parent = Path(temporary)
                     self.configure_version(version)
                     root = parent / 'candidate'
                     fixture(root, variance, version=version)
+                    if mode == 'absent':
+                        (root / 'reproducibility.json').unlink()
+                        sums(root)
                     git_root = parent / 'tagged'
                     git_root.mkdir()
                     git_env = {**os.environ, 'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.invalid',
@@ -687,7 +711,10 @@ class CandidateTests(unittest.TestCase):
                     self.assertEqual((uploaded / image).read_bytes(), (root / image).read_bytes())
                     self.assertEqual((uploaded / 'manifest.json').read_bytes(), (root / 'manifest.json').read_bytes())
                     seen = inspect_materials_tar(uploaded / bundle)
-                    self.assertEqual(set(seen), retained_material_names())
+                    expected_members = retained_material_names()
+                    if mode == 'absent':
+                        expected_members -= {'reproducibility.json'}
+                    self.assertEqual(set(seen), expected_members)
                     self.assertFalse(any(name.startswith('source-materials-') for name in seen))
                     self.assertFalse({image, 'manifest.json'} & set(seen))
                     self.assertNotEqual(set(seen), {p.name for p in root.iterdir()})
@@ -703,8 +730,9 @@ class CandidateTests(unittest.TestCase):
                     self.assertEqual(list(temporary.iterdir()), [])
                     self.assertTrue((root / image).is_file())
                     self.assertTrue((root / 'manifest.json').is_file())
+                    strict = ('--check-only',) if mode == 'absent' else ('--check-only', '--require-reproducibility')
                     verified = self.run_cli(root, parent / 'absent-notes', {**env, 'PATH': ''}, tag=tag,
-                                            extra=('--check-only', '--require-reproducibility'))
+                                            extra=strict)
                     self.assertEqual(verified.returncode, 0, verified.stderr)
 
     def test_failed_existing_release_is_not_retried_replaced_or_edited(self):
@@ -738,20 +766,25 @@ class CandidateTests(unittest.TestCase):
 
     def test_prepare_public_assets_exports_deterministic_contract_bundle(self):
         for version in ('0.1.0', '0.1.0-rc.1'):
-            for variance in (False, True):
-                with self.subTest(version=version, variance=variance), tempfile.TemporaryDirectory() as temporary:
+            for mode in ('absent', 'identical', 'documented_metadata_variance'):
+                variance = mode == 'documented_metadata_variance'
+                with self.subTest(version=version, mode=mode), tempfile.TemporaryDirectory() as temporary:
                     self.configure_version(version)
                     root = Path(temporary)
                     observations = []
                     for offset, mtime in enumerate((1_000_000_000, 2_000_000_000)):
                         candidate = root / f'candidate-{offset}'
                         fixture(candidate, variance, version=version)
+                        if mode == 'absent':
+                            (candidate / 'reproducibility.json').unlink()
+                            sums(candidate)
                         for path in candidate.iterdir():
                             os.utime(path, (mtime, mtime))
                         before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in candidate.iterdir()}
                         output = root / f'output-{offset}'
                         output.mkdir()
-                        verified = publisher.verify_candidate(candidate, version, require_reproducibility=True)
+                        verified = publisher.verify_candidate(candidate, version,
+                                                              require_reproducibility=(mode != 'absent'))
                         returned = publisher.prepare_public_assets(verified, version, output)
                         image = f'Furami-v{version}-Linux-x64.AppImage'
                         bundle = f'Furami-v{version}-Linux-x64-materials.tar'
@@ -769,7 +802,10 @@ class CandidateTests(unittest.TestCase):
                         for name, value in sums_map.items():
                             self.assertEqual(publisher.digest(by_name[name]), value, name)
                         seen = inspect_materials_tar(output / bundle)
-                        self.assertEqual(set(seen), retained_material_names())
+                        expected_members = retained_material_names()
+                        if mode == 'absent':
+                            expected_members -= {'reproducibility.json'}
+                        self.assertEqual(set(seen), expected_members)
                         self.assertFalse(any(name.startswith('source-materials-') for name in seen))
                         self.assertFalse({image, 'manifest.json'} & set(seen))
                         for name, data in seen.items():
@@ -867,7 +903,8 @@ class CandidateTests(unittest.TestCase):
                     patch.dict(os.environ, env, clear=True):
                 with self.assertRaisesRegex(publisher.CandidatePublicationError, 'must be under 2 GiB'):
                     publisher.publish_candidate(tag='v0.1.0-rc.1', version='0.1.0-rc.1', event_name='push',
-                                                repository='owner/repo', notes=notes, candidate=root)
+                                                repository='owner/repo', notes=notes, candidate=root,
+                                                require_reproducibility=True)
             self.assertFalse(capture.exists())
             self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()})
             self.assertEqual(list(Path(env['TMPDIR']).iterdir()), [])

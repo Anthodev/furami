@@ -219,9 +219,9 @@ def release_channel(tag: str, version: str, event_name: str) -> str:
 
 
 def publish_candidate(*, tag: str, version: str, event_name: str, repository: str,
-                      notes: Path, candidate: Path) -> None:
+                      require_reproducibility: bool, notes: Path, candidate: Path) -> None:
     channel = release_channel(tag, version, event_name)
-    assets = verify_candidate(candidate, version, require_reproducibility=True)
+    assets = verify_candidate(candidate, version, require_reproducibility=require_reproducibility)
     if not notes.is_file() or not notes.read_text().strip():
         raise CandidatePublicationError('nonempty release notes required')
     channel_flags = ['--prerelease', '--latest=false'] if channel == 'prerelease' else ['--latest=true']
@@ -256,7 +256,8 @@ def main(argv: list[str] | None = None) -> int:
             if not args.repository or args.notes is None:
                 raise CandidatePublicationError('--repository and --notes required for publication')
             publish_candidate(tag=args.tag, version=version, event_name=args.event_name,
-                              repository=args.repository, notes=args.notes, candidate=args.candidate)
+                              repository=args.repository, notes=args.notes, candidate=args.candidate,
+                              require_reproducibility=args.require_reproducibility)
         return 0
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print('candidate refused: ' + str(error), file=sys.stderr)
