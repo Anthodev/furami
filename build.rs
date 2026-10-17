@@ -23,6 +23,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=QMAKE");
     println!("cargo:rerun-if-env-changed=FURAMI_MEDIA_PREFIX");
     println!("cargo:rerun-if-changed=packaging/media/stack.lock.json");
+    println!("cargo:rerun-if-changed=assets/logo.svg");
 
     let lock: serde_json::Value =
         serde_json::from_str(include_str!("packaging/media/stack.lock.json"))
@@ -111,6 +112,10 @@ fn main() {
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
     resources.sort();
+    // The Furami brand mark is embedded as the scalable SVG and set as the
+    // application window icon; the preflighted Qt SVG icon engine rasterizes it
+    // into the standard icon sizes, so no raster copy is pushed per window.
+    resources.push("assets/logo.svg".to_owned());
 
     let builder = CxxQtBuilder::new_qml_module(qml_module)
         .qrc_resources(QResources::new().resource(QResource::new().files(resources)))

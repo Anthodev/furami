@@ -4,6 +4,7 @@
 pub mod controller;
 mod ffi;
 pub(crate) mod gate;
+pub mod qualification;
 pub mod render_catalog;
 pub mod session;
 

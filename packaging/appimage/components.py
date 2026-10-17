@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import re
+import hashlib
 
 
 def registry(providers, owners, qt, static, digest):
@@ -9,6 +10,25 @@ def registry(providers, owners, qt, static, digest):
     app = json.loads((providers['app'] / 'manifest.json').read_text())
     runtime = json.loads((providers['runtime'] / 'manifest.json').read_text())
     ubuntu = json.loads((providers['stage'] / 'ubuntu-sources.json').read_text())
+    if ubuntu['packages']:
+        terms_path = Path(__file__).with_name('ubuntu-terms.lock.json')
+        terms = json.loads(terms_path.read_text())
+        actual_identities = {row['binary_package'] + '@' + row['binary_version'] for row in ubuntu['packages']}
+        if (actual_identities != set(terms['packages']) or len(actual_identities) != len(ubuntu['packages']) or
+                ubuntu.get('terms_lock_sha256') != hashlib.sha256(terms_path.read_bytes()).hexdigest()):
+            raise ValueError('Ubuntu component terms lock/set mismatch')
+        for row in ubuntu['packages']:
+            pinned = terms['packages'][row['binary_package'] + '@' + row['binary_version']]
+            refs = re.findall(r'LicenseRef-[A-Za-z0-9.-]+', pinned['license_expression'])
+            pinned_texts = {**terms['custom_license_texts'], **pinned.get('custom_license_texts', {})}
+            if row.get('custom_license_texts') != {name: pinned_texts[name] for name in refs}:
+                raise ValueError('Ubuntu component custom license texts changed')
+            if (row['source_package'] != pinned['source_package']['name'] or
+                    row['source_version'] != pinned['source_package']['version'] or
+                    any(row.get(key) != pinned[key] for key in
+                        ('notice', 'license_expression', 'license_exception', 'source_required', 'shipped_objects')) or
+                    row.get('terms_selection_resolved') is not True):
+                raise ValueError('Ubuntu component pinned terms correspondence mismatch')
     package_components = {}
     external_notices = []
 
@@ -40,12 +60,17 @@ def registry(providers, owners, qt, static, digest):
         if notice.is_symlink() or digest(notice) != record['notice']['sha256']:
             raise ValueError(f'Ubuntu component notice changed: {record["binary_package"]}')
         identifier = add('ubuntu:' + record['binary_package'] + '@' + record['binary_version'],
-                         record['applicable_license_labels'] or None,
+                         record['license_expression'],
                          {'notice_sha256': record['notice']['sha256'], 'notice': record['notice']['path'],
-                          'kind': 'original Debian copyright labels, not inferred SPDX',
+                          'kind': 'pinned FUR-025 terms validated against original Debian evidence',
+                          'custom_license_texts': record['custom_license_texts'],
+                          'custom_license_evidence': record.get('custom_license_evidence', {}),
+                          'expression_basis': record['expression_basis'],
+                          'terms_lock_sha256': ubuntu['terms_lock_sha256'],
                           'sections': record['license_sections']}, source_refs=record['files'],
                          source_required=record['source_required'], source_package=record['source_package'],
                          version=record['source_version'])
+        components[identifier]['license_exception'] = record.get('license_exception')
         components[identifier]['terms_selection_resolved'] = record['terms_selection_resolved']
         package_components[record['binary_package']] = identifier
         external_notices.append(notice)
@@ -68,6 +93,9 @@ def registry(providers, owners, qt, static, digest):
                 identifier = add(identifier, item.get('license_expression'), item['evidence'],
                                  file_spdx_id=item.get('file_spdx_id'), source_component_id=base,
                                  role=item.get('role', 'runtime-file'))
+                if item.get('terms_rule'):
+                    components[identifier].update({key: item[key] for key in
+                                                   ('terms_rule', 'terms_basis', 'module_license_expression')})
                 identifiers.append(identifier)
             if 'libplacebo' in identifiers:
                 identifiers += static_components
@@ -142,6 +170,10 @@ def registry(providers, owners, qt, static, digest):
         # Published Qt public module alternatives permit LGPLv3 selection without
         # selecting Qt Commercial or GPLv2-only. No custom terms are invented.
         selected = 'LGPL-3.0-only' if isinstance(expression, str) and 'LGPL-3.0-only' in expression.split(' OR ') else expression
+        if record.get('terms_rule') == 'qt-qml-metadata-inherits-module-terms':
+            module_expression = record.get('module_license_expression')
+            selected = ('LGPL-3.0-only' if isinstance(module_expression, str) and
+                        'LGPL-3.0-only' in module_expression.split(' OR ') else None)
         custom = re.findall(r'LicenseRef-[A-Za-z0-9.-]+', selected or '') if isinstance(selected, str) else []
         evidence = record['license_evidence']
         available_custom = evidence.get('custom_license_texts', {}) if isinstance(evidence, dict) else {}

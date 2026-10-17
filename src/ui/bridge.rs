@@ -14,6 +14,17 @@ pub(crate) mod ffi {
     struct LaunchResult {
         exit_code: i32,
         diagnostic: String,
+        failure_kind: NativeFailureKind,
+        safe_detail: String,
+    }
+    #[derive(Debug)]
+    enum NativeFailureKind {
+        NoFailure,
+        Generic,
+        QtPluginMissing,
+        QtPluginInvalid,
+        QtPluginLoad,
+        Qualification,
     }
     #[derive(Debug)]
     enum GatePhase {
@@ -66,6 +77,7 @@ pub(crate) mod ffi {
         create_native: bool,
         release_native: bool,
         quit: bool,
+        terminal_failure: bool,
         settings_status: String,
         settings_path: String,
         settings_refused: bool,
@@ -92,7 +104,9 @@ pub(crate) mod ffi {
         fn run_qt_application(
             gate: Box<RuntimeCoordinator>,
             display: &str,
+            media_prefix: &str,
             qualification_stdin: bool,
+            qualification_video: bool,
         ) -> LaunchResult;
     }
     extern "Rust" {
@@ -314,6 +328,7 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
             create_native: update.create_native,
             release_native: update.release_native,
             quit: update.quit,
+            terminal_failure: update.terminal_failure,
             settings_status: update.settings_status,
             settings_path: update.settings_path,
             settings_refused: update.settings_refused,

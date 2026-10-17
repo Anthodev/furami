@@ -14,6 +14,26 @@ use crate::media::{
     render_catalog::{NativeRendererValue, native_name},
 };
 
+pub(super) fn install_renderer_settings(
+    handle: &Handle,
+    renderer: &crate::media::render_catalog::CompiledRendererSettings,
+) -> Result<(), MediaError> {
+    for &(property, value) in renderer.native() {
+        handle
+            .renderer_value(None, property, value)
+            .map_err(|error| {
+                MediaError::new(
+                    "renderer_option",
+                    format!(
+                        "{}: mpv error={error}",
+                        native_name(property).to_string_lossy()
+                    ),
+                )
+            })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
     Snapshot,
@@ -318,26 +338,20 @@ impl MpvBackend {
         Ok(self.handle()?.renderer_value(Some(id), property, value))
     }
     pub(super) fn install_renderer(&self, handle: &Handle) -> Result<(), MediaError> {
-        let Some((_, treatments)) = &self.initial_treatments else {
-            return Err(MediaError::new(
-                "treatment_options",
-                "missing prepared initial treatments",
-            ));
+        let renderer = match &self.input {
+            BackendInput::QualificationVideo { renderer, .. } => renderer,
+            BackendInput::Capture(_) => {
+                &self
+                    .initial_treatments
+                    .as_ref()
+                    .ok_or_else(|| {
+                        MediaError::new("treatment_options", "missing prepared initial treatments")
+                    })?
+                    .1
+                    .renderer
+            }
         };
-        for &(property, value) in treatments.renderer.native() {
-            handle
-                .renderer_value(None, property, value)
-                .map_err(|error| {
-                    MediaError::new(
-                        "renderer_option",
-                        format!(
-                            "{}: mpv error={error}",
-                            native_name(property).to_string_lossy()
-                        ),
-                    )
-                })?;
-        }
-        Ok(())
+        install_renderer_settings(handle, renderer)
     }
 
     pub(super) fn begin_treatment(

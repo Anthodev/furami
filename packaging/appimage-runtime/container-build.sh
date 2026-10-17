@@ -8,9 +8,7 @@ case "$JOBS" in 1|2|3|4) ;; *) echo 'build jobs must be 1..4' >&2; exit 1 ;; esa
 # The image database is pinned separately from the fetched APK closure. Alpine
 # verifies signatures on both indexes and packages; --no-network also prevents
 # build-system scripts from silently fetching anything.
-echo "$BASE_APK_DB_SHA256  /lib/apk/db/installed" | sha256sum -c -
-apk --no-network --repositories-file /sources/indexes/repositories update
-apk --no-network --repositories-file /sources/indexes/repositories add --no-cache /sources/apks/*.apk
+sh /recipe/provision.sh "$@"
 apk info -v | sort > /out/apk-installed.txt
 clang --version > /out/clang-version.txt
 ld --version | sed -n '1p' > /out/ld-version.txt

@@ -14,9 +14,10 @@ Item {
     // root | settings | capture | audio | renderer | prefs
     property string section: "root"
     property bool editorActive: false
-    Component.onCompleted: menu.section = Chrome.menuInitialSection
+    Component.onCompleted: menu.section = Projection.view.session_kind === "qualification-video" ? "root" : Chrome.menuInitialSection
 
     readonly property var profile: Projection.view
+    readonly property bool qualificationVideo: menu.profile.session_kind === "qualification-video"
     readonly property bool settingsSection: section !== "root" && section !== "settings"
     // The Options menu runs 20% wider than the shared settings baseline. This
     // seam is menu-only: the standalone settings views and the source/output
@@ -67,7 +68,7 @@ Item {
             BrumeLabel {
                 objectName: "menuTitle"
                 Layout.fillWidth: true
-                text: menu.section === "root" ? "Capture"
+                text: menu.qualificationVideo ? "Vidéo de qualification" : menu.section === "root" ? "Capture"
                     : menu.section === "settings" ? "Réglages"
                     : menu.section === "capture" ? "Capture — format"
                     : menu.section === "audio" ? "Audio"
@@ -108,6 +109,7 @@ Item {
             BrumeButton {
                 objectName: "menuRestart"
                 Layout.fillWidth: true
+                visible: !menu.qualificationVideo
                 icon.source: Brume.icon("refresh")
                 label: "Redémarrer la capture"
                 enabled: menu.profile.canRestart
@@ -144,6 +146,7 @@ Item {
             BrumeButton {
                 objectName: "menuSettings"
                 Layout.fillWidth: true
+                visible: !menu.qualificationVideo
                 icon.source: Brume.icon("settings")
                 label: "Réglages"
                 Accessible.name: label
@@ -157,7 +160,7 @@ Item {
                 // when shown, the action is available with no capture and
                 // with an unavailable sink; only an in-flight preparation or
                 // the application close disables it.
-                visible: Projection.ready && Projection.bridge
+                visible: !menu.qualificationVideo && Projection.ready && Projection.bridge
                     && Projection.bridge.loggingEnabledPreference
                 enabled: !menu.profile.closing
                     && menu.profile.diagnostics.folderState !== "Preparing"
@@ -169,7 +172,7 @@ Item {
                 objectName: "menuCloseCapture"
                 Layout.fillWidth: true
                 icon.source: Brume.icon("x")
-                label: "Fermer la capture"
+                label: menu.qualificationVideo ? "Fermer la qualification" : "Fermer la capture"
                 enabled: !menu.profile.closing
                 Accessible.name: label
                 onClicked: if (Projection.bridge)

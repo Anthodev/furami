@@ -140,13 +140,49 @@ pub(crate) struct PauseObservation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ReadinessFacts {
+    Capture(SessionFacts),
+    QualificationVideo(ObservedFacts),
+}
+impl ReadinessFacts {
+    pub(crate) fn capture(&self) -> Option<&SessionFacts> {
+        match self {
+            Self::Capture(facts) => Some(facts),
+            Self::QualificationVideo(_) => None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn capture_mut(&mut self) -> Option<&mut SessionFacts> {
+        match self {
+            Self::Capture(facts) => Some(facts),
+            Self::QualificationVideo(_) => None,
+        }
+    }
+}
+
+enum OwnerInput {
+    Capture(RequestedFacts),
+    QualificationVideo(crate::domain::capture::FrameSize),
+    #[cfg(test)]
+    Unspecified,
+}
+impl OwnerInput {
+    fn capture(&self) -> Option<&RequestedFacts> {
+        match self {
+            Self::Capture(facts) => Some(facts),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Snapshot {
     pub generation: Generation,
     pub initialized: bool,
     pub file_loaded: bool,
     pub playback_started: bool,
-    pub session: Option<SessionFacts>,
+    pub session: Option<ReadinessFacts>,
     pub pause: Option<PauseObservation>,
+    pub pause_pending: bool,
     pub stream_ended: Option<(i32, i32)>,
     pub failure: Option<MediaError>,
     pub audio: AudioAvailability,
@@ -466,7 +502,56 @@ impl OwnerEndpoint {
                     latest,
                     snapshot,
                     0,
-                    Some(&requested),
+                    &OwnerInput::Capture(requested),
+                )
+            },
+        )
+    }
+
+    pub(crate) fn spawn_qualification(
+        generation: Generation,
+        prefix: String,
+        video: super::qualification::QualificationVideo,
+        renderer: super::render_catalog::CompiledRendererSettings,
+    ) -> Result<Self, MediaError> {
+        let expected = video.size();
+        Self::spawn_task(
+            generation,
+            move |surface, commands, gain, stop, latest, snapshot| {
+                run_backend(
+                    super::ffi::MpvBackend::for_qualification(prefix, video, renderer),
+                    surface,
+                    commands,
+                    gain,
+                    stop,
+                    latest,
+                    snapshot,
+                    0,
+                    &OwnerInput::QualificationVideo(expected),
+                )
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_qualification_with_backend<B: OwnerBackend + Send + 'static>(
+        generation: Generation,
+        expected: crate::domain::capture::FrameSize,
+        backend: B,
+    ) -> Result<Self, MediaError> {
+        Self::spawn_task(
+            generation,
+            move |surface, commands, gain, stop, latest, snapshot| {
+                run_backend(
+                    backend,
+                    surface,
+                    commands,
+                    gain,
+                    stop,
+                    latest,
+                    snapshot,
+                    0,
+                    &OwnerInput::QualificationVideo(expected),
                 )
             },
         )
@@ -507,7 +592,7 @@ impl OwnerEndpoint {
                     latest,
                     snapshot,
                     0,
-                    Some(&requested),
+                    &OwnerInput::Capture(requested),
                 )
             },
         )
@@ -550,7 +635,7 @@ impl OwnerEndpoint {
                     latest,
                     snapshot,
                     0,
-                    Some(&requested),
+                    &OwnerInput::Capture(requested),
                 )
             },
         )
@@ -578,7 +663,7 @@ impl OwnerEndpoint {
                     latest,
                     snapshot,
                     request_seed,
-                    None,
+                    &OwnerInput::Unspecified,
                 )
             },
         )
@@ -616,6 +701,7 @@ impl OwnerEndpoint {
                     playback_started: false,
                     session: None,
                     pause: None,
+                    pause_pending: false,
                     stream_ended: None,
                     failure: None,
                     audio: AudioAvailability::Disabled,
@@ -887,7 +973,7 @@ fn run_backend<B: OwnerBackend>(
     latest: &Mutex<Option<Snapshot>>,
     snapshot: &mut Snapshot,
     request_seed: u64,
-    requested: Option<&RequestedFacts>,
+    input: &OwnerInput,
 ) -> Result<(), MediaError> {
     let mut backend = BackendLifetime(Some(backend));
     let mut outcome = match backend.0.as_mut() {
@@ -900,11 +986,11 @@ fn run_backend<B: OwnerBackend>(
             latest,
             snapshot,
             request_seed,
-            requested,
+            input,
         ),
         None => Err(MediaError::new("owner_backend", "owner backend absent")),
     }
-    .map_err(|error| match requested {
+    .map_err(|error| match input.capture() {
         Some(requested) if error.session.is_none() && error.code != "cancelled" => {
             MediaError::from_session(SessionError::backend(
                 requested.clone(),
@@ -951,7 +1037,7 @@ fn run_owner<B: OwnerBackend>(
     latest: &Mutex<Option<Snapshot>>,
     snapshot: &mut Snapshot,
     mut last_request: u64,
-    requested: Option<&RequestedFacts>,
+    input: &OwnerInput,
 ) -> Result<(), MediaError> {
     let mut reserved_restore = None;
     let mut applied_treatment = None;
@@ -1052,6 +1138,7 @@ fn run_owner<B: OwnerBackend>(
                     };
                     if matches!(command, BackendCommand::SetPaused { .. }) {
                         snapshot.pause = None;
+                        snapshot.pause_pending = matches!(input, OwnerInput::QualificationVideo(_));
                     }
                     let in_flight = match &command {
                         BackendCommand::ApplyTreatments { key, .. } => {
@@ -1152,14 +1239,14 @@ fn run_owner<B: OwnerBackend>(
                     if snapshot.playback == InitialPlayback::Paused
                         && let Some(observed) = backend.refresh_observed(false)?
                     {
-                        apply_observed(snapshot, requested, false, observed)?;
+                        apply_observed(snapshot, input, false, observed)?;
                     }
                     publish(latest, snapshot);
                 }
                 BackendEvent::PlaybackRestart | BackendEvent::VideoReconfig => {
                     let started = matches!(event, BackendEvent::PlaybackRestart);
                     if let Some(observed) = backend.refresh_observed(started)? {
-                        apply_observed(snapshot, requested, started, observed)?;
+                        apply_observed(snapshot, input, started, observed)?;
                         if let Some(paused) = backend.refresh_pause()? {
                             record_pause(
                                 snapshot,
@@ -1174,7 +1261,7 @@ fn run_owner<B: OwnerBackend>(
                     }
                 }
                 BackendEvent::Observed { started, facts } => {
-                    apply_observed(snapshot, requested, started, facts)?;
+                    apply_observed(snapshot, input, started, facts)?;
                     publish(latest, snapshot);
                 }
                 BackendEvent::PauseObserved(observation) => {
@@ -1221,6 +1308,10 @@ fn run_owner<B: OwnerBackend>(
                                 "pause command completed without matching expected readback",
                             ));
                         }
+                        if matches!(kind, InFlight::SetPaused { .. }) && snapshot.pause_pending {
+                            snapshot.pause_pending = false;
+                            publish(latest, snapshot);
+                        }
                         if matches!(kind, InFlight::LoadInput) {
                             snapshot.load_complete = true;
                             publish(latest, snapshot);
@@ -1238,7 +1329,10 @@ fn run_owner<B: OwnerBackend>(
                         reason = end_file_reason(reason),
                         mpv_error = error,
                     );
-                    if error < 0 || reason == 4 {
+                    if error < 0
+                        || reason == 4
+                        || matches!(input, OwnerInput::QualificationVideo(_))
+                    {
                         return Err(MediaError::new(
                             "playback",
                             format!("mpv END_FILE reason={reason} error={error}"),
@@ -1267,7 +1361,7 @@ fn run_owner<B: OwnerBackend>(
                 drained,
                 stop,
                 &mut readiness_started,
-                requested,
+                input.capture(),
                 Instant::now(),
             )?;
         } else if drained {
@@ -1475,16 +1569,31 @@ fn record_pause(
 
 fn apply_observed(
     snapshot: &mut Snapshot,
-    requested: Option<&RequestedFacts>,
+    input: &OwnerInput,
     started: bool,
     observed: ObservedFacts,
 ) -> Result<(), MediaError> {
     if started || snapshot.playback_started || snapshot.playback == InitialPlayback::Paused {
-        if let Some(requested) = requested {
-            let facts = SessionFacts::verify(requested.clone(), observed)
-                .map_err(MediaError::from_session)?;
-            log_capture_observed(snapshot.generation, &facts);
-            snapshot.session = Some(facts);
+        match input {
+            OwnerInput::Capture(requested) => {
+                let facts = SessionFacts::verify(requested.clone(), observed)
+                    .map_err(MediaError::from_session)?;
+                log_capture_observed(snapshot.generation, &facts);
+                snapshot.session = Some(ReadinessFacts::Capture(facts));
+            }
+            OwnerInput::QualificationVideo(expected) => {
+                if let Some(size) = &observed.decoded_size {
+                    if size.value != *expected {
+                        return Err(MediaError::new(
+                            "qualification_format",
+                            "decoded fixture dimensions differ from validated header",
+                        ));
+                    }
+                    snapshot.session = Some(ReadinessFacts::QualificationVideo(observed));
+                }
+            }
+            #[cfg(test)]
+            OwnerInput::Unspecified => {}
         }
         snapshot.playback_started |= started;
     }
@@ -1495,7 +1604,10 @@ fn update_readiness(snapshot: &mut Snapshot) {
     snapshot.readiness = if !snapshot.initialized
         || !snapshot.file_loaded
         || !snapshot.load_complete
-        || snapshot.session.is_none()
+        || snapshot.session.as_ref().is_none_or(|facts| match facts {
+            ReadinessFacts::Capture(_) => false,
+            ReadinessFacts::QualificationVideo(observed) => observed.decoded_size.is_none(),
+        })
         || snapshot.stream_ended.is_some()
         || snapshot.failure.is_some()
     {
@@ -3156,13 +3268,14 @@ mod recovery_readiness_tests {
             initialized: true,
             file_loaded: true,
             playback_started: false,
-            session: Some(
+            session: Some(ReadinessFacts::Capture(
                 SessionFacts::verify(input.requested().clone(), ObservedFacts::default()).unwrap(),
-            ),
+            )),
             pause: Some(PauseObservation {
                 request: None,
                 paused: true,
             }),
+            pause_pending: false,
             stream_ended: None,
             failure: None,
             audio: AudioAvailability::Disabled,
@@ -3231,7 +3344,14 @@ mod recovery_readiness_tests {
             (OPEN_READINESS_DEADLINE + Duration::from_nanos(1), true),
         ] {
             let mut snapshot = paused_snapshot();
-            let requested = snapshot.session.as_ref().unwrap().requested.clone();
+            let requested = snapshot
+                .session
+                .as_ref()
+                .unwrap()
+                .capture()
+                .unwrap()
+                .requested
+                .clone();
             let mut started = Some(accepted);
             let result = check_startup_readiness(
                 &mut snapshot,
@@ -3458,6 +3578,82 @@ mod recovery_readiness_tests {
         .unwrap();
         assert_eq!(snapshot.stream_ended, Some((0, 0)));
         assert!(snapshot.readiness.is_none());
+    }
+    #[test]
+    fn qualification_requires_real_decoded_dimensions_and_never_becomes_capture_facts() {
+        let expected = FrameSize::new(320, 180).unwrap();
+        let input = OwnerInput::QualificationVideo(expected);
+        let mut snapshot = live_snapshot();
+        snapshot.session = None;
+        apply_observed(&mut snapshot, &input, true, ObservedFacts::default()).unwrap();
+        update_readiness(&mut snapshot);
+        assert!(snapshot.readiness.is_none());
+        snapshot.session = Some(ReadinessFacts::QualificationVideo(ObservedFacts::default()));
+        update_readiness(&mut snapshot);
+        assert!(
+            snapshot.readiness.is_none(),
+            "an empty wrapper is not decoder evidence"
+        );
+        let observed = ObservedFacts {
+            decoded_size: Some(super::super::session::Observation {
+                value: expected,
+                source: super::super::session::Source::MpvDecodedParams,
+            }),
+            ..Default::default()
+        };
+        apply_observed(&mut snapshot, &input, true, observed).unwrap();
+        update_readiness(&mut snapshot);
+        assert_eq!(snapshot.readiness, Some(OpenReadiness::Live));
+        assert!(snapshot.session.as_ref().unwrap().capture().is_none());
+        snapshot.pause = Some(PauseObservation {
+            request: Some(PauseRequestId::new(1).unwrap()),
+            paused: true,
+        });
+        update_readiness(&mut snapshot);
+        assert!(snapshot.readiness.is_none());
+        let wrong = ObservedFacts {
+            decoded_size: Some(super::super::session::Observation {
+                value: FrameSize::new(640, 360).unwrap(),
+                source: super::super::session::Source::MpvDecodedParams,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_observed(&mut snapshot, &input, true, wrong)
+                .unwrap_err()
+                .code,
+            "qualification_format"
+        );
+    }
+    #[test]
+    fn qualification_missing_decoder_evidence_expires_without_capture_identity() {
+        let mut snapshot = live_snapshot();
+        snapshot.session = Some(ReadinessFacts::QualificationVideo(ObservedFacts::default()));
+        let accepted = Instant::now();
+        let mut started = Some(accepted);
+        assert!(
+            check_startup_readiness(
+                &mut snapshot,
+                true,
+                &StopFlag::new(),
+                &mut started,
+                None,
+                accepted + OPEN_READINESS_DEADLINE - Duration::from_nanos(1)
+            )
+            .is_ok()
+        );
+        assert!(snapshot.readiness.is_none());
+        let error = check_startup_readiness(
+            &mut snapshot,
+            true,
+            &StopFlag::new(),
+            &mut started,
+            None,
+            accepted + OPEN_READINESS_DEADLINE,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "startup_readiness_timeout");
+        assert!(error.session.is_none());
     }
 }
 

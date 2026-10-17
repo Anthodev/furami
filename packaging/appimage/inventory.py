@@ -369,8 +369,8 @@ STATIC_SOURCE_FACTS = {
         "source_descriptor": "https://archive.ubuntu.com/ubuntu/pool/universe/g/glslang/glslang_15.1.0-2~ubuntu0.24.04.2.dsc",
         "upstream_source_sha256": "4bdcd8cdb330313f0d4deed7be527b0ac1c115ff272e492853a6e98add61b4bc",
         "ubuntu_patch_sha256": "4a1421f9f57bcf573236dfbdee520db44b9a55d2dd9935773b09fe192ca2d5e4",
-        "spdx_scope": "source-level BSD-3-Clause, MIT, GPL-3.0-or-later, LicenseRef-NVIDIA-Apple-MIT; linked files not established",
-        "notices": "BSD copyright/license/disclaimer; MIT Khronos notices; GPL-3 for generated parser if linked; NVIDIA custom notice/disclaimer if preprocessor linked",
+        "spdx_scope": "source-level BSD-3-Clause, MIT, GPL-3.0-or-later, LicenseRef-ubuntu-nvidia-apple-mit; linked files not established",
+        "notices": "BSD copyright/license/disclaimer; MIT Khronos notices; GPL-3.0-or-later for generated parser if linked; verbatim Apple-MIT-license NVIDIA grant, patent reservation and disclaimers in ubuntu-terms.lock.json if preprocessor linked",
         "license_source": "https://changelogs.ubuntu.com/changelogs/pool/universe/g/glslang/glslang_15.1.0-2~ubuntu0.24.04.2/copyright",
     },
     "spirv-tools": {

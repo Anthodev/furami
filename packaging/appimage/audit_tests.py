@@ -51,6 +51,9 @@ class QtAttributionTests(unittest.TestCase):
         for name in ('qtbase', 'qtdeclarative', 'qtsvg', 'qtshadertools'):
             document = self.document if name == 'qtbase' else {'name': name, 'packages': [], 'files': [], 'relationships': []}
             self.file('sbom/' + name + '-6.11.2.spdx.json', json.dumps(document).encode())
+        (self.media / 'manifest.json').write_text(json.dumps({'artifacts': {
+            path.relative_to(self.prefix).as_posix(): {'sha256': audit.stage.digest(path)}
+            for path in self.prefix.rglob('*') if path.is_file()}}))
 
     def owners(self):
         return {'usr/' + source: {'owner': 'media', 'source': source}
@@ -68,7 +71,7 @@ class QtAttributionTests(unittest.TestCase):
             self.assertEqual(component['evidence']['package']['SPDXID'], 'SPDXRef-Example')
             self.assertEqual(component['evidence']['backend_files'][0]['file_spdx_id'], 'SPDXRef-Backend')
 
-    def test_generated_terms_stay_unresolved_in_per_file_registry(self):
+    def test_generated_terms_select_module_rule_without_inventing_file_license(self):
         owners = self.owners()
         qt = audit.qt_evidence(self.media, owners, self.media)
         providers = {'media': self.media}
@@ -86,15 +89,51 @@ class QtAttributionTests(unittest.TestCase):
         for owner in owners.values():
             component = owner['components'][0]
             self.assertEqual(component['source_component_id'], 'qt:qtbase')
-            self.assertIsNone(component['selected_terms'])
-            self.assertFalse(component['terms_resolved'])
+            self.assertIsNone(component['license_expression'])
+            self.assertEqual(component['selected_terms'], 'LGPL-3.0-only')
+            self.assertTrue(component['terms_resolved'])
+            self.assertEqual(component['terms_rule'], 'qt-qml-metadata-inherits-module-terms')
             self.assertEqual(registry[component['component_id']], component)
 
     def test_unrelated_vendor_backend_does_not_attribute_builtin_module(self):
         self.document['relationships'] = []
         self.documents()
-        with self.assertRaisesRegex(ValueError, 'QML module lacks vendor'):
+        owners = self.owners()
+        audit.qt_evidence(self.media, owners, self.media)
+        self.assertTrue(all(owner['components'][0]['license_expression'] is None for owner in owners.values()))
+        self.assertTrue(all(not owner['components'][0].get('terms_rule') for owner in owners.values()))
+
+    def test_changed_generated_metadata_rejects_hash_chain(self):
+        self.file('qml/Builtin/Example/types.qmltypes', b'changed metadata')
+        with self.assertRaisesRegex(ValueError, 'QML provenance hash mismatch'):
             audit.qt_evidence(self.media, self.owners(), self.media)
+
+    def test_missing_backend_checksum_does_not_admit_module_rule(self):
+        self.document['files'][0]['checksums'] = []
+        self.documents()
+        owners = self.owners()
+        audit.qt_evidence(self.media, owners, self.media)
+        self.assertTrue(all(not owner['components'][0].get('terms_rule') for owner in owners.values()))
+
+    def test_module_without_lgpl_alternative_stays_unresolved(self):
+        self.document['packages'][0]['licenseConcluded'] = 'GPL-3.0-only OR LicenseRef-Missing'
+        self.documents()
+        owners = self.owners()
+        qt = audit.qt_evidence(self.media, owners, self.media)
+        providers = {'media': self.media}
+        for name, document in {
+                'app': {'crates': [], 'binary': {'rust_standard_library': {'archives': []}, 'direct_objects': []}},
+                'runtime': {'components': []}, 'stage': {'packages': []}}.items():
+            directory = self.media / name
+            directory.mkdir()
+            providers[name] = directory
+            filename = 'ubuntu-sources.json' if name == 'stage' else 'manifest.json'
+            (directory / filename).write_text(json.dumps(document))
+        registry, _, _ = audit.load('components').registry(providers, owners, qt, {'components': []}, audit.stage.digest)
+        self.assertTrue(registry)
+        for owner in owners.values():
+            self.assertIsNone(owner['components'][0]['selected_terms'])
+            self.assertFalse(owner['components'][0]['terms_resolved'])
 
     def test_changed_vendor_backend_remains_rejected(self):
         self.backend.write_bytes(b'changed backend')

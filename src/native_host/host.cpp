@@ -7,7 +7,14 @@
 #include <QProcessEnvironment>
 #include <QStandardPaths>
 #include <QUrl>
+#include <QDir>
+#include <QFileInfo>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QPluginLoader>
+#include <QLibrary>
 #include <QGuiApplication>
+#include <QIcon>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -221,7 +228,66 @@ LaunchResult launchFailure(const QString &diagnostic)
 {
     emitNativeDiagnostic("native_startup_failure", {}, 2);
     const auto bytes = diagnostic.toUtf8();
-    return LaunchResult{1, rust::String(bytes.constData(), static_cast<std::size_t>(bytes.size()))};
+    return LaunchResult{1, rust::String(bytes.constData(), static_cast<std::size_t>(bytes.size())),
+                        NativeFailureKind::Generic, rust::String()};
+}
+
+LaunchResult pluginFailure(NativeFailureKind kind, const QString &pluginClass,
+                           QString detail, const QString &mediaPrefix)
+{
+    const auto canonicalPrefix = QFileInfo(mediaPrefix).canonicalFilePath();
+    if (!canonicalPrefix.isEmpty())
+        detail.replace(canonicalPrefix, QStringLiteral("<media-prefix>"));
+    if (!mediaPrefix.isEmpty())
+        detail.replace(mediaPrefix, QStringLiteral("<media-prefix>"));
+    QString safe;
+    for (const QChar character : detail) {
+        if (!character.isPrint() || character == QChar::LineSeparator || character == QChar::ParagraphSeparator)
+            safe += QLatin1Char(' ');
+        else
+            safe += character;
+    }
+    safe = (pluginClass + QStringLiteral(": ") + safe).left(512);
+    const auto bytes = safe.toUtf8();
+    return LaunchResult{1, rust::String("required Qt plugin refused"), kind,
+                        rust::String(bytes.constData(), static_cast<std::size_t>(bytes.size()))};
+}
+
+LaunchResult preflightRequiredQtPlugins(const QString &mediaPrefix)
+{
+    const auto prefix = QFileInfo(mediaPrefix).canonicalFilePath();
+    const QString bundle = mediaPrefix + QStringLiteral("/lib/qt6/plugins");
+    const QString dev = mediaPrefix + QStringLiteral("/plugins");
+    // A bundle root, when present, is authoritative even when incomplete.
+    // Never repair its missing plugin with a dev or system plugin.
+    const QString root = QFileInfo::exists(bundle) ? bundle : dev;
+    struct Required { const char *path; const char *iid; const char *name; const char *key; };
+    static constexpr Required required[] = {
+        {"platforms/libqxcb.so", "org.qt-project.Qt.QPA.QPlatformIntegrationFactoryInterface.5.3", "platform", "xcb"},
+        {"xcbglintegrations/libqxcb-egl-integration.so", "org.qt-project.Qt.QPA.Xcb.QXcbGlIntegrationFactoryInterface.5.5", "xcb-egl", "xcb_egl"},
+        {"xcbglintegrations/libqxcb-glx-integration.so", "org.qt-project.Qt.QPA.Xcb.QXcbGlIntegrationFactoryInterface.5.5", "xcb-glx", "xcb_glx"},
+        {"imageformats/libqsvg.so", "org.qt-project.Qt.QImageIOHandlerFactoryInterface", "svg-image", "svg"},
+        {"iconengines/libqsvgicon.so", "org.qt-project.Qt.QIconEngineFactoryInterface", "svg-icon", "svg"}
+    };
+    for (const auto &plugin : required) {
+        const QString name = QString::fromLatin1(plugin.name);
+        const QFileInfo file(root + QLatin1Char('/') + QString::fromLatin1(plugin.path));
+        if (!file.exists() || !file.isReadable() || !file.isFile())
+            return pluginFailure(NativeFailureKind::QtPluginMissing, name, QStringLiteral("missing or unreadable required plugin"), mediaPrefix);
+        const QString canonical = file.canonicalFilePath();
+        if (prefix.isEmpty() || !canonical.startsWith(prefix + QLatin1Char('/'))
+            || !canonical.startsWith(QFileInfo(root).canonicalFilePath() + QLatin1Char('/')))
+            return pluginFailure(NativeFailureKind::QtPluginInvalid, name, QStringLiteral("plugin resolves outside media prefix"), mediaPrefix);
+        QPluginLoader loader(canonical);
+        loader.setLoadHints(QLibrary::ResolveAllSymbolsHint | QLibrary::PreventUnloadHint);
+        const auto metadata = loader.metaData();
+        if (metadata.isEmpty() || metadata.value(QStringLiteral("IID")).toString() != QString::fromLatin1(plugin.iid)
+            || !metadata.value(QStringLiteral("MetaData")).toObject().value(QStringLiteral("Keys")).toArray().contains(QString::fromLatin1(plugin.key)))
+            return pluginFailure(NativeFailureKind::QtPluginInvalid, name, QStringLiteral("invalid plugin metadata or interface"), mediaPrefix);
+        if (!loader.load())
+            return pluginFailure(NativeFailureKind::QtPluginLoad, name, loader.errorString(), mediaPrefix);
+    }
+    return LaunchResult{0, rust::String(), NativeFailureKind::NoFailure, rust::String()};
 }
 
 } // namespace
@@ -343,8 +409,8 @@ private:
     bool m_poisoned = false;
 };
 
-FuramiBridge::FuramiBridge(rust::Box<RuntimeCoordinator> gate, UiUpdate nativeEnvironment)
-    : m_gate(std::move(gate))
+FuramiBridge::FuramiBridge(rust::Box<RuntimeCoordinator> gate, UiUpdate nativeEnvironment, bool qualificationVideo)
+    : m_gate(std::move(gate)), m_qualificationVideo(qualificationVideo)
 {
     assertGuiThread();
     QQmlEngine::setObjectOwnership(this, QQmlEngine::CppOwnership);
@@ -510,7 +576,7 @@ bool FuramiBridge::chromeFamilyActive() const { assertGuiThread(); return m_chro
 bool FuramiBridge::quitAuthorized() const { assertGuiThread(); return m_quitAuthorized; }
 // Launch (not UI) failure: only unauthorized root destruction or a poisoned native lifetime is fatal to startup.
 // A recoverable session failure sets m_failed for the UI but still allows the authorized loop exit to succeed.
-bool FuramiBridge::launchFailed() const { assertGuiThread(); return m_bootstrapFailed || m_poisoned; }
+bool FuramiBridge::launchFailed() const { assertGuiThread(); return m_bootstrapFailed || m_poisoned || m_qualificationFailure; }
 QString FuramiBridge::settingsStatus() const { assertGuiThread(); return m_settingsStatus; }
 QString FuramiBridge::settingsPath() const { assertGuiThread(); return m_settingsPath; }
 bool FuramiBridge::settingsRefused() const { assertGuiThread(); return m_settingsRefused; }
@@ -921,6 +987,14 @@ void FuramiBridge::readQualificationInput()
                     emitNativeDiagnostic("qualification_invalid_utf8", {}, 1);
                 } else {
                     const auto &command = m_qualificationLine;
+                    const bool allowedQualificationCommand = command == "snapshot" || command == "fullscreen"
+                        || command == "application-close" || command.startsWith("pause ");
+                    if (m_qualificationVideo && !allowedQualificationCommand) {
+                        applyUpdate(gate_qualification_command(*m_gate, asRust(command)));
+                        m_qualificationLine.clear();
+                        m_dropQualificationLine = false;
+                        continue;
+                    }
                     if (command == "fullscreen") toggleFullscreen();
                     else if (command == "application-close") requestApplicationClose();
                     else if (command == "reset-confirm") decideSettingsReset(QString::number(m_resetToken), true);
@@ -1629,6 +1703,7 @@ bool FuramiBridge::eventFilter(QObject *watched, QEvent *event)
 void FuramiBridge::applyUpdate(UiUpdate update)
 {
     assertGuiThread();
+    m_qualificationFailure = m_qualificationFailure || (m_qualificationVideo && update.terminal_failure);
     if (!update.changed)
         return;
     const bool productStateChanged = m_actualPhase != phaseName(update.phase)
@@ -2031,7 +2106,7 @@ void FuramiBridge::logGeometry()
     }
 }
 
-LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, bool qualificationStdin)
+LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, rust::Str mediaPrefix, bool qualificationStdin, bool qualificationVideo)
 {
     qInstallMessageHandler(safeQtMessage);
     const QByteArray captured(display.data(), static_cast<qsizetype>(display.size()));
@@ -2048,6 +2123,9 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
         return launchFailure(QStringLiteral("DISPLAY '%1' is unreachable: install/enable XWayland in your Wayland session, or point DISPLAY at a reachable X11 display").arg(QString::fromUtf8(captured)));
     else
         XCloseDisplay(probe);
+    auto plugins = preflightRequiredQtPlugins(QString::fromUtf8(mediaPrefix.data(), static_cast<qsizetype>(mediaPrefix.size())));
+    if (plugins.exit_code != 0)
+        return plugins;
 
     int argc = 1;
     char program[] = "furami";
@@ -2057,9 +2135,10 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
         emitNativeDiagnostic("qt_application_destroy");
     });
     application.setApplicationName(QStringLiteral("Furami"));
+    // One application-level icon: the root window and the chrome windows inherit
+    // it, and Qt rasterizes the embedded SVG through the preflighted icon engine.
+    application.setWindowIcon(QIcon(QStringLiteral(":/qt/qml/dev/antho/furami/assets/logo.svg")));
     application.setQuitOnLastWindowClosed(false);
-    if (QString::fromLatin1(qVersion()) != QStringLiteral("6.11.2"))
-        return launchFailure(QStringLiteral("runtime Qt version differs from frozen 6.11.2: %1").arg(QString::fromLatin1(qVersion())));
     UiUpdate nativeEnvironment;
 #if QT_CONFIG(xcb)
     auto *native = application.nativeInterface<QNativeInterface::QX11Application>();
@@ -2093,7 +2172,7 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
 #endif
 
     // Construction order keeps bridge/timer alive until after the QML engine/root dies.
-    FuramiBridge bridge(std::move(gate), std::move(nativeEnvironment));
+    FuramiBridge bridge(std::move(gate), std::move(nativeEnvironment), qualificationVideo);
     QQmlApplicationEngine engine;
     QObject::connect(&engine, &QObject::destroyed, &application, [] {
         emitNativeDiagnostic("qt_engine_destroy");
@@ -2134,11 +2213,15 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
         exitCode = 1;
     }
     emitNativeDiagnostic("qt_event_loop_exit", {{"exit_code", exitCode}, {"owner_cleanup_authorized", bridge.quitAuthorized()}});
-    if (bridge.launchFailed())
+    if (bridge.launchFailed()) {
+        if (qualificationVideo)
+            return LaunchResult{1, rust::String("qualification failed after owner drain"),
+                                NativeFailureKind::Qualification, rust::String()};
         return launchFailure(bridge.diagnostic());
+    }
     if (exitCode)
         return launchFailure(QStringLiteral("Qt event loop exited with status %1").arg(exitCode));
-    return LaunchResult{0, rust::String()};
+    return LaunchResult{0, rust::String(), NativeFailureKind::NoFailure, rust::String()};
 }
 
 } // namespace furami::bridge

@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
-"""Extract release notes for a stable tag from the tagged CHANGELOG.md.
+"""Extract release notes from the tagged CHANGELOG.md.
 
 Contract:
-- Strict stable tag format: vMAJOR.MINOR.PATCH with no leading zeros.
+- Strict tag format: vMAJOR.MINOR.PATCH, optionally suffixed by ``-rc.N``
+  with ``N >= 1`` and no leading zero. Any other suffix (including build
+  metadata), a trailing newline, or a leading zero is a refusal.
+- Only the exact tagged section is extracted: ``v0.1.0-rc.1`` reads
+  ``## [0.1.0-rc.1]`` and never falls back to ``[Unreleased]`` or to a
+  stable version section.
 - The CI-provided commit SHA must equal refs/tags/<tag>^{commit} (covers
   lightweight and annotated tags).
 - The changelog is read from the tagged commit via ``git show``, never from
   the working tree.
-- The section heading must match ``## [X.Y.Z]`` exactly (optional date
+- The section heading must match ``## [<version>]`` exactly (optional date
   suffix); 1.2.0 must not match 1.20.0.
 - The body runs to the next level-two heading outside fenced code blocks.
 - Missing, empty, or duplicate version sections are fatal. There is no
   fallback to commit-generated notes.
+
+This extractor understands stable and RC tags. Publication policy derives the
+release channel from the optional fourth capture group (the RC number) and
+requires an exact Cargo-version tag push independently of note extraction.
 """
 
 from __future__ import annotations
@@ -21,7 +30,9 @@ import re
 import subprocess
 import sys
 
-TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+TAG_RE = re.compile(
+    r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.([1-9][0-9]*))?"
+)
 SECTION_RE_TEMPLATE = r"^## \[{version}\]( - .*)?$"
 H2_RE = re.compile(r"^## ")
 
@@ -132,8 +143,12 @@ def _git(*args: str) -> str:
 
 def resolve_tag(tag: str, expected_commit: str) -> str:
     """Resolve tag to a commit and require equality with expected_commit."""
-    if not TAG_RE.match(tag):
-        raise ReleaseNotesError(f"tag '{tag}' is not a stable SemVer tag (vX.Y.Z, no leading zeros)")
+    # fullmatch (not match) so no trailing newline or partial suffix slips
+    # through: the shared grammar has no anchors of its own.
+    if not TAG_RE.fullmatch(tag):
+        raise ReleaseNotesError(
+            f"tag '{tag}' is not a release tag (vX.Y.Z or vX.Y.Z-rc.N, no leading zeros)"
+        )
     peeled = _git("rev-parse", f"refs/tags/{tag}^{{commit}}")
     if not re.fullmatch(r"[0-9a-f]{40}", peeled):
         raise ReleaseNotesError(f"refs/tags/{tag} did not resolve to a commit")
@@ -154,7 +169,11 @@ def tagged_changelog(tag: str, commit: str, path: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--tag", required=True, help="stable release tag, e.g. v1.2.0")
+    parser.add_argument(
+        "--tag",
+        required=True,
+        help="release tag, e.g. v1.2.0 or v1.2.0-rc.1",
+    )
     parser.add_argument("--commit", required=True, help="commit SHA the build/publish runs on")
     parser.add_argument("--changelog-path", default="CHANGELOG.md")
     parser.add_argument("--output", required=True, help="path of the notes file to write")

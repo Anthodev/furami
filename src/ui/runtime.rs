@@ -39,6 +39,9 @@ type Engine = ApplyCoordinator<CaptureValidator, GateRunner>;
 
 mod diagnostic;
 use diagnostic::{ProfileSeed, ReportCache};
+mod coordinator;
+mod qualification;
+pub(crate) use coordinator::RuntimeCoordinator;
 
 pub(crate) struct UiUpdate {
     pub ui_snapshot: String,
@@ -77,6 +80,7 @@ pub(crate) struct UiUpdate {
     pub create_native: bool,
     pub release_native: bool,
     pub quit: bool,
+    pub terminal_failure: bool,
     pub settings_status: String,
     pub settings_path: String,
     pub settings_refused: bool,
@@ -214,7 +218,7 @@ impl Default for ProductUi {
     }
 }
 
-pub(crate) struct RuntimeCoordinator {
+pub(crate) struct CaptureRuntime {
     diagnostics: crate::diagnostics::DiagnosticsHandle,
     report_cache: ReportCache,
     next_log_folder_request: Option<crate::diagnostics::FolderRequestId>,
@@ -315,7 +319,7 @@ fn output_silence_text(reason: &OutputSilence) -> String {
     }
 }
 
-impl RuntimeCoordinator {
+impl CaptureRuntime {
     fn ui_reject(
         &mut self,
         code: &'static str,
@@ -1706,6 +1710,7 @@ impl RuntimeCoordinator {
         };
         projection::Snapshot {
             schema: 2,
+            session_kind: projection::SessionKind::Capture,
             state_token: format!("state:{}", self.ui.state_sequence),
             generation: update.restart_generation.to_string(),
             product_phase: model
@@ -3280,6 +3285,7 @@ impl RuntimeCoordinator {
                 create_native: false,
                 release_native: false,
                 quit: self.quit_empty,
+                terminal_failure: false,
                 settings_status: String::new(),
                 settings_path: String::new(),
                 settings_refused: false,
@@ -3598,6 +3604,7 @@ impl RuntimeCoordinator {
             create_native: native.create_native,
             release_native: native.release_native,
             quit,
+            terminal_failure: false,
             settings_status: String::new(),
             settings_path: String::new(),
             settings_refused: false,
@@ -3951,14 +3958,14 @@ mod tests {
         );
         (request, prepared)
     }
-    fn runtime() -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    fn runtime() -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         runtime_with_validator(validate)
     }
     fn runtime_with_validator(
         execute: fn(
             ValidationRequest,
         ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
-    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    ) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         runtime_fixture(execute, None, None)
     }
     fn runtime_fixture(
@@ -3967,7 +3974,7 @@ mod tests {
         ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
         fail_spawn: Option<u64>,
         snapshot: Option<crate::capture::linux::CaptureSnapshot>,
-    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    ) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         let (tx, rx) = mpsc::channel();
         let runner = GateRunner::with_spawner(
             fixture_treatment_capabilities(),
@@ -4002,7 +4009,7 @@ mod tests {
             runner,
         );
         (
-            RuntimeCoordinator {
+            CaptureRuntime {
                 diagnostics: crate::diagnostics::DiagnosticsHandle::for_test(),
                 report_cache: ReportCache::default(),
                 next_log_folder_request: Some(crate::diagnostics::FolderRequestId(1)),
@@ -4055,7 +4062,7 @@ mod tests {
     }
     #[track_caller]
     fn await_update(
-        runtime: &mut RuntimeCoordinator,
+        runtime: &mut CaptureRuntime,
         predicate: impl Fn(&UiUpdate) -> bool,
     ) -> UiUpdate {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4100,7 +4107,7 @@ mod tests {
     /// comparing exact `StateIdentity` values, which carry the stamp; later
     /// polls are stable until a new subscription or validation refresh.
     #[track_caller]
-    fn settle_committed_watch(runtime: &mut RuntimeCoordinator) {
+    fn settle_committed_watch(runtime: &mut CaptureRuntime) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             runtime.poll();
@@ -4234,7 +4241,7 @@ mod tests {
         cleanup(&mut runtime);
     }
 
-    fn start_live(runtime: &mut RuntimeCoordinator, drivers: &mpsc::Receiver<Driver>) -> Driver {
+    fn start_live(runtime: &mut CaptureRuntime, drivers: &mpsc::Receiver<Driver>) -> Driver {
         let opening = runtime.open();
         if !opening.create_native {
             await_update(runtime, |update| update.create_native);
@@ -4257,7 +4264,7 @@ mod tests {
         await_update(runtime, |update| update.can_toggle_pause);
         driver
     }
-    fn confirm_explicit_pause(runtime: &mut RuntimeCoordinator, driver: &Driver) {
+    fn confirm_explicit_pause(runtime: &mut CaptureRuntime, driver: &Driver) {
         let attempt = runtime
             .engine
             .as_ref()
@@ -4292,7 +4299,7 @@ mod tests {
         let paused = await_update(runtime, |update| update.playback_status == "Paused");
         assert!(paused.paused && paused.can_toggle_pause);
     }
-    fn snapshot_expected(runtime: &RuntimeCoordinator) -> ExpectedState {
+    fn snapshot_expected(runtime: &CaptureRuntime) -> ExpectedState {
         let engine = runtime.engine.as_ref().unwrap();
         let model = engine.model();
         let identity = model.state_identity();
@@ -4306,7 +4313,7 @@ mod tests {
             panic!("snapshot close grammar");
         };
         assert_eq!(
-            RuntimeCoordinator::checked_state(engine, expected),
+            CaptureRuntime::checked_state(engine, expected),
             Ok(identity)
         );
         for wrong in [
@@ -4340,13 +4347,13 @@ mod tests {
             },
         ] {
             assert_eq!(
-                RuntimeCoordinator::checked_state(engine, wrong),
+                CaptureRuntime::checked_state(engine, wrong),
                 Err(CommandRejection::StaleState)
             );
         }
         expected
     }
-    fn cleanup(runtime: &mut RuntimeCoordinator) {
+    fn cleanup(runtime: &mut CaptureRuntime) {
         let first = runtime.quit();
         let update = if first.release_native || first.quit {
             first
@@ -4393,7 +4400,7 @@ mod tests {
                 .settings()
                 .clone()
         }
-        fn bind(&self, runtime: &mut RuntimeCoordinator) {
+        fn bind(&self, runtime: &mut CaptureRuntime) {
             runtime.persistence = PersistenceSession::load(Ok(self.path()));
             runtime.persistence.prepare_startup(&StartupSelection {
                 restore_profile: false,
@@ -4426,7 +4433,7 @@ mod tests {
         renderer_settings_with_interpolation(interpolation)
     }
     fn edit_renderer_settings(
-        runtime: &mut RuntimeCoordinator,
+        runtime: &mut CaptureRuntime,
         renderer: &RendererSettings,
     ) -> UiUpdate {
         let revision = runtime
@@ -4443,7 +4450,7 @@ mod tests {
         ))
     }
     fn begin_live_treatments(
-        runtime: &mut RuntimeCoordinator,
+        runtime: &mut CaptureRuntime,
         driver: &Driver,
     ) -> (
         crate::media::controller::RequestId,
@@ -5819,7 +5826,7 @@ mod tests {
             ),
             runner,
         );
-        let mut runtime = RuntimeCoordinator {
+        let mut runtime = CaptureRuntime {
             diagnostics: crate::diagnostics::DiagnosticsHandle::for_test(),
             report_cache: ReportCache::default(),
             next_log_folder_request: Some(crate::diagnostics::FolderRequestId(1)),
@@ -6181,7 +6188,7 @@ mod tests {
             audio_policy: crate::app::settings::StartupAudioPolicy::Explicit,
             bootstrap_audio: Default::default(),
         };
-        let mut runtime = RuntimeCoordinator::new(
+        let mut runtime = CaptureRuntime::new(
             String::new(),
             fixture_treatment_capabilities(),
             startup,
@@ -6605,14 +6612,14 @@ mod tests {
         );
     }
 
-    fn product_runtime() -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    fn product_runtime() -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         product_runtime_with_validator(validate_product)
     }
     fn product_runtime_with_validator(
         execute: fn(
             ValidationRequest,
         ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
-    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    ) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         let (mut runtime, drivers) = runtime_fixture(
             execute,
             None,
@@ -6633,7 +6640,7 @@ mod tests {
         runtime.poll();
         (runtime, drivers)
     }
-    fn product_values(runtime: &mut RuntimeCoordinator) -> serde_json::Value {
+    fn product_values(runtime: &mut CaptureRuntime) -> serde_json::Value {
         runtime.dirty = true;
         let update = runtime.poll();
         if update.ui_snapshot.is_empty() {
@@ -6867,7 +6874,7 @@ mod tests {
         driver.destroyed.recv().unwrap();
     }
 
-    fn seed_renderer(runtime: &mut RuntimeCoordinator, renderer: RendererSettings) {
+    fn seed_renderer(runtime: &mut CaptureRuntime, renderer: RendererSettings) {
         let engine = runtime.engine.as_mut().unwrap();
         let mut settings = engine.model().draft().settings.clone();
         settings.renderer = renderer;
@@ -6893,7 +6900,7 @@ mod tests {
         (id, key)
     }
 
-    fn confirm_renderer_edit(runtime: &mut RuntimeCoordinator, driver: &Driver) {
+    fn confirm_renderer_edit(runtime: &mut CaptureRuntime, driver: &Driver) {
         let (id, key) = receive_renderer_edit(driver);
         let renderer = runtime
             .engine
@@ -7707,7 +7714,7 @@ mod tests {
     }
 
     fn pending_source_fixture(
-        runtime: &mut RuntimeCoordinator,
+        runtime: &mut CaptureRuntime,
         serial: u64,
     ) -> capture_catalog::Physical {
         let physical = runtime.ui.catalog.sources[0].physical();
@@ -7896,7 +7903,7 @@ mod tests {
         driver.destroyed.recv().unwrap();
     }
 
-    fn card_audio_catalog_fixture(runtime: &mut RuntimeCoordinator) -> AudioSourceIdentity {
+    fn card_audio_catalog_fixture(runtime: &mut CaptureRuntime) -> AudioSourceIdentity {
         let physical = runtime.ui.catalog.sources[0].physical();
         let identity = AudioSourceIdentity::new(
             "card.capture".into(),
@@ -8201,13 +8208,13 @@ mod tests {
             .collect()
     }
     static PROFILE_VALIDATION_PROBE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-    fn profiles_runtime(store: &WritableSettings) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    fn profiles_runtime(store: &WritableSettings) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         profiles_runtime_with_spawn_failure(store, None)
     }
     fn profiles_runtime_with_spawn_failure(
         store: &WritableSettings,
         fail_spawn: Option<u64>,
-    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    ) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         profiles_runtime_with_validation(store, fail_spawn, validate_profile_fixture_probe)
     }
     fn profiles_runtime_with_validation(
@@ -8216,7 +8223,7 @@ mod tests {
         validate: fn(
             ValidationRequest,
         ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
-    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    ) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         let (mut runtime, _) = product_runtime();
         let (tx, rx) = mpsc::channel();
         let runner = GateRunner::with_spawner(
@@ -8277,7 +8284,7 @@ mod tests {
         runtime.poll();
         (runtime, rx)
     }
-    fn choose_profile_source(runtime: &mut RuntimeCoordinator, index: usize) -> UiUpdate {
+    fn choose_profile_source(runtime: &mut CaptureRuntime, index: usize) -> UiUpdate {
         product_values(runtime);
         let key = runtime.ui.catalog.projection.source_rows[index].key.clone();
         runtime.select_capture(
@@ -8291,7 +8298,7 @@ mod tests {
     fn startup_profiles_runtime(
         store: &WritableSettings,
         startup: StartupSelection,
-    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    ) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         startup_profiles_runtime_with_validation(store, startup, validate_profile_fixture_probe)
     }
     fn startup_profiles_runtime_with_validation(
@@ -8300,7 +8307,7 @@ mod tests {
         validate: fn(
             ValidationRequest,
         ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
-    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    ) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         startup_profiles_runtime_with_adapters(store, startup, None, validate)
     }
     fn startup_profiles_runtime_with_adapters(
@@ -8310,11 +8317,11 @@ mod tests {
         validate: fn(
             ValidationRequest,
         ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
-    ) -> (RuntimeCoordinator, mpsc::Receiver<Driver>) {
+    ) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         let submitted = startup.draft.clone().expect("complete startup fixture");
         let mut persistence = PersistenceSession::load(Ok(store.path()));
         persistence.prepare_startup(&startup);
-        let mut runtime = RuntimeCoordinator::new_with_catalog(
+        let mut runtime = CaptureRuntime::new_with_catalog(
             String::new(),
             fixture_treatment_capabilities(),
             startup,
@@ -8341,7 +8348,7 @@ mod tests {
         (runtime, drivers)
     }
     fn complete_profile_source(
-        runtime: &mut RuntimeCoordinator,
+        runtime: &mut CaptureRuntime,
         drivers: &mpsc::Receiver<Driver>,
         mut update: UiUpdate,
         old: Option<Driver>,
@@ -9388,7 +9395,7 @@ mod tests {
             panic!("the scalar contract must feed the unchanged qualification grammar");
         };
         let engine = runtime.engine.as_ref().unwrap();
-        assert!(RuntimeCoordinator::checked_state(engine, expected).is_ok());
+        assert!(CaptureRuntime::checked_state(engine, expected).is_ok());
         assert_eq!(revision, engine.model().draft().revision);
         cleanup(&mut runtime);
     }

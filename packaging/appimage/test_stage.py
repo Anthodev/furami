@@ -7,6 +7,8 @@ import struct
 import tarfile
 import tempfile
 import unittest
+import shutil
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +18,15 @@ SPEC.loader.exec_module(stage)
 
 
 class StageIntegrityTests(unittest.TestCase):
+    def test_root_directory_mode_is_part_of_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            left, right = Path(temporary) / "left", Path(temporary) / "right"
+            left.mkdir(mode=0o755)
+            right.mkdir(mode=0o700)
+            self.assertEqual(stage.snapshot(left)["."], {"type": "directory", "mode": "0o755"})
+            with self.assertRaisesRegex(ValueError, "payload mismatch"):
+                stage.compare_payload(left, right)
+
     def test_comparison_detects_payload_bytes_symlink_and_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -328,34 +339,66 @@ class StageIntegrityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Rust std linked archive bytes mismatch"):
                 stage.rust_std_notices(app, manifest, appdir, {})
 
+    def runtime_materials_fixture(self, root):
+        runtime, staged = root / "runtime", root / "AppDir"
+        runtime.mkdir()
+        staged.mkdir()
+        names = ("type2-runtime.runtime.c.NOTICE", "gcc.COPYING3",
+                 "gcc.COPYING.RUNTIME", "libfuse.LGPL2.txt")
+        notice_paths = ["licenses/" + name for name in names]
+        archives = ["type2-runtime.tar.gz", "fuse-3.15.0.tar.xz",
+                    "mount.c.diff", "squashfuse-0.5.2.tar.gz"]
+        relink_paths = ["relink/" + name for name in archives + ["RELINKING.md", "build.sh", "alpine-source.lock.json"]]
+        records = {}
+        for relative in notice_paths + relink_paths:
+            file = runtime / relative
+            file.parent.mkdir(exist_ok=True)
+            file.write_bytes(("actual:" + relative).encode())
+            records[relative] = stage.digest(file)
+        lock = json.loads((stage.REPO / "packaging/appimage-runtime/runtime.lock.json").read_text())
+        lock["sources"] = {key: {"archive": name, "sha256": records["relink/" + name]}
+                           for key, name in zip(("type2_runtime", "libfuse", "libfuse_patch", "squashfuse"), archives)}
+        alpine = json.loads((stage.REPO / "packaging/appimage-runtime/alpine-source.lock.json").read_text())
+        cache = root / "local-cache"
+        verified_inputs, verified_recipes = {}, {}
+        for name, source in alpine["linked_sources"].items():
+            directory = cache / name
+            directory.mkdir(parents=True)
+            items = [source["upstream_source"], *source["aports_inputs"]]
+            for item in items:
+                path = directory / item["file"]
+                path.write_bytes(("actual source:" + name + "/" + item["file"]).encode())
+                item["sha256"] = stage.digest(path)
+                item["sha512"] = hashlib.sha512(path.read_bytes()).hexdigest()
+                verified_inputs[name + "/" + item["file"]] = item["sha256"]
+            recipe = directory / "APKBUILD"
+            recipe.write_text('sha512sums="\n' + "".join(
+                item["sha512"] + "  " + item["file"] + "\n" for item in items) + '"\n')
+            source["apkbuild"]["sha256"] = stage.digest(recipe)
+            verified_recipes[name + "/APKBUILD"] = stage.digest(recipe)
+        source_lock = runtime / "relink/alpine-source.lock.json"
+        source_lock.write_text(json.dumps(alpine))
+        records["relink/alpine-source.lock.json"] = stage.digest(source_lock)
+        lock["linked_source_closure"]["sha256"] = stage.digest(source_lock)
+        manifest = {"notice_files": {p: records[p] for p in notice_paths},
+                    "relink_files": {p: records[p] for p in relink_paths},
+                    "files_sha256": records, "sources": lock["sources"],
+                    "components": [{"name": "runtime", "notice_files": notice_paths}],
+                    "linked_source_closure": {
+                        "lock_sha256": stage.digest(source_lock), "local_cache_path": str(cache),
+                        "verified_input_count": len(verified_inputs),
+                        "verified_inputs": verified_inputs, "verified_apkbuilds": verified_recipes,
+                        "distribution_status": "local qualification evidence only; full cache not bundled"}}
+        patcher = patch.object(stage, "ALPINE_SOURCE_LOCK", source_lock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return runtime, staged, lock, manifest
+
     def test_runtime_materials_copy_verified_notices_and_real_relink_sources(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            runtime, staged = root / "runtime", root / "AppDir"
-            runtime.mkdir()
-            staged.mkdir()
-            names = ("type2-runtime.runtime.c.NOTICE", "gcc.COPYING3",
-                     "gcc.COPYING.RUNTIME", "libfuse.LGPL2.txt")
-            notice_paths = ["licenses/" + name for name in names]
-            sources = ["type2-runtime.tar.gz", "fuse-3.15.0.tar.xz",
-                       "mount.c.diff", "squashfuse-0.5.2.tar.gz"]
-            relink_paths = ["relink/" + name for name in sources + ["RELINKING.md", "build.sh", "alpine-source.lock.json"]]
-            records = {}
-            for relative in notice_paths + relink_paths:
-                file = runtime / relative
-                file.parent.mkdir(exist_ok=True)
-                file.write_bytes(("actual:" + relative).encode())
-                records[relative] = stage.digest(file)
-            lock = {"sources": {key: {"archive": name, "sha256": records["relink/" + name]}
-                                for key, name in zip(("type2_runtime", "libfuse", "libfuse_patch", "squashfuse"), sources)}}
-            manifest = {"notice_files": {p: records[p] for p in notice_paths},
-                        "relink_files": {p: records[p] for p in relink_paths},
-                        "files_sha256": records, "sources": lock["sources"],
-                        "components": [{"name": "runtime", "notice_files": notice_paths}],
-                        "linked_source_closure": {"lock_sha256": records["relink/alpine-source.lock.json"],
-                                                  "local_cache_path": str(root / "local-cache"),
-                                                  "verified_input_count": 60,
-                                                  "distribution_status": "local qualification evidence only; full cache not bundled"}}
+            runtime, staged, lock, manifest = self.runtime_materials_fixture(root)
+            records = manifest["files_sha256"]
             owners = {}
             stage.copy_runtime_materials(runtime, manifest, staged, owners, lock)
             copied = staged / "usr/share/furami/runtime-compliance/relink/fuse-3.15.0.tar.xz"
@@ -375,6 +418,97 @@ class StageIntegrityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "runtime licenses bytes/manifest mismatch"):
                 stage.copy_runtime_materials(runtime, manifest, staged, {}, lock)
 
+
+    def test_runtime_linked_closure_requires_exact_current_sources_and_proof(self):
+        for mutation in ("none", "count", "boolean-count", "missing-proof", "extra-proof", "proof-hash",
+                         "recipe-proof", "missing-patch", "changed-patch", "changed-apkbuild",
+                         "extra-cache-file", "source-symlink", "old-binary", "lock-pin"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                runtime, staged, lock, manifest = self.runtime_materials_fixture(root)
+                linked = manifest["linked_source_closure"]
+                cache = Path(linked["local_cache_path"])
+                source_lock = json.loads((runtime / "relink/alpine-source.lock.json").read_text())
+                patch_input, = source_lock["linked_sources"]["zlib"]["aports_inputs"]
+                patch_path = cache / "zlib" / patch_input["file"]
+                if mutation == "count":
+                    linked["verified_input_count"] -= 1
+                elif mutation == "boolean-count":
+                    linked["verified_input_count"] = True
+                elif mutation == "missing-proof":
+                    linked.pop("verified_inputs")
+                elif mutation == "extra-proof":
+                    linked["verified_inputs"]["zlib/not-in-source-lock.patch"] = "0" * 64
+                elif mutation == "proof-hash":
+                    linked["verified_inputs"]["zlib/" + patch_input["file"]] = "0" * 64
+                elif mutation == "recipe-proof":
+                    linked["verified_apkbuilds"].pop("zlib/APKBUILD")
+                elif mutation == "missing-patch":
+                    patch_path.unlink()
+                elif mutation == "changed-patch":
+                    patch_path.write_bytes(b"unverified patch")
+                elif mutation == "changed-apkbuild":
+                    (cache / "zlib/APKBUILD").write_text('sha512sums=""\n')
+                elif mutation == "extra-cache-file":
+                    (cache / "zlib/unselected.patch").write_bytes(b"stale source")
+                elif mutation == "source-symlink":
+                    outside = root / "outside-patch"
+                    outside.write_bytes(patch_path.read_bytes())
+                    patch_path.unlink()
+                    patch_path.symlink_to(outside)
+                elif mutation == "old-binary":
+                    lock["apk_packages"]["zlib-static"]["version"] = "1.3.2-r0"
+                elif mutation == "lock-pin":
+                    lock["linked_source_closure"]["sha256"] = "0" * 64
+                if mutation == "none":
+                    stage.copy_runtime_materials(runtime, manifest, staged, {}, lock)
+                else:
+                    with self.assertRaises(ValueError):
+                        stage.copy_runtime_materials(runtime, manifest, staged, {}, lock)
+                    self.assertFalse(any(staged.iterdir()))
+
+    def test_container_source_mapping_preserves_raw_host_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime, staged, lock, manifest = self.runtime_materials_fixture(root)
+            mapped_sources = Path(manifest["linked_source_closure"]["local_cache_path"])
+            manifest["linked_source_closure"]["local_cache_path"] = "/host-only/unavailable/alpine-sources"
+            original = json.dumps(manifest, sort_keys=True)
+            stage.copy_runtime_materials(runtime, manifest, staged, {}, lock,
+                                         linked_source_root=mapped_sources)
+            self.assertEqual(json.dumps(manifest, sort_keys=True), original)
+            with self.assertRaisesRegex(ValueError, "regular directory"):
+                stage.verify_runtime_linked_sources(runtime, manifest, lock)
+
+    def test_stager_mounts_only_validated_sources_read_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime, _, lock, manifest = self.runtime_materials_fixture(root)
+            (runtime / "manifest.json").write_text(json.dumps(manifest))
+            original = (runtime / "manifest.json").read_bytes()
+            repo = root / "repo"
+            recipe = repo / "packaging/appimage-runtime"
+            recipe.mkdir(parents=True)
+            shutil.copy2(stage.REPO / "packaging/appimage-runtime/build.py", recipe / "build.py")
+            (recipe / "runtime.lock.json").write_text(json.dumps(lock))
+            tool = root / "checked-tool"
+            tool.write_bytes(b"fixture")
+            arguments = ["stage.py", "--media-output", str(root / "media"), "--app-build", str(root / "app"),
+                         "--runtime-build", str(runtime), "--media-source-cache", str(root / "media-cache"),
+                         "--output", str(root / "out"), "--version", "0.1.0-rc.1", "--tool-cache", str(root / "tools")]
+            with patch.object(stage, "REPO", repo), patch.object(sys, "argv", arguments), \
+                    patch.object(stage, "check_inputs", return_value=({}, {"container": "frozen-test-image"})), \
+                    patch.object(stage, "cached_download", return_value=tool), \
+                    patch.object(stage, "base_image_provenance", return_value={}), \
+                    patch.object(stage.subprocess, "run") as run:
+                run.return_value.returncode = 0
+                stage.main()
+            command = run.call_args.args[0]
+            volumes = [command[index + 1] for index, argument in enumerate(command) if argument == "--volume"]
+            source_root = manifest["linked_source_closure"]["local_cache_path"]
+            self.assertIn(source_root + ":/runtime-linked-sources:ro", volumes)
+            self.assertFalse(any(value.startswith(str(Path(source_root).parent) + ":") for value in volumes))
+            self.assertEqual((runtime / "manifest.json").read_bytes(), original)
 
     def test_base_oci_libraries_need_exact_package_and_file_notice_hashes(self):
         with tempfile.TemporaryDirectory() as temporary:

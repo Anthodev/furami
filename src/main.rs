@@ -63,6 +63,14 @@ enum StartupError {
         #[source]
         source: Box<StartupError>,
     },
+    #[error(
+        "qualification_arguments: qualification video cannot be combined with capture arguments"
+    )]
+    QualificationArguments,
+    #[error(transparent)]
+    QualificationVideo(#[from] furami::media::qualification::QualificationVideoError),
+    #[error("qualification_renderer: default renderer could not be compiled")]
+    QualificationRenderer,
 }
 
 /// The capture process must run with the process-local PulseAudio client
@@ -94,16 +102,35 @@ fn no_fallback_already_set(value: Option<&OsStr>) -> bool {
 }
 
 fn main() -> ExitCode {
-    if ensure_capture_no_fallback_environment().is_err() {
+    let arguments = match StartupArguments::parse(std::env::args_os().skip(1)) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            let failure = error.diagnostic();
+            eprintln!(
+                "furami: startup failed ({} at {})",
+                failure.code, failure.stage
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let qualification = arguments.qualification_video.is_some();
+    if !qualification && ensure_capture_no_fallback_environment().is_err() {
         eprintln!("furami: startup failed (NoFallbackExec)");
         return ExitCode::FAILURE;
     }
-    let persistence = PersistenceSession::load(resolve_settings_path(
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    ));
+    let persistence = if qualification {
+        None
+    } else {
+        Some(PersistenceSession::load(resolve_settings_path(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )))
+    };
     let diagnostics = DiagnosticsRuntime::start(DiagnosticsConfig {
-        logging_enabled: persistence.preferences().logging_enabled,
+        logging_enabled: qualification
+            || persistence
+                .as_ref()
+                .is_some_and(|session| session.preferences().logging_enabled),
         ..DiagnosticsConfig::default()
     });
     diagnostics.install_tracing();
@@ -111,12 +138,18 @@ fn main() -> ExitCode {
     if let Some(report) = initial_report(&handle) {
         handle.publish_report(report);
     }
-    let result = run(handle.clone(), persistence);
+    let result = match persistence {
+        Some(persistence) => run(arguments, handle.clone(), persistence),
+        None => run_qualification(arguments, handle.clone()),
+    };
     if let Err(error) = &result {
         let failure = error.diagnostic();
         let code = failure.code;
         let stage = failure.stage;
         eprintln!("furami: startup failed ({code} at {stage})");
+        if let Some(detail) = error.plugin_detail() {
+            eprintln!("furami: {detail}");
+        }
         if let Some(mut report) = initial_report(&handle) {
             report.session.phase = "StartupFailed".into();
             report.session.startup_failure = Some(failure);
@@ -144,6 +177,22 @@ fn initial_report(diagnostics: &DiagnosticsHandle) -> Option<ReportSnapshot> {
 }
 
 impl StartupError {
+    fn plugin_detail(&self) -> Option<&str> {
+        match self {
+            Self::WithRequest { source, .. } => source.plugin_detail(),
+            Self::NativeLaunch(native)
+                if matches!(
+                    native.failure_kind,
+                    furami::native_host::NativeFailureKind::QtPluginMissing
+                        | furami::native_host::NativeFailureKind::QtPluginInvalid
+                        | furami::native_host::NativeFailureKind::QtPluginLoad
+                ) =>
+            {
+                Some(&native.safe_detail)
+            }
+            _ => None,
+        }
+    }
     fn diagnostic(&self) -> StartupFailure {
         let (code, stage, requested) = match self {
             Self::WithRequest { request, source } => {
@@ -165,8 +214,26 @@ impl StartupError {
             }
             Self::MediaPrefixEnvironment(_) => ("MediaPrefixEnvironment", "MediaStartup", None),
             Self::InvalidMediaPrefix => ("InvalidMediaPrefix", "MediaStartup", None),
-            Self::NativeLaunch(_) => ("NativeLaunch", "NativeStartup", None),
+            Self::NativeLaunch(error) => (
+                match error.failure_kind {
+                    furami::native_host::NativeFailureKind::QtPluginMissing => "qt_plugin_missing",
+                    furami::native_host::NativeFailureKind::QtPluginInvalid => "qt_plugin_invalid",
+                    furami::native_host::NativeFailureKind::QtPluginLoad => "qt_plugin_load",
+                    furami::native_host::NativeFailureKind::Qualification => "qualification",
+                    _ => "NativeLaunch",
+                },
+                "NativeStartup",
+                None,
+            ),
             Self::NoFallbackExec(_) => ("NoFallbackExec", "Reexec", None),
+            Self::QualificationArguments => ("qualification_arguments", "Arguments", None),
+            Self::QualificationVideo(
+                furami::media::qualification::QualificationVideoError::Path,
+            ) => ("qualification_path", "Arguments", None),
+            Self::QualificationVideo(
+                furami::media::qualification::QualificationVideoError::Format,
+            ) => ("qualification_format", "Arguments", None),
+            Self::QualificationRenderer => ("qualification_renderer", "MediaStartup", None),
         };
         StartupFailure {
             code,
@@ -183,20 +250,45 @@ struct StartupArguments {
     audio_off: bool,
     list_audio_sources: bool,
     qualification_stdin: bool,
+    qualification_video: Option<std::path::PathBuf>,
 }
 
 impl StartupArguments {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, StartupError> {
+        let args: Vec<_> = args.into_iter().collect();
+        let qualification = args
+            .iter()
+            .any(|argument| argument == "--qualification-video");
+        Self::parse_inner(args).map_err(|error| {
+            if qualification {
+                StartupError::QualificationArguments
+            } else {
+                error
+            }
+        })
+    }
+    fn parse_inner(args: impl IntoIterator<Item = OsString>) -> Result<Self, StartupError> {
         let mut args = args.into_iter();
         let mut video_args = Vec::new();
         let mut audio_source = None;
         let (mut audio_off, mut list_audio_sources, mut qualification_stdin) =
             (false, false, false);
+        let mut qualification_video = None;
         while let Some(flag) = args.next() {
             let text = flag.to_str().ok_or_else(|| {
                 CaptureArgumentError::InvalidArgument("flag must be UTF-8".into())
             })?;
             match text {
+                "--qualification-video" => {
+                    if qualification_video.is_some() {
+                        return Err(StartupError::QualificationArguments);
+                    }
+                    let path = args
+                        .next()
+                        .filter(|value| !value.as_encoded_bytes().starts_with(b"--"))
+                        .ok_or(StartupError::QualificationArguments)?;
+                    qualification_video = Some(std::path::PathBuf::from(path));
+                }
                 "--capture-audio-source" => {
                     if audio_source.is_some() {
                         return Err(CaptureArgumentError::InvalidArgument(
@@ -247,12 +339,18 @@ impl StartupArguments {
                 }
             }
         }
+        if qualification_video.is_some()
+            && (!video_args.is_empty() || audio_source.is_some() || audio_off || list_audio_sources)
+        {
+            return Err(StartupError::QualificationArguments);
+        }
         Ok(Self {
             video: CaptureArguments::parse(video_args)?,
             audio_off,
             audio_source,
             list_audio_sources,
             qualification_stdin,
+            qualification_video,
         })
     }
     fn capture_audio(
@@ -290,10 +388,10 @@ impl StartupArguments {
 }
 
 fn run(
+    arguments: StartupArguments,
     diagnostics: DiagnosticsHandle,
     persistence: PersistenceSession,
 ) -> Result<(), StartupError> {
-    let arguments = StartupArguments::parse(std::env::args_os().skip(1))?;
     let request = arguments.video.as_ref().map(|video| video.mode);
     run_with_arguments(arguments, diagnostics, persistence).map_err(|source| match request {
         Some(request) => StartupError::WithRequest {
@@ -302,6 +400,44 @@ fn run(
         },
         None => source,
     })
+}
+
+fn run_qualification(
+    arguments: StartupArguments,
+    diagnostics: DiagnosticsHandle,
+) -> Result<(), StartupError> {
+    let path = arguments
+        .qualification_video
+        .as_ref()
+        .ok_or(StartupError::QualificationArguments)?;
+    let video = furami::media::qualification::QualificationVideo::open(path)?;
+    let display = match std::env::var("DISPLAY") {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) | Err(std::env::VarError::NotPresent) => return Err(StartupError::NoDisplay),
+        Err(error) => return Err(StartupError::InvalidDisplayEnvironment(error)),
+    };
+    let prefix =
+        std::env::var("FURAMI_MEDIA_PREFIX").map_err(StartupError::MediaPrefixEnvironment)?;
+    let prefix_path = std::path::Path::new(&prefix);
+    if !prefix_path.is_absolute() || !prefix_path.is_dir() {
+        return Err(StartupError::InvalidMediaPrefix);
+    }
+    let capabilities = furami::media::render_catalog::query_qualified_capabilities(prefix_path)
+        .map_err(|_| StartupError::QualificationRenderer)?;
+    let renderer = furami::media::render_catalog::compile_renderer(
+        &furami::domain::render::RendererSettings::default(),
+        &capabilities,
+    )
+    .map_err(|_| StartupError::QualificationRenderer)?;
+    furami::native_host::run_qualification_application(
+        &prefix,
+        &display,
+        video,
+        renderer,
+        arguments.qualification_stdin,
+        diagnostics,
+    )?;
+    Ok(())
 }
 
 fn run_with_arguments(
@@ -516,6 +652,8 @@ mod tests {
         let error = StartupError::NativeLaunch(furami::native_host::NativeLaunchError {
             exit_code: 1,
             diagnostic: "/dev/private-startup-marker personal backend text".into(),
+            failure_kind: furami::native_host::NativeFailureKind::Generic,
+            safe_detail: String::new(),
         });
         let encoded = serde_json::to_string(&error.diagnostic()).unwrap();
         assert!(!encoded.contains("private-startup-marker"));
@@ -798,5 +936,90 @@ mod tests {
                 "{values:?}"
             );
         }
+    }
+    #[test]
+    fn qualification_arguments_are_exclusive_and_keep_unix_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = OsString::from_vec(b"/tmp/qualification-\xff.y4m".to_vec());
+        let parsed = StartupArguments::parse([
+            OsString::from("--qualification-video"),
+            path.clone(),
+            OsString::from("--qualification-stdin"),
+        ])
+        .unwrap();
+        assert_eq!(parsed.qualification_video.unwrap().as_os_str(), path);
+        assert!(parsed.video.is_none() && parsed.qualification_stdin);
+        for values in [
+            vec!["--qualification-video"],
+            vec![
+                "--qualification-video",
+                "/tmp/a.y4m",
+                "--qualification-video",
+                "/tmp/b.y4m",
+            ],
+            vec!["--qualification-video", "/tmp/a.y4m", "--capture-audio-off"],
+            vec![
+                "--qualification-video",
+                "/tmp/a.y4m",
+                "--list-audio-sources",
+            ],
+            vec![
+                "--qualification-video",
+                "/tmp/a.y4m",
+                "--capture-node",
+                "/dev/video0",
+            ],
+            vec![
+                "--qualification-video",
+                "/tmp/a.y4m",
+                "--qualification-stdin",
+                "--qualification-stdin",
+            ],
+        ] {
+            let failure = StartupArguments::parse(args(&values))
+                .unwrap_err()
+                .diagnostic();
+            assert_eq!(failure.code, "qualification_arguments", "{values:?}");
+        }
+    }
+    #[test]
+    fn typed_plugin_failure_survives_capture_request_wrapper_without_exposing_other_errors() {
+        use furami::native_host::{NativeFailureKind, NativeLaunchError};
+        for (kind, code) in [
+            (NativeFailureKind::QtPluginMissing, "qt_plugin_missing"),
+            (NativeFailureKind::QtPluginInvalid, "qt_plugin_invalid"),
+            (NativeFailureKind::QtPluginLoad, "qt_plugin_load"),
+        ] {
+            let arguments = StartupArguments::parse(args(&[
+                "--capture-node",
+                "/dev/video0",
+                "--capture-size",
+                "320x180",
+                "--capture-rate",
+                "30",
+            ]))
+            .unwrap();
+            let error = StartupError::WithRequest {
+                request: arguments.video.unwrap().mode,
+                source: Box::new(StartupError::NativeLaunch(NativeLaunchError {
+                    exit_code: 1,
+                    diagnostic: "private backend text".into(),
+                    failure_kind: kind,
+                    safe_detail: "platform: <media-prefix> plugin refused".into(),
+                })),
+            };
+            assert_eq!(error.diagnostic().code, code);
+            assert_eq!(
+                error.plugin_detail(),
+                Some("platform: <media-prefix> plugin refused")
+            );
+        }
+        let generic = StartupError::NativeLaunch(NativeLaunchError {
+            exit_code: 1,
+            diagnostic: "private text".into(),
+            failure_kind: NativeFailureKind::Generic,
+            safe_detail: "must not be printed".into(),
+        });
+        assert!(generic.plugin_detail().is_none());
     }
 }

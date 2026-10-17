@@ -6,10 +6,19 @@ use crate::domain::{
 use crate::media::render_catalog::{self, RendererCapabilities, RendererCatalogError};
 use serde::Serialize;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(super) enum SessionKind {
+    #[serde(rename = "capture")]
+    Capture,
+    #[serde(rename = "qualification-video")]
+    QualificationVideo,
+}
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Snapshot {
     pub schema: u32,
+    #[serde(rename = "session_kind")]
+    pub session_kind: SessionKind,
     pub state_token: String,
     pub generation: String,
     pub product_phase: String,

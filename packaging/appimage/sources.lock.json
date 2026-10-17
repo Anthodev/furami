@@ -1,10 +1,146 @@
 {
   "schema": 1,
+  "required_qt_modules": ["qtbase", "qtdeclarative", "qtsvg"],
+  "alpine_private_bootstrap": {
+    "image": "docker.io/library/alpine@sha256:3c81aa9a3d770b316568f4499e30461a5cd3fbd7180bd89e28e34894c7845832",
+    "manifest_sha256": "3c81aa9a3d770b316568f4499e30461a5cd3fbd7180bd89e28e34894c7845832",
+    "config_sha256": "9cb701c20b595f4442ba074b2ec924f396f4c474084608116901ce3098ebfe3d",
+    "layers_sha256": [
+      "16333ee0c00fc65e025a2a4f839703ad37a74728832977fbdf080984de1b8e5a"
+    ],
+    "basis": "Exact original OCI manifest/config/compressed-layer identities verified during authenticated private bootstrap retention; identity-only exclusion facts, not public redistribution clearance."
+  },
   "qt_sources": {
-    "qtbase": {"version": "6.11.2", "archive": "qtbase-everywhere-src-6.11.2.tar.xz", "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz", "sha256": "5b2e00eccaf5a4d8c14134ffa0ea8dfd0a35ae1ffc7f8d87fa4305a1ed23cf22", "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz.mirrorlist", "kit_source_commit": "ef55f427f2c8b410d34f8a7681020a3000cf6866"},
-    "qtdeclarative": {"version": "6.11.2", "archive": "qtdeclarative-everywhere-src-6.11.2.tar.xz", "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtdeclarative-everywhere-src-6.11.2.tar.xz", "sha256": "215b7b70517e380123eabc6b92243f3c47b6f016a91d126057dbe53551c6b430", "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtdeclarative-everywhere-src-6.11.2.tar.xz.mirrorlist", "kit_source_commit": "4e3399c26ec57246c08de019cfcbda8d23604cfa"},
-    "qtsvg": {"version": "6.11.2", "archive": "qtsvg-everywhere-src-6.11.2.tar.xz", "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtsvg-everywhere-src-6.11.2.tar.xz", "sha256": "d594337feca84c26fb67fe87b85e6a5c12fda404b611d905f9d138210c311876", "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtsvg-everywhere-src-6.11.2.tar.xz.mirrorlist", "kit_source_commit": "17ca512f903f935282ebeca496aac5d11ba4199a"},
-    "qtshadertools": {"version": "6.11.2", "archive": "qtshadertools-everywhere-src-6.11.2.tar.xz", "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtshadertools-everywhere-src-6.11.2.tar.xz", "sha256": "805046b8b7757665586890b375940047e874ae3ab00adb6d3f2b38fc6b200b1c", "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtshadertools-everywhere-src-6.11.2.tar.xz.mirrorlist", "kit_source_commit": null}
+    "qtbase": {
+      "version": "6.11.2",
+      "archive": "qtbase-everywhere-src-6.11.2.tar.xz",
+      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz",
+      "sha256": "5b2e00eccaf5a4d8c14134ffa0ea8dfd0a35ae1ffc7f8d87fa4305a1ed23cf22",
+      "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz.mirrorlist",
+      "kit_source_commit": "ef55f427f2c8b410d34f8a7681020a3000cf6866",
+      "supplemental_metadata": {
+        "commit": "ef55f427f2c8b410d34f8a7681020a3000cf6866",
+        "archive_sha256": "5b2e00eccaf5a4d8c14134ffa0ea8dfd0a35ae1ffc7f8d87fa4305a1ed23cf22",
+        "spdx_sha256": "756ed1c39c0f8acfbba13c2d4473a5e84cab7a433f1605f3cf1d7a035a2f43ea",
+        "files": {
+          "src/3rdparty/.gitattributes": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-00.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/3rdparty/.gitattributes",
+            "sha256": "61710d3e049d7346b42f70ef15bbd272d0bb75d4e26f034b3da16f5a20ed3e07",
+            "sha1": "44ae8ff49edf854049431d1410b940227bbd6616",
+            "recipient": "qt-inputs/qtbase-git-metadata/src/3rdparty/.gitattributes"
+          },
+          "src/3rdparty/tinycbor/.gitignore": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-01.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/3rdparty/tinycbor/.gitignore",
+            "sha256": "4eef1f6e5775ae2605ef91fd0d36284a751303f2db78acb150978b7e01ea3abc",
+            "sha1": "231fd6069da29dc2f732a2208ee5c3d6efba8b21",
+            "recipient": "qt-inputs/qtbase-git-metadata/src/3rdparty/tinycbor/.gitignore"
+          },
+          "src/3rdparty/tinycbor/tests/.gitignore": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-02.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/3rdparty/tinycbor/tests/.gitignore",
+            "sha256": "2044f4e5abc4ee4a881df20e375dadeae820f615c6892ef34cd35dc470fa3efe",
+            "sha1": "79a4750d883d4684503bb6335c906fd64326bb74",
+            "recipient": "qt-inputs/qtbase-git-metadata/src/3rdparty/tinycbor/tests/.gitignore"
+          },
+          "src/android/jar/.gitignore": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-03.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/android/jar/.gitignore",
+            "sha256": "3a428cfeb8258e4575fa778fb73f482b00ed14c445a56cbd9c4c510cf7f71892",
+            "sha1": "230fbab6f0a3c7de4035af8b1b71bd2bb4337739",
+            "recipient": "qt-inputs/qtbase-git-metadata/src/android/jar/.gitignore"
+          },
+          "src/android/templates/.gitignore": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-04.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/android/templates/.gitignore",
+            "sha256": "34c41cd103929b13e8e0f904577bc544ab2a886570735221e128762be77a475e",
+            "sha1": "aa27e8a17ca87e892c7df0d2a25c3fa9a0869cc0",
+            "recipient": "qt-inputs/qtbase-git-metadata/src/android/templates/.gitignore"
+          },
+          "src/corelib/serialization/.gitignore": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-05.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/corelib/serialization/.gitignore",
+            "sha256": "78a981762a2418f5bc4d7e23e248fcbc4f8fd68f67201ae7e9a978e8c5b24d3c",
+            "sha1": "4546b27af61e650390e6c84b8a247b9f983647b8",
+            "recipient": "qt-inputs/qtbase-git-metadata/src/corelib/serialization/.gitignore"
+          },
+          "src/network/android/jar/.gitignore": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-06.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/network/android/jar/.gitignore",
+            "sha256": "cd91fd1346f2bbdd6c16c404f296cb3b503427a998bb9957d8ab3bbb29bede84",
+            "sha1": "032387ceb1895268a2bae1b61a3bd41a752b7482",
+            "recipient": "qt-inputs/qtbase-git-metadata/src/network/android/jar/.gitignore"
+          },
+          "src/plugins/networkinformation/android/jar/.gitignore": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-07.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/plugins/networkinformation/android/jar/.gitignore",
+            "sha256": "cd91fd1346f2bbdd6c16c404f296cb3b503427a998bb9957d8ab3bbb29bede84",
+            "sha1": "032387ceb1895268a2bae1b61a3bd41a752b7482",
+            "recipient": "qt-inputs/qtbase-git-metadata/src/plugins/networkinformation/android/jar/.gitignore"
+          }
+        },
+        "license_evidence": {
+          "REUSE.toml": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-08.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/REUSE.toml",
+            "sha256": "56a2d79d2e56893411d04becd342312b3c1c1ff67096aaed5639ff3d0fb0d490",
+            "sha1": "f89e5a097fd53c7b3e3e246d64dd43ed359cef95",
+            "recipient": "qt-inputs/qtbase-git-metadata/REUSE.toml"
+          },
+          "src/3rdparty/tinycbor/REUSE.toml": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-09.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/3rdparty/tinycbor/REUSE.toml",
+            "sha256": "434b9d897d314261691e2546a1238b7ec9ceb10608a68d4a215250579464b20d",
+            "sha1": "6365d4e66ae96ef8f68ec970886e198f369ea13e",
+            "recipient": "qt-inputs/qtbase-git-metadata/src/3rdparty/tinycbor/REUSE.toml"
+          },
+          "LICENSES/BSD-3-Clause.txt": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-10.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/LICENSES/BSD-3-Clause.txt",
+            "sha256": "9f0490f18656c6f2435bd14f603ef0c96434d1825615363dce43abb42ed1dcce",
+            "sha1": "b073f11f0c81a95ab5e32aa6b5d23a5955a95274",
+            "recipient": "qt-inputs/qtbase-git-metadata/LICENSES/BSD-3-Clause.txt"
+          },
+          "src/3rdparty/tinycbor/LICENSE": {
+            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-11.metadata",
+            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/3rdparty/tinycbor/LICENSE",
+            "sha256": "3c6ba0b5bfa7830505301ffb336a17b0748e0d61c4d34216e9dc98f10e40395e",
+            "sha1": "744aeb214e5bd02d894c0390cb505be56847b6be",
+            "recipient": "qt-inputs/qtbase-git-metadata/src/3rdparty/tinycbor/LICENSE"
+          }
+        },
+        "selected_terms": {
+          "qt_metadata": "BSD-3-Clause",
+          "tinycbor_metadata": "MIT"
+        },
+        "basis": "Pinned root REUSE.toml Git metadata annotation; closer tinycbor REUSE.toml MIT annotation. Original notices and complete license texts accompany the overlay; SPDX LicenseConcluded remains NOASSERTION."
+      }
+    },
+    "qtdeclarative": {
+      "version": "6.11.2",
+      "archive": "qtdeclarative-everywhere-src-6.11.2.tar.xz",
+      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtdeclarative-everywhere-src-6.11.2.tar.xz",
+      "sha256": "215b7b70517e380123eabc6b92243f3c47b6f016a91d126057dbe53551c6b430",
+      "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtdeclarative-everywhere-src-6.11.2.tar.xz.mirrorlist",
+      "kit_source_commit": "4e3399c26ec57246c08de019cfcbda8d23604cfa"
+    },
+    "qtsvg": {
+      "version": "6.11.2",
+      "archive": "qtsvg-everywhere-src-6.11.2.tar.xz",
+      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtsvg-everywhere-src-6.11.2.tar.xz",
+      "sha256": "d594337feca84c26fb67fe87b85e6a5c12fda404b611d905f9d138210c311876",
+      "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtsvg-everywhere-src-6.11.2.tar.xz.mirrorlist",
+      "kit_source_commit": "17ca512f903f935282ebeca496aac5d11ba4199a"
+    },
+    "qtshadertools": {
+      "version": "6.11.2",
+      "archive": "qtshadertools-everywhere-src-6.11.2.tar.xz",
+      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtshadertools-everywhere-src-6.11.2.tar.xz",
+      "sha256": "805046b8b7757665586890b375940047e874ae3ab00adb6d3f2b38fc6b200b1c",
+      "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtshadertools-everywhere-src-6.11.2.tar.xz.mirrorlist",
+      "kit_source_commit": null
+    }
   },
   "icu_notice": {
     "version": "73.2",
