@@ -86,7 +86,7 @@ Alpine **binary** bootstrap packages and base-image material are deliberately ex
 
 ```sh
 python3 packaging/appimage/audit.py \
-  --image /absolute/new-output/release/Furami-v1.0.0-rc.1-Linux-x64.AppImage \
+  --image /absolute/new-output/release/Furami-v1.0.0-rc.2-Linux-x64.AppImage \
   --provenance /absolute/new-output/provenance.json \
   --output /absolute/new-audit
 ```
@@ -106,7 +106,7 @@ The media provider's own `mpv` program is staged at `usr/bin/mpv` from the same 
 FUSE-free extraction is supported by the type-2 runtime:
 
 ```sh
-./Furami-v1.0.0-rc.1-Linux-x64.AppImage --appimage-extract
+./Furami-v1.0.0-rc.2-Linux-x64.AppImage --appimage-extract
 ./squashfs-root/AppRun
 ```
 
@@ -114,7 +114,7 @@ Extraction does not prove a no-FUSE host qualification. Direct launch and extrac
 
 ## Release channels
 
-Furami is distributed through tag-driven GitHub releases. A stable tag is `vX.Y.Z` and becomes a GitHub release marked **Latest**; a candidate tag is `vX.Y.Z-rc.N` with `N >= 1` and no leading zero and becomes a pre-release that is never Latest. Either tag must equal `v` followed by the `Cargo.toml` package version of its own commit — a tag never rewrites the version, and the Cargo version itself has no leading `v`. The published asset is named `Furami-v<version>-Linux-x64.AppImage`, so the current version produces `Furami-v1.0.0-rc.1-Linux-x64.AppImage` and a stable `1.0.0` would produce `Furami-v1.0.0-Linux-x64.AppImage`. The workflow triggers on `v*` tags while the executable guard derives the channel from the tag itself, so a malformed tag is refused before the build and manual dispatch stays artifact-only.
+Furami is distributed through tag-driven GitHub releases. A stable tag is `vX.Y.Z` and becomes a GitHub release marked **Latest**; a candidate tag is `vX.Y.Z-rc.N` with `N >= 1` and no leading zero and becomes a pre-release that is never Latest. Either tag must equal `v` followed by the `Cargo.toml` package version of its own commit — a tag never rewrites the version, and the Cargo version itself has no leading `v`. The published asset is named `Furami-v<version>-Linux-x64.AppImage`, so the current version produces `Furami-v1.0.0-rc.2-Linux-x64.AppImage` and a stable `1.0.0` would produce `Furami-v1.0.0-Linux-x64.AppImage`. The workflow triggers on `v*` tags while the executable guard derives the channel from the tag itself, so a malformed tag is refused before the build and manual dispatch stays artifact-only.
 
 A stable release therefore needs its version prepared in the tagged commit: set `Cargo.toml` and its single `Furami` `Cargo.lock` entry to the stable version and add the exact `## [<version>] - <date>` section to `CHANGELOG.md`, then commit before tagging. The release notes are extracted from that same tagged commit, never the working tree. Both channels keep the full source/license/checksum gate; a stable tag gets no relaxation. A tag build compiles the image once from the frozen recipes and is published without a reproducibility comparison — the two-build measurement runs only on an explicit manual dispatch, which never publishes, so a tag release carries no reproducibility claim and receives no fabricated receipt. The asset name matches GearLever's `Furami-v*-Linux-x64.AppImage` pattern, but the image carries no embedded update information and ships no `.zsync`, so naming alone does not configure automatic updates — such a tool reads `/releases/latest`, which only a stable release is marked as.
 
@@ -133,7 +133,7 @@ A **complete local candidate** — the flat directory that also holds the indexe
 
 ```sh
 python3 scripts/publish_candidate.py --check-only \
-  --event-name push --tag v1.0.0-rc.1 --candidate /absolute/new-output/release
+  --event-name push --tag v1.0.0-rc.2 --candidate /absolute/new-output/release
 ```
 
 The same check accepts a prepared stable tag (`--tag v1.0.0`): the channel follows the tag, so nothing else changes. `--check-only` reads the version from `Cargo.toml`, requires the matching Furami entry in `Cargo.lock`, and re-verifies the real files: a non-empty exact image, regular non-symlink assets, a `SHA256SUMS` that covers every upload except itself with no duplicate or dangerous path, `release-ready.json.ready is True` with image/audit/sources-index fingerprints matching the actual bytes, and a `reproducibility.json`, when present, linked to the selected image by `second_image_sha256` with accepted comparison criteria. It writes nothing and returns the sorted list of verified assets. The four downloads alone cannot satisfy this check: they carry only the materials archive, so the indexed source archives it needs are absent.
