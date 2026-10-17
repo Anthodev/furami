@@ -41,7 +41,7 @@ Media input is a build root containing `manifest.json`, `prefix/` and the locked
 
 `--acquire-sources` explicitly requests missing checked source/relink inputs. Omit it for the local smoke image: unavailable large source inputs are recorded, not silently downloaded. Cold CI release builds use it. `--compliance-cache` controls the corresponding-source cache; `--source-cache` controls pinned Rust/Cargo crate inputs. Download cache entries are rechecked before reuse.
 
-Each fresh application build writes `app/build-inputs.json` and `app/source-snapshot/` before compilation. They bind current source files, build recipes, locked source archives and media receipt. Sources, snapshot hashes and frozen media bytes are rechecked after compilation. `app/first/evidence/container-command.json` records the exact build invocation; Qt tool hashes and RCC calls have separate receipts.
+Each fresh application build writes `app/build-inputs.json` and `app/source-snapshot/` before compilation. They bind current source files, build recipes, locked source archives and media receipt. Sources, snapshot hashes and frozen media bytes are rechecked after compilation. `app/first/evidence/container-command.json` records the exact build invocation as `{"schema": 1, "command": [...]}`; Qt tool hashes and RCC calls have separate receipts. CI diagnostic evidence collects only allowlisted JSON objects and the application container's `app/first/build.log`, including failed builds. Logs retain at most the last 8 MiB; `executed-inputs.json` records original/stored sizes, omitted byte count and both SHA256 hashes. Container failures also print a bounded tail (120 lines / 16 KiB) to stderr without changing the failure result. Media/runtime logs, binaries and private bootstrap caches are not collected.
 
 ## Frozen qmake and reproducible RCC
 
@@ -80,7 +80,7 @@ Alpine **binary** bootstrap packages and base-image material are deliberately ex
 
 ```sh
 python3 packaging/appimage/audit.py \
-  --image /absolute/new-output/release/Furami-v0.1.0-rc.1-Linux-x64.AppImage \
+  --image /absolute/new-output/release/Furami-v0.1.0-rc.2-Linux-x64.AppImage \
   --provenance /absolute/new-output/provenance.json \
   --output /absolute/new-audit
 ```
@@ -100,7 +100,7 @@ The media provider's own `mpv` program is staged at `usr/bin/mpv` from the same 
 FUSE-free extraction is supported by the type-2 runtime:
 
 ```sh
-./Furami-v0.1.0-rc.1-Linux-x64.AppImage --appimage-extract
+./Furami-v0.1.0-rc.2-Linux-x64.AppImage --appimage-extract
 ./squashfs-root/AppRun
 ```
 
@@ -108,7 +108,7 @@ Extraction does not prove a no-FUSE host qualification. Direct launch and extrac
 
 ## Release channels
 
-Furami is distributed through tag-driven GitHub releases. A stable tag is `vX.Y.Z` and becomes a GitHub release marked **Latest**; a candidate tag is `vX.Y.Z-rc.N` with `N >= 1` and no leading zero and becomes a pre-release that is never Latest. Either tag must equal `v` followed by the `Cargo.toml` package version of its own commit — a tag never rewrites the version, and the Cargo version itself has no leading `v`. The published asset is named `Furami-v<version>-Linux-x64.AppImage`, so the current version produces `Furami-v0.1.0-rc.1-Linux-x64.AppImage` and a stable `0.1.0` would produce `Furami-v0.1.0-Linux-x64.AppImage`. The workflow triggers on `v*` tags while the executable guard derives the channel from the tag itself, so a malformed tag is refused before the build and manual dispatch stays artifact-only.
+Furami is distributed through tag-driven GitHub releases. A stable tag is `vX.Y.Z` and becomes a GitHub release marked **Latest**; a candidate tag is `vX.Y.Z-rc.N` with `N >= 1` and no leading zero and becomes a pre-release that is never Latest. Either tag must equal `v` followed by the `Cargo.toml` package version of its own commit — a tag never rewrites the version, and the Cargo version itself has no leading `v`. The published asset is named `Furami-v<version>-Linux-x64.AppImage`, so the current version produces `Furami-v0.1.0-rc.2-Linux-x64.AppImage` and a stable `0.1.0` would produce `Furami-v0.1.0-Linux-x64.AppImage`. The workflow triggers on `v*` tags while the executable guard derives the channel from the tag itself, so a malformed tag is refused before the build and manual dispatch stays artifact-only.
 
 A stable release therefore needs its version prepared in the tagged commit: set `Cargo.toml` and its single `Furami` `Cargo.lock` entry to the stable version and add the exact `## [<version>] - <date>` section to `CHANGELOG.md`, then commit before tagging. The release notes are extracted from that same tagged commit, never the working tree. Both channels keep the full source/license/checksum/reproducibility gate; a stable tag gets no relaxation. The asset name matches GearLever's `Furami-v*-Linux-x64.AppImage` pattern, but the image carries no embedded update information and ships no `.zsync`, so naming alone does not configure automatic updates — such a tool reads `/releases/latest`, which only a stable release is marked as.
 
@@ -118,7 +118,7 @@ Verify a candidate locally without network access, a token or a real remote tag:
 
 ```sh
 python3 scripts/publish_candidate.py --check-only --require-reproducibility \
-  --event-name push --tag v0.1.0-rc.1 --candidate /absolute/new-output/release
+  --event-name push --tag v0.1.0-rc.2 --candidate /absolute/new-output/release
 ```
 
 The same check accepts a prepared stable tag (`--tag v0.1.0`): the channel follows the tag, so nothing else changes. `--check-only` reads the version from `Cargo.toml`, requires the matching Furami entry in `Cargo.lock`, and re-verifies the real files: a non-empty exact image, regular non-symlink assets, a `SHA256SUMS` that covers every upload except itself with no duplicate or dangerous path, `release-ready.json.ready is True` with image/audit/sources-index fingerprints matching the actual bytes, and `reproducibility.json` linked to the selected image by `second_image_sha256` with accepted comparison criteria. It writes nothing and returns the sorted list of verified assets. Publication is a separate, explicit run (`publish_candidate.py` without `--check-only`) performed by the tag workflow's protected job; it never happens during verification.

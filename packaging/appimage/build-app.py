@@ -318,6 +318,31 @@ def snapshot_inputs(output, inputs):
         shutil.copy2(source, target)
 
 
+def emit_failed_build_log(log_path):
+    """Best-effort bounded diagnostics; never replace the child failure."""
+    try:
+        if (not log_path.is_file()
+                or not log_path.resolve().is_relative_to(log_path.parent.absolute())
+                or any(path.is_symlink() for path in (log_path, *log_path.parents))):
+            raise ValueError("build log is not regular and confined without symlinks")
+        with log_path.open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            size = log.tell()
+            log.seek(max(0, size - 16 * 1024))
+            tail = log.read(16 * 1024)
+        tail = b"\n".join(tail.split(b"\n")[-120:])
+        print("--- app container build.log tail (at most 120 lines / 16384 bytes) ---",
+              file=sys.stderr)
+        print(tail.decode("utf-8", errors="replace"), file=sys.stderr)
+        print("--- end app container build.log tail ---", file=sys.stderr)
+    except (OSError, ValueError):
+        # Missing/unreadable logs or a closed stderr cannot hide the exit code.
+        try:
+            print("app container build.log tail unavailable", file=sys.stderr)
+        except (OSError, ValueError):
+            pass
+
+
 def run_build(media, output, cache, stack, label):
     build = output / label
     build.mkdir()
@@ -353,10 +378,12 @@ def run_build(media, output, cache, stack, label):
                "--env", f"FURAMI_BUILD_JOBS={os.environ.get('FURAMI_BUILD_JOBS', '2')}",
                stack["container"], "bash", "packaging/appimage/app-container-build.sh"]
     log_path = build / "build.log"
-    (evidence / "container-command.json").write_text(json.dumps(command, indent=2) + "\n")
+    receipt = {"schema": 1, "command": command}
+    (evidence / "container-command.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     with log_path.open("w") as log:
         result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False)
     if result.returncode:
+        emit_failed_build_log(log_path)
         raise RuntimeError(f"{label} app container exited {result.returncode}; see {log_path}")
     binary = build / "bin/furami"
     if not binary.is_file() or not (build / "evidence/furami.link.map").is_file():

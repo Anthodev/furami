@@ -2,6 +2,7 @@
 """Build one frozen x86_64 AppImage and emit independently audited release assets."""
 import argparse
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import tomllib
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+MAX_LOG_BYTES = 8 * 1024 * 1024
 
 
 def module(path, name):
@@ -41,40 +43,60 @@ def private_cache_outside(cache, upload_roots):
 
 
 def collect_evidence(out, destination, commit):
-    """Copy only JSON receipts, including on failure; never recurse over caches."""
+    """Copy allowlisted receipts and bounded app logs, never provider/cache trees."""
     out, destination = out.resolve(), destination.absolute()
     if destination.is_symlink() or (destination.exists() and any(destination.iterdir())):
         raise ValueError('evidence upload root must be empty and not a symlink')
     paths = ('provenance.json', 'app/build-inputs.json', 'app/first/evidence/container-command.json',
              'reproducibility.json', 'release/release-ready.json', 'audit/audit.json')
+    log_paths = ('app/first/build.log',)
+    logs = []
     selected = []
     for prefix in ('', 'first', 'second'):
-        provenance = out / prefix / 'provenance.json'
-        if provenance.is_file():
-            receipt = json.loads(provenance.read_text())
-            cache = receipt.get('source_caches', {}).get('runtime')
-            if not isinstance(cache, str) or not Path(cache).is_absolute():
-                raise ValueError('runtime private cache provenance missing')
-            private_cache_outside(Path(cache), (out, destination))
-        for name in paths:
+        for name in (*paths, *log_paths):
             source = out / prefix / name
             if not source.exists() and not source.is_symlink():
                 continue
-            if source.is_symlink() or not source.is_file() or not source.resolve().is_relative_to(out):
-                raise ValueError('evidence receipt must be regular and confined: ' + name)
-            if not isinstance(json.loads(source.read_text()), dict):
+            if (not source.is_file() or not source.resolve().is_relative_to(out)
+                    or any(path.is_symlink() for path in (source, *source.parents)
+                           if path.is_relative_to(out))):
+                raise ValueError('evidence input must be regular and confined without symlinks: ' + name)
+            if name in paths and not isinstance(json.loads(source.read_text()), dict):
                 raise ValueError('evidence receipt must contain a JSON object: ' + name)
-            selected.append((source, destination / prefix / name))
+            if name == 'provenance.json':
+                receipt = json.loads(source.read_text())
+                cache = receipt.get('source_caches', {}).get('runtime')
+                if not isinstance(cache, str) or not Path(cache).is_absolute():
+                    raise ValueError('runtime private cache provenance missing')
+                private_cache_outside(Path(cache), (out, destination))
+            selected.append((source, destination / prefix / name, name in log_paths))
     destination.mkdir(parents=True, exist_ok=True)
-    for source, target in selected:
+    for source, target, is_log in selected:
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        if not is_log:
+            shutil.copy2(source, target)
+            continue
+        original_digest = hashlib.sha256()
+        original_bytes = 0
+        with source.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                original_digest.update(chunk)
+                original_bytes += len(chunk)
+            stream.seek(max(0, original_bytes - MAX_LOG_BYTES))
+            tail = stream.read(MAX_LOG_BYTES)
+        target.write_bytes(tail)
+        logs.append({'path': target.relative_to(destination).as_posix(),
+                     'original_bytes': original_bytes, 'stored_bytes': len(tail),
+                     'truncated_bytes': original_bytes - len(tail),
+                     'original_sha256': original_digest.hexdigest(),
+                     'sha256': hashlib.sha256(tail).hexdigest()})
     sources_recipe = module(HERE / 'sources.py', 'furami_evidence_sources')
     recipes = {str(path.relative_to(REPO)): sources_recipe.sha(path)
                for path in (REPO / 'packaging').rglob('*')
                if path.is_file() and not path.is_symlink()
                and path.suffix in ('.py', '.json', '.sh', '.Containerfile')}
-    sources_recipe.dump(destination / 'executed-inputs.json', {'commit': commit, 'recipes': recipes})
+    sources_recipe.dump(destination / 'executed-inputs.json',
+                        {'commit': commit, 'recipes': recipes, 'logs': logs})
 
 
 def build(args):

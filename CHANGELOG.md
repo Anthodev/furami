@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.0-rc.2] - 2026-10-17
+
+Second release candidate, prepared for local evaluation. Furami is not stable and this candidate carries no certification: no tag, release or remote CI run has been published, and publication stays gated on the source and license clearance for every public artifact, stable or pre-release. The primary AppImage build failure behind this candidate is still unresolved.
+
+### Fixes
+
+- A failed AppImage CI build now preserves its diagnostic logs instead of aborting evidence collection ([#25](https://github.com/Anthodev/furami/issues/25), uncommitted local work).
+
 ## [0.1.0-rc.1] - 2026-10-17
 
 First release candidate, prepared for local evaluation. Furami is not stable: this candidate carries no certification, and no tag, release or remote CI run has been published. Publication stays gated on the `release-ready.json` source and license clearance for every public artifact, stable or pre-release. The entries below combine the feature work merged into `develop` with the release-candidate chain that is still uncommitted local work of [#25](https://github.com/Anthodev/furami/issues/25).

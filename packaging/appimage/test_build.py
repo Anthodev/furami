@@ -1,5 +1,9 @@
 """Candidate and failure-receipt uploads never absorb private runtime inputs."""
 import importlib.util
+import contextlib
+import hashlib
+import subprocess
+import sys
 import json
 from pathlib import Path
 import tempfile
@@ -307,6 +311,94 @@ class HistoricalImageTests(unittest.TestCase):
 
 
 class UploadIsolationTests(unittest.TestCase):
+    def test_failed_producer_receipt_and_logs_are_collectable(self):
+        app = builder.module(Path(__file__).with_name('build-app.py'), 'failed_app_fixture')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media, out = root / 'media', root / 'out'
+            output = out / 'first/app'
+            output.mkdir(parents=True)
+            for name in ('bin/qmake6', 'libexec/rcc'):
+                tool = media / 'prefix' / name
+                tool.parent.mkdir(parents=True, exist_ok=True)
+                tool.write_bytes(b'fixture Qt tool')
+            stack = json.loads(app.STACK_LOCK.read_text())
+            commands = []
+            real_run = subprocess.run
+
+            def failed_container(command, **kwargs):
+                commands.append(command)
+                # A real child writes to run_build's real redirected log.
+                return real_run([sys.executable, '-c',
+                                 'import sys; print("fixture compiler failure"); sys.exit(23)'],
+                                **kwargs)
+
+            stderr = io.StringIO()
+            with patch.object(app.subprocess, 'run', side_effect=failed_container), \
+                    contextlib.redirect_stderr(stderr), \
+                    self.assertRaisesRegex(RuntimeError, 'container exited 23'):
+                app.run_build(media, output, root / 'sources', stack, 'first')
+            receipt = json.loads((output / 'first/evidence/container-command.json').read_text())
+            self.assertEqual(receipt, {'schema': 1, 'command': commands[0]})
+            self.assertIn('fixture compiler failure', stderr.getvalue())
+            (out / 'private.apk').write_bytes(b'PRIVATE BOOTSTRAP')
+            (out / 'runtime').mkdir()
+            (out / 'runtime/build.log').write_bytes(b'PRIVATE BOOTSTRAP')
+            dest = root / 'evidence'
+            builder.collect_evidence(out, dest, 'fixture')
+            relative = 'first/app/first/build.log'
+            self.assertEqual((dest / relative).read_bytes(),
+                             (out / relative).read_bytes())
+            metadata = json.loads((dest / 'executed-inputs.json').read_text())['logs'][0]
+            self.assertEqual(metadata['path'], relative)
+            self.assertEqual(metadata['truncated_bytes'], 0)
+            self.assertEqual(metadata['sha256'], hashlib.sha256((dest / relative).read_bytes()).hexdigest())
+            self.assertFalse(any(b'PRIVATE BOOTSTRAP' in path.read_bytes()
+                                 for path in dest.rglob('*') if path.is_file()))
+
+    def test_log_tail_archive_is_bounded_and_hashes_are_truthful(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            out, dest = root / 'out', root / 'evidence'
+            log = out / 'app/first/build.log'
+            log.parent.mkdir(parents=True)
+            content = b'head\n' + b'x' * builder.MAX_LOG_BYTES + b'\nerror\n'
+            log.write_bytes(content)
+            builder.collect_evidence(out, dest, 'fixture')
+            stored = (dest / 'app/first/build.log').read_bytes()
+            self.assertEqual(stored, content[-builder.MAX_LOG_BYTES:])
+            record = json.loads((dest / 'executed-inputs.json').read_text())['logs'][0]
+            self.assertEqual(record['original_bytes'], len(content))
+            self.assertEqual(record['stored_bytes'], len(stored))
+            self.assertEqual(record['truncated_bytes'], len(content) - len(stored))
+            self.assertEqual(record['original_sha256'], hashlib.sha256(content).hexdigest())
+            self.assertEqual(record['sha256'], hashlib.sha256(stored).hexdigest())
+
+    def test_log_symlinks_and_json_arrays_refuse_before_copying(self):
+        for mutation in ('log-symlink', 'parent-escape', 'internal-parent-symlink', 'array'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                out, dest = root / 'out', root / 'evidence'
+                out.mkdir()
+                (out / 'reproducibility.json').write_text('[]' if mutation == 'array' else '{}')
+                private = root / 'private'
+                private.mkdir()
+                (private / 'build.log').write_bytes(b'PRIVATE')
+                if mutation == 'parent-escape':
+                    (out / 'app').mkdir()
+                    (out / 'app/first').symlink_to(private, target_is_directory=True)
+                elif mutation == 'internal-parent-symlink':
+                    (out / 'app').mkdir()
+                    (out / 'app/first').symlink_to(out / 'elsewhere', target_is_directory=True)
+                    (out / 'elsewhere').mkdir()
+                    (out / 'elsewhere/build.log').write_bytes(b'PRIVATE')
+                elif mutation == 'log-symlink':
+                    (out / 'app/first').mkdir(parents=True)
+                    (out / 'app/first/build.log').symlink_to(private / 'build.log')
+                with self.assertRaises(ValueError):
+                    builder.collect_evidence(out, dest, 'fixture')
+                self.assertFalse(dest.exists())
+
     def test_private_runtime_cache_must_be_disjoint_from_both_upload_roots(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

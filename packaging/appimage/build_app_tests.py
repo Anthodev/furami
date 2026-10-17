@@ -6,6 +6,9 @@ import importlib.util
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
+import contextlib
 from pathlib import Path
 import os
 import struct
@@ -17,6 +20,69 @@ SPEC.loader.exec_module(app_build)
 
 
 class AppBuildContractTests(unittest.TestCase):
+    def test_failed_build_tail_refuses_symlinked_log_or_parent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private = root / "private"
+            private.mkdir()
+            (private / "build.log").write_text("PRIVATE HOST DATA")
+            direct = root / "build.log"
+            direct.symlink_to(private / "build.log")
+            alias = root / "alias"
+            alias.symlink_to(private, target_is_directory=True)
+            for log in (direct, alias / "build.log"):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    app_build.emit_failed_build_log(log)
+                self.assertNotIn("PRIVATE HOST DATA", stderr.getvalue())
+                self.assertIn("tail unavailable", stderr.getvalue())
+
+    def test_failed_build_tail_is_bounded_and_missing_log_is_nonfatal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "build.log"
+            log.write_bytes(b"OMITTED HEAD\n" + b"x\n" * 200 + b"z" * 20000 + b"\nfinal error\n")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                app_build.emit_failed_build_log(log)
+                app_build.emit_failed_build_log(log.with_name("missing"))
+            text = stderr.getvalue()
+            self.assertNotIn("OMITTED HEAD", text)
+            self.assertIn("final error", text)
+            self.assertIn("tail unavailable", text)
+            self.assertLess(len(text), 17000)
+            # The line bound also applies when the byte bound is not reached.
+            log.write_text("".join(f"line {i}\n" for i in range(200)))
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                app_build.emit_failed_build_log(log)
+            self.assertNotIn("line 0\n", stderr.getvalue())
+            self.assertIn("line 199\n", stderr.getvalue())
+            self.assertLessEqual(len(stderr.getvalue().splitlines()), 122)
+
+    def test_unavailable_diagnostics_cannot_replace_container_exit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media, output = root / "media", root / "app"
+            output.mkdir()
+            for name in ("bin/qmake6", "libexec/rcc"):
+                tool = media / "prefix" / name
+                tool.parent.mkdir(parents=True, exist_ok=True)
+                tool.write_bytes(b"fixture")
+            stack = json.loads(app_build.STACK_LOCK.read_text())
+
+            def fail(command, **kwargs):
+                (output / "first/build.log").unlink()
+                return SimpleNamespace(returncode=37)
+
+            class ClosedStderr:
+                def write(self, text):
+                    raise OSError("closed stderr")
+
+            with patch.object(app_build.subprocess, "run", side_effect=fail), \
+                    contextlib.redirect_stderr(ClosedStderr()), \
+                    self.assertRaisesRegex(RuntimeError, "container exited 37"):
+                app_build.run_build(media, output, root / "sources", stack, "first")
+
     def test_changed_prefix_artifact_is_rejected_before_build(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
