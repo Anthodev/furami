@@ -11,12 +11,15 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import tempfile
 import tomllib
 import tarfile
 
 from release_notes import TAG_RE
 
 REPO = Path(__file__).resolve().parents[1]
+
+MAX_RELEASE_ASSET_BYTES = 2_147_483_648
 
 
 class CandidatePublicationError(ValueError):
@@ -157,6 +160,57 @@ def verify_candidate(candidate: Path, version: str, *, require_reproducibility: 
     return assets
 
 
+def prepare_public_assets(verified_assets: list[Path], version: str, output: Path) -> list[Path]:
+    image_name = f'Furami-v{version}-Linux-x64.AppImage'
+    by_name = {path.name: path for path in verified_assets}
+    if len(by_name) != len(verified_assets):
+        raise CandidatePublicationError('verified assets must have distinct basenames')
+    for name in (image_name, 'manifest.json', 'components.json'):
+        if name not in by_name:
+            raise CandidatePublicationError(f'public export requires {name}')
+    if output.is_symlink() or not output.is_dir():
+        raise CandidatePublicationError('public asset output must be a real directory')
+    if any(output.iterdir()):
+        raise CandidatePublicationError('public asset output directory must be empty')
+    internal = {}
+    for line in by_name['SHA256SUMS'].read_text().splitlines():
+        match = re.fullmatch(r'([0-9a-f]{64})  ([^/\\\x00-\x1f\x7f]+)', line)
+        if not match or match[2] in ('.', '..', 'SHA256SUMS') or match[2] in internal:
+            raise CandidatePublicationError('unsafe or duplicate internal SHA256SUMS entry')
+        internal[match[2]] = match[1]
+    if set(internal) != set(by_name) - {'SHA256SUMS'}:
+        raise CandidatePublicationError('internal SHA256SUMS does not cover exactly the verified assets')
+    members = sorted(
+        (path for path in verified_assets
+         if path.name not in {image_name, 'manifest.json'}
+         and re.fullmatch(r'source-materials-[0-9]{3}\.tar', path.name) is None),
+        key=lambda path: path.name)
+    archive_path = output / f'Furami-v{version}-Linux-x64-materials.tar'
+    try:
+        with tarfile.open(archive_path, 'w', format=tarfile.PAX_FORMAT) as archive:
+            for path in members:
+                info = tarfile.TarInfo(path.name)
+                info.type = tarfile.REGTYPE
+                info.mode = 0o644
+                info.uid = info.gid = 0
+                info.uname = info.gname = ''
+                info.mtime = 0
+                info.size = path.stat().st_size
+                with path.open('rb') as stream:
+                    archive.addfile(info, stream)
+    except tarfile.TarError as error:
+        raise CandidatePublicationError('public materials archive refused: ' + str(error)) from error
+    size = archive_path.stat().st_size
+    if size >= MAX_RELEASE_ASSET_BYTES:
+        raise CandidatePublicationError(f'public materials archive must be under 2 GiB: {size} bytes')
+    public = {image_name: internal[image_name], 'manifest.json': internal['manifest.json'],
+              archive_path.name: digest(archive_path)}
+    sums_path = output / 'SHA256SUMS'
+    sums_path.write_text(''.join(f'{public[name]}  {name}\n' for name in sorted(public)))
+    return sorted([by_name[image_name], by_name['manifest.json'], archive_path, sums_path],
+                  key=lambda path: path.name)
+
+
 def release_channel(tag: str, version: str, event_name: str) -> str:
     match = TAG_RE.fullmatch(tag)
     if event_name != 'push' or match is None or tag != 'v' + version:
@@ -171,9 +225,11 @@ def publish_candidate(*, tag: str, version: str, event_name: str, repository: st
     if not notes.is_file() or not notes.read_text().strip():
         raise CandidatePublicationError('nonempty release notes required')
     channel_flags = ['--prerelease', '--latest=false'] if channel == 'prerelease' else ['--latest=true']
-    subprocess.run(['gh', 'release', 'create', tag, '--repo', repository, '--title', tag,
-                    '--notes-file', str(notes.resolve()), '--verify-tag', *channel_flags,
-                    *(str(path) for path in assets)], check=True)
+    with tempfile.TemporaryDirectory(prefix='furami-release-') as directory:
+        public_assets = prepare_public_assets(assets, version, Path(directory))
+        subprocess.run(['gh', 'release', 'create', tag, '--repo', repository, '--title', tag,
+                        '--notes-file', str(notes.resolve()), '--verify-tag', *channel_flags,
+                        *(str(path) for path in public_assets)], check=True)
 
 
 def main(argv: list[str] | None = None) -> int:

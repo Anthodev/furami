@@ -47,9 +47,13 @@ def write_materials(root, members):
 
 def fixture(root, variance=False, *, version='0.1.0-rc.1'):
     root.mkdir()
-    for name, content in {f'Furami-v{version}-Linux-x64.AppImage': b'image', 'audit.json': b'{}',
+    image_name = f'Furami-v{version}-Linux-x64.AppImage'
+    for name, content in {image_name: b'image', 'audit.json': b'{}',
                           'NOTICE.txt': b'notices', 'RELINKING.md': b'relink instructions'}.items():
         (root / name).write_bytes(content)
+    (root / 'manifest.json').write_text(json.dumps(
+        {'schema': 1, 'image': {'path': image_name, 'sha256': hashlib.sha256(b'image').hexdigest()}}))
+    (root / 'components.json').write_text(json.dumps({'schema': 1, 'files': {}, 'components': {}}))
     write_materials(root, source_members())
     hashes = {p.name: publisher.digest(p) for p in root.iterdir()}
     ready = {'ready': True, 'image_sha256': hashes[f'Furami-v{version}-Linux-x64.AppImage'],
@@ -78,6 +82,38 @@ def image_variance():
 
 def sums(root):
     (root / 'SHA256SUMS').write_text(''.join(f'{publisher.digest(p)}  {p.name}\n' for p in sorted(root.iterdir()) if p.name != 'SHA256SUMS'))
+
+
+def public_asset_names(version):
+    return {f'Furami-v{version}-Linux-x64.AppImage',
+            f'Furami-v{version}-Linux-x64-materials.tar', 'manifest.json', 'SHA256SUMS'}
+
+
+def retained_material_names():
+    return {'SHA256SUMS', 'sources-index.json', 'release-ready.json', 'reproducibility.json',
+            'audit.json', 'components.json', 'NOTICE.txt', 'RELINKING.md'}
+
+
+def read_public_sums(directory):
+    return {name: value for value, name in
+            (line.split('  ', 1) for line in (directory / 'SHA256SUMS').read_text().splitlines())}
+
+
+def inspect_materials_tar(bundle):
+    seen = {}
+    with tarfile.open(bundle, 'r:') as archive:
+        for member in archive:
+            assert member.isfile() and not member.issym() and not member.islnk(), member.name
+            assert member.name == Path(member.name).name, member.name
+            assert member.name not in seen, member.name
+            assert (member.uid, member.gid, member.uname, member.gname) == (0, 0, '', ''), member.name
+            assert member.mode == 0o644, member.mode
+            assert member.mtime == 0, member.mtime
+            assert member.pax_headers == {}, member.pax_headers
+            with archive.extractfile(member) as stream:
+                seen[member.name] = stream.read()
+        support.sources.verify_tar_footer(archive, bundle.name)
+    return seen
 
 
 class CandidateTests(unittest.TestCase):
@@ -133,18 +169,31 @@ class CandidateTests(unittest.TestCase):
         binary = root / 'bin'
         binary.mkdir()
         capture = root / 'gh-calls.jsonl'
+        assets = root / 'gh-assets'
+        assets.mkdir()
+        temporary = root / 'tmp'
+        temporary.mkdir()
         gh = binary / 'gh'
         gh.write_text(
             f'#!{sys.executable}\n'
-            'import json, os, pathlib, sys\n'
+            'import json, os, pathlib, shutil, sys\n'
             'args = sys.argv[1:]\n'
             'notes_hex = pathlib.Path(args[args.index("--notes-file") + 1]).read_bytes().hex()\n'
+            'tail = args[args.index("--verify-tag") + 1:]\n'
+            'target_dir = pathlib.Path(os.environ["FAKE_GH_ASSETS"])\n'
+            'for value in (entry for entry in tail if not entry.startswith("--")):\n'
+            '    source = pathlib.Path(value)\n'
+            '    target = target_dir / source.name\n'
+            '    if target.exists():\n'
+            '        raise SystemExit("duplicate upload basename: " + source.name)\n'
+            '    shutil.copyfile(source, target)\n'
             'with open(os.environ["FAKE_GH_CAPTURE"], "a") as stream:\n'
             '    stream.write(json.dumps({"argv": args, "notes_hex": notes_hex}) + "\\n")\n'
             'sys.exit(int(os.environ.get("FAKE_GH_EXIT", "0")))\n')
         gh.chmod(0o755)
         env = {key: value for key, value in os.environ.items() if key not in ('GH_TOKEN', 'GITHUB_TOKEN')}
-        env.update(PATH=str(binary), FAKE_GH_CAPTURE=str(capture))
+        env.update(PATH=str(binary), FAKE_GH_CAPTURE=str(capture), FAKE_GH_ASSETS=str(assets),
+                   TMPDIR=str(temporary))
         return env, capture
 
     def run_cli(self, root, notes, env, *, tag, event='push', extra=()):
@@ -570,7 +619,7 @@ class CandidateTests(unittest.TestCase):
                 with self.assertRaises(publisher.CandidatePublicationError):
                     publisher.verify_candidate(root, '0.1.0-rc.1', require_reproducibility=True)
 
-    def test_publication_cli_uses_tagged_notes_channel_and_exact_verified_assets(self):
+    def test_publication_cli_uses_tagged_notes_channel_and_exact_public_assets(self):
         for version in ('0.1.0', '0.1.0-rc.1'):
             for variance in (False, True):
                 with self.subTest(version=version, variance=variance), tempfile.TemporaryDirectory() as temporary:
@@ -604,14 +653,59 @@ class CandidateTests(unittest.TestCase):
                     expected_notes = 'Tagged RC notes\n' if '-rc.' in version else 'Tagged stable notes\n'
                     self.assertEqual(notes.read_text(), expected_notes)
                     env, capture = self.fake_gh(parent)
+                    before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()}
                     result = self.run_cli(root, notes, env, tag=tag)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    channel_flags = ['--prerelease', '--latest=false'] if '-rc.' in version else ['--latest=true']
-                    expected_argv = ['release', 'create', tag, '--repo', 'owner/repo', '--title', tag,
-                                     '--notes-file', str(notes.resolve()), '--verify-tag', *channel_flags,
-                                     *(str(p) for p in sorted(root.iterdir()))]
-                    self.assertEqual([json.loads(line) for line in capture.read_text().splitlines()],
-                                     [{'argv': expected_argv, 'notes_hex': expected_notes.encode().hex()}])
+                    calls = [json.loads(line) for line in capture.read_text().splitlines()]
+                    self.assertEqual(len(calls), 1, result.stdout)
+                    argv, notes_hex = calls[0]['argv'], calls[0]['notes_hex']
+                    self.assertEqual(notes_hex, expected_notes.encode().hex())
+                    self.assertEqual(argv[:2], ['release', 'create'])
+                    self.assertEqual(argv[2], tag)
+                    for option, value in (('--repo', 'owner/repo'), ('--title', tag),
+                                          ('--notes-file', str(notes.resolve()))):
+                        with self.subTest(option=option):
+                            self.assertEqual(argv.count(option), 1)
+                            self.assertEqual(argv[argv.index(option) + 1], value)
+                    self.assertIn('--verify-tag', argv)
+                    if '-rc.' in version:
+                        self.assertIn('--prerelease', argv)
+                        self.assertIn('--latest=false', argv)
+                        self.assertNotIn('--latest=true', argv)
+                    else:
+                        self.assertIn('--latest=true', argv)
+                        self.assertNotIn('--prerelease', argv)
+                    image = f'Furami-v{version}-Linux-x64.AppImage'
+                    bundle = f'Furami-v{version}-Linux-x64-materials.tar'
+                    expected = public_asset_names(version)
+                    uploaded = Path(env['FAKE_GH_ASSETS'])
+                    self.assertEqual({p.name for p in uploaded.iterdir()}, expected)
+                    sums_map = read_public_sums(uploaded)
+                    self.assertEqual(set(sums_map), expected - {'SHA256SUMS'})
+                    for name, value in sums_map.items():
+                        self.assertEqual(publisher.digest(uploaded / name), value, name)
+                    self.assertEqual((uploaded / image).read_bytes(), (root / image).read_bytes())
+                    self.assertEqual((uploaded / 'manifest.json').read_bytes(), (root / 'manifest.json').read_bytes())
+                    seen = inspect_materials_tar(uploaded / bundle)
+                    self.assertEqual(set(seen), retained_material_names())
+                    self.assertFalse(any(name.startswith('source-materials-') for name in seen))
+                    self.assertFalse({image, 'manifest.json'} & set(seen))
+                    self.assertNotEqual(set(seen), {p.name for p in root.iterdir()})
+                    for name, data in seen.items():
+                        self.assertEqual(data, (root / name).read_bytes(), name)
+                    self.assertIn(b'source-materials-001.tar', seen['SHA256SUMS'])
+                    self.assertIn(b'source-materials-001.tar', seen['sources-index.json'])
+                    self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()})
+                    temporary = Path(env['TMPDIR'])
+                    generated = {Path(value) for value in argv if temporary in Path(value).parents}
+                    self.assertEqual(len(generated), 2)
+                    self.assertFalse(any(path.exists() for path in generated))
+                    self.assertEqual(list(temporary.iterdir()), [])
+                    self.assertTrue((root / image).is_file())
+                    self.assertTrue((root / 'manifest.json').is_file())
+                    verified = self.run_cli(root, parent / 'absent-notes', {**env, 'PATH': ''}, tag=tag,
+                                            extra=('--check-only', '--require-reproducibility'))
+                    self.assertEqual(verified.returncode, 0, verified.stderr)
 
     def test_failed_existing_release_is_not_retried_replaced_or_edited(self):
         for version in ('0.1.0', '0.1.0-rc.1'):
@@ -630,5 +724,171 @@ class CandidateTests(unittest.TestCase):
                 self.assertIn('returned non-zero exit status 7', result.stderr)
                 calls = [json.loads(line) for line in capture.read_text().splitlines()]
                 self.assertEqual(len(calls), 1)
-                self.assertEqual(calls[0]['argv'][:3], ['release', 'create', 'v' + version])
+                argv = calls[0]['argv']
+                self.assertEqual(argv[:3], ['release', 'create', 'v' + version])
+                self.assertEqual({p.name for p in Path(env['FAKE_GH_ASSETS']).iterdir()}, public_asset_names(version))
+                temporary = Path(env['TMPDIR'])
+                generated = {Path(value) for value in argv if temporary in Path(value).parents}
+                self.assertEqual(len(generated), 2)
+                self.assertFalse(any(path.exists() for path in generated))
+                self.assertTrue((root / f'Furami-v{version}-Linux-x64.AppImage').is_file())
+                self.assertTrue((root / 'manifest.json').is_file())
                 self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()})
+                self.assertEqual(list(temporary.iterdir()), [])
+
+    def test_prepare_public_assets_exports_deterministic_contract_bundle(self):
+        for version in ('0.1.0', '0.1.0-rc.1'):
+            for variance in (False, True):
+                with self.subTest(version=version, variance=variance), tempfile.TemporaryDirectory() as temporary:
+                    self.configure_version(version)
+                    root = Path(temporary)
+                    observations = []
+                    for offset, mtime in enumerate((1_000_000_000, 2_000_000_000)):
+                        candidate = root / f'candidate-{offset}'
+                        fixture(candidate, variance, version=version)
+                        for path in candidate.iterdir():
+                            os.utime(path, (mtime, mtime))
+                        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in candidate.iterdir()}
+                        output = root / f'output-{offset}'
+                        output.mkdir()
+                        verified = publisher.verify_candidate(candidate, version, require_reproducibility=True)
+                        returned = publisher.prepare_public_assets(verified, version, output)
+                        image = f'Furami-v{version}-Linux-x64.AppImage'
+                        bundle = f'Furami-v{version}-Linux-x64-materials.tar'
+                        expected = public_asset_names(version)
+                        self.assertEqual(sorted(p.name for p in returned), sorted(expected))
+                        self.assertEqual([p.name for p in returned], sorted(p.name for p in returned))
+                        self.assertEqual({p.name for p in output.iterdir()}, {bundle, 'SHA256SUMS'})
+                        by_name = {p.name: p for p in returned}
+                        self.assertEqual(by_name[image], candidate / image)
+                        self.assertEqual(by_name['manifest.json'], candidate / 'manifest.json')
+                        self.assertEqual(by_name[bundle], output / bundle)
+                        self.assertEqual(by_name['SHA256SUMS'], output / 'SHA256SUMS')
+                        sums_map = read_public_sums(output)
+                        self.assertEqual(set(sums_map), expected - {'SHA256SUMS'})
+                        for name, value in sums_map.items():
+                            self.assertEqual(publisher.digest(by_name[name]), value, name)
+                        seen = inspect_materials_tar(output / bundle)
+                        self.assertEqual(set(seen), retained_material_names())
+                        self.assertFalse(any(name.startswith('source-materials-') for name in seen))
+                        self.assertFalse({image, 'manifest.json'} & set(seen))
+                        for name, data in seen.items():
+                            self.assertEqual(data, before[name][0], name)
+                        self.assertIn(b'source-materials-001.tar', seen['SHA256SUMS'])
+                        self.assertIn(b'source-materials-001.tar', seen['sources-index.json'])
+                        self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns)
+                                                  for p in candidate.iterdir()})
+                        observations.append((publisher.digest(output / bundle),
+                                             (output / 'SHA256SUMS').read_bytes(), seen))
+                    self.assertEqual(observations[0], observations[1])
+
+    def test_prepare_public_assets_refuses_missing_export_prerequisites(self):
+        for mutation in ('image', 'manifest', 'components'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                candidate = root / 'candidate'
+                fixture(candidate)
+                output = root / 'output'
+                output.mkdir()
+                assets = publisher.verify_candidate(candidate, '0.1.0-rc.1', require_reproducibility=True)
+                name = {'image': 'Furami-v0.1.0-rc.1-Linux-x64.AppImage',
+                        'manifest': 'manifest.json', 'components': 'components.json'}[mutation]
+                reduced = [path for path in assets if path.name != name]
+                with self.assertRaisesRegex(publisher.CandidatePublicationError, 'public export requires'):
+                    publisher.prepare_public_assets(reduced, '0.1.0-rc.1', output)
+                self.assertEqual(list(output.iterdir()), [])
+
+    def test_prepare_public_assets_refuses_invalid_or_nonempty_output_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / 'candidate'
+            fixture(candidate)
+            assets = publisher.verify_candidate(candidate, '0.1.0-rc.1', require_reproducibility=True)
+            nonempty = root / 'nonempty'
+            nonempty.mkdir()
+            (nonempty / 'keep').write_bytes(b'x')
+            symlink = root / 'symlink'
+            symlink.symlink_to(nonempty)
+            regular = root / 'regular'
+            regular.write_bytes(b'x')
+            missing = root / 'missing'
+            for output in (nonempty, symlink, regular, missing):
+                with self.subTest(output=output.name):
+                    with self.assertRaises(publisher.CandidatePublicationError):
+                        publisher.prepare_public_assets(assets, '0.1.0-rc.1', output)
+            self.assertEqual(list(nonempty.iterdir()), [nonempty / 'keep'])
+            self.assertEqual(regular.read_bytes(), b'x')
+            self.assertFalse(missing.exists())
+
+    def test_public_materials_size_limit_is_strict(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / 'candidate'
+            fixture(candidate)
+            assets = publisher.verify_candidate(candidate, '0.1.0-rc.1', require_reproducibility=True)
+            probe = root / 'probe'
+            probe.mkdir()
+            returned = publisher.prepare_public_assets(assets, '0.1.0-rc.1', probe)
+            bundle = next(path for path in returned if path.name.endswith('.tar'))
+            size = bundle.stat().st_size
+            self.assertGreater(size, 0)
+            for limit in (1, size):
+                with self.subTest(limit=limit), tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / 'output'
+                    output.mkdir()
+                    with patch.object(publisher, 'MAX_RELEASE_ASSET_BYTES', limit):
+                        with self.assertRaisesRegex(publisher.CandidatePublicationError, 'must be under 2 GiB'):
+                            publisher.prepare_public_assets(assets, '0.1.0-rc.1', output)
+                    self.assertFalse((output / 'SHA256SUMS').exists())
+            allowed = root / 'allowed'
+            allowed.mkdir()
+            with patch.object(publisher, 'MAX_RELEASE_ASSET_BYTES', size + 1):
+                exported = publisher.prepare_public_assets(assets, '0.1.0-rc.1', allowed)
+            self.assertEqual(sorted(p.name for p in exported), sorted(public_asset_names('0.1.0-rc.1')))
+
+    def test_publication_cli_refuses_oversized_public_materials_before_gh(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            self.configure_version('0.1.0-rc.1')
+            root = parent / 'candidate'
+            fixture(root)
+            notes = parent / 'notes'
+            notes.write_text('Release notes\n')
+            env, capture = self.fake_gh(parent)
+            probe = parent / 'probe'
+            probe.mkdir()
+            exported = publisher.prepare_public_assets(
+                publisher.verify_candidate(root, '0.1.0-rc.1', require_reproducibility=True),
+                '0.1.0-rc.1', probe)
+            bundle = next(path for path in exported if path.name.endswith('.tar'))
+            limit = bundle.stat().st_size
+            before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()}
+            with patch.object(publisher, 'MAX_RELEASE_ASSET_BYTES', limit), \
+                    patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(publisher.CandidatePublicationError, 'must be under 2 GiB'):
+                    publisher.publish_candidate(tag='v0.1.0-rc.1', version='0.1.0-rc.1', event_name='push',
+                                                repository='owner/repo', notes=notes, candidate=root)
+            self.assertFalse(capture.exists())
+            self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()})
+            self.assertEqual(list(Path(env['TMPDIR']).iterdir()), [])
+
+    def test_publication_cli_refuses_missing_manifest_or_components_before_gh(self):
+        for version in ('0.1.0', '0.1.0-rc.1'):
+            for missing in ('manifest.json', 'components.json'):
+                with self.subTest(version=version, missing=missing), tempfile.TemporaryDirectory() as temporary:
+                    parent = Path(temporary)
+                    self.configure_version(version)
+                    root = parent / 'candidate'
+                    fixture(root, version=version)
+                    (root / missing).unlink()
+                    sums(root)
+                    notes = parent / 'notes'
+                    notes.write_text('Release notes\n')
+                    env, capture = self.fake_gh(parent)
+                    before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()}
+                    result = self.run_cli(root, notes, env, tag='v' + version)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn('candidate refused:', result.stderr)
+                    self.assertFalse(capture.exists(), result.stderr)
+                    self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns)
+                                              for p in root.iterdir()})

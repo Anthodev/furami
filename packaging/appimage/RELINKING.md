@@ -1,27 +1,37 @@
 # Replacing libraries and rebuilding Furami
 
-Furami-authored source is MIT. The distributed combined executable uses GPL-compatible terms with the selected Qt/media/runtime terms recorded in `components.json` and original notices in `NOTICE.txt`. `release-ready.json` is the source/license completeness gate. A non-ready local smoke artifact is not a cleared release or a complete Corresponding Source offer.
+Furami-authored source is MIT. The distributed combined executable uses GPL-compatible terms with the selected Qt/media/runtime terms recorded in `components.json` and original notices in `NOTICE.txt`. `release-ready.json` is the source/license completeness gate, evaluated on the complete internal candidate. A non-ready local smoke artifact is not a cleared release or a complete Corresponding Source offer, and the four future release downloads carry the retained evidence set described below — notices, licenses and receipts — but not the dependency sources themselves.
 
 ## Releases and local verification
 
 Furami is distributed through tag-driven GitHub releases. A stable tag `vX.Y.Z` becomes a GitHub release marked **Latest**, while a candidate tag `vX.Y.Z-rc.N` (`N >= 1`, no leading zero) becomes a pre-release that is never Latest. Either tag must equal `v` followed by the `Cargo.toml` version of its own commit; the Cargo version has no leading `v`, and the image is named `Furami-v<version>-Linux-x64.AppImage`. Publishing a stable tag requires that commit to carry the stable version in `Cargo.toml` and `Cargo.lock` plus the matching `## [<version>] - <date>` changelog section, and every image — stable or pre-release — still requires `release-ready.json.ready == true`.
 
-Keep the image and its adjacent assets together and check them before use: `SHA256SUMS`, `manifest.json`, `audit.json`, `components.json` + `NOTICE.txt`, `sources-index.json`, the `source-materials-*.tar` archives, `reproducibility.json` and this document. `sources-index.json` states which checked inputs are actually present, and any `source-materials-*` archive extracts independently; a missing file is never replaced by an empty archive or a future offer.
+A release uploads exactly four files: `Furami-v<version>-Linux-x64.AppImage`, `Furami-v<version>-Linux-x64-materials.tar`, `manifest.json` and `SHA256SUMS`. Download all four into one directory and check them before use — the public checksums cover exactly the AppImage, the manifest and the materials archive, and no entry covers the checksum file itself:
 
-Verify a candidate offline — no network, token or real remote tag — before distributing or modifying anything:
+```sh
+sha256sum -c SHA256SUMS
+```
+
+This check confirms the downloaded bytes match the supplied checksum file: it establishes integrity relative to those sums, not independent authentication of the release.
+
+The materials archive is an uncompressed tar of flat, normalized members: the candidate's internal `SHA256SUMS`, `sources-index.json`, `release-ready.json`, `reproducibility.json`, `audit.json`, `components.json`, `NOTICE.txt` and this document, byte-for-byte. Extract it only into a **new empty directory**, never into the download directory, a checkout or an existing candidate — the archive supplies a second `SHA256SUMS` with the same basename as the downloaded public checksum file, and the two differ in scope and contents, so a careless extraction would overwrite the public one. The materials archive is repository evidence and receipts only: it does not carry the AppImage, the manifest or the dependency sources. Its internal `SHA256SUMS` and `sources-index.json` still describe the complete candidate, including the `source-materials-*.tar` archives, which are **not** among these downloads, so the index names files it does not supply. Those receipts were produced for the complete candidate and do not certify that the four downloads form a complete Corresponding Source offer; GitHub's automatic `Source code` archives snapshot the tagged repository only and do not include the fetched dependency sources.
+
+Verify a **complete internal candidate** offline — no network, token or real remote tag — before distributing or modifying anything. This check needs the flat directory that also holds the indexed `source-materials-*.tar` archives, not the four downloaded files:
 
 ```sh
 python3 scripts/publish_candidate.py --check-only --require-reproducibility \
   --event-name push --tag v1.0.0-rc.1 --candidate /absolute/candidate/release
 ```
 
-A prepared stable tag (`--tag v1.0.0`) uses the same check with no other change. `--check-only` re-verifies the real files (exact non-empty image, regular non-symlink assets, a complete `SHA256SUMS`, a true readiness gate whose fingerprints match the bytes, and a `reproducibility.json` bound to that image) and lists the verified assets without writing anything. Publication is a separate, explicit run of the same script without `--check-only`, performed only by the protected tag job.
+A prepared stable tag (`--tag v1.0.0`) uses the same check with no other change. `--check-only` re-verifies the real files (exact non-empty image, regular non-symlink assets, a complete `SHA256SUMS`, a true readiness gate whose fingerprints match the bytes, and a `reproducibility.json` bound to that image) and lists the verified assets without writing anything. The four downloads cannot satisfy it, because the source archives it indexes are not supplied. Publication is a separate, explicit run of the same script without `--check-only`, performed only by the protected tag job.
 
 The candidate can be exercised without a capture card through the dedicated qualification video; see the [AppImage recipe](README.md#qualification-video) for the fixture generator and the `--qualification-video` entry.
 
-## Obtain and check source materials
+## Source materials when separately available
 
-Keep the AppImage and all adjacent release assets together. Verify `SHA256SUMS` before extracting materials. Each `source-materials-###.tar` is independently extractable into the same empty directory:
+The dependency sources are **not** part of the four release downloads. The material-set contents described below are the complete candidate's `source-materials-*.tar` archives, and they apply only when you separately hold matching archives from the same candidate commit; the acquisition recipes remain the authoritative reference and no other download route is promised.
+
+Each `source-materials-###.tar` is independently extractable into the same empty directory, and `sources-index.json` lists every supplied file and its SHA256, plus actual missing required inputs and separately optional unavailable sources:
 
 ```sh
 mkdir recipient-inputs
@@ -30,7 +40,7 @@ for archive in source-materials-*.tar; do
 done
 ```
 
-`sources-index.json` lists every supplied file and its SHA256, plus actual missing required inputs and separately optional unavailable sources. The material set is complete only when the release gate says it is. Missing files are never represented by empty archives or future source-offer promises.
+The material set is complete only when the release gate says it is. Missing files are never represented by empty archives or future source-offer promises.
 
 For qtbase, the official source archive remains byte-for-byte unchanged. Copy the contents of `qt-inputs/qtbase-git-metadata/` into the extracted qtbase root, preserving relative paths. The eight Git metadata files are bound to the kit's exact upstream commit and vendor source SPDX checksums. The overlay includes original REUSE annotations, copyrights and BSD-3-Clause/MIT license texts; no individual Qt `LicenseConcluded: NOASSERTION` field is rewritten as an upstream license conclusion.
 
@@ -43,11 +53,11 @@ The extracted tree contains:
 - `media-inputs/`, available frozen mpv/FFmpeg/libplacebo/Vulkan-Headers inputs and the verified official Qt build kit.
 - `qt-inputs/` and `qt-evidence/`, applicable checked Qt source archives, vendor source SPDX, third-party license evidence and original configure options/summaries. `sources-index.json.qt_correspondence` records source/code/license checksum reconciliation against vendor source SPDX. This does not claim a bit-identical Qt rebuild.
 - `ubuntu-inputs/` and `ubuntu-evidence/`, applicable exact source descriptors/original source/Ubuntu patches, signed-source-index evidence and original component copyright notices.
-- `runtime-inputs/` and `runtime-evidence/`, available type-2 runtime/FUSE/squashfuse sources and patch, the linked Alpine source closure (each pinned `APKBUILD` with its upstream and patch inputs), locked rebuild inputs and original static contributor notices/linkage receipts. The Alpine binary bootstrap packages and the base-image material are not in this public set; its signed index metadata is separate and never substitutes for binary or source coverage.
+- `runtime-inputs/` and `runtime-evidence/`, available type-2 runtime/FUSE/squashfuse sources and patch, the linked Alpine source closure (each pinned `APKBUILD` with its upstream and patch inputs), locked rebuild inputs and original static contributor notices/linkage receipts. The Alpine binary bootstrap packages and the base-image material are not in this material set; its signed index metadata is separate and never substitutes for binary or source coverage.
 
 Plain checked HTTPS acquisition remains in the recipes, but local developer cache paths are not recipient instructions. A required unavailable historical source/build input blocks publication.
 
-The public set carries corresponding sources, not the Alpine binary bootstrap. The candidate records this policy as data in its sources index (`material_policy`: `alpine_bootstrap: "private"`, `public_offline_bootstrap_complete: false`). Those pinned binary packages are retained in a private authenticated cache, are not publicly distributed and are not declared license-cleared; because they are absent here, the public assets alone are **not** a complete offline bootstrap of the runtime and cannot rebuild it unaided.
+That material set carries corresponding sources, not the Alpine binary bootstrap. The candidate records this policy as data in its sources index (`material_policy`: `alpine_bootstrap: "private"`, `public_offline_bootstrap_complete: false`). Those pinned binary packages are retained in a private authenticated cache, are not publicly distributed and are not declared license-cleared; because they are absent, even the full material set is **not** a complete offline bootstrap of the runtime and cannot rebuild it unaided.
 
 ## Replace shared libraries without rebuilding the app
 
@@ -63,7 +73,7 @@ Launch `./squashfs-root/AppRun`. It uses the extracted `usr/` as `FURAMI_MEDIA_P
 
 ## Rebuild the application
 
-The source tree includes the full controlling scripts. The canonical build recipe uses frozen container/APT/source pins, not the recipient's installed Qt/mpv/FFmpeg. Set absolute input-cache paths from the extracted material set, copy the already checked `app-inputs/ca-certificates.deb` into `media-inputs/` if needed, and run:
+When matching source materials are separately available, the source tree includes the full controlling scripts. The canonical build recipe uses frozen container/APT/source pins, not the recipient's installed Qt/mpv/FFmpeg. Set absolute input-cache paths from the extracted material set, copy the already checked `app-inputs/ca-certificates.deb` into `media-inputs/` if needed, and run:
 
 ```sh
 python3 recipient-inputs/furami/packaging/appimage/build.py \
@@ -75,11 +85,11 @@ python3 recipient-inputs/furami/packaging/appimage/build.py \
   --jobs 2
 ```
 
-The original sources can build the original application. This run also rebuilds the runtime from source caches; because the pinned Alpine bootstrap binaries are not in the public material set, supply your own authenticated copies of those exact pinned inputs or reuse a runtime root you already built (`--runtime-build`) instead of relaxing a hash check. For modified source, adjust the relevant hash/pin deliberately in your own copy rather than disabling verification of unrelated inputs. Full application source and verified vendor crates permit relinking static CXX/Rust support code too. The recipe does not contact a publication service.
+The original sources can build the original application. This run also rebuilds the runtime from source caches; because the pinned Alpine bootstrap binaries are not in the material set, supply your own authenticated copies of those exact pinned inputs or reuse a runtime root you already built (`--runtime-build`) instead of relaxing a hash check. For modified source, adjust the relevant hash/pin deliberately in your own copy rather than disabling verification of unrelated inputs. Full application source and verified vendor crates permit relinking static CXX/Rust support code too. The recipe does not contact a publication service.
 
 ## Replace statically linked runtime libfuse
 
-The outer type-2 runtime statically links LGPL-2.1 libfuse. Replacing an AppDir shared library does not replace this code. Modify the supplied unpatched FUSE source, preserve interface compatibility, create a source tarball and invoke the runtime recipe:
+The outer type-2 runtime statically links LGPL-2.1 libfuse. Replacing an AppDir shared library does not replace this code. This route needs the supplied unpatched FUSE source from matching source materials: modify it, preserve interface compatibility, create a source tarball and invoke the runtime recipe:
 
 ```sh
 python3 recipient-inputs/furami/packaging/appimage-runtime/build.py \
@@ -88,7 +98,7 @@ python3 recipient-inputs/furami/packaging/appimage-runtime/build.py \
   --modified-libfuse /absolute/modified-fuse.tar.xz
 ```
 
-The recipe applies the exact frozen mount patch and relinks the complete runtime. Modified-libfuse mode records the new source hash and keeps unrelated APK/source pins checked. Permissive/exception source copies for unchanged compiler/static inputs are optional; the checked binary toolchain stays in a private authenticated cache rather than the public material set, so you must supply those pinned inputs yourself to run this recipe, while the signed historical indexes and the required FUSE source/relink inputs remain public. It does not claim a new modified runtime is the original canonical provider.
+The recipe applies the exact frozen mount patch and relinks the complete runtime. Modified-libfuse mode records the new source hash and keeps unrelated APK/source pins checked. Permissive/exception source copies for unchanged compiler/static inputs are optional; the checked binary toolchain stays in a private authenticated cache rather than the material set, so you must supply those pinned inputs yourself to run this recipe, while the signed historical indexes and the required FUSE source/relink inputs remain part of the material set. It does not claim a new modified runtime is the original canonical provider.
 
 To repack a modified extracted tree, use the pinned appimagetool 1.9.1 asset and a compatible source-built runtime explicitly with `--runtime-file`. Its official asset URL/hash are recorded in the build receipt and `stage.py`; no implicit latest runtime is used:
 
