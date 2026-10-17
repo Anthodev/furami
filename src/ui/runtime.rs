@@ -7374,7 +7374,7 @@ mod tests {
     }
     #[test]
     fn renderer_qualified_unsupported_and_inactive_values_remain_honest() {
-        let (mut runtime, _) = product_runtime();
+        let (mut runtime, _drivers) = product_runtime();
         let unavailable = runtime
             .ui
             .renderer

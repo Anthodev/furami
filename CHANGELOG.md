@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.0-rc.4] - 2026-10-17
+
+Fourth release candidate, prepared for local evaluation. Furami is not stable and this candidate carries no certification. Publication stays gated on the source and license clearance for every public artifact, stable or pre-release. No production behavior changes in this candidate.
+
+### Fixes
+
+- Keep the driver channel alive through cleanup in the captured-renderer regression test so the asynchronous owner can no longer fail sending its terminal message, removing an intermittent `SendError` in CI and leaving strict sender assertions, product code and workflow unchanged ([#25](https://github.com/Anthodev/furami/issues/25), uncommitted local work).
+
 ## [0.1.0-rc.3] - 2026-10-17
 
 Third release candidate, prepared for local evaluation. Furami is not stable and this candidate carries no certification. Publication stays gated on the source and license clearance for every public artifact, stable or pre-release. The clean-checkout AppImage build repair is prepared locally; a successful fresh CI build remains unverified.
