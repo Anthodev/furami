@@ -105,6 +105,7 @@ pub(crate) mod ffi {
             gate: Box<RuntimeCoordinator>,
             display: &str,
             media_prefix: &str,
+            application_version: &str,
             qualification_stdin: bool,
             qualification_video: bool,
         ) -> LaunchResult;

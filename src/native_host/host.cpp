@@ -2115,7 +2115,7 @@ void FuramiBridge::logGeometry()
     }
 }
 
-LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, rust::Str mediaPrefix, bool qualificationStdin, bool qualificationVideo)
+LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, rust::Str mediaPrefix, rust::Str applicationVersion, bool qualificationStdin, bool qualificationVideo)
 {
     qInstallMessageHandler(safeQtMessage);
     const QByteArray captured(display.data(), static_cast<qsizetype>(display.size()));
@@ -2144,6 +2144,10 @@ LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str di
         emitNativeDiagnostic("qt_application_destroy");
     });
     application.setApplicationName(QStringLiteral("Furami"));
+    // The compiled Cargo package version crosses the CXX boundary as a borrowed
+    // string and is exposed through Qt's own metadata, so QML reads
+    // Qt.application.version without any release literal or runtime file read.
+    application.setApplicationVersion(QString::fromUtf8(applicationVersion.data(), static_cast<qsizetype>(applicationVersion.size())));
     // One application-level icon: the root window and the chrome windows inherit
     // it, and Qt rasterizes the embedded SVG through the preflighted icon engine.
     application.setWindowIcon(QIcon(QStringLiteral(":/qt/qml/dev/antho/furami/assets/logo.svg")));

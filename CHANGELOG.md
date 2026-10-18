@@ -7,6 +7,7 @@
 **Interface**
 
 - Show only the input format on the **Resolved input** statistics line, adding `(auto)` when that format was chosen automatically. Formats you select explicitly appear alone.
+- Show the full application version at the top-right of the Options menu and its settings pages, without narrowing the playback summary below the title.
 
 ### 🐛 Fixes
 

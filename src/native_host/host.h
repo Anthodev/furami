@@ -320,7 +320,7 @@ private:
     bool m_insideSurfaceCallback = false;
 };
 
-LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, rust::Str mediaPrefix, bool qualificationStdin, bool qualificationVideo);
+LaunchResult run_qt_application(rust::Box<RuntimeCoordinator> gate, rust::Str display, rust::Str mediaPrefix, rust::Str applicationVersion, bool qualificationStdin, bool qualificationVideo);
 
 } // namespace furami::bridge
 

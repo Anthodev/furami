@@ -65,16 +65,31 @@ Item {
         ColumnLayout {
             Layout.fillWidth: true
             spacing: 0
-            BrumeLabel {
-                objectName: "menuTitle"
+            RowLayout {
                 Layout.fillWidth: true
-                text: menu.qualificationVideo ? "Qualification video" : menu.section === "root" ? "Capture"
-                    : menu.section === "settings" ? "Settings"
-                    : menu.section === "capture" ? "Capture — format"
-                    : menu.section === "audio" ? "Audio"
-                    : menu.section === "renderer" ? "Rendering"
-                    : "Preferences"
-                variant: "title"
+                spacing: Brume.gap
+                BrumeLabel {
+                    objectName: "menuTitle"
+                    Layout.fillWidth: true
+                    text: menu.qualificationVideo ? "Qualification video" : menu.section === "root" ? "Capture"
+                        : menu.section === "settings" ? "Settings"
+                        : menu.section === "capture" ? "Capture — format"
+                        : menu.section === "audio" ? "Audio"
+                        : menu.section === "renderer" ? "Rendering"
+                        : "Preferences"
+                    variant: "title"
+                }
+                // Compiled Cargo version exposed through Qt metadata; this note
+                // stays non-interactive and never takes the keyboard focus.
+                BrumeLabel {
+                    objectName: "menuVersion"
+                    variant: "note"
+                    text: "v" + Qt.application.version
+                    wrapMode: Text.NoWrap
+                    Layout.minimumWidth: implicitWidth
+                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                    Accessible.name: "Version " + Qt.application.version
+                }
             }
             BrumeLabel {
                 objectName: "menuSubtitle"

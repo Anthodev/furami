@@ -42,6 +42,7 @@ pub fn run_application(
         gate,
         display,
         media_prefix,
+        env!("CARGO_PKG_VERSION"),
         qualification_stdin,
         false,
     );
@@ -75,6 +76,7 @@ pub fn run_qualification_application(
         Box::new(runtime),
         display,
         media_prefix,
+        env!("CARGO_PKG_VERSION"),
         qualification_stdin,
         true,
     );
