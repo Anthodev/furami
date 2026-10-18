@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-19
+
 ### 🔄 Changes
+
+**Release**
+
+- chore(release): bump version to 1.0.0
 
 **Interface**
 
@@ -20,6 +26,8 @@
 **Interface**
 
 - Show input formats only once in Capture settings, using the existing dropdown instead of repeating its choices as radio buttons. Selection still applies immediately.
+
+Full changelog: [v1.0.0-rc.2...v1.0.0](https://github.com/Anthodev/furami/compare/v1.0.0-rc.2...v1.0.0)
 
 ## [1.0.0-rc.2] - 2026-10-18
 
