@@ -68,6 +68,17 @@ Item {
             RowLayout {
                 Layout.fillWidth: true
                 spacing: Brume.gap
+                // One compact back affordance in the header, before the title,
+                // on every non-root page. The section bodies carry no back
+                // button of their own.
+                BrumeButton {
+                    objectName: "menuBack"
+                    visible: menu.section !== "root"
+                    Layout.preferredWidth: Brume.hitTarget + 2 * Brume.edge
+                    label: "Back"
+                    Accessible.name: menu.section === "settings" ? "Back to menu" : "Back to settings"
+                    onClicked: menu.goBack()
+                }
                 BrumeLabel {
                     objectName: "menuTitle"
                     Layout.fillWidth: true
@@ -94,6 +105,9 @@ Item {
             BrumeLabel {
                 objectName: "menuSubtitle"
                 Layout.fillWidth: true
+                // The live playback summary belongs to the root menu only;
+                // every settings page is a static body without it.
+                visible: menu.section === "root"
                 variant: "note"
                 text: Projection.productPhaseText(menu.profile.productPhase)
                     + (menu.profile.live.sourceLabel.length > 0
@@ -202,14 +216,6 @@ Item {
             spacing: Brume.gapSmall
 
             BrumeButton {
-                objectName: "menuBack"
-                Layout.fillWidth: true
-                icon.source: Brume.icon("chevron-down")
-                label: "Back"
-                Accessible.name: "Back to menu"
-                onClicked: menu.goBack()
-            }
-            BrumeButton {
                 objectName: "settingsCaptureEntry"
                 Layout.fillWidth: true
                 implicitHeight: 52
@@ -299,16 +305,6 @@ Item {
             Layout.fillWidth: true
             visible: menu.settingsSection
             spacing: Brume.gapSmall
-
-            BrumeButton {
-                id: sectionBack
-                objectName: "menuBackSection"
-                Layout.fillWidth: true
-                icon.source: Brume.icon("chevron-down")
-                label: "Back"
-                Accessible.name: "Back to settings"
-                onClicked: menu.goBack()
-            }
 
             BrumeScrollView {
                 Layout.fillWidth: true

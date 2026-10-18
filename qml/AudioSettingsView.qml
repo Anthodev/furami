@@ -36,12 +36,6 @@ Item {
         anchors.fill: parent
         spacing: Brume.gap
 
-        BrumeLabel {
-            Layout.fillWidth: true
-            text: "Audio"
-            variant: "title"
-        }
-
         // ── Captured audio (immediate selection) ──────────────────────────
         BrumeLabel {
             Layout.fillWidth: true

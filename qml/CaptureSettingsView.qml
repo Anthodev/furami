@@ -33,13 +33,12 @@ Item {
         anchors.fill: parent
         spacing: Brume.gap
 
+        // The section title lives in the shared menu header; the refresh
+        // control stays right-aligned, preceded by the fill-width seam the
+        // title used to provide.
         RowLayout {
             Layout.fillWidth: true
-            BrumeLabel {
-                Layout.fillWidth: true
-                text: "Capture — input format"
-                variant: "title"
-            }
+            Item { Layout.fillWidth: true }
             BrumeIconButton {
                 objectName: "captureRefresh"
                 label: "Refresh catalogs"

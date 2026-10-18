@@ -203,6 +203,12 @@ pub struct PersistenceSession {
     write_status: String,
     durability_unconfirmed: bool,
     startup_reason: String,
+    /// Legacy filters were loaded but not yet removed by an authorized save.
+    retired_filters_pending: bool,
+    /// The load/refusal channel and the write channel are independent: a
+    /// successful save never hides an unresolved startup or refusal problem.
+    write_needs_attention: bool,
+    startup_needs_attention: bool,
 }
 impl PersistenceSession {
     pub fn load(path: Result<PathBuf, String>) -> Self {
@@ -220,6 +226,9 @@ impl PersistenceSession {
             write_status: String::new(),
             startup_reason: String::new(),
             durability_unconfirmed: false,
+            retired_filters_pending: false,
+            write_needs_attention: false,
+            startup_needs_attention: false,
         };
         match path {
             Err(error) => session.load_status = error,
@@ -231,6 +240,7 @@ impl PersistenceSession {
                         session.preferences = document.preferences;
                         session.profiles = document.profiles;
                         session.last_source = document.last_source;
+                        session.retired_filters_pending = retired_filters_present;
                         if retired_filters_present {
                             "Legacy filters ignored; the other settings are preserved. The legacy filter data will be permanently removed from the settings file, without deleting that file, at the next authorized save. After that v3-format save, older builds will refuse the file and reverting to an older binary will not restore the filters. Before this save, the file bytes remain unchanged.".into()
                         } else {
@@ -312,15 +322,44 @@ impl PersistenceSession {
             .find(|profile| &profile.settings().video.identity == identity)
             .map(|profile| profile.binding())
     }
+    /// Independent, non-stale alerts for the settings surface: the load/refusal
+    /// channel, the write channel and the startup channel survive each other.
+    /// Built directly from borrowed messages, in that order, with no temporary
+    /// collection and no empty line for an unset channel.
+    pub fn attention(&self) -> String {
+        let mut attention = String::new();
+        let append = |attention: &mut String, message: &str| {
+            if message.is_empty() {
+                return;
+            }
+            if !attention.is_empty() {
+                attention.push('\n');
+            }
+            attention.push_str(message);
+        };
+        if self.store.is_none() || self.refused() || self.retired_filters_pending {
+            append(&mut attention, &self.load_status);
+        }
+        if self.write_needs_attention {
+            append(&mut attention, &self.write_status);
+        }
+        if self.startup_needs_attention {
+            append(&mut attention, &self.startup_reason);
+        }
+        attention
+    }
     pub fn prepare_startup(&mut self, selection: &StartupSelection) {
         self.startup_reason = selection.reason.clone();
+        self.startup_needs_attention = selection.restore_profile && !selection.auto_open;
     }
     pub fn startup_failed(&mut self, reason: String) {
         self.startup_reason =
             format!("Saved selection pre-filled, not active: initial restoration failed: {reason}");
+        self.startup_needs_attention = true;
     }
     pub fn startup_verified(&mut self) {
         self.startup_reason = "Startup restoration completed: exact capture and initial audio receipt verified. Pause state was not restored.".into();
+        self.startup_needs_attention = false;
     }
     pub fn path(&self) -> String {
         self.store
@@ -491,6 +530,7 @@ impl PersistenceSession {
     fn save(&mut self) -> bool {
         let Some(store) = &mut self.store else {
             self.write_status = "Save unavailable: no valid configuration location. Session preferences are not durable.".into();
+            self.write_needs_attention = true;
             return false;
         };
         let outcome = store.save_profiles(
@@ -504,10 +544,17 @@ impl PersistenceSession {
                     "Save failed at {}: {error}. Previous published file preserved.",
                     store.path().display()
                 );
+                self.write_needs_attention = true;
                 false
             }
             Ok(WriteOutcome::Committed { durability }) => {
                 self.durability_unconfirmed = matches!(&durability, Durability::Unconfirmed(_));
+                self.write_needs_attention = self.durability_unconfirmed;
+                // The document is published in every case, so the pending
+                // legacy-removal notice is replaced by its factual outcome.
+                if std::mem::take(&mut self.retired_filters_pending) {
+                    self.load_status = "Legacy filter data removed by an authorized v3-format save; other settings preserved. Older builds refuse this file, and reverting to an older binary will not restore filters.".into();
+                }
                 self.write_status = match durability {
                     Durability::Confirmed => format!("Saved to {}.", store.path().display()),
                     Durability::Unconfirmed(error) => format!(
@@ -611,7 +658,8 @@ impl PersistenceSession {
                 self.write_status = format!(
                     "Reset failed at {}: {error}. Original and refusal preserved.",
                     store.path().display()
-                )
+                );
+                self.write_needs_attention = true;
             }
             Ok(WriteOutcome::Committed { durability }) => {
                 // An older in-flight Apply or retry cannot resurrect cleared saved capture.
@@ -619,7 +667,11 @@ impl PersistenceSession {
                 self.last_source = None;
                 self.user_apply = None;
                 self.user_open = None;
+                // The published document no longer carries legacy filters, but
+                // the startup channel is untouched by a file-only reset.
+                self.retired_filters_pending = false;
                 self.load_status = "Saved file explicitly reset; capture is not saved. Live capture and selection unchanged.".into();
+                self.write_needs_attention = matches!(&durability, Durability::Unconfirmed(_));
                 self.write_status = match durability {
                     Durability::Confirmed => {
                         "Reset committed with current session preferences and no source profiles."
@@ -793,6 +845,34 @@ mod tests {
             fullscreen: true,
             ..LocalPreferences::default()
         }
+    }
+    /// A saved selection that could not auto-open: the only startup shape that
+    /// raises the startup attention channel.
+    fn prefill_selection(reason: &str) -> StartupSelection {
+        StartupSelection {
+            draft: Some(selection(60000)),
+            auto_open: false,
+            adapt_video: false,
+            restore_profile: true,
+            source_binding: None,
+            topology_pin: None,
+            reason: reason.into(),
+            audio_policy: StartupAudioPolicy::Explicit,
+            bootstrap_audio: Default::default(),
+        }
+    }
+    /// Rebuilds a schema-2 document that still carries legacy `filters` data.
+    fn legacy_filter_bytes(seed: &Temp) -> Vec<u8> {
+        let mut original = PersistenceSession::load(Ok(seed.file()));
+        let mut saved = selection(60000);
+        saved.renderer = reference_renderer();
+        original.set_preferences(preferences(29));
+        user_apply(&mut original, saved);
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&fs::read(seed.file()).unwrap()).unwrap();
+        wire["schema_version"] = 2.into();
+        wire["profiles"][0]["settings"]["filters"] = serde_json::json!({"invalid": true});
+        serde_json::to_vec(&wire).unwrap()
     }
 
     #[test]
@@ -1210,18 +1290,29 @@ mod tests {
                     assert!(loaded.refused());
                     assert!(loaded.saved_selection().is_none());
                     assert!(!loaded.preferences().logging_enabled);
+                    assert!(loaded.attention().contains("refused"));
                     assert!(loaded.request_close());
                     loaded.drained();
                     assert!(!loaded.quit_allowed());
                     assert_eq!(fs::read(temp.file()).unwrap(), bytes);
+                    assert!(loaded.attention().contains("refused"));
                     continue;
                 }
                 assert_eq!(loaded.saved_selection(), Some(saved.clone()));
                 assert_eq!(loaded.preferences(), &globals);
+                if retired {
+                    assert!(loaded.attention().contains("Legacy filters ignored"));
+                } else {
+                    assert!(loaded.attention().is_empty());
+                }
                 assert!(loaded.request_close());
                 assert_eq!(fs::read(temp.file()).unwrap(), bytes);
                 loaded.drained();
                 assert!(loaded.quit_allowed());
+                assert!(
+                    loaded.attention().is_empty(),
+                    "a confirmed v3 publication clears the pending-migration alert"
+                );
                 let written: serde_json::Value =
                     serde_json::from_slice(&fs::read(temp.file()).unwrap()).unwrap();
                 assert_eq!(written["schema_version"], 3);
@@ -1282,10 +1373,21 @@ mod tests {
         session.set_stats_hidden_preference(true);
         session.request_reset();
         let token = session.reset_token();
+        let refused_attention = session.attention();
+        assert!(refused_attention.contains("refused"));
         session.decide_reset(token + 1, true);
         assert!(session.refused());
+        assert_eq!(
+            session.attention(),
+            refused_attention,
+            "a stale token leaves every channel untouched"
+        );
         session.decide_reset(token, true);
         assert!(!session.refused());
+        assert!(
+            session.attention().is_empty(),
+            "a confirmed reset clears refusal and write attention together"
+        );
         let mut expected = preferences(12);
         expected.stats_hidden = true;
         assert_eq!(session.preferences(), &expected);
@@ -1295,6 +1397,223 @@ mod tests {
         session.request_close();
         session.drained();
         assert_eq!(load_document(temp.file()).applied, None);
+    }
+    #[test]
+    fn attention_stays_empty_until_a_channel_actually_needs_it() {
+        // First use: the informational load message is not an alert.
+        let temp = Temp::new();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        assert!(session.attention().is_empty());
+        assert!(session.request_close());
+        session.drained();
+        assert!(session.quit_allowed());
+        assert!(session.attention().is_empty());
+        let restored = PersistenceSession::load(Ok(temp.file()));
+        assert!(restored.attention().is_empty());
+
+        // An active prefill that can open by itself is not an alert either.
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        let mut auto = prefill_selection("Saved sources are available; restoring live capture.");
+        auto.auto_open = true;
+        session.prepare_startup(&auto);
+        assert!(session.attention().is_empty());
+        // No saved capture at all is never an alert, whatever it explains.
+        let mut none = prefill_selection("No saved capture selection.");
+        none.restore_profile = false;
+        none.draft = None;
+        session.prepare_startup(&none);
+        assert!(session.attention().is_empty());
+    }
+    #[test]
+    fn invalid_location_and_refused_file_are_alerts_and_preserve_their_bytes() {
+        let invalid = PersistenceSession::load(Err("no usable configuration location".into()));
+        assert_eq!(invalid.attention(), invalid.status());
+        assert!(
+            invalid
+                .attention()
+                .contains("no usable configuration location")
+        );
+
+        for original in [
+            b"not json".as_slice(),
+            br#"{"schema_version":999,"future":true}"#.as_slice(),
+        ] {
+            let temp = Temp::new();
+            fs::write(temp.file(), original).unwrap();
+            let session = PersistenceSession::load(Ok(temp.file()));
+            assert!(session.refused());
+            assert_eq!(session.attention(), session.status());
+            assert!(session.attention().contains("NOT survive"));
+            assert_eq!(fs::read(temp.file()).unwrap(), original);
+        }
+    }
+    #[test]
+    fn startup_attention_toggles_independently_of_an_unresolved_write_problem() {
+        let temp = Temp::new();
+        let blocked = temp.0.join("blocked");
+        let mut session = PersistenceSession::load(Ok(blocked.join("settings.json")));
+        fs::write(&blocked, b"not a directory").unwrap();
+        user_apply(&mut session, selection(60000));
+        assert!(session.attention().contains("Save failed"));
+        session.prepare_startup(&prefill_selection(
+            "Saved selection pre-filled, not active: device absent.",
+        ));
+        let both = session.attention();
+        assert!(both.contains("Save failed"));
+        assert!(both.contains("device absent"));
+        assert_eq!(both.lines().count(), 2, "one line per raised channel");
+        // A later failure keeps both; a verified startup clears only its own.
+        session.startup_failed("device absent".into());
+        assert!(session.attention().contains("initial restoration failed"));
+        assert!(session.attention().contains("Save failed"));
+        session.startup_verified();
+        assert!(!session.attention().contains("verified"));
+        assert_eq!(session.attention().lines().count(), 1);
+        assert!(session.attention().contains("Save failed"));
+        // Fixing the write clears the last channel without touching the rest.
+        fs::remove_file(&blocked).unwrap();
+        assert!(session.request_close());
+        session.drained();
+        assert!(session.quit_allowed());
+        assert!(session.attention().is_empty());
+    }
+    #[test]
+    fn reset_cancellation_failure_and_success_keep_the_startup_channel() {
+        use crate::settings::WriteFaultPoint;
+        let temp = Temp::new();
+        fs::write(temp.file(), b"refused").unwrap();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        user_apply(&mut session, selection(60000));
+        session.prepare_startup(&prefill_selection(
+            "Saved selection pre-filled, not active: device absent.",
+        ));
+        let initial = session.attention();
+        assert!(initial.contains("refused"));
+        assert!(initial.contains("device absent"));
+        // A cancelled confirmation and a stale token change nothing at all.
+        session.request_reset();
+        let token = session.reset_token();
+        session.decide_reset(token, false);
+        assert_eq!(session.attention(), initial);
+        session.request_reset();
+        let token = session.reset_token();
+        session.decide_reset(token + 1, true);
+        assert_eq!(session.attention(), initial);
+        assert!(session.refused());
+        // The pending request now fails: refusal and write problems both stay.
+        session.store = Some(SettingsStore::with_injected_fault(
+            temp.file(),
+            WriteFaultPoint::BeforeRename,
+        ));
+        session.decide_reset(token, true);
+        assert!(session.refused());
+        let failed = session.attention();
+        assert!(failed.contains("refused"));
+        assert!(failed.contains("Reset failed"));
+        assert!(failed.contains("device absent"));
+        // A confirmed reset clears the persistence channels, never startup's.
+        session.request_reset();
+        let token = session.reset_token();
+        session.decide_reset(token, true);
+        assert!(!session.refused());
+        let after = session.attention();
+        assert!(!after.contains("refused"));
+        assert!(!after.contains("Reset failed"));
+        assert!(after.contains("device absent"));
+    }
+    #[test]
+    fn unconfirmed_reset_keeps_its_durability_warning_and_the_startup_channel() {
+        use crate::settings::WriteFaultPoint;
+        let temp = Temp::new();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        session.prepare_startup(&prefill_selection(
+            "Saved selection pre-filled, not active: device absent.",
+        ));
+        session.store = Some(SettingsStore::with_injected_fault(
+            temp.file(),
+            WriteFaultPoint::ParentSyncIo,
+        ));
+        session.request_reset();
+        let token = session.reset_token();
+        session.decide_reset(token, true);
+        let attention = session.attention();
+        assert!(attention.contains("durability is NOT confirmed"));
+        assert!(attention.contains("device absent"));
+        assert!(session.status().contains("Reset committed"));
+    }
+    #[test]
+    fn legacy_notice_is_replaced_only_by_a_published_outcome() {
+        use crate::settings::WriteFaultPoint;
+        let temp = Temp::new();
+        let bytes = legacy_filter_bytes(&Temp::new());
+        fs::write(temp.file(), &bytes).unwrap();
+
+        // Loading never rewrites the file; the pending migration is an alert.
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        assert!(session.attention().contains("Legacy filters ignored"));
+        assert!(session.status().contains("will be permanently removed"));
+        assert_eq!(fs::read(temp.file()).unwrap(), bytes);
+
+        // A failed save publishes nothing and keeps the pending-migration notice.
+        session.store = Some(SettingsStore::with_injected_fault(
+            temp.file(),
+            WriteFaultPoint::BeforeRename,
+        ));
+        assert!(session.request_close());
+        session.drained();
+        assert!(!session.quit_allowed());
+        assert_eq!(fs::read(temp.file()).unwrap(), bytes);
+        let failed = session.attention();
+        assert!(failed.contains("Legacy filters ignored"));
+        assert!(failed.contains("Save failed"));
+
+        // A confirmed publication replaces it with the factual outcome.
+        let (store, _) = SettingsStore::load(temp.file());
+        session.store = Some(store);
+        session.retry_close_save();
+        assert!(session.quit_allowed());
+        assert!(
+            session.attention().is_empty(),
+            "the confirmed v3 save clears the alert"
+        );
+        assert!(
+            session
+                .status()
+                .contains("Legacy filter data removed by an authorized v3-format save")
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.file()).unwrap()).unwrap();
+        assert_eq!(written["schema_version"], 3);
+        assert!(written["profiles"][0]["settings"].get("filters").is_none());
+    }
+    #[test]
+    fn unconfirmed_publication_drops_the_migration_notice_but_keeps_durability_attention() {
+        use crate::settings::WriteFaultPoint;
+        let temp = Temp::new();
+        let bytes = legacy_filter_bytes(&Temp::new());
+        fs::write(temp.file(), &bytes).unwrap();
+        let mut session = PersistenceSession::load(Ok(temp.file()));
+        assert!(session.attention().contains("Legacy filters ignored"));
+        session.store = Some(SettingsStore::with_injected_fault(
+            temp.file(),
+            WriteFaultPoint::ParentSyncIo,
+        ));
+        assert!(session.request_close());
+        session.drained();
+        assert_eq!(session.close_dialog(), "warning");
+        let attention = session.attention();
+        assert!(!attention.contains("will be permanently removed"));
+        assert!(!attention.contains("Legacy filters ignored"));
+        assert!(attention.contains("durability is NOT confirmed"));
+        assert!(
+            session
+                .status()
+                .contains("Legacy filter data removed by an authorized v3-format save")
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.file()).unwrap()).unwrap();
+        assert_eq!(written["schema_version"], 3);
+        assert!(written["profiles"][0]["settings"].get("filters").is_none());
     }
     #[test]
     fn logging_preference_is_off_by_default_and_safe_close_omits_the_key() {
@@ -1363,13 +1682,23 @@ mod tests {
         user_apply(&mut session, selection(60000));
         assert_eq!(session.profiles.entries().len(), 1);
         assert!(session.status().contains("Save failed"));
+        assert!(session.attention().contains("Save failed"));
         session.set_preferences(preferences(9));
+        session.prepare_startup(&prefill_selection(
+            "Saved selection pre-filled, not active: device absent.",
+        ));
+        assert!(session.attention().contains("device absent"));
         assert!(session.request_close());
         session.drained();
         assert_eq!(session.close_dialog(), "save");
         fs::remove_file(&blocked).unwrap();
         session.retry_close_save();
         assert!(session.quit_allowed());
+        assert!(
+            !session.attention().contains("Save failed"),
+            "a confirmed save clears only the write channel"
+        );
+        assert!(session.attention().contains("device absent"));
         let document = load_document(path);
         assert_eq!(document.applied, Some(selection(60000)));
         assert_eq!(document.preferences, preferences(9));

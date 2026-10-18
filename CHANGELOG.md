@@ -8,6 +8,8 @@
 
 - Show only the input format on the **Resolved input** statistics line, adding `(auto)` when that format was chosen automatically. Formats you select explicitly appear alone.
 - Show the full application version at the top-right of the Options menu and its settings pages, without narrowing the playback summary below the title.
+- Group the Preferences page around the settings you actually change: stream statistics and diagnostic logging first, then the saved-file reset, with the saved settings, startup restoration, settings file and current session tucked behind a collapsed **Technical details** section. Persistence errors and legacy-migration notices stay visible above it.
+- Give every settings page the same compact header: one **Back** button before the single page title and the version, with the playback summary shown only on the Options menu. Capture and Audio keep their **Refresh catalogs** action, and selectors and mandatory confirmations keep their own layout.
 
 ### 🐛 Fixes
 

@@ -307,8 +307,8 @@ QtObject {
                 }))
             return "recovery"
         const settings = s.settings
-        if (!projection.strings(settings, ["status", "path", "startupReason", "closeDialog",
-                "resetToken"]) || !projection.flags(settings, ["refused"])
+        if (!projection.strings(settings, ["status", "attention", "path", "startupReason",
+                "closeDialog", "resetToken"]) || !projection.flags(settings, ["refused"])
                 || !projection.u64(settings.resetToken)
                 || ["", "save", "warning"].indexOf(settings.closeDialog) < 0)
             return "settings"
@@ -570,6 +570,7 @@ QtObject {
         if (!s) return projection.emptyView.settings
         return {
             status: projection.text(s.status),
+            attention: projection.text(s.attention),
             path: projection.text(s.path),
             refused: projection.flag(s.refused),
             startupReason: projection.text(s.startupReason),
@@ -634,7 +635,7 @@ QtObject {
         },
         recovery: { evidence: "", stage: "", candidates: [] },
         settings: {
-            status: "", path: "", refused: false, startupReason: "",
+            status: "", attention: "", path: "", refused: false, startupReason: "",
             closeDialog: "", resetToken: ""
         },
         diagnostics: {

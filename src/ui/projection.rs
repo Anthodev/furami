@@ -279,6 +279,7 @@ pub(super) struct RecoveryRow {
 #[serde(rename_all = "camelCase")]
 pub(super) struct Settings {
     pub status: String,
+    pub attention: String,
     pub path: String,
     pub refused: bool,
     pub startup_reason: String,

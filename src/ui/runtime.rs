@@ -1764,6 +1764,7 @@ impl CaptureRuntime {
             recovery,
             settings: projection::Settings {
                 status: self.persistence.status(),
+                attention: self.persistence.attention(),
                 path: self.persistence.path(),
                 refused: self.persistence.refused(),
                 startup_reason: self.persistence.startup_reason().into(),

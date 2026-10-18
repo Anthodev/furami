@@ -98,12 +98,6 @@ Item {
         spacing: Brume.gap
 
         BrumeLabel {
-            Layout.fillWidth: true
-            text: "Rendering"
-            variant: "title"
-        }
-
-        BrumeLabel {
             objectName: "rendererError"
             Layout.fillWidth: true
             visible: text.length > 0
