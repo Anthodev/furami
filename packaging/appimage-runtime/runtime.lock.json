@@ -5,7 +5,7 @@
       "url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/community/x86_64/APKINDEX.tar.gz"
     },
     "main": {
-      "sha256": "697cc65873d8a32d0eb8c70ee0c438bb23f4875cfb761a0d52c9745576289b12",
+      "sha256": "a48ace4f057549d67efdb25fda4e74d537ba8dd1ed73ba59926db5e8ec11d3d9",
       "url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz"
     }
   },
@@ -461,13 +461,13 @@
       "version": "2.78-r0"
     },
     "libcurl": {
-      "aports_commit": "2c79595339118c69c0809dbff53ad71c90beba48",
-      "archive": "libcurl-8.14.1-r2.apk",
-      "index_checksum": "Q1wT0MZpiQqpTZtXuOLjE+8n11Cx8=",
+      "aports_commit": "4277a10b6f212864a4c88d3cae7192383f9badcb",
+      "archive": "libcurl-8.14.1-r3.apk",
+      "index_checksum": "Q1fvPg7KSWfmJyx08p6Y3wDdaUnvM=",
       "license": "curl",
       "repository": "main",
-      "sha256": "e6f76cb875242f30d5e174ef228a698b73e718217f82f7cc749a6c190672d992",
-      "version": "8.14.1-r2"
+      "sha256": "ce11750996550c732eec37c6ed25a4f97f5be1863b3b0fe93bee4596f4832c53",
+      "version": "8.14.1-r3"
     },
     "libdw": {
       "aports_commit": "73946d6789300358ecf5ef75975de57cef4df125",
@@ -497,13 +497,13 @@
       "version": "0.191-r0"
     },
     "libexpat": {
-      "aports_commit": "d46a3884017c3c180ea5fa36585135b4da608fcb",
-      "archive": "libexpat-2.8.4-r0.apk",
-      "index_checksum": "Q1ehFjl6MLN4tyIWmqStb2gbil6g8=",
+      "aports_commit": "1b945828c222e1a3ccfbdcad36184bbe3aa34848",
+      "archive": "libexpat-2.9.0-r0.apk",
+      "index_checksum": "Q1mVkgy7s1jQI9tSmldPSMFhWeits=",
       "license": "MIT",
       "repository": "main",
-      "sha256": "065af3b201fbfd91f2d747c1f7a3fea39f1bff9bf664c911ed94ac86fd4b0c56",
-      "version": "2.8.4-r0"
+      "sha256": "f2bf4f5674a5305f43fd7415e327f19122b1f1f7f2f0afa08134e9a7e78f1a90",
+      "version": "2.9.0-r0"
     },
     "libfdisk": {
       "aports_commit": "67123673d9594a0de26838c585ce77ac2e75e7de",

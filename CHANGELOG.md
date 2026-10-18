@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### 🐛 Fixes
+
+**AppImage**
+
+- Restore runtime builds that stopped with an `APKINDEX.tar.gz` checksum mismatch after the Alpine repository changed. Refresh the signed index and the pinned `libcurl` / `libexpat` build packages, while preserving signature, checksum and package-identity verification.
+
 ## [1.0.0-rc.2] - 2026-10-18
 
 ### 🔄 Changes
