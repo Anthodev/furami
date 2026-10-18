@@ -62,6 +62,8 @@ printf '%s  %s\n' "$APT_DEBS_SHA256" /out/apt-debs.sha256 |
 # Media sources were SHA256-verified by build.py before read-only mounting.
 mkdir -p "$WORK/ffmpeg" "$WORK/libplacebo/3rdparty/Vulkan-Headers" "$WORK/mpv"
 tar -xf /sources/ffmpeg.tar.xz --strip-components=1 -C "$WORK/ffmpeg"
+python3 /workspace/packaging/media/source-patches.py /media-inputs "$WORK/ffmpeg" \
+  /out/source-patches.json "$FURAMI_MEDIA_LOCK_SHA256"
 tar -xf /sources/libplacebo.tar.gz --strip-components=1 -C "$WORK/libplacebo"
 tar -xf /sources/vulkan-headers.tar.gz --strip-components=1 -C "$WORK/libplacebo/3rdparty/Vulkan-Headers"
 tar -xf /sources/mpv.tar.gz --strip-components=1 -C "$WORK/mpv"
@@ -141,7 +143,7 @@ require_private_pc mpv "$MPV_CLIENT_API"
 # Official Qt 6.11.2 linux_gcc_64 archives carry the original configure
 # options/summaries and SPDX SBOM. No system Qt, local Qt build or aqt update.
 record python3 /workspace/packaging/media/build-qt-kit.py \
-  /workspace/packaging/media/stack.lock.json /sources "$PREFIX"
+  /media-inputs/stack.lock.json /sources "$PREFIX"
 
 "$PREFIX/bin/mpv" --no-config --version > /out/mpv-version.txt
 "$PREFIX/bin/ffmpeg" -hide_banner -version > /out/ffmpeg-version.txt

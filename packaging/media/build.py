@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -13,6 +14,9 @@ from pathlib import Path
 
 LOCK_PATH = Path(__file__).with_name("stack.lock.json")
 REQUIRED = {"ca_certificates", "mpv", "libplacebo", "vulkan_headers", "ffmpeg", "qt", "cxx_qt"}
+PATCH_SPEC = importlib.util.spec_from_file_location("furami_media_source_patches", LOCK_PATH.with_name("source-patches.py"))
+source_patches = importlib.util.module_from_spec(PATCH_SPEC)
+PATCH_SPEC.loader.exec_module(source_patches)
 
 
 def sha256(path):
@@ -26,6 +30,7 @@ def sha256(path):
 def check_lock(lock):
     if lock.get("schema") != 1 or set(lock.get("sources", {})) != REQUIRED:
         raise ValueError("expected schema 1 and seven frozen sources")
+    source_patches.entries(lock["sources"])
     if not re.fullmatch(r"docker.io/library/ubuntu@sha256:[0-9a-f]{64}", lock.get("container", "")):
         raise ValueError("Ubuntu container must use an immutable OCI digest")
     if lock.get("platform") != "linux/amd64" or not re.fullmatch(r"\d{8}T\d{6}Z", lock.get("apt_snapshot", "")):
@@ -132,14 +137,21 @@ def compare_deliverables(first, second):
 
 
 def build(output, cache):
-    lock = json.loads(LOCK_PATH.read_text())
+    lock_bytes = LOCK_PATH.read_bytes()
+    lock = json.loads(lock_bytes)
     check_lock(lock)
+    patch_inputs = source_patches.inputs(LOCK_PATH.parent, lock["sources"])
+    lock_sha256 = hashlib.sha256(lock_bytes).hexdigest()
+    recipes = {name: sha256(LOCK_PATH.parent / name) for name in
+               ("build.py", "container-build.sh", "build-device-check.sh",
+                "build-qt-kit.py", "build-apt-closure.json", "source-patches.py")}
     closure = LOCK_PATH.parent / lock["apt_closure"]["file"]
     if sha256(closure) != lock["apt_closure"]["sha256"]:
         raise ValueError("APT closure file SHA256 differs from stack lock")
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"output must be empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
+    source_patches.snapshot(output / "source-inputs", lock_bytes, patch_inputs)
     cache.mkdir(parents=True, exist_ok=True)
     for name, source in lock["sources"].items():
         if name == "qt":
@@ -154,9 +166,11 @@ def build(output, cache):
     command = ["podman", "run", "--rm", "--pull=always", "--platform", lock["platform"],
                "--security-opt", "label=disable",
                "--volume", f"{repository}:/workspace:ro", "--volume", f"{cache}:/sources:ro",
+               "--volume", f"{output / 'source-inputs'}:/media-inputs:ro",
                "--volume", f"{output}:/out", "--workdir", "/workspace",
                "--env", f"APT_SNAPSHOT={lock['apt_snapshot']}",
                "--env", f"SOURCE_DATE_EPOCH={lock['source_date_epoch']}",
+               "--env", f"FURAMI_MEDIA_LOCK_SHA256={lock_sha256}",
                "--env", f"MPV_CLIENT_API={lock['sources']['mpv']['client_api']}",
                "--env", f"MPV_JPEG_FLAG={lock['sources']['mpv']['build_flags'][0]}",
                "--env", f"APT_CLOSURE_SHA256={lock['apt_closure']['sha256']}",
@@ -169,12 +183,17 @@ def build(output, cache):
     if result.returncode:
         raise RuntimeError(f"container exited {result.returncode}; see {output / 'build.log'}")
     prefix = output / "prefix"
-    manifest = {"schema": 1, "lock_sha256": sha256(LOCK_PATH), "container": lock["container"],
+    if (LOCK_PATH.read_bytes() != lock_bytes
+            or patch_inputs != source_patches.inputs(LOCK_PATH.parent, lock["sources"])
+            or recipes != {name: sha256(LOCK_PATH.parent / name) for name in recipes}):
+        raise ValueError("media recipe or source patch inputs changed during build")
+    manifest = {"schema": 1, "lock_sha256": lock_sha256, "container": lock["container"],
                 "apt_snapshot": lock["apt_snapshot"], "sources": lock["sources"],
-                "recipe_sha256": {name: sha256(LOCK_PATH.parent / name) for name in
-                                  ("build.py", "container-build.sh", "build-device-check.sh",
-                                   "build-qt-kit.py", "build-apt-closure.json")},
+                "recipe_sha256": recipes,
+                "source_patches": {"path": "source-patches.json",
+                                   "sha256": sha256(output / "source-patches.json")},
                 "artifacts": deliverables(prefix)}
+    source_patches.verify_provider(output, manifest, lock["sources"])
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(f"Built {prefix} ({len(manifest['artifacts'])} files/symlinks); manifest {output / 'manifest.json'}")
 

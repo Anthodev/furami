@@ -1,11 +1,13 @@
 """Focused consumer-visible checks; run with python3 -m unittest discover -s packaging/media -p 'build_tests.py'."""
 
 import importlib.util
+import hashlib
 import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SPEC = importlib.util.spec_from_file_location("media_build", Path(__file__).with_name("build.py"))
@@ -14,6 +16,9 @@ SPEC.loader.exec_module(media_build)
 QT_SPEC = importlib.util.spec_from_file_location("official_qt_kit", Path(__file__).with_name("build-qt-kit.py"))
 qt_kit = importlib.util.module_from_spec(QT_SPEC)
 QT_SPEC.loader.exec_module(qt_kit)
+PATCH_SPEC = importlib.util.spec_from_file_location("media_source_patches", Path(__file__).with_name("source-patches.py"))
+source_patches = importlib.util.module_from_spec(PATCH_SPEC)
+PATCH_SPEC.loader.exec_module(source_patches)
 
 
 class SourceTests(unittest.TestCase):
@@ -75,6 +80,134 @@ class SourceTests(unittest.TestCase):
         lock["sources"]["qt"]["archives"][0]["url"] = "https://example.invalid/qtbase.7z"
         with self.assertRaisesRegex(ValueError, "Qt.*official"):
             media_build.check_lock(lock)
+
+
+class SourcePatchTests(unittest.TestCase):
+    def fixture(self, root):
+        recipe = root / "recipe"
+        (recipe / "patches").mkdir(parents=True)
+        target = recipe / "patches/first.patch"
+        target.write_bytes(b"diff --git a/value.txt b/value.txt\n--- a/value.txt\n+++ b/value.txt\n"
+                           b"@@ -1 +1 @@\n-before\n+after\n")
+        sources = {"ffmpeg": {"patches": [{"file": "patches/first.patch",
+                                          "sha256": media_build.sha256(target)}]}}
+        return recipe, target, sources
+
+    def test_verified_snapshot_is_applied_in_order_not_live_patch_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            recipe, first, sources = self.fixture(root)
+            second = recipe / "patches/second.patch"
+            second.write_bytes(first.read_bytes().replace(b"-before\n+after", b"-after\n+final"))
+            sources["ffmpeg"]["patches"].append(
+                {"file": "patches/second.patch", "sha256": media_build.sha256(second)})
+            lock_bytes = json.dumps({"sources": sources}).encode()
+            snapshot = root / "source-inputs"
+            source_patches.snapshot(snapshot, lock_bytes, source_patches.inputs(recipe, sources))
+            first.write_bytes(b"untrusted later bytes")
+            tree = root / "ffmpeg"
+            tree.mkdir()
+            (tree / "value.txt").write_text("before\n")
+            receipt = root / "receipt.json"
+            source_patches.apply(snapshot, tree, receipt, hashlib.sha256(lock_bytes).hexdigest())
+            self.assertEqual((tree / "value.txt").read_text(), "final\n")
+            self.assertEqual(json.loads(receipt.read_text()), source_patches.receipt(sources))
+            self.assertEqual(snapshot.joinpath("patches/first.patch").read_bytes(),
+                             b"diff --git a/value.txt b/value.txt\n--- a/value.txt\n+++ b/value.txt\n"
+                             b"@@ -1 +1 @@\n-before\n+after\n")
+
+    def test_tampered_missing_symlink_and_parent_symlink_inputs_fail_closed(self):
+        for mutation in ("tampered", "missing", "symlink", "parent-symlink"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                recipe, target, sources = self.fixture(root)
+                original = target.read_bytes()
+                if mutation == "tampered":
+                    target.write_bytes(b"tampered")
+                elif mutation == "missing":
+                    target.unlink()
+                else:
+                    external = root / "external"
+                    external.mkdir()
+                    (external / target.name).write_bytes(original)
+                    target.unlink()
+                    if mutation == "symlink":
+                        target.symlink_to(external / target.name)
+                    else:
+                        target.parent.rmdir()
+                        target.parent.symlink_to(external, target_is_directory=True)
+                with self.assertRaises(ValueError):
+                    source_patches.inputs(recipe, sources)
+
+    def test_invalid_metadata_cannot_escape_recipe_or_patch_another_component(self):
+        for relative in ("../escape.patch", "/absolute.patch", "patches/../escape.patch",
+                         "patches//x.patch", "patches/./x.patch", "patches\\x.patch"):
+            with self.subTest(relative=relative), self.assertRaises(ValueError):
+                source_patches.entries({"ffmpeg": {"patches": [{"file": relative, "sha256": "a" * 64}]}})
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, sources = self.fixture(Path(temporary))
+            entry = sources["ffmpeg"]["patches"][0]
+            for value in (None, {}, [entry, entry], [{**entry, "extra": True}],
+                          [{**entry, "sha256": ""}]):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    source_patches.entries({"ffmpeg": {"patches": value}})
+            with self.assertRaises(ValueError):
+                source_patches.entries({"mpv": sources["ffmpeg"]})
+
+    def test_patch_application_failure_or_changed_snapshot_has_no_success_receipt(self):
+        for mutation in ("context", "patch-hash", "lock-hash"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                recipe, _, sources = self.fixture(root)
+                lock_bytes = json.dumps({"sources": sources}).encode()
+                snapshot, tree, receipt = root / "snapshot", root / "ffmpeg", root / "receipt.json"
+                source_patches.snapshot(snapshot, lock_bytes, source_patches.inputs(recipe, sources))
+                tree.mkdir()
+                (tree / "value.txt").write_text("wrong context\n" if mutation == "context" else "before\n")
+                expected = hashlib.sha256(lock_bytes).hexdigest()
+                if mutation == "patch-hash":
+                    file = snapshot / "patches/first.patch"
+                    file.chmod(0o644)
+                    file.write_bytes(b"tampered")
+                elif mutation == "lock-hash":
+                    expected = "0" * 64
+                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                    source_patches.apply(snapshot, tree, receipt, expected)
+                self.assertFalse(receipt.exists())
+                self.assertEqual((tree / "value.txt").read_text(),
+                                 "wrong context\n" if mutation == "context" else "before\n")
+
+    def test_diff_traversal_cannot_modify_a_file_outside_extracted_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            recipe, supplied, sources = self.fixture(root)
+            supplied.write_bytes(supplied.read_bytes().replace(b"value.txt", b"../outside.txt"))
+            sources["ffmpeg"]["patches"][0]["sha256"] = media_build.sha256(supplied)
+            lock_bytes = json.dumps({"sources": sources}).encode()
+            snapshot, tree, receipt = root / "snapshot", root / "ffmpeg", root / "receipt.json"
+            source_patches.snapshot(snapshot, lock_bytes, source_patches.inputs(recipe, sources))
+            tree.mkdir()
+            outside = root / "outside.txt"
+            outside.write_text("before\n")
+            with self.assertRaises(subprocess.CalledProcessError):
+                source_patches.apply(snapshot, tree, receipt, hashlib.sha256(lock_bytes).hexdigest())
+            self.assertEqual(outside.read_text(), "before\n")
+            self.assertFalse(receipt.exists())
+
+    def test_builder_rejects_patch_tampering_before_output_or_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            recipe, target, sources = self.fixture(root)
+            lock = json.loads(media_build.LOCK_PATH.read_text())
+            lock["sources"]["ffmpeg"]["patches"] = sources["ffmpeg"]["patches"]
+            pinned = recipe / "stack.lock.json"
+            pinned.write_text(json.dumps(lock))
+            target.write_bytes(b"tampered")
+            with patch.object(media_build, "LOCK_PATH", pinned), \
+                    patch.object(media_build, "obtain_source", side_effect=AssertionError("must not download")):
+                with self.assertRaisesRegex(ValueError, "SHA256"):
+                    media_build.build(root / "output", root / "cache")
+            self.assertFalse((root / "output").exists())
 
 
 class QtMetadataTests(unittest.TestCase):

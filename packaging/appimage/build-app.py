@@ -4,6 +4,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,9 @@ APP_LOCK = HERE / "app.lock.json"
 STACK_LOCK = HERE.parent / "media/stack.lock.json"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+PATCH_SPEC = importlib.util.spec_from_file_location("furami_app_media_patches", STACK_LOCK.with_name("source-patches.py"))
+source_patches = importlib.util.module_from_spec(PATCH_SPEC)
+PATCH_SPEC.loader.exec_module(source_patches)
 
 
 def sha256(path):
@@ -87,6 +91,7 @@ def verify_media(media, stack):
         raise ValueError("media OCI image or APT snapshot differs from stack lock")
     if manifest.get("sources") != stack["sources"]:
         raise ValueError("media source versions differ from stack lock")
+    source_patches.verify_provider(media, manifest, stack["sources"])
     closure = STACK_LOCK.parent / stack["apt_closure"]["file"]
     check_sha(closure, stack["apt_closure"]["sha256"], "media APT closure")
     if manifest.get("recipe_sha256", {}).get("build-apt-closure.json") != sha256(closure):
@@ -294,6 +299,8 @@ def rust_std_closure(output, linked_archives, app_lock, cache=None):
 
 
 def input_hashes():
+    stack = json.loads(STACK_LOCK.read_text())
+    patches = source_patches.inputs(STACK_LOCK.parent, stack["sources"])
     inputs = [APP_LOCK, STACK_LOCK, STACK_LOCK.parent / "build-apt-closure.json",
               REPOSITORY / "Cargo.lock", REPOSITORY / "Cargo.toml",
               REPOSITORY / "build.rs", REPOSITORY / "rust-toolchain.toml",
@@ -301,6 +308,8 @@ def input_hashes():
               REPOSITORY / "assets/logo.svg",
               HERE / "build-app.py", HERE / "app-container-build.sh",
               HERE / "rcc-wrapper.sh",
+              STACK_LOCK.with_name("source-patches.py"),
+              *(STACK_LOCK.parent / relative for relative in patches),
               *sorted((REPOSITORY / "src").rglob("*")),
               *sorted((REPOSITORY / "qml").rglob("*"))]
     if any(path.is_symlink() for path in inputs):

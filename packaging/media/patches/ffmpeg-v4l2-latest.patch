@@ -1,0 +1,596 @@
+--- a/libavdevice/v4l2.c
++++ b/libavdevice/v4l2.c
+@@ -47,6 +47,8 @@
+ #include "timefilter.h"
+ #include "v4l2-common.h"
+ #include <dirent.h>
++#include <poll.h>
++#include <pthread.h>
+ 
+ #if CONFIG_LIBV4L2
+ #include <libv4l2.h>
+@@ -80,6 +82,29 @@
+  */
+ #define V4L_TS_CONVERT_READY V4L_TS_DEFAULT
+ 
++/* Mapped packets may outlive AVFormatContext (for example in mpv's packet
++ * pool). Nothing reachable from their release callback may belong to priv_data. */
++struct latest_owner {
++    atomic_uint refs;
++    pthread_mutex_t mutex;
++    int retired;
++    int streaming;
++    int fd;
++    int buffers;
++    int mapped;
++    int buffers_queued;
++    unsigned char *queued;
++    void **buf_start;
++    unsigned int *buf_len;
++#if HAVE_IOCTL_POSIX
++    int (*ioctl_f)(int fd, int request, ...);
++#else
++    int (*ioctl_f)(int fd, unsigned long int request, ...);
++#endif
++    int (*close_f)(int fd);
++    int (*munmap_f)(void *start, size_t length);
++};
++
+ struct video_data {
+     AVClass *class;
+     int fd;
+@@ -97,6 +122,8 @@
+ 
+     int buffers;
+     atomic_int buffers_queued;
++    int furami_latest;
++    struct latest_owner *latest;
+     void **buf_start;
+     unsigned int *buf_len;
+     char *standard;
+@@ -122,7 +149,10 @@
+ };
+ 
+ struct buff_data {
+-    struct video_data *s;
++    union {
++        struct video_data *s;
++        struct latest_owner *latest;
++    };
+     int index;
+ };
+ 
+@@ -163,7 +193,7 @@
+ #define v4l2_mmap   s->mmap_f
+ #define v4l2_munmap s->munmap_f
+ 
+-    if (ctx->flags & AVFMT_FLAG_NONBLOCK) {
++    if (s->furami_latest || ctx->flags & AVFMT_FLAG_NONBLOCK) {
+         flags |= O_NONBLOCK;
+     }
+ 
+@@ -201,6 +231,12 @@
+         av_log(ctx, AV_LOG_ERROR,
+                "The device does not support the streaming I/O method.\n");
+         err = AVERROR(ENOSYS);
++        goto fail;
++    }
++
++    if (s->furami_latest && s->multiplanar) {
++        av_log(ctx, AV_LOG_ERROR, "furami_latest requires single-planar capture.\n");
++        err = AVERROR(EINVAL);
+         goto fail;
+     }
+ 
+@@ -356,6 +392,86 @@
+     }
+ }
+ 
++static void latest_owner_unref(struct latest_owner *owner)
++{
++    if (atomic_fetch_sub(&owner->refs, 1) != 1)
++        return;
++    for (int i = 0; i < owner->mapped; i++)
++        owner->munmap_f(owner->buf_start[i], owner->buf_len[i]);
++    av_free(owner->buf_start);
++    av_free(owner->buf_len);
++    av_free(owner->queued);
++    pthread_mutex_destroy(&owner->mutex);
++    av_free(owner);
++}
++
++static int latest_owner_init(struct video_data *s)
++{
++    struct latest_owner *owner = av_mallocz(sizeof(*owner));
++    int res;
++
++    if (!owner)
++        return AVERROR(ENOMEM);
++    res = pthread_mutex_init(&owner->mutex, NULL);
++    if (res) {
++        av_free(owner);
++        return AVERROR(res);
++    }
++    atomic_init(&owner->refs, 1);
++    owner->fd = s->fd;
++    owner->buffers = s->buffers;
++    owner->ioctl_f = s->ioctl_f;
++    owner->close_f = s->close_f;
++    owner->munmap_f = s->munmap_f;
++    owner->buf_start = av_malloc_array(s->buffers, sizeof(*owner->buf_start));
++    owner->buf_len = av_malloc_array(s->buffers, sizeof(*owner->buf_len));
++    owner->queued = av_calloc(s->buffers, sizeof(*owner->queued));
++    if (!owner->buf_start || !owner->buf_len || !owner->queued) {
++        latest_owner_unref(owner);
++        return AVERROR(ENOMEM);
++    }
++    s->latest = owner;
++    s->buf_start = owner->buf_start;
++    s->buf_len = owner->buf_len;
++    return 0;
++}
++
++static int latest_owner_retire(struct latest_owner *owner)
++{
++    int res = 0;
++
++    pthread_mutex_lock(&owner->mutex);
++    if (!owner->retired) {
++        int fd = owner->fd;
++        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++
++        owner->retired = 1;
++        owner->fd = -1;
++        /* Serialize the complete retirement against in-flight callback QBUF.
++         * No callback can use a closed, subsequently reused descriptor. */
++        if (owner->streaming)
++            owner->ioctl_f(fd, VIDIOC_STREAMOFF, &type);
++        if (owner->close_f(fd) < 0) {
++            res = AVERROR(errno);
++            av_log(NULL, AV_LOG_ERROR, "close(V4L2): %s\n", av_err2str(res));
++        }
++    }
++    pthread_mutex_unlock(&owner->mutex);
++    return res;
++}
++
++static int buffers_queued(struct video_data *s)
++{
++    int count;
++
++    if (!s->furami_latest)
++        return atomic_load(&s->buffers_queued);
++    pthread_mutex_lock(&s->latest->mutex);
++    count = s->latest->buffers_queued;
++    pthread_mutex_unlock(&s->latest->mutex);
++    return count;
++}
++
+ static int mmap_init(AVFormatContext *ctx)
+ {
+     int i, res;
+@@ -377,16 +493,21 @@
+         return AVERROR(ENOMEM);
+     }
+     s->buffers = req.count;
+-    s->buf_start = av_malloc_array(s->buffers, sizeof(void *));
+-    if (!s->buf_start) {
+-        av_log(ctx, AV_LOG_ERROR, "Cannot allocate buffer pointers\n");
+-        return AVERROR(ENOMEM);
+-    }
+-    s->buf_len = av_malloc_array(s->buffers, sizeof(unsigned int));
+-    if (!s->buf_len) {
+-        av_log(ctx, AV_LOG_ERROR, "Cannot allocate buffer sizes\n");
+-        av_freep(&s->buf_start);
+-        return AVERROR(ENOMEM);
++    if (s->furami_latest) {
++        if ((res = latest_owner_init(s)) < 0)
++            return res;
++    } else {
++        s->buf_start = av_malloc_array(s->buffers, sizeof(void *));
++        if (!s->buf_start) {
++            av_log(ctx, AV_LOG_ERROR, "Cannot allocate buffer pointers\n");
++            return AVERROR(ENOMEM);
++        }
++        s->buf_len = av_malloc_array(s->buffers, sizeof(unsigned int));
++        if (!s->buf_len) {
++            av_log(ctx, AV_LOG_ERROR, "Cannot allocate buffer sizes\n");
++            av_freep(&s->buf_start);
++            return AVERROR(ENOMEM);
++        }
+     }
+ 
+     for (i = 0; i < req.count; i++) {
+@@ -433,15 +554,42 @@
+             av_log(ctx, AV_LOG_ERROR, "mmap: %s\n", av_err2str(res));
+             return res;
+         }
++        if (s->furami_latest)
++            s->latest->mapped++;
+     }
+ 
+     return 0;
+ }
+ 
++/* Caller holds owner->mutex across the syscall and accounting update. */
++static int latest_enqueue_locked(struct latest_owner *owner, struct v4l2_buffer *buf)
++{
++    int res;
++
++    if (owner->retired)
++        return AVERROR(ENODEV);
++    if (buf->index >= owner->buffers || owner->queued[buf->index])
++        return AVERROR(EINVAL);
++    if (owner->ioctl_f(owner->fd, VIDIOC_QBUF, buf) < 0) {
++        res = AVERROR(errno);
++        av_log(NULL, AV_LOG_ERROR, "ioctl(VIDIOC_QBUF): %s\n", av_err2str(res));
++        return res;
++    }
++    owner->queued[buf->index] = 1;
++    owner->buffers_queued++;
++    return 0;
++}
++
+ static int enqueue_buffer(struct video_data *s, struct v4l2_buffer *buf)
+ {
+     int res = 0;
+ 
++    if (s->furami_latest) {
++        pthread_mutex_lock(&s->latest->mutex);
++        res = latest_enqueue_locked(s->latest, buf);
++        pthread_mutex_unlock(&s->latest->mutex);
++        return res;
++    }
+     if (v4l2_ioctl(s->fd, VIDIOC_QBUF, buf) < 0) {
+         res = AVERROR(errno);
+         av_log(NULL, AV_LOG_ERROR, "ioctl(VIDIOC_QBUF): %s\n", av_err2str(res));
+@@ -450,6 +598,24 @@
+     }
+ 
+     return res;
++}
++
++static void latest_release_buffer(void *opaque, uint8_t *data)
++{
++    struct buff_data *descriptor = opaque;
++    struct latest_owner *owner = descriptor->latest;
++    struct v4l2_buffer buf = {
++        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
++        .memory = V4L2_MEMORY_MMAP,
++        .index = descriptor->index,
++    };
++
++    pthread_mutex_lock(&owner->mutex);
++    if (!owner->retired)
++        latest_enqueue_locked(owner, &buf);
++    pthread_mutex_unlock(&owner->mutex);
++    av_free(descriptor);
++    latest_owner_unref(owner);
+ }
+ 
+ static void mmap_release_buffer(void *opaque, uint8_t *data)
+@@ -530,6 +696,120 @@
+     return 0;
+ }
+ 
++static int latest_dequeue_buffer(AVFormatContext *ctx, struct v4l2_buffer *buf)
++{
++    struct video_data *s = ctx->priv_data;
++    struct latest_owner *owner = s->latest;
++    int res = 0;
++
++    pthread_mutex_lock(&owner->mutex);
++    if (owner->retired) {
++        res = AVERROR(ENODEV);
++    } else if (owner->ioctl_f(owner->fd, VIDIOC_DQBUF, buf) < 0) {
++        res = AVERROR(errno);
++    } else if (buf->index >= owner->buffers || !owner->queued[buf->index]) {
++        av_log(ctx, AV_LOG_ERROR, "Invalid or already owned V4L2 buffer index.\n");
++        res = AVERROR(EINVAL);
++    } else {
++        owner->queued[buf->index] = 0;
++        owner->buffers_queued--;
++    }
++    pthread_mutex_unlock(&owner->mutex);
++    return res;
++}
++
++/* The descriptor is nonblocking. Only the first candidate may wait; the
++ * bounded drain below never waits for a future completion. */
++static int latest_dequeue_first(AVFormatContext *ctx, struct v4l2_buffer *buf)
++{
++    struct video_data *s = ctx->priv_data;
++    struct pollfd pfd = { .fd = s->fd, .events = POLLIN };
++    int res;
++
++    for (;;) {
++        if (ctx->interrupt_callback.callback &&
++            ctx->interrupt_callback.callback(ctx->interrupt_callback.opaque))
++            return AVERROR_EXIT;
++        res = latest_dequeue_buffer(ctx, buf);
++        if (res == 0)
++            return 0;
++        if (res == AVERROR(EINTR))
++            continue;
++        if (res != AVERROR(EAGAIN))
++            return res;
++        if (ctx->flags & AVFMT_FLAG_NONBLOCK)
++            return AVERROR(EAGAIN);
++        pfd.revents = 0;
++        res = poll(&pfd, 1, 100);
++        if (res < 0) {
++            if (errno == EINTR)
++                continue;
++            return AVERROR(errno);
++        }
++        if (res > 0) {
++            if (pfd.revents & POLLNVAL)
++                return AVERROR(EBADF);
++            if (pfd.revents & (POLLERR | POLLHUP))
++                return AVERROR(ENODEV);
++        }
++    }
++}
++
++static int latest_read_buffer(AVFormatContext *ctx, struct v4l2_buffer *buf)
++{
++    struct video_data *s = ctx->priv_data;
++    int res = latest_dequeue_first(ctx, buf);
++
++    if (res < 0)
++        return res;
++
++    /* Actual REQBUFS count, not desired_video_buffers. Even a continuously
++     * producing device cannot keep this read in an unbounded drain loop. */
++    for (int i = 0; i < s->buffers - 1; i++) {
++        struct v4l2_buffer newer = {
++            .type = s->buf_type,
++            .memory = V4L2_MEMORY_MMAP,
++        };
++        if (ctx->interrupt_callback.callback &&
++            ctx->interrupt_callback.callback(ctx->interrupt_callback.opaque)) {
++            res = AVERROR_EXIT;
++            goto fail;
++        }
++        res = latest_dequeue_buffer(ctx, &newer);
++        if (res < 0) {
++            if (res == AVERROR(EAGAIN))
++                break;
++            if (res == AVERROR(EINTR))
++                continue;
++            goto fail;
++        }
++        /* With B=2 accounting may be zero only during this exchange.
++         * No allocation, copy or wait may be introduced before requeueing. */
++        res = enqueue_buffer(s, buf);
++        if (res < 0) {
++            enqueue_buffer(s, &newer);
++            goto fail;
++        }
++        *buf = newer;
++    }
++    if (ctx->interrupt_callback.callback &&
++        ctx->interrupt_callback.callback(ctx->interrupt_callback.opaque)) {
++        res = AVERROR_EXIT;
++        goto fail;
++    }
++    if (buf->bytesused > s->buf_len[buf->index]) {
++        av_log(ctx, AV_LOG_ERROR, "V4L2 payload exceeds mapped buffer size.\n");
++        res = AVERROR_INVALIDDATA;
++        goto fail;
++    }
++    return 0;
++
++fail:
++    /* Preserve the original failure even if best-effort requeue also fails. */
++    enqueue_buffer(s, buf);
++    return res;
++}
++
+ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
+ {
+     struct video_data *s = ctx->priv_data;
+@@ -546,27 +826,31 @@
+ 
+     pkt->size = 0;
+ 
+-    /* FIXME: Some special treatment might be needed in case of loss of signal... */
+-    while ((res = v4l2_ioctl(s->fd, VIDIOC_DQBUF, &buf)) < 0 && (errno == EINTR));
+-    if (res < 0) {
+-        if (errno == EAGAIN)
+-            return AVERROR(EAGAIN);
+-
+-        res = AVERROR(errno);
+-        av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_DQBUF): %s\n",
+-               av_err2str(res));
+-        return res;
+-    }
+-
++    if (s->furami_latest) {
++        if ((res = latest_read_buffer(ctx, &buf)) < 0)
++            return res;
++    } else {
++        /* FIXME: Some special treatment might be needed in case of loss of signal... */
++        while ((res = v4l2_ioctl(s->fd, VIDIOC_DQBUF, &buf)) < 0 && (errno == EINTR));
++        if (res < 0) {
++            if (errno == EAGAIN)
++                return AVERROR(EAGAIN);
++
++            res = AVERROR(errno);
++            av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_DQBUF): %s\n",
++                   av_err2str(res));
++            return res;
++        }
++
++        if (buf.index >= s->buffers) {
++            av_log(ctx, AV_LOG_ERROR, "Invalid buffer index received.\n");
++            return AVERROR(EINVAL);
++        }
++        atomic_fetch_add(&s->buffers_queued, -1);
++    }
+     buf_ts = buf.timestamp;
+-
+-    if (buf.index >= s->buffers) {
+-        av_log(ctx, AV_LOG_ERROR, "Invalid buffer index received.\n");
+-        return AVERROR(EINVAL);
+-    }
+-    atomic_fetch_add(&s->buffers_queued, -1);
+-    // always keep at least one buffer queued
+-    av_assert0(atomic_load(&s->buffers_queued) >= 1);
++    // always keep at least one buffer queued, after any latest-buffer exchange
++    av_assert0(buffers_queued(s) >= 1);
+ 
+     bytesused = s->multiplanar ? buf.m.planes[0].bytesused : buf.bytesused;
+ 
+@@ -593,7 +877,7 @@
+     }
+ 
+     /* Image is at s->buff_start[buf.index] */
+-    if (atomic_load(&s->buffers_queued) == FFMAX(s->buffers / 8, 1)) {
++    if (buffers_queued(s) == FFMAX(s->buffers / 8, 1)) {
+         /* when we start getting low on queued buffers, fall back on copying data */
+         res = av_new_packet(pkt, bytesused);
+         if (res < 0) {
+@@ -625,13 +909,21 @@
+             return AVERROR(ENOMEM);
+         }
+         buf_descriptor->index = buf.index;
+-        buf_descriptor->s     = s;
+-
+-        pkt->buf = av_buffer_create(pkt->data, pkt->size, mmap_release_buffer,
++        if (s->furami_latest) {
++            buf_descriptor->latest = s->latest;
++            atomic_fetch_add(&s->latest->refs, 1);
++        } else {
++            buf_descriptor->s = s;
++        }
++
++        pkt->buf = av_buffer_create(pkt->data, pkt->size,
++                                    s->furami_latest ? latest_release_buffer : mmap_release_buffer,
+                                     buf_descriptor, 0);
+         if (!pkt->buf) {
+             av_log(ctx, AV_LOG_ERROR, "Failed to create a buffer\n");
+             enqueue_buffer(s, &buf);
++            if (s->furami_latest)
++                latest_owner_unref(buf_descriptor->latest);
+             av_freep(&buf_descriptor);
+             return AVERROR(ENOMEM);
+         }
+@@ -658,14 +950,18 @@
+             .length   = s->multiplanar ? VIDEO_MAX_PLANES : 0,
+         };
+ 
+-        if (v4l2_ioctl(s->fd, VIDIOC_QBUF, &buf) < 0) {
++        if (s->furami_latest) {
++            if ((res = enqueue_buffer(s, &buf)) < 0)
++                return res;
++        } else if (v4l2_ioctl(s->fd, VIDIOC_QBUF, &buf) < 0) {
+             res = AVERROR(errno);
+             av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_QBUF): %s\n",
+                    av_err2str(res));
+             return res;
+         }
+     }
+-    atomic_store(&s->buffers_queued, s->buffers);
++    if (!s->furami_latest)
++        atomic_store(&s->buffers_queued, s->buffers);
+ 
+     type = s->buf_type;
+     if (v4l2_ioctl(s->fd, VIDIOC_STREAMON, &type) < 0) {
+@@ -674,14 +970,27 @@
+                av_err2str(res));
+         return res;
+     }
++    if (s->furami_latest)
++        s->latest->streaming = 1;
+ 
+     return 0;
+ }
+ 
+-static void mmap_close(struct video_data *s)
++static int mmap_close(struct video_data *s)
+ {
+     enum v4l2_buf_type type;
+     int i;
++    if (s->furami_latest) {
++        struct latest_owner *owner = s->latest;
++        int res = latest_owner_retire(owner);
++
++        s->latest = NULL;
++        s->buf_start = NULL;
++        s->buf_len = NULL;
++        s->fd = -1;
++        latest_owner_unref(owner);
++        return res;
++    }
+ 
+     type = s->buf_type;
+     /* We do not check for the result, because we could
+@@ -693,6 +1002,7 @@
+     }
+     av_freep(&s->buf_start);
+     av_freep(&s->buf_len);
++    return 0;
+ }
+ 
+ static int v4l2_set_parameters(AVFormatContext *ctx)
+@@ -978,6 +1288,15 @@
+     res = device_try_init(ctx, pix_fmt, &s->width, &s->height, &desired_format, &codec_id);
+     if (res < 0)
+         goto fail;
++    if (s->furami_latest &&
++        desired_format != V4L2_PIX_FMT_NV12 &&
++        desired_format != V4L2_PIX_FMT_YUYV &&
++        desired_format != V4L2_PIX_FMT_BGR24 &&
++        desired_format != V4L2_PIX_FMT_MJPEG) {
++        av_log(ctx, AV_LOG_ERROR, "furami_latest requires NV12, YUYV, BGR3 or MJPEG.\n");
++        res = AVERROR(EINVAL);
++        goto fail;
++    }
+ 
+     /* If no pixel_format was specified, the codec_id was not known up
+      * until now. Set video_codec_id in the context, as codec_id will
+@@ -1025,7 +1344,10 @@
+     return 0;
+ 
+ fail:
+-    v4l2_close(s->fd);
++    if (s->latest)
++        mmap_close(s);
++    else
++        v4l2_close(s->fd);
+     return res;
+ }
+ 
+@@ -1043,16 +1365,18 @@
+ static int v4l2_read_close(AVFormatContext *ctx)
+ {
+     struct video_data *s = ctx->priv_data;
+-
+-    if (atomic_load(&s->buffers_queued) != s->buffers)
++    int res;
++
++    if (!s->furami_latest && atomic_load(&s->buffers_queued) != s->buffers)
+         av_log(ctx, AV_LOG_WARNING, "Some buffers are still owned by the caller on "
+                "close.\n");
+ 
+-    mmap_close(s);
++    res = mmap_close(s);
+ 
+     ff_timefilter_destroy(s->timefilter);
+-    v4l2_close(s->fd);
+-    return 0;
++    if (!s->furami_latest)
++        v4l2_close(s->fd);
++    return res;
+ }
+ 
+ static int v4l2_is_v4l_dev(const char *name)
+@@ -1161,6 +1485,7 @@
+     { "abs",          "use absolute timestamps (wall clock)",                     OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_ABS      }, 0, 2, DEC, .unit = "timestamps" },
+     { "mono2abs",     "force conversion from monotonic to absolute timestamps",   OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_MONO2ABS }, 0, 2, DEC, .unit = "timestamps" },
+     { "use_libv4l2",  "use libv4l2 (v4l-utils) conversion functions",             OFFSET(use_libv4l2),  AV_OPT_TYPE_BOOL,   {.i64 = 0}, 0, 1, DEC },
++    { "furami_latest", "select newest ready single-planar capture buffer within a bounded drain", OFFSET(furami_latest), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, DEC },
+     { NULL },
+ };
+ 

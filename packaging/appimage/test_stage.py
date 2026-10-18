@@ -18,6 +18,38 @@ SPEC.loader.exec_module(stage)
 
 
 class StageIntegrityTests(unittest.TestCase):
+    def test_source_patch_bytes_are_inside_appdir_with_explicit_media_ownership(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            recipe, media, appdir = root / "recipe", root / "media", root / "AppDir"
+            (recipe / "patches").mkdir(parents=True)
+            media.mkdir()
+            appdir.mkdir()
+            supplied = recipe / "patches/latest.patch"
+            supplied.write_bytes(b"checked media source modification\n")
+            sources = {"ffmpeg": {"patches": [{"file": "patches/latest.patch",
+                                               "sha256": stage.digest(supplied)}]}}
+            lock_bytes = json.dumps({"sources": sources}).encode()
+            stage.source_patches.snapshot(media / "source-inputs", lock_bytes,
+                                          stage.source_patches.inputs(recipe, sources))
+            receipt = media / "source-patches.json"
+            receipt.write_text(json.dumps(stage.source_patches.receipt(sources)))
+            manifest = {"sources": sources, "lock_sha256": hashlib.sha256(lock_bytes).hexdigest(),
+                        "source_patches": {"path": receipt.name, "sha256": stage.digest(receipt)}}
+            owners = {}
+            stage.stage_source_patches(media, manifest, appdir, owners)
+            relative = "usr/share/licenses/media/ffmpeg/patches/latest.patch"
+            self.assertEqual((appdir / relative).read_bytes(), supplied.read_bytes())
+            self.assertEqual(owners[relative], {"owner": "checked-source-patch",
+                                               "source": "ffmpeg:patches/latest.patch",
+                                               "source_sha256": stage.digest(supplied)})
+            frozen = media / "source-inputs/patches/latest.patch"
+            frozen.chmod(0o644)
+            frozen.write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "source input SHA256"):
+                stage.stage_source_patches(media, manifest, root / "uncreated", {})
+            self.assertFalse((root / "uncreated").exists())
+
     def test_root_directory_mode_is_part_of_payload(self):
         with tempfile.TemporaryDirectory() as temporary:
             left, right = Path(temporary) / "left", Path(temporary) / "right"

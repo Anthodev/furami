@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.0.0-rc.2] - 2026-10-18
+
+### 🔄 Changes
+
+**AppImage**
+
+- Apply the bundled FFmpeg patch automatically during a rebuild and verify it against a retained checksum; a mismatch rejects the build. This concerns only the privately bundled FFmpeg, never the FFmpeg installed on the host.
+- Include the patch in the AppImage notices and corresponding source materials, and retain its application record in build provenance so future builds can verify and reconstruct the bundled changes.
+
+### 🐛 Fixes
+
+**Capture**
+
+- Prioritize a recent video image instead of replaying older queued frames, addressing capture startup lag caused by accumulated frames. Each V4L2 read discards older completed frames within a bounded drain, without adding frame copies.
+- Keep the packet buffer valid when the decoder still holds frames while capture shuts down, fixing a crash in the new freshness path.
+
+Full changelog: [v1.0.0-rc.1...v1.0.0-rc.2](https://github.com/Anthodev/furami/compare/v1.0.0-rc.1...v1.0.0-rc.2)
+
 ## [1.0.0-rc.1] - 2026-10-18
 
 First release candidate for `1.0.0`.

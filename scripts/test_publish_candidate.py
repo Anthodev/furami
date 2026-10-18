@@ -129,6 +129,11 @@ class CandidateTests(unittest.TestCase):
         (repo / 'Cargo.toml').write_text('[package]\nname="furami"\nversion="0.1.0-rc.1"\n')
         (repo / 'Cargo.lock').write_text('[[package]]\nname="furami"\nversion="0.1.0-rc.1"\n')
         _, _, members = support.runtime_source_fixture(repo, root / 'private-cache')
+        # Synthetic publication assets contain no media code. Declare that
+        # explicitly and distribute the same canonical lock with their sources.
+        media_lock = repo / 'packaging/media/stack.lock.json'
+        media_lock.write_text(json.dumps({'source_date_epoch': 1, 'sources': {}}))
+        members['furami/packaging/media/stack.lock.json'] = media_lock.read_bytes()
         for name, data in members.items():
             path = repo / 'public-fixture' / name
             path.parent.mkdir(parents=True, exist_ok=True)

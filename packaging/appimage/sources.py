@@ -24,6 +24,9 @@ REPO = HERE.parents[1]
 
 PUBLIC_MATERIAL_POLICY = {'schema': 1, 'alpine_bootstrap': 'private',
                           'public_offline_bootstrap_complete': False}
+PATCH_SPEC = importlib.util.spec_from_file_location("furami_sources_media_patches", REPO / "packaging/media/source-patches.py")
+source_patches = importlib.util.module_from_spec(PATCH_SPEC)
+PATCH_SPEC.loader.exec_module(source_patches)
 
 
 def sha(path):
@@ -473,6 +476,8 @@ def verify_public_materials(release, index, *, require_complete=True):
 
     runtime = read_lock('runtime.lock.json')
     alpine = read_lock('alpine-source.lock.json')
+    media_lock = read_lock('stack.lock.json', 'media')
+    media_patches = source_patches.entries(media_lock['sources'])
     runtime_recipe_path = REPO / 'packaging/appimage-runtime/build.py'
     spec = importlib.util.spec_from_file_location('furami_public_runtime_validation', runtime_recipe_path)
     runtime_recipe = importlib.util.module_from_spec(spec)
@@ -501,6 +506,11 @@ def verify_public_materials(release, index, *, require_complete=True):
     required = {'runtime-inputs/' + entry['archive']: entry['sha256']
                 for entry in runtime['sources'].values()}
     required.update(public_indexes)
+    for name, source in media_lock['sources'].items():
+        if name not in ('qt', 'ca_certificates'):
+            required['media-inputs/' + source['archive']] = source['sha256']
+    required.update({'furami/packaging/media/' + row['file']: row['sha256']
+                     for row in media_patches})
     for name, source in linked_sources.items():
         prefix = 'runtime-inputs/alpine-sources/' + name + '/'
         required[prefix + 'APKBUILD'] = source['apkbuild']['sha256']
@@ -517,6 +527,21 @@ def verify_public_materials(release, index, *, require_complete=True):
                 with archive.extractfile(name) as stream, target.open('wb') as output:
                     shutil.copyfileobj(stream, output)
             return target
+        if media_patches:
+            manifest_name = 'media-evidence/manifest.json'
+            receipt_name = 'media-evidence/source-patches.json'
+            if require_complete or manifest_name in inventory or receipt_name in inventory:
+                manifest = json.loads(delivered(manifest_name).read_bytes())
+                applied = delivered(receipt_name)
+                if (manifest.get('sources') != media_lock['sources']
+                        or manifest.get('lock_sha256') != sha(REPO / 'packaging/media/stack.lock.json')
+                        or manifest.get('source_patches') != {'path': 'source-patches.json', 'sha256': sha(applied)}
+                        or json.loads(applied.read_bytes()) != source_patches.receipt(media_lock['sources'])):
+                    raise ValueError('public applied media patches differ from frozen source lock')
+            for row in media_patches:
+                name = 'furami/packaging/media/' + row['file']
+                if name in inventory and inventory[name]['sha256'] != row['sha256']:
+                    raise ValueError('public media source patch differs from lock: ' + name)
         for raw_name, report_name in LOADER_REPORTS.items():
             if 'media-evidence/' + raw_name in inventory:
                 raise ValueError('raw process-address transcript in public sources')
@@ -602,6 +627,10 @@ def assemble(provenance, audit, output, caches, acquire):
     app_manifest = json.loads((app / 'manifest.json').read_text())
     media_manifest = json.loads((media / 'manifest.json').read_text())
     runtime_manifest = json.loads((runtime / 'manifest.json').read_text())
+    stack = json.loads((REPO / 'packaging/media/stack.lock.json').read_text())
+    if media_manifest.get('sources') != stack['sources']:
+        raise ValueError('media source versions differ from stack lock')
+    source_patches.verify_provider(media, media_manifest, stack['sources'])
 
     def add(path, target, expected=None, role='corresponding-source', component=None):
         if Path(target).is_absolute() or '..' in Path(target).parts:
@@ -634,13 +663,19 @@ def assemble(provenance, audit, output, caches, acquire):
             add(path, target, entry['sha256'], role, component)
         return path
 
+    patch_owners = {'packaging/media/' + row['file']: row['source']
+                    for row in source_patches.entries(media_manifest['sources'])}
     for relative, digest in app_manifest['inputs'].items():
-        add(app / 'source-snapshot' / relative, 'furami/' + relative, digest, component='furami')
+        add(app / 'source-snapshot' / relative, 'furami/' + relative, digest,
+            component=patch_owners.get(relative, 'furami'))
     # Full controlling scripts and locks, not developer-specific output paths.
     for folder in ('appimage', 'media', 'appimage-runtime'):
         for path in sorted((REPO / 'packaging' / folder).iterdir()):
             if path.is_file() and not path.is_symlink() and (path.name == 'AppRun' or path.suffix in ('.py', '.sh', '.json', '.md', '.conf', '.svg', '.png', '.desktop')):
                 add(path, 'furami/packaging/' + folder + '/' + path.name, role='build-recipe')
+    for row in source_patches.entries(media_manifest['sources']):
+        add(media / 'source-inputs' / row['file'], 'furami/packaging/media/' + row['file'],
+            row['sha256'], component=row['source'])
     if provenance.get('original_recipes'):
         original = Path(provenance['original_recipes'])
         for path in sorted(original.rglob('*')):

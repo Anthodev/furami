@@ -299,7 +299,8 @@ class PublicMaterialTests(unittest.TestCase):
         patcher = patch.object(sources, 'REPO', self.repo)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.write_json(self.repo / 'packaging/media/stack.lock.json', {'source_date_epoch': 1})
+        self.write_json(self.repo / 'packaging/media/stack.lock.json',
+                        {'source_date_epoch': 1, 'sources': {'qt': {'archives': []}}})
         self.write_json(self.root / 'app/manifest.json', {'inputs': {}, 'source_archives': []})
         self.write_json(self.root / 'media/manifest.json', {'sources': {'qt': {'archives': []}}, 'artifacts': {}})
         for name in sources.LOADER_REPORTS:
@@ -323,6 +324,98 @@ class PublicMaterialTests(unittest.TestCase):
             index = sources.assemble(self.provenance, {'component_files': {}}, output,
                                      dict.fromkeys(('runtime', 'media', 'compliance'), self.cache), False)
         return output, index
+
+    def configure_media_patch(self):
+        recipe = self.repo / 'packaging/media'
+        (recipe / 'patches').mkdir()
+        supplied = recipe / 'patches/latest.patch'
+        supplied.write_bytes(b"diff --git a/value.txt b/value.txt\n--- a/value.txt\n+++ b/value.txt\n"
+                             b"@@ -1 +1 @@\n-before\n+after\n")
+        archive = self.cache / 'ffmpeg.tar.xz'
+        with tarfile.open(archive, 'w:xz') as stream:
+            member = tarfile.TarInfo('ffmpeg/value.txt')
+            member.size = 7
+            stream.addfile(member, io.BytesIO(b'before\n'))
+        lock_path = recipe / 'stack.lock.json'
+        lock = json.loads(lock_path.read_text())
+        lock['sources']['ffmpeg'] = {
+            'archive': archive.name, 'sha256': sources.sha(archive), 'url': 'https://example.invalid/ffmpeg.tar.xz',
+            'patches': [{'file': 'patches/latest.patch', 'sha256': sources.sha(supplied)}]}
+        self.write_json(lock_path, lock)
+        media = self.root / 'media'
+        sources.source_patches.snapshot(media / 'source-inputs', lock_path.read_bytes(),
+                                       sources.source_patches.inputs(recipe, lock['sources']))
+        applied = media / 'source-patches.json'
+        self.write_json(applied, sources.source_patches.receipt(lock['sources']))
+        self.write_json(media / 'manifest.json',
+                        {'sources': lock['sources'], 'artifacts': {}, 'lock_sha256': sources.sha(lock_path),
+                         'source_patches': {'path': applied.name, 'sha256': sources.sha(applied)}})
+        return supplied, archive
+
+    def delivered_members(self, output):
+        result = {}
+        for archive_path in output.glob('source-materials-*.tar'):
+            with tarfile.open(archive_path) as archive:
+                result.update({member.name: archive.extractfile(member).read() for member in archive})
+        return result
+
+    def test_patched_media_delivers_original_archive_patch_and_applied_metadata(self):
+        supplied, archive = self.configure_media_patch()
+        original_archive = archive.read_bytes()
+        output, index = self.assemble()
+        self.assertTrue(index['complete'])
+        members = self.delivered_members(output)
+        self.assertEqual(members['furami/packaging/media/patches/latest.patch'], supplied.read_bytes())
+        self.assertEqual(members['media-inputs/ffmpeg.tar.xz'], original_archive)
+        metadata = json.loads(members['media-evidence/source-patches.json'])
+        self.assertEqual(metadata['patches'][0]['sha256'], sources.sha(supplied))
+        shutil.rmtree(self.cache)
+        sources.verify_public_materials(output, index)
+
+    def test_missing_original_media_source_cannot_be_reported_complete(self):
+        _, archive = self.configure_media_patch()
+        archive.unlink()
+        output, index = self.assemble()
+        self.assertFalse(index['complete'])
+        self.assertTrue(any('ffmpeg.tar.xz' in reason for reason in index['missing']))
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            sources.verify_public_materials(output, index)
+
+    def test_rehashed_public_media_patch_archive_or_receipt_tampering_still_refuses(self):
+        self.configure_media_patch()
+        for mutation in ('missing-patch', 'changed-patch', 'missing-archive', 'changed-receipt'):
+            with self.subTest(mutation=mutation):
+                output, index = self.assemble()
+                members = self.delivered_members(output)
+                if mutation == 'missing-patch':
+                    del members['furami/packaging/media/patches/latest.patch']
+                elif mutation == 'changed-patch':
+                    members['furami/packaging/media/patches/latest.patch'] = b'changed'
+                elif mutation == 'missing-archive':
+                    del members['media-inputs/ffmpeg.tar.xz']
+                else:
+                    members['media-evidence/source-patches.json'] = b'{"schema": 1, "patches": []}'
+                self.rewrite_materials(output, index, members)
+                with self.assertRaises(ValueError):
+                    sources.verify_public_materials(output, index)
+                shutil.rmtree(output)
+
+    def test_provider_patch_tampering_or_missing_snapshot_blocks_source_assembly(self):
+        self.configure_media_patch()
+        supplied = self.root / 'media/source-inputs/patches/latest.patch'
+        original = supplied.read_bytes()
+        for mutation in ('changed', 'missing'):
+            with self.subTest(mutation=mutation):
+                supplied.chmod(0o644)
+                if mutation == 'changed':
+                    supplied.write_bytes(b'changed')
+                else:
+                    supplied.unlink()
+                with self.assertRaises(ValueError):
+                    self.assemble()
+                shutil.rmtree(self.root / 'public')
+                supplied.write_bytes(original)
+                supplied.chmod(0o444)
 
     def test_actual_archives_exclude_private_apks_but_keep_linked_sources(self):
         output, index = self.assemble()

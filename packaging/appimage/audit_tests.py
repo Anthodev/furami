@@ -169,6 +169,39 @@ class MediaProgramAttributionTests(unittest.TestCase):
             self.assertEqual(component['component_id'], 'mpv')
             self.assertEqual(component['license_expression'], 'GPL-2.0-or-later')
 
+    def test_ffmpeg_attribution_retains_pristine_identity_and_applied_patch_metadata(self):
+        lock_path = audit.REPO / 'packaging/media/stack.lock.json'
+        stack = json.loads(lock_path.read_text())
+        helper = audit.stage.source_patches
+        helper.snapshot(self.media / 'source-inputs', lock_path.read_bytes(),
+                        helper.inputs(lock_path.parent, stack['sources']))
+        applied = self.media / 'source-patches.json'
+        applied.write_text(json.dumps(helper.receipt(stack['sources'])))
+        manifest = {'sources': stack['sources'], 'lock_sha256': audit.stage.digest(lock_path),
+                    'source_patches': {'path': applied.name, 'sha256': audit.stage.digest(applied)}}
+        (self.media / 'manifest.json').write_text(json.dumps(manifest))
+        self.file('lib/libavdevice.so.62', b'checked patched library')
+        owners = {'usr/lib/libavdevice.so.62': {'owner': 'media', 'source': 'lib/libavdevice.so.62'}}
+        audit.qt_evidence(self.media, owners, self.media)
+        evidence = owners['usr/lib/libavdevice.so.62']['components'][0]['evidence']
+        self.assertEqual(evidence['upstream_source'], stack['sources']['ffmpeg'])
+        self.assertEqual(evidence['source_patch_receipt'], manifest['source_patches'])
+
+    def test_source_patch_is_ffmpeg_gpl_material_never_authored_mit(self):
+        providers = {name: self.media / name for name in ('app', 'runtime', 'stage')}
+        values = {'app': {'crates': [], 'binary': {'rust_standard_library': {'archives': []}, 'direct_objects': []}},
+                  'runtime': {'components': []}, 'stage': {'packages': []}}
+        for name, provider in providers.items():
+            provider.mkdir()
+            path = provider / ('ubuntu-sources.json' if name == 'stage' else 'manifest.json')
+            path.write_text(json.dumps(values[name]))
+        owners = {'usr/share/licenses/media/ffmpeg/patches/latest.patch':
+                  {'owner': 'checked-source-patch', 'source': 'ffmpeg:patches/latest.patch'}}
+        audit.load('components').registry(providers, owners, [], {'components': []}, audit.stage.digest)
+        component = next(iter(owners.values()))['components'][0]
+        self.assertEqual(component['component_id'], 'ffmpeg')
+        self.assertEqual(component['license_expression'], 'GPL-2.0-or-later')
+
     def test_unrelated_or_inexact_provider_programs_remain_refused(self):
         for source in ('bin/ffmpeg', 'bin/ffprobe', 'bin/mpv-tool', 'mpv', 'usr/bin/mpv'):
             owners = {'usr/bin/mpv': {'owner': 'media', 'source': source}}

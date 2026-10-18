@@ -53,7 +53,7 @@ any PASS is accepted.
 Usage:
 
     python3 packaging/appimage/smoke-fedora44.py \
-      --image "$OUT/release/Furami-v1.0.0-rc.1-Linux-x64.AppImage" \
+      --image "$OUT/release/Furami-v1.0.0-rc.2-Linux-x64.AppImage" \
       --container-image "$FEDORA_IMAGE_ID" \
       --render-device /dev/dri/renderD128 \
       --output "$EVIDENCE/fedora44-smoke"

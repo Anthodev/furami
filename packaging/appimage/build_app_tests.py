@@ -463,6 +463,65 @@ LOAD /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a
             with self.assertRaisesRegex(ValueError, "media stack lock"):
                 app_build.verify_media(media, stack)
 
+    def test_old_unpatched_provider_is_rejected_before_app_output_or_download(self):
+        stack = json.loads(app_build.STACK_LOCK.read_text())
+        stack["sources"]["ffmpeg"].pop("patches", None)
+        previous_lock = hashlib.sha256(json.dumps(stack, sort_keys=True).encode()).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "old-media"
+            media.mkdir()
+            original = json.dumps({"schema": 1, "lock_sha256": previous_lock,
+                                   "container": stack["container"], "apt_snapshot": stack["apt_snapshot"],
+                                   "sources": stack["sources"], "artifacts": {}})
+            (media / "manifest.json").write_text(original)
+            with patch.object(app_build, "obtain", side_effect=AssertionError("must not download")):
+                with self.assertRaisesRegex(ValueError, "media stack lock"):
+                    app_build.build_app(media, root / "app", root / "cache")
+            self.assertFalse((root / "app").exists())
+            self.assertEqual((media / "manifest.json").read_text(), original)
+
+    def test_pristine_provider_cannot_claim_new_lock_without_source_patch_metadata(self):
+        stack = json.loads(app_build.STACK_LOCK.read_text())
+        pristine = json.loads(json.dumps(stack["sources"]))
+        pristine["ffmpeg"].pop("patches", None)
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory)
+            (media / "manifest.json").write_text(json.dumps({
+                "schema": 1, "lock_sha256": app_build.sha256(app_build.STACK_LOCK),
+                "container": stack["container"], "apt_snapshot": stack["apt_snapshot"],
+                "sources": pristine, "artifacts": {}}))
+            with self.assertRaisesRegex(ValueError, "media source versions"):
+                app_build.verify_media(media, stack)
+
+    def test_provider_requires_applied_patch_receipt_and_original_snapshot_bytes(self):
+        stack = json.loads(app_build.STACK_LOCK.read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory)
+            manifest = {"schema": 1, "lock_sha256": app_build.sha256(app_build.STACK_LOCK),
+                        "sources": stack["sources"]}
+            with self.assertRaisesRegex(ValueError, "receipt missing"):
+                app_build.source_patches.verify_provider(media, manifest, stack["sources"])
+            app_build.source_patches.snapshot(
+                media / "source-inputs", app_build.STACK_LOCK.read_bytes(),
+                app_build.source_patches.inputs(app_build.STACK_LOCK.parent, stack["sources"]))
+            receipt = media / "source-patches.json"
+            receipt.write_text(json.dumps(app_build.source_patches.receipt(stack["sources"])))
+            manifest["source_patches"] = {"path": receipt.name, "sha256": app_build.sha256(receipt)}
+            app_build.source_patches.verify_provider(media, manifest, stack["sources"])
+            row = app_build.source_patches.entries(stack["sources"])[0]
+            supplied = media / "source-inputs" / row["file"]
+            supplied.chmod(0o644)
+            supplied.write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "source input SHA256"):
+                app_build.source_patches.verify_provider(media, manifest, stack["sources"])
+
+    def test_source_snapshot_explicitly_includes_locked_patch_bytes(self):
+        stack = json.loads(app_build.STACK_LOCK.read_text())
+        actual = app_build.input_hashes()
+        for row in app_build.source_patches.entries(stack["sources"]):
+            self.assertEqual(actual["packaging/media/" + row["file"]], row["sha256"])
+
 
 if __name__ == "__main__":
     unittest.main()

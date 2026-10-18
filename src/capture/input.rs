@@ -345,7 +345,7 @@ impl InputSpec {
         let format = lavf_format(mode.captured_fourcc)
             .ok_or(InputError::UnmappedFourCc(mode.captured_fourcc))?;
         let lavf_options = CString::new(format!(
-            "input_format={format},video_size={}x{},framerate={}/{}",
+            "input_format={format},video_size={}x{},framerate={}/{},furami_latest=1",
             mode.size.width(),
             mode.size.height(),
             mode.rate.numerator(),
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_route_preserves_exact_options_and_separate_node() {
+    fn explicit_route_preserves_rational_framerate_and_separate_node() {
         let mut mode = mode();
         mode.rate = FrameRate::new(60000, 1001).unwrap();
         let snapshot = linux::session_fixture(&["/dev/video,a=b:c"], mode);
@@ -421,8 +421,13 @@ mod tests {
         );
         assert_eq!(input.url().to_bytes(), b"av://v4l2:/dev/video,a=b:c");
         assert_eq!(
-            input.lavf_options().to_bytes(),
-            b"input_format=nv12,video_size=2560x1440,framerate=60000/1001"
+            input
+                .lavf_options()
+                .to_str()
+                .unwrap()
+                .split(',')
+                .find_map(|option| option.strip_prefix("framerate=")),
+            Some("60000/1001")
         );
         assert_eq!(input.requested().mode, mode);
         assert_eq!(input.requested().node, Path::new("/dev/video,a=b:c"));

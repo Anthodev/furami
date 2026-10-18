@@ -71,6 +71,11 @@ class ComparisonTests(unittest.TestCase):
             shutil.copytree(comparison.HERE.parent, canonical / 'packaging',
                             ignore=shutil.ignore_patterns('__pycache__'))
             _, _, public_members = support.runtime_source_fixture(canonical, root / 'private-inputs')
+            # These synthetic images contain no media code; their canonical
+            # source lock must say so instead of claiming the real provider.
+            media_lock = canonical / 'packaging/media/stack.lock.json'
+            media_lock.write_text(json.dumps({'source_date_epoch': 1, 'sources': {}}))
+            public_members['furami/packaging/media/stack.lock.json'] = media_lock.read_bytes()
             shutil.rmtree(root / 'private-inputs')
             for label, token in (('first', 'abcdef'), ('second', '123456')):
                 runtime = root / label / 'runtime'

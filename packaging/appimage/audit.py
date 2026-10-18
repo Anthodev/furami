@@ -210,9 +210,15 @@ def qt_evidence(media, owners, root):
                          else 'libplacebo' if name.startswith('libplacebo')
                          else 'ffmpeg' if name.startswith(('libav', 'libsw')) else None)
             if component:
+                evidence = 'frozen checked source and build configuration; packaging/media/LICENSE-AUDIT.md'
+                if component == 'ffmpeg':
+                    manifest = read_json(media / 'manifest.json')
+                    stage.source_patches.verify_provider(media, manifest, manifest['sources'])
+                    evidence = {'basis': evidence, 'upstream_source': manifest['sources'][component],
+                                'source_patch_receipt': manifest.get('source_patches')}
                 owner['components'] = [{'component_id': component,
                                         'license_expression': {'mpv': 'GPL-2.0-or-later', 'ffmpeg': 'GPL-2.0-or-later', 'libplacebo': 'LGPL-2.1-or-later'}[component],
-                                        'evidence': 'frozen checked source and build configuration; packaging/media/LICENSE-AUDIT.md'}]
+                                        'evidence': evidence}]
             else:
                 raise ValueError(f'media owner lacks component mapping: {relative} <- {source}')
     return documents

@@ -2,7 +2,7 @@
   "schema": 1,
   "rust_version": "1.97.1",
   "target": "x86_64-unknown-linux-gnu",
-  "media_lock_sha256": "05840c73903c6af3e7c696ab8b73b77f07130345c5847a18fc0f887757ab514b",
+  "media_lock_sha256": "6ee70cabb2811fe00b4d942a45a74dd73ee7ea0be34062bf2638466b376a24c6",
   "toolchain": {
     "rustc": {
       "url": "https://static.rust-lang.org/dist/rustc-1.97.1-x86_64-unknown-linux-gnu.tar.xz",

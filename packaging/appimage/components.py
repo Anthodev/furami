@@ -116,6 +116,11 @@ def registry(providers, owners, qt, static, digest):
             name = owner['source'].split('.', 1)[0]
             terms = {'mpv': 'GPL-2.0-or-later', 'ffmpeg': 'GPL-2.0-or-later', 'libplacebo': 'LGPL-2.1-or-later'}.get(name)
             identifiers = [add(name, terms, owner['source'])]
+        elif label == 'checked-source-patch':
+            name = owner['source'].split(':', 1)[0]
+            if name != 'ffmpeg':
+                raise ValueError('unknown patched source component: ' + name)
+            identifiers = [add(name, 'GPL-2.0-or-later', owner['source'])]
         elif label == 'checked-ICU-notice':
             item = next(item for other in owners.values() for item in other.get('components', [])
                         if item['component_id'] == 'icu:73.2')

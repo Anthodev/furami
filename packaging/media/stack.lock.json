@@ -44,7 +44,13 @@
       "version": "8.1.2",
       "url": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz",
       "archive": "ffmpeg.tar.xz",
-      "sha256": "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+      "sha256": "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
+      "patches": [
+        {
+          "file": "patches/ffmpeg-v4l2-latest.patch",
+          "sha256": "f6d537e3bd9938d27d25c6a161a1a7f8c0124a8ad60bd628bbea85f3867c3d9a"
+        }
+      ]
     },
     "qt": {
       "version": "6.11.2",

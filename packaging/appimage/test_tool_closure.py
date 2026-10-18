@@ -1,9 +1,11 @@
 """Stage-only package gates: signed bytes and no changes to media APT identity."""
 import hashlib
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("furami_stage_tools", Path(__file__).with_name("tool-closure.py"))
 tools = importlib.util.module_from_spec(SPEC)
@@ -11,6 +13,19 @@ SPEC.loader.exec_module(tools)
 
 
 class PackagingToolClosureTests(unittest.TestCase):
+    def test_stage_tool_lock_tracks_patched_media_and_rejects_previous_identity(self):
+        lock, _ = tools.locks()
+        self.assertEqual(lock["media_lock_sha256"], tools.sha(tools.MEDIA_LOCK))
+        previous = json.loads(tools.MEDIA_LOCK.read_text())
+        previous["sources"]["ffmpeg"].pop("patches", None)
+        lock["media_lock_sha256"] = hashlib.sha256(json.dumps(previous, sort_keys=True).encode()).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "tool.lock.json"
+            path.write_text(json.dumps(lock))
+            with patch.object(tools, "LOCK_PATH", path):
+                with self.assertRaisesRegex(ValueError, "Ubuntu/media identity"):
+                    tools.locks()
+
     def test_downloaded_packages_reject_unpinned_extra_or_modified_archive(self):
         with tempfile.TemporaryDirectory() as temporary:
             cache = Path(temporary)

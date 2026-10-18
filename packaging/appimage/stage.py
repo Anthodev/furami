@@ -23,6 +23,9 @@ STACK_LOCK = REPO / "packaging/media/stack.lock.json"
 ALPINE_SOURCE_LOCK = REPO / "packaging/appimage-runtime/alpine-source.lock.json"
 TOOL_URL = "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
 TOOL_SHA256 = "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+PATCH_SPEC = importlib.util.spec_from_file_location("furami_stage_media_patches", STACK_LOCK.with_name("source-patches.py"))
+source_patches = importlib.util.module_from_spec(PATCH_SPEC)
+PATCH_SPEC.loader.exec_module(source_patches)
 # The only non-prefix absolute loader path observed in 84 staged ELF objects.
 # Both byte hashes came from the signed-snapshot libpulse0 .deb below.
 PULSE_DIR = "/usr/lib/x86_64-linux-gnu/pulseaudio"
@@ -245,6 +248,9 @@ def check_inputs(media_root, app_root, runtime_root):
         raise ValueError("application Ubuntu container/APT provenance differs from media")
     app_build = verify_app_reproducibility(app_root, app)
     lock = json.loads(STACK_LOCK.read_text())
+    if media.get("sources") != lock["sources"]:
+        raise ValueError("media source versions differ from stack lock")
+    source_patches.verify_provider(media_root, media, lock["sources"])
     if digest(REPO / "packaging/media/build-apt-closure.json") != lock["apt_closure"]["sha256"]:
         raise ValueError("pinned Ubuntu APT package closure changed")
     if not all((media_root / name).is_file() for name in ("apt-direct-packages.txt", "apt-debs.sha256", "apt-installed.tsv")):
@@ -914,6 +920,19 @@ def copy_runtime_materials(runtime_root, manifest, appdir, owners, lock, *, link
             "destination": "usr/share/furami/runtime-compliance"}
 
 
+def stage_source_patches(media_root, media, appdir, owners):
+    source_patches.verify_provider(media_root, media, media["sources"])
+    verified = source_patches.inputs(media_root / "source-inputs", media["sources"])
+    for row in source_patches.entries(media["sources"]):
+        relative = "usr/share/licenses/media/" + row["source"] + "/" + row["file"]
+        target = appdir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(verified[row["file"]])
+        owners[relative] = {"owner": "checked-source-patch",
+                            "source": row["source"] + ":" + row["file"],
+                            "source_sha256": row["sha256"]}
+
+
 def internal(media_root, app_root, runtime_root, out, version, linked_source_root):
     ids, media = check_inputs(media_root, app_root, runtime_root)
     if {p.name for p in out.iterdir()} != {"ubuntu-apt.log", "base-image-provenance.json",
@@ -985,6 +1004,7 @@ def internal(media_root, app_root, runtime_root, out, version, linked_source_roo
                     count += 1
         if not count:
             raise ValueError(f"core source archive lacks upstream notices: {name}")
+    stage_source_patches(media_root, media, appdir, owners)
     for relative in sorted(media["artifacts"]):
         if relative.startswith("sbom/") or relative.startswith("config_"):
             if (prefix / relative).is_file() and not (prefix / relative).is_symlink():
@@ -1041,6 +1061,7 @@ def internal(media_root, app_root, runtime_root, out, version, linked_source_roo
         linked_source_root=linked_source_root)
     source_offer = {"schema": 1, "scope": "build provenance; release-ready.json controls publication",
                     "media_sources": media["sources"], "media_lock_sha256": ids["stack_lock"],
+                    "media_source_patches": media.get("source_patches"),
                     "rust_crates": rust_crates, "rust_standard_library": rust_standard_library,
                     "app_toolchain": app_manifest.get("toolchain"),
                     "app_cargo_lock_sha256": app_manifest.get("cargo_lock_sha256"),
