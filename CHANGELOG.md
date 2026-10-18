@@ -8,6 +8,10 @@
 
 - Restore runtime builds that stopped with an `APKINDEX.tar.gz` checksum mismatch after the Alpine repository changed. Refresh the signed index and the pinned `libcurl` / `libexpat` build packages, while preserving signature, checksum and package-identity verification.
 
+**Interface**
+
+- Show input formats only once in Capture settings, using the existing dropdown instead of repeating its choices as radio buttons. Selection still applies immediately.
+
 ## [1.0.0-rc.2] - 2026-10-18
 
 ### 🔄 Changes

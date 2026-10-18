@@ -83,32 +83,6 @@ Item {
                     ? view.selection.resolvedFormatLabel : "—")
         }
 
-        ColumnLayout {
-            id: formatList
-            Layout.fillWidth: true
-            spacing: Brume.gapSmall
-            enabled: view.profile.canEditSelection && view.selection.present
-
-            Repeater {
-                model: view.catalog.formatRows
-
-                ChoiceRow {
-                    required property var modelData
-                    Layout.fillWidth: true
-                    caption: String(modelData.label || "")
-                    // The FourCC equals the label in the catalog projection: an
-                    // identical value is never shown twice.
-                    detail: String(modelData.fourcc || "") === String(modelData.label || "")
-                        ? "" : String(modelData.fourcc || "")
-                    reason: String(modelData.reason || "")
-                    eligible: modelData.eligible === true
-                    selected: String(modelData.key)
-                        === (view.selection.formatPolicy === "manual" ? view.selection.manualFormatKey : "auto")
-                    onActivated: view.chooseFormat(String(modelData.key))
-                }
-            }
-        }
-
         BrumeLabel {
             Layout.fillWidth: true
             variant: "note"
