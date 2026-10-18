@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### 🔄 Changes
+
+**Interface**
+
+- Show only the input format on the **Resolved input** statistics line, adding `(auto)` when that format was chosen automatically. Formats you select explicitly appear alone.
+
 ### 🐛 Fixes
 
 **AppImage**

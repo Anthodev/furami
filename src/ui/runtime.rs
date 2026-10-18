@@ -1559,14 +1559,16 @@ impl CaptureRuntime {
             },
             size: settings.video.mode.size.into(),
             rate: settings.video.mode.rate.into(),
-            resolved_input: format!(
-                "{} (advertised selection, not negotiated proof)",
-                settings
-                    .video
-                    .resolved_fourcc
-                    .map(capture_catalog::fourcc_text)
-                    .unwrap_or_else(|| "not prepared".into())
-            ),
+            resolved_input: match settings.video.resolved_fourcc {
+                Some(fourcc) => {
+                    let text = capture_catalog::fourcc_text(fourcc);
+                    match settings.video.mode.format_policy {
+                        InputFormatPolicy::Auto => format!("{text} (auto)"),
+                        InputFormatPolicy::Manual { .. } => text,
+                    }
+                }
+                None => "not prepared".into(),
+            },
             audio_enabled: settings.audio.enabled(),
             audio_input_label: self.audio_input_label(&settings.audio),
         }
