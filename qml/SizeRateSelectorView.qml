@@ -137,7 +137,7 @@ Item {
         spacing: Brume.gap
 
         BrumeLabel {
-            text: view.sizeMode ? "Résolution" : "Framerate"
+            text: view.sizeMode ? "Resolution" : "Framerate"
             variant: "title"
             Layout.fillWidth: true
         }
@@ -198,9 +198,9 @@ Item {
             visible: view.rows.length === 0 && view.ranges.length === 0
             variant: "note"
             text: view.catalog.busy
-                ? "Lecture des formats en cours…"
+                ? "Reading formats…"
                 : (view.catalog.capabilityReason
-                    || "Aucun mode rapporté pour le nœud sélectionné.")
+                    || "No mode reported for the selected node.")
         }
 
         // Edit the exact tuple, without selecting a format or resolving Auto here.
@@ -221,20 +221,20 @@ Item {
                     variant: "secondary"
                     text: view.rangeFormatText(modelData.formatKey) + " · "
                         + (view.sizeMode
-                            ? (modelData.kind === "continuous" ? "Plage continue : " : "Plage : ")
+                            ? (modelData.kind === "continuous" ? "Continuous range: " : "Range: ")
                                 + view.rangeText(modelData.min)
                                 + " — " + view.rangeText(modelData.max)
                                 + (modelData.stepWidth !== null
                                     && modelData.stepWidth !== undefined
-                                    ? "   pas " + String(modelData.stepWidth) + " × "
+                                    ? "   step " + String(modelData.stepWidth) + " × "
                                         + String(modelData.stepHeight) : "")
                             : (modelData.kind === "continuous"
-                                ? "Intervalle continu natif (période) : "
-                                : "Intervalle natif (période) : ")
+                                ? "Native continuous interval (period): "
+                                : "Native interval (period): ")
                                 + view.rangeText(modelData.min)
                                 + " — " + view.rangeText(modelData.max)
                                 + (modelData.step
-                                    ? "   pas " + view.rangeText(modelData.step) : ""))
+                                    ? "   step " + view.rangeText(modelData.step) : ""))
                 }
             }
 
@@ -252,7 +252,7 @@ Item {
                     maximum: 4294967295
                     projected: view.profile.selection.size
                         ? String(view.profile.selection.size.width) : ""
-                    Accessible.name: "Largeur en pixels"
+                    Accessible.name: "Width in pixels"
                     // A genuine user edit re-arms the pair; the inherited
                     // keyboard-activity hook is preserved explicitly.
                     onTextEdited: {
@@ -274,7 +274,7 @@ Item {
                     maximum: 4294967295
                     projected: view.profile.selection.size
                         ? String(view.profile.selection.size.height) : ""
-                    Accessible.name: "Hauteur en pixels"
+                    Accessible.name: "Height in pixels"
                     onTextEdited: {
                         view.sizeEditPending = true
                         Chrome.noteKeyboardActivity()
@@ -295,7 +295,7 @@ Item {
                 validator: RegularExpressionValidator { regularExpression: /^[0-9]+(\/[0-9]+)?$/ }
                 placeholderText: "30000/1001"
                 projected: Projection.rateText(view.profile.selection)
-                Accessible.name: "Framerate exact : un entier ou N/D"
+                Accessible.name: "Exact framerate: an integer or N/D"
                 onTextEdited: {
                     view.rateEditPending = true
                     Chrome.noteKeyboardActivity()
@@ -312,8 +312,8 @@ Item {
             Layout.fillWidth: true
             variant: "note"
             text: view.sizeMode
-                ? "Une valeur hors descripteur est refusée par la validation exacte du moteur, jamais arrondie."
-                : "Les lignes discrètes sont des cadences exactes ; la plage native est une période en secondes, jamais convertie en image/s. Une cadence hors descripteur est refusée, jamais arrondie."
+                ? "A value outside the descriptor is refused by the engine's exact validation, never rounded."
+                : "Discrete rows are exact framerates; the native range is a period in seconds, never converted to frames/s. A framerate outside the descriptor is refused, never rounded."
         }
     }
 }

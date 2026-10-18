@@ -503,20 +503,20 @@ pub(crate) fn sound_usb(
     card: &str,
 ) -> Result<Option<crate::capture::audio::UsbAssociation>, String> {
     if card.is_empty() || !card.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("Le locator alsa.card n'est pas un entier décimal.".into());
+        return Err("The alsa.card locator is not a decimal integer.".into());
     }
     let index: u32 = card
         .parse()
-        .map_err(|_| "Le locator alsa.card dépasse u32.")?;
+        .map_err(|_| "The alsa.card locator exceeds u32.")?;
     let path = PathBuf::from(format!("/sys/class/sound/card{index}"));
     let canonical = fs::canonicalize(&path).map_err(|error| {
         format!(
-            "Association audio USB indisponible ({}): {error}",
+            "USB audio association unavailable ({}): {error}",
             path.display()
         )
     })?;
     let cpath = CString::new(canonical.as_os_str().as_bytes())
-        .map_err(|_| "Le chemin ALSA contient NUL.")?;
+        .map_err(|_| "The ALSA path contains NUL.")?;
     let context = Context::new().map_err(|error| error.to_string())?;
     let device = Device::new(&context, &cpath).map_err(|error| error.to_string())?;
     let Some(usb) = device.borrow().usb_parent(c"usb_device") else {

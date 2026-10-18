@@ -21,7 +21,7 @@ Item {
 
         BrumeLabel {
             Layout.fillWidth: true
-            text: "Préférences"
+            text: "Preferences"
             variant: "title"
         }
 
@@ -52,20 +52,20 @@ Item {
             objectName: "preferencesImmediate"
             Layout.fillWidth: true
             variant: "secondary"
-            text: "Immédiat : volume " + view.profile.live.volumePercent + " %"
-                + " · sourdine " + (view.profile.live.muted ? "activée" : "désactivée")
-                + " · fenêtre " + (Projection.bridge && Projection.bridge.fullscreenPreference
-                    ? "plein écran" : "fenêtrée")
+            text: "Immediate: volume " + view.profile.live.volumePercent + " %"
+                + " · mute " + (view.profile.live.muted ? "enabled" : "disabled")
+                + " · window " + (Projection.bridge && Projection.bridge.fullscreenPreference
+                    ? "full screen" : "windowed")
         }
 
         BrumeToggle {
             objectName: "preferencesStatsHidden"
             Layout.fillWidth: true
-            label: "Masquer les statistiques du flux"
+            label: "Hide stream statistics"
             checked: Projection.bridge
                 && Projection.bridge.statsHiddenPreference
             enabled: Projection.ready && !view.profile.closing
-            Accessible.name: "Masquer les statistiques du flux"
+            Accessible.name: "Hide stream statistics"
             onToggled: if (Projection.bridge)
                 Projection.bridge.setStatsHidden(checked)
         }
@@ -73,11 +73,11 @@ Item {
         BrumeToggle {
             objectName: "preferencesLoggingEnabled"
             Layout.fillWidth: true
-            label: "Activer les journaux de diagnostic"
+            label: "Enable diagnostic logging"
             checked: Projection.bridge
                 && Projection.bridge.loggingEnabledPreference
             enabled: Projection.ready && !view.profile.closing
-            Accessible.name: "Activer les journaux de diagnostic"
+            Accessible.name: "Enable diagnostic logging"
             onToggled: if (Projection.bridge)
                 Projection.bridge.setLoggingEnabled(checked)
         }
@@ -85,15 +85,15 @@ Item {
         BrumeLabel {
             Layout.fillWidth: true
             variant: "note"
-            text: "Active les fichiers journaux et les traces techniques du terminal. Les journaux existants sont conservés en cas de désactivation."
+            text: "Enables log files and terminal technical traces. Existing logs are kept when disabled."
         }
 
         BrumeButton {
             objectName: "preferencesReset"
             Layout.fillWidth: true
-            label: "Réinitialiser le fichier enregistré…"
+            label: "Reset saved file…"
             enabled: !view.profile.closing && view.settings.path.length > 0
-            Accessible.name: "Réinitialiser le fichier de réglages avec confirmation"
+            Accessible.name: "Reset the settings file with confirmation"
             onClicked: if (Projection.bridge)
                 Projection.bridge.requestSettingsReset()
         }
@@ -101,7 +101,7 @@ Item {
         BrumeLabel {
             Layout.fillWidth: true
             variant: "note"
-            text: "La réinitialisation efface tous les profils de source et la dernière source enregistrée, en conservant les préférences globales actuelles. La capture en cours reste inchangée."
+            text: "Reset clears every source profile and the last saved source, keeping the current global preferences. The running capture stays unchanged."
         }
 
         BrumeLabel {
@@ -109,7 +109,7 @@ Item {
             Layout.fillWidth: true
             visible: view.settings.refused
             variant: "error"
-            text: "Fichier de réglages refusé : les changements restent valables pour la session."
+            text: "Settings file refused: changes remain valid for this session."
         }
     }
 }

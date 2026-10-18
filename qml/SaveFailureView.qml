@@ -25,8 +25,8 @@ Item {
         BrumeLabel {
             Layout.fillWidth: true
             text: view.warning
-                ? "Durabilité non confirmée"
-                : "Enregistrement impossible"
+                ? "Durability not confirmed"
+                : "Save failed"
             variant: "title"
         }
 
@@ -45,7 +45,7 @@ Item {
                 spacing: Brume.gapSmall
                 BrumeLabel {
                     Layout.fillWidth: true
-                    text: "La libération du média est terminée ; aucun propriétaire média ne rouvrira."
+                    text: "Media release is complete; no media owner will reopen."
                 }
                 BrumeLabel {
                     Layout.fillWidth: true
@@ -66,7 +66,7 @@ Item {
             objectName: "saveFailureRetry"
             Layout.fillWidth: true
             visible: !view.warning
-            label: "Réessayer l'enregistrement"
+            label: "Retry save"
             Accessible.name: label
             onClicked: if (Projection.bridge)
                 Projection.bridge.retrySave()
@@ -75,7 +75,7 @@ Item {
             id: closeButton
             objectName: "saveFailureClose"
             Layout.fillWidth: true
-            label: view.warning ? "Fermer sans durabilité confirmée" : "Fermer sans enregistrer"
+            label: view.warning ? "Close without confirmed durability" : "Close without saving"
             Accessible.name: label
             onClicked: if (Projection.bridge)
                 Projection.bridge.closeWithoutSave()

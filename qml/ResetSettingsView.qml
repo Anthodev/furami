@@ -24,7 +24,7 @@ Item {
 
         BrumeLabel {
             Layout.fillWidth: true
-            text: "Remplacer le fichier de réglages ?"
+            text: "Replace the settings file?"
             variant: "title"
         }
 
@@ -43,7 +43,7 @@ Item {
                 spacing: Brume.gapSmall
                 BrumeLabel {
                     Layout.fillWidth: true
-                    text: "Le fichier d'origine sera remplacé et son contenu perdu :"
+                    text: "The original file will be replaced and its content lost:"
                 }
                 BrumeLabel {
                     Layout.fillWidth: true
@@ -52,7 +52,7 @@ Item {
                 }
                 BrumeLabel {
                     Layout.fillWidth: true
-                    text: "Tous les profils de source et la dernière source enregistrée seront effacés. Les préférences globales actuelles sont conservées ; la capture en cours n'est ni arrêtée ni modifiée."
+                    text: "Every source profile and the last saved source will be erased. Current global preferences are kept; the running capture is neither stopped nor changed."
                 }
             }
         }
@@ -61,7 +61,7 @@ Item {
             id: cancelButton
             objectName: "resetCancel"
             Layout.fillWidth: true
-            label: "Annuler"
+            label: "Cancel"
             Accessible.name: label
             onClicked: if (Projection.bridge)
                 Projection.bridge.decideSettingsReset(view.expectedToken, false)
@@ -70,7 +70,7 @@ Item {
             id: confirmButton
             objectName: "resetConfirm"
             Layout.fillWidth: true
-            label: "Remplacer le fichier d'origine"
+            label: "Replace the original file"
             Accessible.name: label
             onClicked: if (Projection.bridge)
                 Projection.bridge.decideSettingsReset(view.expectedToken, true)

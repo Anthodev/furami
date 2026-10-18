@@ -49,7 +49,7 @@ ColumnLayout {
         objectName: "renderToggle_" + field.fieldKey
         Layout.fillWidth: true
         visible: field.fieldType === "boolean"
-        label: field.value === true ? "Activé" : "Désactivé"
+        label: field.value === true ? "Enabled" : "Disabled"
         checked: field.value === true
         Accessible.name: field.fieldLabel
         onClicked: field.setRequested(field.fieldKey, booleanToggle.checked)

@@ -1,20 +1,22 @@
 # Changelog
 
-## [1.0.0-rc.2] - 2026-10-18
-
-Version bump only; no functional changes.
-
-Full changelog: [v1.0.0-rc.1...v1.0.0-rc.2](https://github.com/Anthodev/furami/compare/v1.0.0-rc.1...v1.0.0-rc.2)
-
 ## [1.0.0-rc.1] - 2026-10-18
 
-First release candidate for `1.0.0`, prepared for local evaluation. Furami is not stable and this candidate carries no certification: no tag, release or remote CI run has been published for it, and the qualified AppImage remains `0.1.0-rc.4` because no artifact was rebuilt for this version. Publication stays gated on the source and license clearance for every public artifact, stable or pre-release.
+First release candidate for `1.0.0`.
+
+### 🔄 Changes
+
+**Interface**
+
+- Use English throughout the interface, including controls, settings, status and error messages, and accessibility descriptions. Keep the label **Framerate** and display fractional FPS with a decimal point.
 
 ### 🐛 Fixes
 
 **Interface**
 
-- Prevent compositor borders and shadows around the three transparent control windows under XWayland, and explicitly activate clicked or touched controls so subsequent keyboard input reaches them ([#25](https://github.com/Anthodev/furami/issues/25), uncommitted local work).
+- Prevent compositor borders and shadows around the three transparent control windows under XWayland, and explicitly activate clicked or touched controls so subsequent keyboard input reaches them ([#25](https://github.com/Anthodev/furami/issues/25)).
+
+Full changelog: [v0.1.0-rc.4...v1.0.0-rc.1](https://github.com/Anthodev/furami/compare/v0.1.0-rc.4...v1.0.0-rc.1)
 
 ## [0.1.0-rc.4] - 2026-10-17
 

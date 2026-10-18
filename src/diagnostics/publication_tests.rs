@@ -599,7 +599,7 @@ fn disabled_callbacks_skip_sequences_buffers_json_and_all_oversize_loss_accounti
     assert!(health.has_problem());
     handle.set_logging_enabled(false).unwrap();
     assert!(!handle.health().has_problem());
-    assert_eq!(handle.health().message_fr(), "");
+    assert_eq!(handle.health().message(), "");
     handle.set_logging_enabled(true).unwrap();
     assert_eq!(handle.health().oversized_records, 3);
     assert_eq!(handle.health().dropped_events, 3);

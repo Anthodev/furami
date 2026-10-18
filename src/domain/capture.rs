@@ -138,7 +138,7 @@ pub enum CaptureDataError {
     InvalidIdentity { field: &'static str },
     #[error("zero value in rational field `{field}`")]
     ZeroRational { field: &'static str },
-    #[error("invalid frame rate value `{value}`")]
+    #[error("invalid Framerate value `{value}`")]
     InvalidRate { value: String },
     #[error("invalid capture descriptor: {reason}")]
     InvalidDescriptor { reason: &'static str },

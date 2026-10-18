@@ -99,7 +99,7 @@ Item {
 
         BrumeLabel {
             Layout.fillWidth: true
-            text: "Rendu"
+            text: "Rendering"
             variant: "title"
         }
 
@@ -148,8 +148,8 @@ Item {
             visible: view.renderer.fields.length === 0
             variant: "note"
             text: view.renderer.available
-                ? "Aucun champ de rendu rapporté."
-                : "Catalogue de rendu indisponible."
+                ? "No rendering field reported."
+                : "Rendering catalog unavailable."
         }
     }
 }

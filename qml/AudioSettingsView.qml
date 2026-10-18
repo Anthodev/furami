@@ -45,17 +45,17 @@ Item {
         // ── Captured audio (immediate selection) ──────────────────────────
         BrumeLabel {
             Layout.fillWidth: true
-            text: "Audio capturé"
+            text: "Captured audio"
             variant: "secondary"
         }
 
         BrumeToggle {
             objectName: "audioCaptureEnabled"
             Layout.fillWidth: true
-            label: "Capturer l'audio"
+            label: "Capture audio"
             checked: view.selection.audioEnabled
             enabled: view.captureEditable
-            Accessible.name: "Capturer l'audio depuis la source"
+            Accessible.name: "Capture audio from the source"
             onClicked: if (Projection.bridge)
                 Projection.bridge.setAudioEnabled(view.profile.selectionRevision, checked)
         }
@@ -65,7 +65,7 @@ Item {
             Layout.fillWidth: true
             visible: !view.selection.audioEnabled && view.selection.audioInputKey.length === 0
             variant: "note"
-            text: "Aucune entrée sélectionnée : choisissez une entrée puis activez la capture audio."
+            text: "No input selected: choose an input, then enable audio capture."
         }
 
         RowLayout {
@@ -78,8 +78,8 @@ Item {
                 enabled: view.captureEditable
                 rows: view.catalog.audioInputRows
                 selectedKey: view.selection.audioInputKey
-                emptyText: "Aucune entrée"
-                Accessible.name: "Entrée audio capturée"
+                emptyText: "No input"
+                Accessible.name: "Captured audio input"
                 onActivated: {
                     if (currentIndex < 0)
                         return
@@ -88,7 +88,7 @@ Item {
             }
             BrumeIconButton {
                 objectName: "audioRefresh"
-                label: "Actualiser les catalogues"
+                label: "Refresh catalogs"
                 icon.source: Brume.icon("refresh")
                 enabled: !view.catalog.busy && !view.profile.closing
                 onClicked: view.refresh()
@@ -100,14 +100,14 @@ Item {
             Layout.fillWidth: true
             visible: view.selection.audioInputLabel.length > 0
             variant: "note"
-            text: "Entrée conservée quand l'audio est désactivé : " + view.selection.audioInputLabel
+            text: "Input retained when audio is disabled: " + view.selection.audioInputLabel
         }
 
         BrumeLabel {
             objectName: "audioCaptureStatus"
             Layout.fillWidth: true
             variant: "note"
-            text: "État : " + (view.profile.live.audioStatus.length > 0
+            text: "Status: " + (view.profile.live.audioStatus.length > 0
                     ? view.profile.live.audioStatus : "—")
                 + (view.profile.live.audioDiagnostic.length > 0
                     ? "\n" + view.profile.live.audioDiagnostic : "")
@@ -122,7 +122,7 @@ Item {
         // ── Playback output route (immediate) ─────────────────────────────
         BrumeLabel {
             Layout.fillWidth: true
-            text: "Sortie de lecture"
+            text: "Playback output"
             variant: "secondary"
         }
 
@@ -132,7 +132,7 @@ Item {
             rows: view.profile.output.rows
             selectedKey: view.profile.output.selectedKey
             emptyText: view.profile.output.selectedLabel
-            Accessible.name: "Sortie audio de lecture"
+            Accessible.name: "Playback audio output"
             onActivated: {
                 if (currentIndex < 0)
                     return
@@ -143,9 +143,9 @@ Item {
         BrumeToggle {
             objectName: "audioOutputMute"
             Layout.fillWidth: true
-            label: view.profile.live.muted ? "Sourdine active" : "Sourdine"
+            label: view.profile.live.muted ? "Mute active" : "Mute"
             checked: view.profile.live.muted
-            Accessible.name: "Sourdine de lecture"
+            Accessible.name: "Playback mute"
             onClicked: if (Projection.bridge)
                 Projection.bridge.setMuted(checked)
         }
@@ -158,13 +158,13 @@ Item {
             variant: "note"
             text: view.profile.output.status
                 + (view.profile.output.effectiveLabel.length > 0
-                    ? "\nSortie active : " + view.profile.output.effectiveLabel : "")
+                    ? "\nActive output: " + view.profile.output.effectiveLabel : "")
         }
 
         BrumeLabel {
             Layout.fillWidth: true
             variant: "note"
-            text: "La sourdine ne remplace pas la route sélectionnée ; la sortie reste choisie."
+            text: "Mute does not replace the selected route; the output stays selected."
         }
     }
 }

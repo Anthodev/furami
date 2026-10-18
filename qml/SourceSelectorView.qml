@@ -38,13 +38,13 @@ Item {
         RowLayout {
             Layout.fillWidth: true
             BrumeLabel {
-                text: "Source de capture"
+                text: "Capture source"
                 variant: "secondary"
                 Layout.fillWidth: true
             }
             BrumeIconButton {
                 objectName: "sourceRefresh"
-                label: "Actualiser les catalogues"
+                label: "Refresh catalogs"
                 icon.source: Brume.icon("refresh")
                 enabled: !view.catalog.busy && !view.profile.closing
                 onClicked: view.refresh()
@@ -64,7 +64,7 @@ Item {
             Layout.fillWidth: true
             visible: view.catalog.capabilityReason.length > 0
             variant: "note"
-            text: "Capacités : " + view.catalog.capabilityStatus
+            text: "Capabilities: " + view.catalog.capabilityStatus
                 + " — " + view.catalog.capabilityReason
         }
 
@@ -109,8 +109,8 @@ Item {
             visible: view.catalog.sourceRows.length === 0
             variant: "note"
             text: view.catalog.busy
-                ? "Découverte des sources en cours…"
-                : "Aucune source rapportée par le catalogue pour le moment."
+                ? "Discovering sources…"
+                : "No source reported by the catalog yet."
         }
     }
 }

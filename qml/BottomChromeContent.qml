@@ -181,7 +181,7 @@ Item {
             Layout.alignment: Qt.AlignRight | Qt.AlignBottom
             icon.source: Brume.icon("adjustments")
             label: "Options"
-            Accessible.name: "Options de capture"
+            Accessible.name: "Capture options"
             enabled: Projection.ready && !Chrome.mandatoryPopupOpen
             onClicked: Chrome.openPopup("menu")
         }

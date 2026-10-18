@@ -82,7 +82,7 @@ Item {
             Layout.fillWidth: true
             visible: context.profile.settings.refused
             variant: "error"
-            text: "Fichier de réglages refusé : les changements restent valables pour cette session."
+            text: "Settings file refused: changes remain valid for this session."
         }
 
         BrumeLabel {
@@ -90,7 +90,7 @@ Item {
             Layout.fillWidth: true
             visible: context.profile.output.needsAction
             variant: "error"
-            text: "Sortie audio manuelle introuvable : reselectionnez une sortie dans le menu (la capture ne redémarre pas)."
+            text: "Manual audio output not found: reselect an output in the menu (capture does not restart)."
         }
 
         BrumeLabel {
@@ -121,9 +121,9 @@ Item {
                 }
                 BrumeButton {
                     objectName: "recoveryUse"
-                    label: "Reconnecter"
+                    label: "Reconnect"
                     enabled: candidateRow.modelData.eligible !== false
-                    Accessible.name: "Reconnecter cette source"
+                    Accessible.name: "Reconnect this source"
                     onClicked: context.chooseRecovery(String(candidateRow.modelData.key))
                 }
             }

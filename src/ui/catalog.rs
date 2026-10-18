@@ -229,9 +229,7 @@ impl Worker {
                                 .map_err(|error| error.to_string())
                             },
                         )
-                        .and_then(|mode| {
-                            mode.ok_or_else(|| "Intervalles exacts indisponibles.".into())
-                        });
+                        .and_then(|mode| mode.ok_or_else(|| "Exact intervals unavailable.".into()));
                         let mut slots = worker.slots.lock();
                         if slots.stop {
                             return;
@@ -293,7 +291,7 @@ impl Worker {
     fn resolve_mode(&self, query: ModeQuery) -> Result<(), String> {
         let mut slots = self.shared.slots.lock();
         if slots.stop {
-            return Err("Le catalogue est en cours de fermeture.".into());
+            return Err("The catalog is closing.".into());
         }
         slots.query = Some(Request::Mode(query));
         self.shared.ready.notify_one();
@@ -704,7 +702,7 @@ impl Model {
                 reason: if self.fresh {
                     String::new()
                 } else {
-                    "Catalogue indisponible".into()
+                    "Catalog unavailable".into()
                 },
             });
         }
@@ -719,9 +717,9 @@ impl Model {
                 exact,
                 eligible,
                 reason: if !self.fresh {
-                    "Catalogue indisponible".into()
+                    "Catalog unavailable".into()
                 } else if !eligible {
-                    "Intervalles exacts en cours de lecture".into()
+                    "Reading exact intervals".into()
                 } else {
                     String::new()
                 },
@@ -736,12 +734,12 @@ impl Model {
         intent: ModeIntent,
     ) -> Result<ModeResolution, String> {
         if self.mode_pending.is_some() {
-            return Err("Un choix de source est déjà en cours de résolution.".into());
+            return Err("A source choice is already resolving.".into());
         }
         let source = self
             .source(physical)
             .filter(|_| self.fresh)
-            .ok_or("Le nœud physique choisi n'est plus disponible.")?;
+            .ok_or("The chosen physical node is no longer available.")?;
         if let Some(mode) =
             resolve_mode_with_intent(source.node.capabilities(), policy, prior, intent, |_, _| {
                 Ok(None)
@@ -752,11 +750,11 @@ impl Model {
         let worker = self
             .worker
             .as_ref()
-            .ok_or("Le catalogue ne peut pas lire les intervalles exacts.")?;
+            .ok_or("The catalog cannot read exact intervals.")?;
         let serial = self
             .query_sequence
             .checked_add(1)
-            .ok_or("Séquence de requêtes épuisée.")?;
+            .ok_or("Request sequence exhausted.")?;
         worker.resolve_mode(ModeQuery {
             serial,
             revision: self.revision,
@@ -782,13 +780,14 @@ impl Model {
         if !self.audio_fresh {
             return (
                 AudioSelection::default(),
-                format!("Association audio indisponible : {}", self.audio_error),
+                format!("Audio association unavailable: {}", self.audio_error),
             );
         }
         if self.audio_usb.len() != self.audio.len() {
             return (
                 AudioSelection::default(),
-                "Association audio USB indisponible : preuve physique absente du catalogue.".into(),
+                "USB audio association unavailable: physical evidence missing from the catalog."
+                    .into(),
             );
         }
         if let Some(error) = self
@@ -798,7 +797,7 @@ impl Model {
         {
             return (
                 AudioSelection::default(),
-                format!("Association audio USB indisponible : {error} Choix manuel disponible."),
+                format!("USB audio association unavailable: {error} Manual choice available."),
             );
         }
         let mut matches = self.audio.iter().zip(&self.audio_usb).filter(|(_, usb)| {
@@ -817,12 +816,11 @@ impl Model {
             ),
             (Some(_), Some(_)) => (
                 AudioSelection::default(),
-                "Plusieurs entrées audio sur cette carte USB ; choisissez une entrée explicite."
-                    .into(),
+                "Multiple audio inputs on this USB card; choose an explicit input.".into(),
             ),
             _ => (
                 AudioSelection::default(),
-                "Aucune entrée audio de cette carte USB dans le catalogue.".into(),
+                "No audio input for this USB card in the catalog.".into(),
             ),
         }
     }
@@ -877,12 +875,12 @@ impl Model {
                 .unwrap_or_default(),
             selected_audio_input_key: self.input_key(audio),
             capability_status: "unavailable".into(),
-            capability_reason: "Sélectionnez une source explicite.".into(),
+            capability_reason: "Select an explicit source.".into(),
             ..Catalog::default()
         };
         for (index, source) in self.sources.iter().enumerate() {
             let identity = source.device.identity();
-            projection.source_rows.push(SourceRow { key: format!("capture:{}:{index}", self.revision), label: source.node.card_name().into(), detail: format!("{} · {} · {}", source.node.driver(), topology(identity), source.node.devnode().display()), eligible: self.fresh && source.supports_input(), reason: if !self.fresh { "Catalogue indisponible · observation précédente".into() } else if !source.supports_input() { "Ce nœud n'annonce aucun format mono-planaire compatible avec l'entrée qualifiée.".into() } else { String::new() }, vendor_id: format!("{:04x}", identity.vendor_id()), product_id: format!("{:04x}", identity.product_id()), topology: topology(identity), serial: identity.serial().map(str::to_owned), node_label: source.node.devnode().display().to_string() });
+            projection.source_rows.push(SourceRow { key: format!("capture:{}:{index}", self.revision), label: source.node.card_name().into(), detail: format!("{} · {} · {}", source.node.driver(), topology(identity), source.node.devnode().display()), eligible: self.fresh && source.supports_input(), reason: if !self.fresh { "Catalog unavailable · previous observation".into() } else if !source.supports_input() { "This node advertises no single-planar format compatible with the qualified input.".into() } else { String::new() }, vendor_id: format!("{:04x}", identity.vendor_id()), product_id: format!("{:04x}", identity.product_id()), topology: topology(identity), serial: identity.serial().map(str::to_owned), node_label: source.node.devnode().display().to_string() });
         }
         for (index, source) in self.audio.iter().enumerate() {
             projection.audio_input_rows.push(AudioInputRow {
@@ -896,7 +894,7 @@ impl Model {
                 reason: if self.audio_fresh {
                     String::new()
                 } else {
-                    "Catalogue audio indisponible".into()
+                    "Audio catalog unavailable".into()
                 },
             });
         }
@@ -920,9 +918,9 @@ impl Model {
                 fourcc: String::new(),
                 eligible: self.fresh && auto_available,
                 reason: if !self.fresh {
-                    "Catalogue indisponible".into()
+                    "Catalog unavailable".into()
                 } else if !auto_available {
-                    "Aucun format de la politique Auto n'est annoncé sur ce nœud.".into()
+                    "No format from the Auto policy is advertised on this node.".into()
                 } else {
                     String::new()
                 },
@@ -933,7 +931,7 @@ impl Model {
                 let label = fourcc_text(format.captured_fourcc);
                 let mapped = crate::capture::input::supports_fourcc(format.captured_fourcc);
                 let single_planar = source.supports_format(format.captured_fourcc);
-                projection.format_rows.push(FormatRow { key: format!("format:{}:{index}", self.revision), label: label.clone(), fourcc: label, eligible: self.fresh && mapped && single_planar, reason: if !self.fresh { "Catalogue indisponible".into() } else if !mapped { "Format annoncé, mais sans correspondance dans l'entrée lavf qualifiée.".into() } else if !single_planar { "Ce format n'est annoncé que sur une file multi-planaire, non admise par l'entrée qualifiée.".into() } else { String::new() } });
+                projection.format_rows.push(FormatRow { key: format!("format:{}:{index}", self.revision), label: label.clone(), fourcc: label, eligible: self.fresh && mapped && single_planar, reason: if !self.fresh { "Catalog unavailable".into() } else if !mapped { "Format advertised, but with no match in the qualified lavf input.".into() } else if !single_planar { "This format is advertised only on a multi-planar queue, not admitted by the qualified input.".into() } else { String::new() } });
             }
             projection.capability_status = if self.fresh { "ready" } else { "unavailable" }.into();
             projection.capability_reason.clear();
@@ -1103,35 +1101,35 @@ impl Model {
                     }
                 }
                 projection.capability_status = "querying".into();
-                projection.capability_reason = "Intervalles exacts en cours de lecture.".into();
+                projection.capability_reason = "Reading exact intervals.".into();
             } else if unknown && self.fresh {
                 projection.capability_status = "unknown".into();
                 if projection.capability_reason.is_empty() {
                     projection.capability_reason =
-                        "Descripteurs non rapportés · la validation exacte reste nécessaire."
-                            .into();
+                        "Descriptors not reported · exact validation is still required.".into();
                 }
             } else if !has_policy_format {
                 projection.capability_reason = match policy {
-                InputFormatPolicy::Auto => "Aucun format de la politique Auto n'est annoncé sur une file mono-planaire ; aucun repli RGB ou inconnu.",
-                InputFormatPolicy::Manual { fourcc } if !crate::capture::input::supports_fourcc(fourcc) => "Le format manuel conservé n'a pas de correspondance dans l'entrée lavf qualifiée.",
-                InputFormatPolicy::Manual { .. } => "Le format manuel conservé n'est pas annoncé sur une file mono-planaire de ce nœud.",
+                InputFormatPolicy::Auto => "No format from the Auto policy is advertised on a single-planar queue; no RGB or unknown fallback.",
+                InputFormatPolicy::Manual { fourcc } if !crate::capture::input::supports_fourcc(fourcc) => "The retained manual format has no match in the qualified lavf input.",
+                InputFormatPolicy::Manual { .. } => "The retained manual format is not advertised on a single-planar queue of this node.",
             }.into();
             } else if size.is_some() && !size_supported {
                 projection.capability_reason =
-                    "La résolution conservée n'est pas annoncée pour ce format sur ce nœud.".into();
+                    "The retained resolution is not advertised for this format on this node."
+                        .into();
             } else if rate.is_some() && !rate_supported {
                 projection.capability_reason =
-                    "La cadence conservée n'est pas annoncée pour cette résolution exacte.".into();
+                    "The retained Framerate is not advertised for this exact resolution.".into();
             }
             if !self.fresh {
                 projection.capability_reason =
-                    "Observation précédente uniquement · catalogue indisponible.".into();
+                    "Previous observation only · catalog unavailable.".into();
             } else if needs_physical_confirmation {
                 if !projection.capability_reason.is_empty() {
                     projection.capability_reason.push('\n');
                 }
-                projection.capability_reason.push_str("Identité USB ambiguë · une confirmation physique de récupération est requise ; ce choix de ligne n'admet pas encore la capture.");
+                projection.capability_reason.push_str("Ambiguous USB identity · a physical recovery confirmation is required; this row choice does not yet admit capture.");
             }
             self.project_modes(&mut projection, size);
         }
@@ -1149,11 +1147,11 @@ impl Model {
             .join("\n");
             for row in &mut projection.source_rows {
                 row.eligible = false;
-                row.reason = "Catalogue indisponible · observation précédente".into();
+                row.reason = "Catalog unavailable · previous observation".into();
             }
             for row in &mut projection.format_rows {
                 row.eligible = false;
-                row.reason = "Catalogue indisponible".into();
+                row.reason = "Catalog unavailable".into();
             }
         }
         projection.busy |= self.query_pending || self.mode_pending.is_some();
@@ -1362,7 +1360,7 @@ fn resolve_mode_with_intent(
         match manual_eligibility(capabilities, fourcc) {
             ManualEligibility::Absent => policy = InputFormatPolicy::Auto,
             ManualEligibility::Unknown => {
-                return Err("Les capacités du format manuel ne sont pas rapportées.".into());
+                return Err("The manual format's capabilities are not reported.".into());
             }
             ManualEligibility::Eligible => {}
         }
@@ -1457,7 +1455,7 @@ fn resolve_mode(
             return Ok(None);
         }
         if unknown {
-            return Err("La compatibilité du mode actuel n'est pas rapportée par ce nœud.".into());
+            return Err("The current mode's compatibility is not reported by this node.".into());
         }
         // Reuse the just-read exact intervals if the incompatible old mode was
         // already at the largest size; never issue the same ioctl twice.
@@ -1472,10 +1470,10 @@ fn resolve_mode(
         }
     }
     if unknown_sizes {
-        return Err("Les résolutions de ce format ne sont pas rapportées.".into());
+        return Err("The resolutions of this format are not reported.".into());
     }
-    let size = largest
-        .ok_or("Aucun mode mono-planaire compatible avec la politique de format conservée.")?;
+    let size =
+        largest.ok_or("No single-planar mode compatible with the retained format policy.")?;
     let mut maximum = None;
     let mut unresolved = false;
     for format in formats
@@ -1506,7 +1504,7 @@ fn resolve_mode(
         };
         let intervals = intervals
             .as_option()
-            .ok_or("La Framerate maximale de la plus grande résolution n'est pas rapportée.")?;
+            .ok_or("The maximum Framerate of the largest resolution is not reported.")?;
         let rate = maximum_rate(intervals);
         if maximum.is_none_or(|current| rate_cmp(rate, current).is_gt()) {
             maximum = Some(rate);
@@ -1518,7 +1516,7 @@ fn resolve_mode(
     Ok(Some(CaptureModeRequest {
         format_policy: policy,
         size,
-        rate: maximum.ok_or("Intervalles exacts indisponibles pour la plus grande résolution.")?,
+        rate: maximum.ok_or("Exact intervals unavailable for the largest resolution.")?,
     }))
 }
 

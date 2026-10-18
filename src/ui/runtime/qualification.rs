@@ -46,7 +46,7 @@ impl QualificationRuntime {
             code: "unavailable",
             action,
             field: "qualification",
-            message: "Action indisponible pendant la qualification vidéo.".into(),
+            message: "Action unavailable during video qualification.".into(),
         });
         self.poll()
     }
@@ -190,7 +190,7 @@ impl QualificationRuntime {
                 .as_ref()
                 .map(|location| location.path.clone())
                 .unwrap_or_default(),
-            message: health.message_fr(),
+            message: health.message(),
             has_problem: health.has_problem(),
             dropped_events: health.dropped_events.to_string(),
             oversized_records: health.oversized_records.to_string(),
@@ -222,7 +222,7 @@ impl QualificationRuntime {
             last_valid: None,
             stream_stats: None,
             live: projection::Live {
-                source_label: "Vidéo de qualification".into(),
+                source_label: "Qualification video".into(),
                 playback_status: if update.paused {
                     "Paused"
                 } else if update.can_toggle_pause {

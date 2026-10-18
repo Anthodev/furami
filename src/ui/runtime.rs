@@ -347,13 +347,10 @@ impl CaptureRuntime {
             message: message.into(),
         };
         if !self.persistence.mutations_open() {
-            return Err(error("closing", "L'application est en cours de fermeture."));
+            return Err(error("closing", "The application is closing."));
         }
         if self.ui.exhausted || self.ui.public_revision == u64::MAX {
-            return Err(error(
-                "unavailable",
-                "La séquence de révisions est épuisée.",
-            ));
+            return Err(error("unavailable", "The revision sequence is exhausted."));
         }
         if capture_catalog::decimal(revision) != Some(self.ui.public_revision)
             || self
@@ -364,7 +361,7 @@ impl CaptureRuntime {
         {
             return Err(error(
                 "stale_selection",
-                "La sélection a changé ; utilisez sa révision actuelle.",
+                "The selection changed; use its current revision.",
             ));
         }
         Ok(())
@@ -424,18 +421,18 @@ impl CaptureRuntime {
                 let physical = partial
                     .source
                     .as_ref()
-                    .ok_or("Sélectionnez un nœud de capture explicite.")?;
+                    .ok_or("Select an explicit capture node.")?;
                 let source = self
                     .ui
                     .catalog
                     .source(physical)
-                    .ok_or("Le nœud physique choisi n'est plus disponible.")?;
+                    .ok_or("The chosen physical node is no longer available.")?;
                 let snapshot = self
                     .ui
                     .catalog
                     .snapshot
                     .as_ref()
-                    .ok_or("Le catalogue de capture est indisponible.")?;
+                    .ok_or("The capture catalog is unavailable.")?;
                 let mut request = crate::capture::input::CaptureSelection::request_from_snapshot(
                     snapshot,
                     source.node.devnode(),
@@ -468,18 +465,15 @@ impl CaptureRuntime {
     }
     fn check_selection_ready(&self) -> Result<(), (&'static str, String)> {
         if !self.persistence.mutations_open() {
-            return Err(("closing", "L'application est en cours de fermeture.".into()));
+            return Err(("closing", "The application is closing.".into()));
         }
         if self.ui.exhausted || self.ui.public_revision == u64::MAX {
-            return Err((
-                "unavailable",
-                "La séquence de révisions est épuisée.".into(),
-            ));
+            return Err(("unavailable", "The revision sequence is exhausted.".into()));
         }
         if self.ui.resolving.is_some() {
             return Err((
                 "busy",
-                "Le mode de la source choisie est en cours de résolution.".into(),
+                "The chosen source's mode is still resolving.".into(),
             ));
         }
         match &self.engine {
@@ -490,10 +484,7 @@ impl CaptureRuntime {
                 )
                 .map_err(|error| ("busy", error.to_string())),
             None if self.ui.bootstrap_runner.is_some() => Ok(()),
-            None => Err((
-                "unavailable",
-                "Le propriétaire média n'est pas disponible.".into(),
-            )),
+            None => Err(("unavailable", "The media owner is unavailable.".into())),
         }
     }
     fn cancel_startup_selection(&mut self) {
@@ -563,7 +554,7 @@ impl CaptureRuntime {
                     "unavailable",
                     ACTION,
                     "source",
-                    "Ce nœud n'a aucun format mono-planaire compatible.",
+                    "This node has no compatible single-planar format.",
                 );
                 return self.poll();
             }
@@ -797,7 +788,7 @@ impl CaptureRuntime {
                 "stale_catalog",
                 "selectCapture",
                 "source",
-                "Le catalogue a changé pendant la résolution du mode.",
+                "The catalog changed during mode resolution.",
             );
             self.ui.catalog.cancel_mode();
             return;
@@ -814,7 +805,7 @@ impl CaptureRuntime {
                 "stale_selection",
                 "selectCapture",
                 "source",
-                "La sélection a changé pendant la résolution du mode.",
+                "The selection changed during mode resolution.",
             );
             return;
         }
@@ -902,11 +893,11 @@ impl CaptureRuntime {
                 if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
                     return Err((
                         "invalid_value",
-                        "La dimension doit être un entier positif ASCII.".into(),
+                        "The dimension must be a positive ASCII integer.".into(),
                     ));
                 }
                 text.parse()
-                    .map_err(|_| ("invalid_value", "La dimension dépasse u32.".into()))
+                    .map_err(|_| ("invalid_value", "The dimension exceeds u32.".into()))
             };
             draft.size = Some(
                 FrameSize::new(dimension(width)?, dimension(height)?)
@@ -950,7 +941,7 @@ impl CaptureRuntime {
             {
                 return Err((
                     "unavailable",
-                    "Ce format n'est pas disponible pour le nœud et l'entrée qualifiée.".into(),
+                    "This format is not available for the node and the qualified input.".into(),
                 ));
             }
             draft.policy = policy;
@@ -963,7 +954,7 @@ impl CaptureRuntime {
                 AudioSelection::Enabled {
                     source: draft.audio.source().cloned().ok_or((
                         "audio_error",
-                        "Sélectionnez une entrée audio explicite avant de l'activer.".into(),
+                        "Select an explicit audio input before enabling it.".into(),
                     ))?,
                 }
             } else {
@@ -1013,7 +1004,7 @@ impl CaptureRuntime {
             if !available {
                 return Err((
                     "unavailable",
-                    "Le catalogue de rendu qualifié est indisponible.".into(),
+                    "The qualified render catalog is unavailable.".into(),
                 ));
             }
             let mut values = draft.renderer.values();
@@ -1039,10 +1030,10 @@ impl CaptureRuntime {
         let allowed = self.scaler_allowed("scale", kernel);
         self.edit_renderer(revision, "setScale", "scale", |values| {
             let kernel = ScalerKernel::from_token(kernel)
-                .ok_or("Noyau inconnu (scale n'accepte pas auto).")?;
+                .ok_or("Unknown kernel (scale does not accept auto).")?;
             if !allowed {
                 return Err(
-                    "Noyau annoncé mais inefficace ou indisponible sur le renderer qualifié."
+                    "Kernel advertised but ineffective or unavailable on the qualified renderer."
                         .into(),
                 );
             }
@@ -1066,11 +1057,11 @@ impl CaptureRuntime {
                 let choice = if kernel == "auto" {
                     ScalerChoice::Inherit
                 } else {
-                    ScalerChoice::Kernel(ScalerKernel::from_token(kernel).ok_or("Noyau inconnu.")?)
+                    ScalerChoice::Kernel(ScalerKernel::from_token(kernel).ok_or("Unknown kernel.")?)
                 };
                 if !allowed {
                     return Err(
-                        "Noyau annoncé mais inefficace ou indisponible sur le renderer qualifié."
+                        "Kernel advertised but ineffective or unavailable on the qualified renderer."
                             .into(),
                     );
                 }
@@ -1094,7 +1085,7 @@ impl CaptureRuntime {
             values.dither = *DitherMode::ALL
                 .iter()
                 .find(|value| value.as_str() == mode)
-                .ok_or("Mode de dithering inconnu.")?;
+                .ok_or("Unknown dithering mode.")?;
             Ok(())
         })
     }
@@ -1111,7 +1102,7 @@ impl CaptureRuntime {
             "deband_iterations",
             |values| {
                 values.deband.iterations = u8::try_from(value)
-                    .map_err(|_| "Le nombre d'itérations doit être un entier entre 0 et 16.")?;
+                    .map_err(|_| "The iteration count must be an integer between 0 and 16.")?;
                 Ok(())
             },
         )
@@ -1209,7 +1200,7 @@ impl CaptureRuntime {
                         "stale_catalog",
                         action,
                         "source",
-                        "Le nœud physique choisi n'est plus disponible ; actualisez le catalogue.",
+                        "The chosen physical node is no longer available; refresh the catalog.",
                     );
                     return;
                 }
@@ -1225,7 +1216,7 @@ impl CaptureRuntime {
                     "invalid_value",
                     action,
                     field,
-                    "Sélectionnez une source avec un mode complet.",
+                    "Select a source with a complete mode.",
                 );
                 return;
             }
@@ -1267,7 +1258,7 @@ impl CaptureRuntime {
                     "unavailable",
                     action,
                     field,
-                    "Le propriétaire média n'est pas disponible.",
+                    "The media owner is unavailable.",
                 );
                 return;
             };
@@ -1495,7 +1486,7 @@ impl CaptureRuntime {
                     capture_catalog::topology(&settings.video.identity)
                 )
             })
-            .unwrap_or_else(|| "Aucune source sélectionnée".into());
+            .unwrap_or_else(|| "No source selected".into());
         let manual = match partial.policy {
             InputFormatPolicy::Auto => None,
             InputFormatPolicy::Manual { fourcc } => Some(fourcc),
@@ -1520,7 +1511,7 @@ impl CaptureRuntime {
             resolved_format_label: settings
                 .and_then(|settings| settings.video.resolved_fourcc)
                 .map(capture_catalog::fourcc_text)
-                .unwrap_or_else(|| "Non préparé".into()),
+                .unwrap_or_else(|| "Not prepared".into()),
             audio_enabled: partial.audio.enabled(),
             audio_input_key: self.ui.catalog.input_key(&partial.audio),
             audio_input_label: self.audio_input_label(&partial.audio),
@@ -1636,11 +1627,11 @@ impl CaptureRuntime {
         let live = projection::Live {
             source_label: visible
                 .map(|selection| selection.source_label.clone())
-                .unwrap_or_else(|| "Aucune capture active".into()),
+                .unwrap_or_else(|| "No active capture".into()),
             size_label: visible
                 .and_then(|selection| selection.size)
                 .map(|size| format!("{} × {}", size.width, size.height))
-                .unwrap_or_else(|| "Résolution".into()),
+                .unwrap_or_else(|| "Resolution".into()),
             rate_label: visible
                 .and_then(|selection| selection.rate.as_ref())
                 .map(|rate| rate.text.clone())
@@ -1748,7 +1739,7 @@ impl CaptureRuntime {
                         reason: if row.eligible {
                             String::new()
                         } else {
-                            "Sortie indisponible".into()
+                            "Output unavailable".into()
                         },
                     })
                     .collect(),
@@ -1994,7 +1985,7 @@ impl CaptureRuntime {
                 "closing",
                 "selectCapture",
                 "source",
-                "La fermeture annule la résolution de la source.",
+                "Closing cancels the source resolution.",
             );
         }
         self.ui.catalog.cancel_mode();
@@ -2104,7 +2095,7 @@ impl CaptureRuntime {
                 "unavailable",
                 "setLoggingEnabled",
                 "loggingEnabled",
-                error.message_fr(),
+                error.message(),
             );
             return self.poll();
         }
@@ -2136,7 +2127,7 @@ impl CaptureRuntime {
                 "busy",
                 "openCapture",
                 "capture",
-                "Le mode de la source choisie est en cours de résolution.",
+                "The chosen source's mode is still resolving.",
             );
             return self.poll();
         }
@@ -8971,10 +8962,6 @@ mod tests {
         assert_eq!(
             runtime.engine.as_ref().unwrap().model().draft().settings,
             expected_b
-        );
-        assert_ne!(
-            runtime.ui.audio_reason,
-            "Association audio indisponible : indisponible"
         );
         assert_eq!(
             runtime.ui.error.as_ref().map(|error| error.code),

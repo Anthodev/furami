@@ -232,7 +232,7 @@ impl PersistenceSession {
                         session.profiles = document.profiles;
                         session.last_source = document.last_source;
                         if retired_filters_present {
-                            "Anciens filtres ignorés ; les autres réglages sont conservés. Les anciennes données de filtres seront définitivement retirées du fichier de réglages, sans supprimer ce fichier, lors de la prochaine sauvegarde autorisée. Après cette sauvegarde au format v3, les anciens builds refuseront le fichier et revenir à un ancien binaire ne restaurera pas les filtres. Avant cette sauvegarde, les octets du fichier restent inchangés.".into()
+                            "Legacy filters ignored; the other settings are preserved. The legacy filter data will be permanently removed from the settings file, without deleting that file, at the next authorized save. After that v3-format save, older builds will refuse the file and reverting to an older binary will not restore the filters. Before this save, the file bytes remain unchanged.".into()
                         } else {
                             "Saved local preferences restored.".into()
                         }

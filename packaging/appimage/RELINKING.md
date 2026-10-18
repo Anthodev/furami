@@ -20,7 +20,7 @@ Verify a **complete internal candidate** offline — no network, token or real r
 
 ```sh
 python3 scripts/publish_candidate.py --check-only \
-  --event-name push --tag v1.0.0-rc.2 --candidate /absolute/candidate/release
+  --event-name push --tag v1.0.0-rc.1 --candidate /absolute/candidate/release
 ```
 
 A prepared stable tag (`--tag v1.0.0`) uses the same check with no other change. `--check-only` re-verifies the real files (exact non-empty image, regular non-symlink assets, a complete `SHA256SUMS`, a true readiness gate whose fingerprints match the bytes, and a `reproducibility.json`, when present, bound to that image) and lists the verified assets without writing anything. The four downloads cannot satisfy it, because the source archives it indexes are not supplied. Add `--require-reproducibility` to demand the comparison receipt explicitly: the flag has the same meaning for `--check-only` and for publication, an absent receipt is accepted without it, and a present receipt is always strictly validated whether or not it is passed. Publication is a separate, explicit run of the same script without `--check-only`, performed only by the protected tag job.
@@ -64,7 +64,7 @@ That material set carries corresponding sources, not the Alpine binary bootstrap
 Qt, libmpv, libplacebo, FFmpeg and bundled application dependencies are ordinary separate ELF shared libraries under `usr/lib/`. Extract the image without FUSE:
 
 ```sh
-./Furami-v1.0.0-rc.2-Linux-x64.AppImage --appimage-extract
+./Furami-v1.0.0-rc.1-Linux-x64.AppImage --appimage-extract
 ```
 
 Replace the appropriate shared object with an ABI-compatible modified build. Preserve its SONAME and relative symlink chain. Rebuild Qt from the supplied module sources using the vendor configuration evidence when modifying Qt, and retain corresponding compatible plugins/QML. Do not mix unrelated Qt major/minor versions or host Qt plugins into the bundle.

@@ -396,7 +396,7 @@ impl CaptureRuntime {
                 .as_ref()
                 .map(|location| location.path.clone())
                 .unwrap_or_default(),
-            message: health.message_fr(),
+            message: health.message(),
             has_problem: health.has_problem(),
             dropped_events: health.dropped_events.to_string(),
             oversized_records: health.oversized_records.to_string(),

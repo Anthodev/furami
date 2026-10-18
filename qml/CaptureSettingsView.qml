@@ -37,12 +37,12 @@ Item {
             Layout.fillWidth: true
             BrumeLabel {
                 Layout.fillWidth: true
-                text: "Capture — format d'entrée"
+                text: "Capture — input format"
                 variant: "title"
             }
             BrumeIconButton {
                 objectName: "captureRefresh"
-                label: "Actualiser les catalogues"
+                label: "Refresh catalogs"
                 icon.source: Brume.icon("refresh")
                 enabled: !view.catalog.busy && !view.profile.closing
                 onClicked: view.refresh()
@@ -64,8 +64,8 @@ Item {
             enabled: view.profile.canEditSelection && view.selection.present
             rows: view.catalog.formatRows
             selectedKey: view.selection.formatPolicy === "manual" ? view.selection.manualFormatKey : "auto"
-            emptyText: "Format indisponible"
-            Accessible.name: "Format d'entrée"
+            emptyText: "Format unavailable"
+            Accessible.name: "Input format"
             onActivated: {
                 if (currentIndex < 0)
                     return
@@ -77,9 +77,9 @@ Item {
             objectName: "captureFormatResolved"
             Layout.fillWidth: true
             variant: "note"
-            text: "Demandé : " + (view.selection.requestedFormatLabel.length > 0
+            text: "Requested: " + (view.selection.requestedFormatLabel.length > 0
                     ? view.selection.requestedFormatLabel : "—")
-                + "   Résolu : " + (view.selection.resolvedFormatLabel.length > 0
+                + "   Resolved: " + (view.selection.resolvedFormatLabel.length > 0
                     ? view.selection.resolvedFormatLabel : "—")
         }
 
@@ -112,7 +112,7 @@ Item {
         BrumeLabel {
             Layout.fillWidth: true
             variant: "note"
-            text: "Un ancien mode devenu incompatible reste affiché comme indisponible jusqu'à un choix explicite."
+            text: "A previously selected mode that became incompatible stays listed as unavailable until an explicit choice."
         }
     }
 }

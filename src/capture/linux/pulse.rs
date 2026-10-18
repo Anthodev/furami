@@ -721,7 +721,7 @@ impl ObservedSource {
         } else {
             self.alsa_card
                 .as_deref()
-                .ok_or_else(|| "La source Pulse ne rapporte pas alsa.card.".to_owned())
+                .ok_or_else(|| "The Pulse source does not report alsa.card.".to_owned())
                 .and_then(super::udev::sound_usb)
         };
         super::super::audio::CatalogSource {

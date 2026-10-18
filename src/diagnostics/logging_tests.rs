@@ -1771,7 +1771,7 @@ fn default_and_explicit_off_bootstrap_leave_absent_log_tree_and_console_empty() 
         let health = harness.handle.health();
         assert!(!health.logging_enabled);
         assert!(!health.has_problem());
-        assert_eq!(health.message_fr(), "");
+        assert_eq!(health.message(), "");
         assert_eq!(health.dropped_events, 0);
         assert_eq!(health.oversized_records, 0);
         assert_eq!(health.oversized_reports, 0);
@@ -1971,7 +1971,7 @@ fn late_claimed_storage_failure_is_retained_masked_and_not_retried_on_enable() {
     );
     assert_eq!(health.sink_status, SinkStatus::Unavailable);
     assert!(!health.has_problem());
-    assert_eq!(health.message_fr(), "");
+    assert_eq!(health.message(), "");
     handle.set_logging_enabled(true).unwrap();
     worker.drain_available();
     assert_eq!(handle.health().sink_error, health.sink_error);
@@ -2120,7 +2120,7 @@ fn claimed_console_failure_does_not_block_disable_and_stays_failed_after_enable(
     );
     assert_eq!(failed.sink_status, SinkStatus::Ready);
     assert!(!failed.has_problem());
-    assert_eq!(failed.message_fr(), "");
+    assert_eq!(failed.message(), "");
     handle.set_logging_enabled(true).unwrap();
     handle.event(
         EventLevel::Info,
@@ -2156,7 +2156,7 @@ fn disabling_preserves_completed_folder_failure_and_masked_diagnostic_warning() 
     harness.handle.set_logging_enabled(false).unwrap();
     assert_eq!(harness.handle.health().folder, failure);
     assert!(!harness.handle.health().has_problem());
-    assert_eq!(harness.handle.health().message_fr(), "");
+    assert_eq!(harness.handle.health().message(), "");
     harness.handle.set_logging_enabled(true).unwrap();
     assert_eq!(harness.handle.health().folder, failure);
     assert!(harness.handle.health().has_problem());

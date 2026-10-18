@@ -304,15 +304,15 @@ pub(super) fn treatments(
         .unwrap_or_default();
     let mut fields = Vec::new();
     for (key, label) in [
-        ("scale", "Agrandissement"),
+        ("scale", "Upscaling"),
         ("cscale", "Chroma"),
-        ("dscale", "Réduction"),
+        ("dscale", "Downscaling"),
     ] {
         let mut choices = Vec::new();
         if key != "scale" {
             choices.push(Choice {
                 key: "auto".into(),
-                label: "Auto · hériter".into(),
+                label: "Auto · inherit".into(),
                 eligible: available,
                 reason: error.clone(),
             });
@@ -381,7 +381,7 @@ pub(super) fn treatments(
         ("deband", "Debanding", "boolean", None, None, None),
         (
             "deband_iterations",
-            "Itérations",
+            "Iterations",
             "integer",
             Some(0.0),
             Some(16.0),
@@ -404,9 +404,16 @@ pub(super) fn treatments(
             None,
         ),
     ] {
-        fields.push(RenderFieldRow { key, label: label.into(), field_type, choices: Vec::new(), min, max, step, notice: if key == "interpolation" { "Réglage conservé et appliqué, mais inactif avec la synchronisation actuelle à faible latence.".into() } else { String::new() } });
+        fields.push(RenderFieldRow { key, label: label.into(), field_type, choices: Vec::new(), min, max, step, notice: if key == "interpolation" { "Setting preserved and applied, but inactive with the current low-latency synchronization.".into() } else { String::new() } });
     }
-    Renderer { available, error, fields, notice: "Interpolation conservée mais inactive avec la synchronisation actuelle à faible latence.".into() }
+    Renderer {
+        available,
+        error,
+        fields,
+        notice:
+            "Interpolation preserved but inactive with the current low-latency synchronization."
+                .into(),
+    }
 }
 pub(super) fn mutate_renderer(values: RendererValues) -> Result<RendererSettings, String> {
     RendererSettings::new(values).map_err(|error| error.to_string())

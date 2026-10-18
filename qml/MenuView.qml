@@ -68,12 +68,12 @@ Item {
             BrumeLabel {
                 objectName: "menuTitle"
                 Layout.fillWidth: true
-                text: menu.qualificationVideo ? "Vidéo de qualification" : menu.section === "root" ? "Capture"
-                    : menu.section === "settings" ? "Réglages"
+                text: menu.qualificationVideo ? "Qualification video" : menu.section === "root" ? "Capture"
+                    : menu.section === "settings" ? "Settings"
                     : menu.section === "capture" ? "Capture — format"
                     : menu.section === "audio" ? "Audio"
-                    : menu.section === "renderer" ? "Rendu"
-                    : "Préférences"
+                    : menu.section === "renderer" ? "Rendering"
+                    : "Preferences"
                 variant: "title"
             }
             BrumeLabel {
@@ -100,7 +100,7 @@ Item {
                 objectName: "menuPauseResume"
                 Layout.fillWidth: true
                 icon.source: Brume.icon(menu.profile.paused ? "play" : "pause")
-                label: menu.profile.paused ? "Reprendre" : "Mettre en pause"
+                label: menu.profile.paused ? "Resume" : "Pause"
                 enabled: menu.profile.canTogglePause
                 Accessible.name: label
                 onClicked: if (Projection.bridge)
@@ -111,7 +111,7 @@ Item {
                 Layout.fillWidth: true
                 visible: !menu.qualificationVideo
                 icon.source: Brume.icon("refresh")
-                label: "Redémarrer la capture"
+                label: "Restart capture"
                 enabled: menu.profile.canRestart
                 Accessible.name: label
                 onClicked: if (Projection.bridge)
@@ -122,7 +122,7 @@ Item {
                 Layout.fillWidth: true
                 visible: menu.profile.canReconnect
                 icon.source: Brume.icon("refresh")
-                label: "Reconnecter la capture"
+                label: "Reconnect capture"
                 enabled: menu.profile.canReconnect && !menu.profile.closing
                 Accessible.name: label
                 onClicked: if (Projection.bridge)
@@ -138,7 +138,7 @@ Item {
                     ? Projection.bridge.canOpen === true : false
                 visible: openable && !menu.profile.canReconnect
                 icon.source: Brume.icon("play")
-                label: "Ouvrir la capture"
+                label: "Open capture"
                 Accessible.name: label
                 onClicked: if (Projection.bridge)
                     Projection.bridge.openCapture()
@@ -148,14 +148,14 @@ Item {
                 Layout.fillWidth: true
                 visible: !menu.qualificationVideo
                 icon.source: Brume.icon("settings")
-                label: "Réglages"
+                label: "Settings"
                 Accessible.name: label
                 onClicked: menu.chooseSettings("settings")
             }
             BrumeButton {
                 objectName: "menuOpenLogs"
                 Layout.fillWidth: true
-                label: "Ouvrir le dossier des journaux"
+                label: "Open logs folder"
                 // The entry only exists once diagnostic logging is opted in;
                 // when shown, the action is available with no capture and
                 // with an unavailable sink; only an in-flight preparation or
@@ -172,7 +172,7 @@ Item {
                 objectName: "menuCloseCapture"
                 Layout.fillWidth: true
                 icon.source: Brume.icon("x")
-                label: menu.qualificationVideo ? "Fermer la qualification" : "Fermer la capture"
+                label: menu.qualificationVideo ? "Close qualification" : "Close capture"
                 enabled: !menu.profile.closing
                 Accessible.name: label
                 onClicked: if (Projection.bridge)
@@ -190,8 +190,8 @@ Item {
                 objectName: "menuBack"
                 Layout.fillWidth: true
                 icon.source: Brume.icon("chevron-down")
-                label: "Retour"
-                Accessible.name: "Retour au menu"
+                label: "Back"
+                Accessible.name: "Back to menu"
                 onClicked: menu.goBack()
             }
             BrumeButton {
@@ -200,8 +200,8 @@ Item {
                 implicitHeight: 52
                 icon.source: Brume.icon("camera")
                 label: "Capture\n" + (menu.profile.selection.sourceLabel.length > 0
-                    ? menu.profile.selection.sourceLabel : "aucune source")
-                Accessible.name: "Réglages de capture"
+                    ? menu.profile.selection.sourceLabel : "No source")
+                Accessible.name: "Capture settings"
                 onClicked: menu.chooseSettings("capture")
             }
             BrumeButton {
@@ -211,9 +211,9 @@ Item {
                 icon.source: Brume.icon("headphones")
                 label: "Audio\n" + (menu.profile.selection.audioEnabled
                     ? (menu.profile.selection.audioInputLabel.length > 0
-                        ? menu.profile.selection.audioInputLabel : "entrée à choisir")
-                    : "désactivé")
-                Accessible.name: "Réglages audio"
+                        ? menu.profile.selection.audioInputLabel : "Input to choose")
+                    : "Disabled")
+                Accessible.name: "Audio settings"
                 onClicked: menu.chooseSettings("audio")
             }
             BrumeButton {
@@ -221,10 +221,10 @@ Item {
                 Layout.fillWidth: true
                 implicitHeight: 52
                 icon.source: Brume.icon("palette")
-                label: "Rendu\n" + (menu.profile.selection.renderer.scale !== undefined
+                label: "Rendering\n" + (menu.profile.selection.renderer.scale !== undefined
                     ? String(menu.profile.selection.renderer.scale)
                         + " / " + String(menu.profile.selection.renderer.dscale) : "—")
-                Accessible.name: "Réglages de rendu"
+                Accessible.name: "Rendering settings"
                 onClicked: menu.chooseSettings("renderer")
             }
             BrumeButton {
@@ -234,9 +234,9 @@ Item {
                 Layout.minimumWidth: 0
                 implicitHeight: 52
                 icon.source: Brume.icon("adjustments")
-                label: "Préférences\n" + (menu.profile.settings.status.length > 0
+                label: "Preferences\n" + (menu.profile.settings.status.length > 0
                     ? menu.profile.settings.status : "—")
-                Accessible.name: "Préférences"
+                Accessible.name: "Preferences"
                 onClicked: menu.chooseSettings("prefs")
                 contentItem: RowLayout {
                     spacing: preferencesEntry.spacing
@@ -254,7 +254,7 @@ Item {
                         BrumeLabel {
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
-                            text: "Préférences"
+                            text: "Preferences"
                             font: preferencesEntry.font
                             color: preferencesEntry.enabled ? Brume.foreground : Brume.disabledText
                             horizontalAlignment: Text.AlignHCenter
@@ -290,8 +290,8 @@ Item {
                 objectName: "menuBackSection"
                 Layout.fillWidth: true
                 icon.source: Brume.icon("chevron-down")
-                label: "Retour"
-                Accessible.name: "Retour aux réglages"
+                label: "Back"
+                Accessible.name: "Back to settings"
                 onClicked: menu.goBack()
             }
 

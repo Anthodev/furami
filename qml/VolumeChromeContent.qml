@@ -72,7 +72,7 @@ Item {
             to: 100
             stepSize: 1
             enabled: volume.profile.canSetGain
-            Accessible.name: "Volume de lecture"
+            Accessible.name: "Playback volume"
             onMoved: if (Projection.bridge)
                 Projection.bridge.setVolume(Math.round(value))
             Keys.onPressed: function(event) {
@@ -88,7 +88,7 @@ Item {
         BrumeIconButton {
             id: muteButton
             objectName: "volumeMute"
-            label: volume.profile.live.muted ? "Réactiver le son" : "Couper le son"
+            label: volume.profile.live.muted ? "Unmute" : "Mute"
             icon.source: Brume.icon(volume.profile.live.muted ? "volume-off" : "volume")
             enabled: volume.profile.canSetGain
             onClicked: if (Projection.bridge)

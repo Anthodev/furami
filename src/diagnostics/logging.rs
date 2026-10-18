@@ -239,27 +239,25 @@ impl DiagnosticsError {
             os_code: error.raw_os_error(),
         }
     }
-    pub fn message_fr(self) -> &'static str {
+    pub fn message(self) -> &'static str {
         match self.code {
             DiagnosticsCode::InvalidStateRoot
             | DiagnosticsCode::MissingHome
             | DiagnosticsCode::PathEncoding
             | DiagnosticsCode::DirectoryAccess
-            | DiagnosticsCode::UnsafeEntry => "L’emplacement des journaux est inaccessible.",
-            DiagnosticsCode::OpenRejected => "L’ouverture du dossier des journaux a été refusée.",
-            DiagnosticsCode::LauncherFailed => {
-                "Le lanceur du dossier des journaux a échoué après son démarrage."
-            }
+            | DiagnosticsCode::UnsafeEntry => "The log location is inaccessible.",
+            DiagnosticsCode::OpenRejected => "Opening the log folder was refused.",
+            DiagnosticsCode::LauncherFailed => "The log folder launcher failed after starting.",
             DiagnosticsCode::QueueFull
             | DiagnosticsCode::OversizedRecord
             | DiagnosticsCode::OversizedReport
             | DiagnosticsCode::ShutdownIncomplete => {
-                "Les journaux sont incomplets : certains diagnostics ont été perdus."
+                "Logs are incomplete: some diagnostics were lost."
             }
             DiagnosticsCode::InvalidLogFilter | DiagnosticsCode::SubscriberUnavailable => {
-                "La journalisation est partiellement indisponible."
+                "Logging is partially unavailable."
             }
-            _ => "L’écriture des journaux est impossible.",
+            _ => "Writing logs is impossible.",
         }
     }
 }
@@ -327,7 +325,7 @@ impl DiagnosticsHealth {
                 || self.oversized_reports != 0
                 || self.sink_status == SinkStatus::Unavailable)
     }
-    pub fn message_fr(&self) -> &'static str {
+    pub fn message(&self) -> &'static str {
         if !self.logging_enabled {
             return "";
         }
@@ -335,10 +333,10 @@ impl DiagnosticsHealth {
             .error
             .or(self.sink_error)
             .or(self.last_error)
-            .map(DiagnosticsError::message_fr)
+            .map(DiagnosticsError::message)
             .unwrap_or_else(|| {
                 if self.has_problem() {
-                    "Les journaux sont incomplets : certains diagnostics ont été perdus."
+                    "Logs are incomplete: some diagnostics were lost."
                 } else {
                     ""
                 }

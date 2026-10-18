@@ -59,19 +59,19 @@ ApplicationWindow {
 
     readonly property string backdropTitle: {
         if (Projection.failureText.length > 0)
-            return "Interface indisponible"
+            return "Interface unavailable"
         if (!Projection.ready)
-            return "Préparation de l'interface…"
+            return "Preparing the interface…"
         if (root.qualificationVideo)
-            return root.profile.opening ? "Ouverture de la vidéo de qualification…" : "Vidéo de qualification"
+            return root.profile.opening ? "Opening the qualification video…" : "Qualification video"
         if (root.profile.productPhase === "Disconnected")
-            return "Capture déconnectée"
+            return "Capture disconnected"
         if (root.profile.opening)
-            return "Ouverture de la capture…"
+            return "Opening capture…"
         if (root.bridge.presentationSuppressed)
-            return "Capture masquée jusqu'à la reprise"
+            return "Capture hidden until resume"
         if (!root.sessionReady)
-            return "Aucune capture sélectionnée"
+            return "No capture selected"
         return Projection.productPhaseText(root.profile.productPhase)
     }
 
@@ -81,17 +81,17 @@ ApplicationWindow {
         if (!Projection.ready)
             return ""
         if (root.qualificationVideo)
-            return root.profile.opening ? "Préparation de la lecture du fichier local." : ""
+            return root.profile.opening ? "Preparing local file playback." : ""
         if (root.profile.productPhase === "Disconnected")
             return root.profile.recovery.evidence.length > 0
                 ? root.profile.recovery.evidence
-                : "Utilisez Options pour reconnecter une source."
+                : "Use Options to reconnect a source."
         if (root.profile.opening)
-            return "Validation et ouverture de la source en cours."
+            return "Validating and opening the source."
         if (root.bridge.presentationSuppressed)
-            return "La capture reprendra à la reprise demandée."
+            return "Capture will resume when resume is requested."
         if (!root.sessionReady)
-            return "Choisissez une source dans Options : la capture s'ouvre immédiatement."
+            return "Choose a source in Options: capture opens immediately."
         return ""
     }
 

@@ -31,7 +31,7 @@ Item {
         spacing: Brume.gap
 
         BrumeLabel {
-            text: "Sortie audio"
+            text: "Audio output"
             variant: "secondary"
             Layout.fillWidth: true
         }
@@ -75,7 +75,7 @@ Item {
             Layout.fillWidth: true
             visible: view.output.selectedKey.length === 0 && view.output.selectedLabel.length > 0
             variant: "error"
-            text: "Sortie sélectionnée « " + view.output.selectedLabel + " » introuvable : aucune substitution automatique."
+            text: "Selected output \"" + view.output.selectedLabel + "\" not found: no automatic substitution."
         }
 
         BrumeLabel {
@@ -85,7 +85,7 @@ Item {
             variant: "note"
             text: view.output.status
                 + (view.output.effectiveLabel.length > 0
-                    ? "\nSortie active : " + view.output.effectiveLabel : "")
+                    ? "\nActive output: " + view.output.effectiveLabel : "")
         }
     }
 }

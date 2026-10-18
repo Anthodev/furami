@@ -83,16 +83,16 @@ QtObject {
     readonly property string failureText: {
         switch (projection.failure) {
         case "unparseable":
-            return "Projection illisible : aucun état produit."
+            return "Unreadable projection: no state produced."
         case "not-object":
-            return "Projection invalide : aucun état produit."
+            return "Invalid projection: no state produced."
         case "missing-schema":
-            return "Projection sans version : aucun état produit."
+            return "Projection without schema: no state produced."
         case "unsupported-schema":
-            return "Version de projection non prise en charge par cette interface."
+            return "Projection version unsupported by this interface."
         case "invalid-contract":
-            return "Projection invalide (" + projection.failureField
-                + ") : contrôles désactivés."
+            return "Invalid projection (" + projection.failureField
+                + "): controls disabled."
         }
         return ""
     }
@@ -260,7 +260,7 @@ QtObject {
             return "stateToken / generation / selectionRevision"
         if (!projection.flags(s, ["paused", "opening", "closing", "canEditSelection",
                 "canRestart", "canReconnect", "canTogglePause", "canSetGain"]))
-            return "état / permissions"
+            return "state / permissions"
         if (!projection.selectionValid(s.selection))
             return "selection"
         if (!projection.selectionValid(s.applied))
@@ -288,7 +288,7 @@ QtObject {
                 return otherIndex < index && other.key === row.key
             })
         }))
-            return "renderer.fields (identité dupliquée)"
+            return "renderer.fields (duplicate identity)"
         const o = s.output
         if (!projection.strings(o, ["revision", "selectedKey", "selectedLabel", "effectiveLabel", "status"])
                 || !projection.u64(o.revision) || !projection.flags(o, ["needsAction"])
@@ -408,8 +408,8 @@ QtObject {
 
     // Human framerate label for an exact `N` or `N/D` rational. An integral
     // rate stays a whole number ("60 FPS"), detected by exact divisibility; a
-    // genuine fraction is shown as a rounded two-decimal FPS value (French
-    // comma, redundant zeros removed), so `60000/1001` reads `59,94 FPS`. The
+    // genuine fraction is shown as a rounded two-decimal FPS value (decimal
+    // dot, redundant zeros removed), so `60000/1001` reads `59.94 FPS`. The
     // display is an approximation only: the exact rational stays available
     // through rateText and the exact editor. Any non-rational text ("" or the
     // producer's own label) is returned verbatim.
@@ -429,7 +429,7 @@ QtObject {
         if (numerator % denominator === 0)
             return String(numerator / denominator) + " FPS"
         const rounded = (numerator / denominator).toFixed(2)
-            .replace(/0+$/, "").replace(/\.$/, "").replace(".", ",")
+            .replace(/0+$/, "").replace(/\.$/, "")
         return rounded + " FPS"
     }
 
@@ -439,55 +439,55 @@ QtObject {
     function productPhaseText(phase) {
         switch (phase) {
         case "Idle":
-            return "Aucune capture"
+            return "No capture"
         case "Stopped":
-            return "Capture arrêtée"
+            return "Capture stopped"
         case "Active":
-            return "Lecture en cours"
+            return "Playing"
         case "Paused":
-            return "Lecture en pause"
+            return "Playback paused"
         case "PausePending":
-            return "Mise en pause…"
+            return "Pausing…"
         case "Validating":
-            return "Validation…"
+            return "Validating…"
         case "ClosingOld":
-            return "Fermeture du média…"
+            return "Closing media…"
         case "ApplyingTreatments":
-            return "Application des traitements…"
+            return "Applying treatments…"
         case "RestoringTreatments":
-            return "Restauration des traitements…"
+            return "Restoring treatments…"
         case "OpeningCandidate":
-            return "Ouverture de la source…"
+            return "Opening source…"
         case "CleaningFailedCandidate":
-            return "Nettoyage après échec…"
+            return "Cleaning up after failure…"
         case "ValidatingPrior":
-            return "Validation de la session précédente…"
+            return "Validating previous session…"
         case "OpeningRestore":
-            return "Restauration du média…"
+            return "Restoring media…"
         case "CleaningFailedRestore":
-            return "Nettoyage après échec…"
+            return "Cleaning up after failure…"
         case "ValidatingResume":
-            return "Validation de la reprise…"
+            return "Validating resume…"
         case "ClosingResume":
-            return "Fermeture pour reprise…"
+            return "Closing for resume…"
         case "OpeningResume":
-            return "Reprise de la lecture…"
+            return "Resuming playback…"
         case "CleaningFailedResume":
-            return "Nettoyage après échec…"
+            return "Cleaning up after failure…"
         case "ErrorWithActiveRestored":
-            return "Erreur — capture restaurée"
+            return "Error — capture restored"
         case "ErrorWithoutActive":
-            return "Erreur — aucune capture active"
+            return "Error — no active capture"
         case "Disconnected":
-            return "Capture déconnectée"
+            return "Capture disconnected"
         case "Recovering":
-            return "Récupération en cours…"
+            return "Recovering…"
         case "SelectionRequired":
-            return "Source à sélectionner"
+            return "Source required"
         case "Stopping":
-            return "Arrêt en cours…"
+            return "Stopping…"
         case "ShutdownReady":
-            return "Arrêt terminé"
+            return "Shutdown complete"
         }
         return phase
     }

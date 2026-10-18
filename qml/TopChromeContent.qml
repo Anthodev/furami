@@ -126,7 +126,7 @@ Item {
             iconName: "camera"
             caption: "Source"
             value: top.profile.live.sourceLabel.length > 0 ? top.profile.live.sourceLabel : "—"
-            Accessible.name: "Source de capture"
+            Accessible.name: "Capture source"
             onClicked: {
                 top.invoker = sourceControl
                 Chrome.openPopup("source")
@@ -153,7 +153,7 @@ Item {
             value: top.profile.output.selectedLabel.length > 0
                 ? top.profile.output.selectedLabel : "Auto"
             showChevron: true
-            Accessible.name: "Sortie audio de lecture"
+            Accessible.name: "Playback audio output"
             onClicked: {
                 top.invoker = ribbonOutput
                 Chrome.openPopup("output")
@@ -168,9 +168,9 @@ Item {
             Layout.minimumWidth: 0
             Layout.preferredWidth: top.width / ribbon.columns
             iconName: "maximize"
-            caption: "Résolution"
+            caption: "Resolution"
             value: top.profile.live.sizeLabel.length > 0 ? top.profile.live.sizeLabel : "—"
-            Accessible.name: "Résolution de capture"
+            Accessible.name: "Capture resolution"
             onClicked: {
                 top.invoker = resolutionControl
                 Chrome.openPopup("size")
@@ -202,10 +202,10 @@ Item {
             Layout.minimumWidth: 0
             Layout.preferredWidth: top.width / ribbon.columns
             iconName: top.fullscreen ? "minimize" : "maximize"
-            caption: "Fenêtre"
-            value: top.fullscreen ? "Plein écran" : "Fenêtré"
+            caption: "Window"
+            value: top.fullscreen ? "Full screen" : "Windowed"
             showChevron: false
-            Accessible.name: top.fullscreen ? "Quitter le plein écran" : "Passer en plein écran"
+            Accessible.name: top.fullscreen ? "Exit full screen" : "Enter full screen"
             onClicked: if (Projection.bridge)
                 Projection.bridge.toggleFullscreen()
             Keys.onPressed: function(event) {
