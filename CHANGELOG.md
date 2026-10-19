@@ -2,12 +2,18 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-19
+
 ### 🐛 Fixes
 
 **Interface**
 
+`fix(ui): inhibit screen idle during visible live playback` ([7cdbb9e8](https://github.com/Anthodev/furami/commit/7cdbb9e8)).
+
 - Keep the screen awake while a video plays Live in a visible, non-minimized window, without requiring focus or fullscreen. Pause, stop, close or minimize releases the request. As with other video players, this also postpones automatic screen locking and sleep while it is held; manual locking and sleep stay available.
 - Use the desktop's standard `org.freedesktop.ScreenSaver` inhibition interface with a stable `dev.antho.furami` / `Playing video` identity. KDE exposes it directly and hypridle on Hyprland exposes the same contract; if the desktop service is absent or refuses, playback continues unchanged.
+
+Full changelog: [v1.0.0...v1.1.0](https://github.com/Anthodev/furami/compare/v1.0.0...v1.1.0)
 
 ## [1.0.0] - 2026-10-19
 
