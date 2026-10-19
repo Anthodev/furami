@@ -3,6 +3,10 @@
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QDBusConnection>
+#include <QDBusMessage>
+#include <QDBusPendingCallWatcher>
+#include <QDBusPendingReply>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QStandardPaths>
@@ -442,6 +446,8 @@ FuramiBridge::FuramiBridge(rust::Box<RuntimeCoordinator> gate, UiUpdate nativeEn
 FuramiBridge::~FuramiBridge()
 {
     assertGuiThread();
+    m_displayInhibitWanted = false;
+    releaseDisplayInhibit();
     m_pollTimer.stop();
     m_chromeIdleTimer.stop();
     if (m_qualificationInput) {
@@ -912,6 +918,7 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
         }
         cancelFullscreenChoice("root-destroyed");
         m_root.clear();
+        reconcileDisplayInhibit();
         m_container.clear();
         refreshChromeFamilyActive(QGuiApplication::focusWindow());
         emitNativeDiagnostic("native_root_destroyed", {{"root", m_rootXid}, {"generation", m_generation}, {"authorized", m_quitAuthorized}});
@@ -938,6 +945,7 @@ bool FuramiBridge::bindRoot(QQuickWindow *root, QQuickItem *container, QString &
             m_root->update();
         }
         scheduleChromeGeometry();
+        reconcileDisplayInhibit();
     });
     QTimer::singleShot(0, this, [this] {
         if (!m_root) return;
@@ -1820,6 +1828,60 @@ void FuramiBridge::applyUpdate(UiUpdate update)
         && gate_claim_log_folder_dispatch(*m_gate, update.log_folder_request)) {
         launchLogFolderOpener(fromRust(update.log_folder_path), update.log_folder_request);
     }
+    reconcileDisplayInhibit();
+}
+
+void FuramiBridge::reconcileDisplayInhibit()
+{
+    assertGuiThread();
+    const bool wanted = !m_quitAuthorized && !m_bootstrapFailed && !m_poisoned && !m_closing
+        && m_actualPhase == QStringLiteral("Ready")
+        && m_published && m_host && m_host->isVisible() && !m_host->poisoned()
+        && m_root && m_root->isVisible() && m_root->visibility() != QWindow::Minimized
+        && !m_paused && m_playbackStatus == QStringLiteral("Live");
+    const bool acquire = wanted && !m_displayInhibitWanted;
+    m_displayInhibitWanted = wanted;
+    if (!wanted) {
+        releaseDisplayInhibit();
+        return;
+    }
+    if (!acquire || m_displayInhibitCookie || m_displayInhibitPending)
+        return;
+
+    m_displayInhibitPending = true;
+    auto message = QDBusMessage::createMethodCall(
+        QStringLiteral("org.freedesktop.ScreenSaver"),
+        QStringLiteral("/org/freedesktop/ScreenSaver"),
+        QStringLiteral("org.freedesktop.ScreenSaver"), QStringLiteral("Inhibit"));
+    message << QStringLiteral("dev.antho.furami") << QStringLiteral("Playing video");
+    auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(message), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *finished) {
+        const QDBusPendingReply<quint32> reply = *finished;
+        finished->deleteLater();
+        m_displayInhibitPending = false;
+        if (reply.isError()) {
+            qWarning("display_idle_inhibit_failed");
+            return;
+        }
+        m_displayInhibitCookie = reply.value();
+        // Re-evaluate visibility and shutdown state before retaining a late cookie.
+        reconcileDisplayInhibit();
+    });
+}
+
+void FuramiBridge::releaseDisplayInhibit()
+{
+    assertGuiThread();
+    if (!m_displayInhibitCookie)
+        return;
+    auto message = QDBusMessage::createMethodCall(
+        QStringLiteral("org.freedesktop.ScreenSaver"),
+        QStringLiteral("/org/freedesktop/ScreenSaver"),
+        QStringLiteral("org.freedesktop.ScreenSaver"), QStringLiteral("UnInhibit"));
+    message << QVariant::fromValue(static_cast<quint32>(*m_displayInhibitCookie));
+    m_displayInhibitCookie.reset();
+    if (!QDBusConnection::sessionBus().send(message))
+        qWarning("display_idle_uninhibit_failed");
 }
 
 void FuramiBridge::createNative(std::uint64_t generation)
@@ -1840,12 +1902,14 @@ void FuramiBridge::createNative(std::uint64_t generation)
     auto *host = new HostWindow(this, generation);
     QQmlEngine::setObjectOwnership(host, QQmlEngine::CppOwnership);
     m_host = host;
+    connect(host, &QWindow::visibleChanged, this, [this] { reconcileDisplayInhibit(); });
     refreshChromeFamilyActive(QGuiApplication::focusWindow());
     connect(host, &QObject::destroyed, this, [this, generation] {
         assertGuiThread();
         emitNativeDiagnostic("native_object_destroyed", {{"generation", generation}, {"host", m_lastHostXid}, {"authorized", m_releasing}});
         if (!m_releasing && generation == m_nativeGeneration) {
             m_host.clear();
+            reconcileDisplayInhibit();
             refreshChromeFamilyActive(QGuiApplication::focusWindow());
             // WindowContainer first receives its own windowDestroyed notification.
             QTimer::singleShot(0, this, [this] { emit hostWindowChanged(); });
@@ -1926,6 +1990,7 @@ void FuramiBridge::publishNative(std::uint64_t generation)
     auto update = gate_surface_ready(*m_gate, generation, xid);
     const bool closeDuringOpening = m_closeDuringOpening == generation && update.phase == GatePhase::Opening;
     applyUpdate(std::move(update));
+    reconcileDisplayInhibit();
     if (closeDuringOpening) {
         m_closeDuringOpening = 0;
         auto close = gate_close(*m_gate, generation, false);
@@ -1944,6 +2009,7 @@ void FuramiBridge::surfaceLost(std::uint64_t generation, std::uint64_t previousX
     if (generation != m_nativeGeneration || m_releasing || m_poisoned)
         return;
     m_poisoned = true;
+    reconcileDisplayInhibit();
     m_closeDuringOpening = 0;
     m_nativeDiagnostic = QStringLiteral("uncontrolled native surface loss for generation %1, previous XID %2")
         .arg(generation).arg(previousXid);
@@ -1966,6 +2032,7 @@ void FuramiBridge::failNative(std::uint64_t generation, const QString &diagnosti
     if (m_host)
         m_host->poison();
     m_poisoned = true;
+    reconcileDisplayInhibit();
     m_nativeDiagnostic = diagnostic;
     emitNativeDiagnostic("native_failure", {{"generation", generation}, {"root", m_rootXid}, {"host", m_lastHostXid}}, 2);
     applyUpdate(gate_surface_lost(*m_gate, generation));
@@ -2000,6 +2067,7 @@ void FuramiBridge::releaseNative(std::uint64_t generation)
     m_nativeGeneration = 0;
     m_releasing = false;
     m_published = false;
+    reconcileDisplayInhibit();
     m_closeDuringOpening = 0;
     applyUpdate(gate_native_released(*m_gate, generation));
 }

@@ -121,6 +121,7 @@ fn main() {
         .qrc_resources(QResources::new().resource(QResource::new().files(resources)))
         .file("src/ui/bridge.rs")
         .qt_module("Quick")
+        .qt_module("DBus")
         .cpp_file("src/native_host/host.cpp")
         .cpp_file(
             CppFile::from("src/native_host/host.h")
@@ -147,14 +148,15 @@ fn main() {
     // (bin, tests and examples alike).
     println!("cargo:rustc-link-arg=-Wl,--require-defined=cxx_qt_init_crate_furami");
     // The generated CXX-Qt static archive (libfurami_cxxqt_generated.a) is emitted
-    // before any Qt6Quick reference is resolved. With --as-needed (the default
+    // before any Qt6Quick or Qt6DBus reference is resolved. With --as-needed (the default
     // final-campaign link command), a shared library is retained only if it
     // satisfies an undefined symbol from objects already seen at its position on
-    // the link line — so the .qt_module("Quick") directive emitted by
-    // builder.build() is dropped before the archive that needs it is scanned.
-    // Re-emitting Qt6Quick here places it after the archive, so the linker sees
-    // the archive's undefined Quick symbols first and retains the library.
+    // the link line — so the .qt_module("Quick") and .qt_module("DBus") directives
+    // emitted by builder.build() are dropped before the archive that needs them
+    // is scanned. Re-emitting these modules here places them after the archive,
+    // so the linker sees its undefined Qt symbols first and retains the libraries.
     println!("cargo:rustc-link-lib=Qt6Quick");
+    println!("cargo:rustc-link-lib=Qt6DBus");
     for library in ["X11", "xcb", "xcb-shape"] {
         println!("cargo:rustc-link-lib={library}");
     }

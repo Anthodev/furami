@@ -18,6 +18,7 @@
 #include <QtQml/qqmlregistration.h>
 
 #include <cstdint>
+#include <optional>
 
 namespace furami::bridge {
 
@@ -203,6 +204,8 @@ protected:
 private:
     void assertGuiThread() const;
     void applyUpdate(UiUpdate update);
+    void reconcileDisplayInhibit();
+    void releaseDisplayInhibit();
     void launchLogFolderOpener(const QString &path, std::uint64_t request);
     void createNative(std::uint64_t generation);
     void publishNative(std::uint64_t generation);
@@ -281,6 +284,9 @@ private:
     bool m_failed = false;
     bool m_bootstrapFailed = false;
     bool m_paused = false;
+    std::optional<std::uint32_t> m_displayInhibitCookie;
+    bool m_displayInhibitWanted = false;
+    bool m_displayInhibitPending = false;
     // Per-host latch: a prepared-paused owner is never shown, even during
     // Resume validation/teardown. Only its fresh Live successor may present.
     bool m_presentationSuppressed = false;

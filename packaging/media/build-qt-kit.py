@@ -79,7 +79,7 @@ def install(lock_path, source_dir, prefix):
         print(f"Installed official Qt {qt['version']} {metadata['component']}: {archive.name}", flush=True)
 
     required = ("bin/qmake", "bin/qmake6", "lib/libQt6Core.so", "lib/libQt6Qml.so",
-                "lib/libQt6Quick.so", "lib/libQt6Svg.so", "lib/libQt6ShaderTools.so",
+                "lib/libQt6Quick.so", "lib/libQt6DBus.so", "lib/libQt6Svg.so", "lib/libQt6ShaderTools.so",
                 "libexec/qmlimportscanner", "plugins/platforms/libqxcb.so",
                 "qml/QtQuick/Controls/qmldir", "qml/QtQuick/Controls/impl/qmldir")
     missing = [name for name in required if not (prefix / name).exists()]
