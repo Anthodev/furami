@@ -5,6 +5,7 @@ use crate::media::{
     qualification::QualificationVideo,
     render_catalog::CompiledRendererSettings,
 };
+use std::rc::Rc;
 
 pub(crate) struct QualificationRuntime {
     gate: QualificationGate,
@@ -13,7 +14,7 @@ pub(crate) struct QualificationRuntime {
     error: Option<projection::IntentError>,
     startup_failure: Option<crate::media::controller::MediaError>,
     fullscreen: bool,
-    last_snapshot: String,
+    last_snapshot: Option<Rc<projection::Snapshot>>,
     last_backend: Option<crate::media::controller::RuntimeMediaObservation>,
     native_environment: crate::diagnostics::report::NativeEnvironmentReport,
 }
@@ -31,7 +32,7 @@ impl QualificationRuntime {
             error: None,
             startup_failure: None,
             fullscreen: false,
-            last_snapshot: String::new(),
+            last_snapshot: None,
             last_backend: None,
             native_environment: Default::default(),
         }
@@ -129,6 +130,10 @@ impl QualificationRuntime {
             .map(|error| error.code.to_owned())
             .unwrap_or_default()
     }
+    #[cfg(all(feature = "gpui-host", target_os = "linux"))]
+    pub(super) fn owner_ack_failed(&self) -> bool {
+        self.gate.owner_ack_failed()
+    }
     pub(super) fn native_released(&mut self, attempt: AttemptId) -> UiUpdate {
         self.gate.native_released(attempt);
         self.poll()
@@ -154,7 +159,7 @@ impl QualificationRuntime {
         );
         match line {
             "snapshot" => {
-                self.last_snapshot.clear();
+                self.last_snapshot = None;
                 self.poll()
             }
             "fullscreen" => self.set_fullscreen(!self.fullscreen),
@@ -259,11 +264,11 @@ impl QualificationRuntime {
             .terminal_failure
             .as_ref()
             .or(self.startup_failure.as_ref());
-        let snapshot = serde_json::to_string(&self.snapshot(&update))
-            .expect("finite qualification projection");
-        let changed = snapshot != self.last_snapshot;
-        if changed {
-            self.last_snapshot.clone_from(&snapshot);
+        let snapshot = self.snapshot(&update);
+        let changed = self.last_snapshot.as_deref() != Some(&snapshot);
+        let ui_snapshot = if changed {
+            let snapshot = Rc::new(snapshot);
+            self.last_snapshot = Some(Rc::clone(&snapshot));
             let phase = match update.phase {
                 GatePhase::Idle => "Idle",
                 GatePhase::WaitingSurface => "WaitingSurface",
@@ -306,7 +311,10 @@ impl QualificationRuntime {
                 report.session.identity.generation = Some(1);
                 self.diagnostics.publish_report(report);
             }
-        }
+            Some(snapshot)
+        } else {
+            None
+        };
         if self.last_backend != update.diagnostics {
             self.last_backend.clone_from(&update.diagnostics);
             if let Some(observed) = &update.diagnostics {
@@ -326,7 +334,7 @@ impl QualificationRuntime {
             }
         }
         UiUpdate {
-            ui_snapshot: if changed { snapshot } else { String::new() },
+            ui_snapshot,
             changed,
             log_folder_request: 0,
             log_folder_path: String::new(),
@@ -396,10 +404,15 @@ impl QualificationRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     fn runtime() -> QualificationRuntime {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "furami-ui-qualification-{}.y4m",
-            std::process::id()
+            "furami-ui-qualification-{}-{}.y4m",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::write(
             &path,
@@ -424,7 +437,8 @@ mod tests {
     fn qualification_projection_has_no_capture_identity_or_catalog_and_commands_cannot_create_one()
     {
         let mut runtime = runtime();
-        let initial: serde_json::Value = serde_json::from_str(&runtime.poll().ui_snapshot).unwrap();
+        let initial: serde_json::Value =
+            serde_json::to_value(runtime.poll().ui_snapshot.as_deref().unwrap()).unwrap();
         assert_eq!(initial["session_kind"], "qualification-video");
         for field in ["selection", "applied", "lastValid", "streamStats"] {
             assert!(initial[field].is_null());
@@ -443,23 +457,47 @@ mod tests {
             "snapshot ",
         ] {
             let update = runtime.qualification_command(command);
-            let snapshot: serde_json::Value =
-                serde_json::from_str(if update.ui_snapshot.is_empty() {
-                    &runtime.last_snapshot
-                } else {
-                    &update.ui_snapshot
-                })
+            let published = update
+                .ui_snapshot
+                .as_deref()
+                .or(runtime.last_snapshot.as_deref())
                 .unwrap();
+            let snapshot: serde_json::Value = serde_json::to_value(published).unwrap();
             assert_eq!(snapshot["intentError"]["code"], "unavailable", "{command}");
             assert_eq!(snapshot["gatePhase"], "Idle", "{command}");
             assert!(runtime.pending.is_some());
             assert!(!update.create_native && !update.release_native && !update.quit);
         }
         let snapshot = runtime.qualification_command("snapshot");
-        assert!(!snapshot.ui_snapshot.is_empty());
+        assert!(snapshot.ui_snapshot.is_some());
         assert!(!snapshot.create_native);
         let closed = runtime.request_application_close();
         assert!(closed.quit && !closed.terminal_failure);
         assert!(runtime.pending.is_none());
+    }
+
+    #[test]
+    fn gpui_host_qualification_republishes_only_on_change_and_snapshot_forces_one_replay() {
+        let mut runtime = runtime();
+        let first = runtime.poll();
+        assert!(first.ui_snapshot.is_some());
+        let retained = runtime.last_snapshot.clone().expect("retained snapshot");
+
+        let unchanged = runtime.poll();
+        assert!(
+            unchanged.ui_snapshot.is_none(),
+            "an identical projection is not republished"
+        );
+        assert!(Rc::ptr_eq(
+            &retained,
+            runtime.last_snapshot.as_ref().expect("retained snapshot")
+        ));
+
+        let forced = runtime.qualification_command("snapshot");
+        assert!(
+            forced.ui_snapshot.is_some(),
+            "explicit snapshot republishes"
+        );
+        assert!(runtime.poll().ui_snapshot.is_none());
     }
 }

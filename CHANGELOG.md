@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Features
+
+- Add an experimental Linux GPUI/XWayland host behind `gpui-host` and `--gpui` ([#53](https://github.com/Anthodev/furami/issues/53)). It reuses the existing Rust runtime and bundled libmpv. Qt/QML remains the default and AppImage staging is unchanged.
+
 ## [1.1.0] - 2026-10-19
 
 ### 🐛 Fixes

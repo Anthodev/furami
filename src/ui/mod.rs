@@ -3,5 +3,5 @@
 
 pub(crate) mod bridge;
 mod catalog;
-mod projection;
+pub(crate) mod projection;
 pub(crate) mod runtime;

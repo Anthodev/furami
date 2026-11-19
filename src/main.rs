@@ -71,6 +71,15 @@ enum StartupError {
     QualificationVideo(#[from] furami::media::qualification::QualificationVideoError),
     #[error("qualification_renderer: default renderer could not be compiled")]
     QualificationRenderer,
+    #[error(
+        "gpui_arguments: --gpui cannot be repeated or combined with --qualification-stdin or --list-audio-sources"
+    )]
+    GpuiArguments,
+    #[error("gpui_unavailable: this build does not include the GPUI host")]
+    GpuiUnavailable,
+    #[cfg(all(target_os = "linux", feature = "gpui-host"))]
+    #[error(transparent)]
+    Gpui(#[from] furami::native_host::GpuiLaunchError),
 }
 
 /// The capture process must run with the process-local PulseAudio client
@@ -234,6 +243,10 @@ impl StartupError {
                 furami::media::qualification::QualificationVideoError::Format,
             ) => ("qualification_format", "Arguments", None),
             Self::QualificationRenderer => ("qualification_renderer", "MediaStartup", None),
+            Self::GpuiArguments => ("gpui_arguments", "Arguments", None),
+            Self::GpuiUnavailable => ("gpui_unavailable", "Arguments", None),
+            #[cfg(all(target_os = "linux", feature = "gpui-host"))]
+            Self::Gpui(error) => (error.code(), "NativeStartup", None),
         };
         StartupFailure {
             code,
@@ -251,7 +264,13 @@ struct StartupArguments {
     list_audio_sources: bool,
     qualification_stdin: bool,
     qualification_video: Option<std::path::PathBuf>,
+    gpui: bool,
 }
+
+/// Whether this executable was compiled with the opt-in GPUI/XWayland host.
+/// `--gpui` is always parsed so an unsupported build refuses it explicitly
+/// instead of silently falling back to Qt.
+const GPUI_HOST_SUPPORTED: bool = cfg!(all(target_os = "linux", feature = "gpui-host"));
 
 impl StartupArguments {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, StartupError> {
@@ -260,7 +279,12 @@ impl StartupArguments {
             .iter()
             .any(|argument| argument == "--qualification-video");
         Self::parse_inner(args).map_err(|error| {
-            if qualification {
+            if qualification
+                && !matches!(
+                    error,
+                    StartupError::GpuiArguments | StartupError::GpuiUnavailable
+                )
+            {
                 StartupError::QualificationArguments
             } else {
                 error
@@ -274,6 +298,7 @@ impl StartupArguments {
         let (mut audio_off, mut list_audio_sources, mut qualification_stdin) =
             (false, false, false);
         let mut qualification_video = None;
+        let mut gpui = false;
         while let Some(flag) = args.next() {
             let text = flag.to_str().ok_or_else(|| {
                 CaptureArgumentError::InvalidArgument("flag must be UTF-8".into())
@@ -324,6 +349,12 @@ impl StartupArguments {
                     }
                     *slot = true;
                 }
+                "--gpui" => {
+                    if gpui {
+                        return Err(StartupError::GpuiArguments);
+                    }
+                    gpui = true;
+                }
                 "--capture-node" | "--capture-fourcc" | "--capture-size" | "--capture-rate" => {
                     let value = args.next().ok_or_else(|| {
                         CaptureArgumentError::InvalidArgument(format!("missing value for {text}"))
@@ -339,10 +370,16 @@ impl StartupArguments {
                 }
             }
         }
+        if gpui && (qualification_stdin || list_audio_sources) {
+            return Err(StartupError::GpuiArguments);
+        }
         if qualification_video.is_some()
             && (!video_args.is_empty() || audio_source.is_some() || audio_off || list_audio_sources)
         {
             return Err(StartupError::QualificationArguments);
+        }
+        if gpui && !GPUI_HOST_SUPPORTED {
+            return Err(StartupError::GpuiUnavailable);
         }
         Ok(Self {
             video: CaptureArguments::parse(video_args)?,
@@ -351,6 +388,7 @@ impl StartupArguments {
             list_audio_sources,
             qualification_stdin,
             qualification_video,
+            gpui,
         })
     }
     fn capture_audio(
@@ -429,6 +467,21 @@ fn run_qualification(
         &capabilities,
     )
     .map_err(|_| StartupError::QualificationRenderer)?;
+    #[cfg(all(target_os = "linux", feature = "gpui-host"))]
+    if arguments.gpui {
+        furami::native_host::run_gpui_qualification_application(
+            &prefix,
+            &display,
+            video,
+            renderer,
+            diagnostics,
+        )?;
+        return Ok(());
+    }
+    #[cfg(not(all(target_os = "linux", feature = "gpui-host")))]
+    if arguments.gpui {
+        return Err(StartupError::GpuiUnavailable);
+    }
     furami::native_host::run_qualification_application(
         &prefix,
         &display,
@@ -594,6 +647,24 @@ fn run_with_arguments(
     let treatment_capabilities =
         furami::media::render_catalog::query_qualified_capabilities(prefix);
     tracing::info!(event_code = "application_starting");
+    #[cfg(all(target_os = "linux", feature = "gpui-host"))]
+    if arguments.gpui {
+        furami::native_host::run_gpui_application(
+            &media_prefix,
+            treatment_capabilities,
+            &x11_display,
+            startup,
+            persistence,
+            sources,
+            diagnostics,
+        )?;
+        tracing::info!(event_code = "application_exited");
+        return Ok(());
+    }
+    #[cfg(not(all(target_os = "linux", feature = "gpui-host")))]
+    if arguments.gpui {
+        return Err(StartupError::GpuiUnavailable);
+    }
     furami::native_host::run_application(
         &media_prefix,
         treatment_capabilities,
@@ -1021,5 +1092,90 @@ mod tests {
             safe_detail: "must not be printed".into(),
         });
         assert!(generic.plugin_detail().is_none());
+    }
+
+    #[test]
+    fn gpui_cli_is_explicit_and_refuses_unsupported_builds() {
+        assert!(!StartupArguments::parse(args(&[])).unwrap().gpui);
+        let parsed = StartupArguments::parse(args(&["--gpui"]));
+        if cfg!(all(target_os = "linux", feature = "gpui-host")) {
+            assert!(parsed.unwrap().gpui);
+        } else {
+            let failure = parsed.unwrap_err().diagnostic();
+            assert_eq!(failure.code, "gpui_unavailable");
+            assert_eq!(failure.stage, "Arguments");
+            assert!(failure.requested.is_none());
+        }
+        let with_capture = StartupArguments::parse(args(&[
+            "--gpui",
+            "--capture-node",
+            "/dev/video0",
+            "--capture-size",
+            "1920x1080",
+            "--capture-rate",
+            "60/1",
+            "--capture-audio-off",
+        ]));
+        if cfg!(all(target_os = "linux", feature = "gpui-host")) {
+            let with_capture = with_capture.unwrap();
+            assert!(with_capture.gpui && with_capture.video.is_some());
+        } else {
+            assert_eq!(
+                with_capture.unwrap_err().diagnostic().code,
+                "gpui_unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn gpui_cli_rejects_repetition_and_stdio_companions() {
+        for values in [
+            vec!["--gpui", "--gpui"],
+            vec!["--gpui", "--qualification-stdin"],
+            vec!["--gpui", "--list-audio-sources"],
+            vec![
+                "--gpui",
+                "--qualification-video",
+                "/tmp/a.y4m",
+                "--list-audio-sources",
+            ],
+        ] {
+            let failure = StartupArguments::parse(args(&values))
+                .unwrap_err()
+                .diagnostic();
+            assert_eq!(failure.code, "gpui_arguments", "{values:?}");
+            assert_eq!(failure.stage, "Arguments", "{values:?}");
+        }
+    }
+
+    #[test]
+    fn gpui_qualification_video_is_permitted_and_keeps_gpui_errors() {
+        let parsed = StartupArguments::parse(args(&[
+            "--gpui",
+            "--qualification-video",
+            "/tmp/qualification.y4m",
+        ]));
+        if cfg!(all(target_os = "linux", feature = "gpui-host")) {
+            let parsed = parsed.unwrap();
+            assert!(parsed.gpui);
+            assert_eq!(
+                parsed.qualification_video.as_deref(),
+                Some(std::path::Path::new("/tmp/qualification.y4m"))
+            );
+        } else {
+            let failure = parsed.unwrap_err().diagnostic();
+            assert_eq!(failure.code, "gpui_unavailable");
+            assert_eq!(failure.stage, "Arguments");
+        }
+        // The qualification remap must not hide the GPUI argument refusal.
+        let failure = StartupArguments::parse(args(&[
+            "--qualification-video",
+            "/tmp/qualification.y4m",
+            "--gpui",
+            "--qualification-stdin",
+        ]))
+        .unwrap_err()
+        .diagnostic();
+        assert_eq!(failure.code, "gpui_arguments");
     }
 }
