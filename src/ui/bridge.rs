@@ -287,7 +287,15 @@ pub(crate) mod ffi {
 impl From<runtime::UiUpdate> for ffi::UiUpdate {
     fn from(update: runtime::UiUpdate) -> Self {
         Self {
-            ui_snapshot: update.ui_snapshot,
+            // An absent projection means the previously published snapshot
+            // stands; the wire protocol keeps signalling that with an empty
+            // string. Serialize the borrowed typed value, never the Rc.
+            ui_snapshot: match update.ui_snapshot {
+                Some(snapshot) => {
+                    serde_json::to_string(&*snapshot).expect("finite validated typed UI snapshot")
+                }
+                None => String::new(),
+            },
             log_folder_request: update.log_folder_request,
             log_folder_path: update.log_folder_path,
             changed: update.changed,
@@ -350,6 +358,12 @@ impl From<runtime::UiUpdate> for ffi::UiUpdate {
             output_needs_action: update.output_needs_action,
         }
     }
+}
+/// Exercises the CXX translation without exposing the generated bridge types.
+#[cfg(test)]
+pub(crate) fn test_wire_snapshot(update: runtime::UiUpdate) -> String {
+    let wire: ffi::UiUpdate = update.into();
+    wire.ui_snapshot
 }
 #[allow(clippy::too_many_arguments)]
 fn gate_native_environment(

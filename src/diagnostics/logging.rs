@@ -623,6 +623,10 @@ fn token_allowed(name: &str, value: &str) -> bool {
                 | "Approximate"
                 | "ObservedCompatible"
                 | "Unverified"
+                | "Destroyed"
+                | "ExternallyAbsent"
+                | "ConnectionRetired"
+                | "NoXid"
         ),
         "reason" => matches!(
             value,
@@ -641,6 +645,25 @@ fn token_allowed(name: &str, value: &str) -> bool {
                 | "application-close"
                 | "superseded"
                 | "native-state-superseded"
+                | "publication-blocked"
+                | "create-failed"
+                | "framework-exit"
+                | "framework-panic"
+                | "framework-return"
+                | "window-unavailable"
+                | "child-destroyed"
+                | "child-reparented"
+                | "x11-event-failed"
+                | "layout-failed"
+                | "fullscreen-layout-failed"
+                | "f11-state-failed"
+                | "numeric-locale-query-failed"
+                | "numeric-locale-not-c"
+                | "xlib-thread-init-failed"
+                | "display-unreachable"
+                | "shape-unsupported"
+                | "shape-version"
+                | "display-preflight-failed"
         ),
         "kind" => matches!(
             value,
@@ -753,6 +776,11 @@ fn token_allowed(name: &str, value: &str) -> bool {
                 | "qt_plugin_missing"
                 | "qt_plugin_invalid"
                 | "qt_plugin_load"
+                | "gpui_arguments"
+                | "gpui_unavailable"
+                | "gpui_native_startup"
+                | "gpui_native_loss"
+                | "gpui_owner_barrier_failed"
                 | "qualification"
         ),
         "format_policy" => matches!(value, "Auto" | "Manual"),
@@ -949,6 +977,12 @@ fn known_code(code: &str) -> Option<&'static str> {
         "native_environment",
         "native_surface",
         "native_release",
+        "gpui_publish",
+        "gpui_wm_close",
+        "gpui_surface_loss",
+        "gpui_release",
+        "gpui_exit",
+        "gpui_layout",
         "ui_intent",
         "log_folder_requested",
         "log_folder_result",

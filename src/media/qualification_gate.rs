@@ -33,6 +33,7 @@ pub(crate) struct QualificationGate {
     create_native: bool,
     release_native: bool,
     acknowledged: bool,
+    owner_ack_failed: bool,
     pause_pending: Option<(PauseRequestId, bool)>,
     pause_sequence: u64,
     paused: bool,
@@ -50,6 +51,7 @@ impl QualificationGate {
             create_native: false,
             release_native: false,
             acknowledged: false,
+            owner_ack_failed: false,
             pause_pending: None,
             pause_sequence: 0,
             paused: false,
@@ -110,6 +112,10 @@ impl QualificationGate {
             ));
         }
     }
+    #[cfg(any(test, all(feature = "gpui-host", target_os = "linux")))]
+    pub(crate) fn owner_ack_failed(&self) -> bool {
+        self.owner_ack_failed
+    }
     pub(crate) fn wait_for_owner_ack(&mut self, attempt: AttemptId) -> Result<(), MediaError> {
         if !self.matches(attempt) {
             return Err(MediaError::new(
@@ -117,13 +123,22 @@ impl QualificationGate {
                 "stale qualification surface",
             ));
         }
-        let result = self
-            .endpoint
-            .as_mut()
-            .ok_or_else(|| MediaError::new("owner_disconnect", "qualification owner absent"))?
-            .wait_for_ack();
+        if self.owner_ack_failed {
+            return Err(MediaError::new(
+                "surface_loss_barrier",
+                "qualification owner acknowledgement protocol already failed",
+            ));
+        }
+        let Some(owner) = self.endpoint.as_mut() else {
+            let error = MediaError::new("owner_disconnect", "qualification owner absent");
+            if !matches!(self.phase, GatePhase::Idle | GatePhase::QuitReady) {
+                self.fail_owner_ack(error.clone());
+            }
+            return Err(error);
+        };
+        let result = owner.wait_for_ack();
         if let Err(error) = &result {
-            self.failure.get_or_insert_with(|| error.clone());
+            self.fail_owner_ack(error.clone());
         }
         result
     }
@@ -139,9 +154,17 @@ impl QualificationGate {
         }
         self.request_close();
     }
+    fn fail_owner_ack(&mut self, error: MediaError) {
+        self.owner_ack_failed = true;
+        self.fail(error);
+    }
     pub(crate) fn request_close(&mut self) {
         self.closing = true;
         self.pause_pending = None;
+        if self.owner_ack_failed {
+            self.phase = GatePhase::Stopping;
+            return;
+        }
         if let Some(owner) = &self.endpoint {
             if !self.acknowledged {
                 owner.stop(
@@ -234,6 +257,9 @@ impl QualificationGate {
         status
     }
     fn collect(&mut self) {
+        if self.owner_ack_failed {
+            return;
+        }
         if let Some(snapshot) = self
             .endpoint
             .as_ref()
@@ -257,7 +283,14 @@ impl QualificationGate {
                 self.phase = GatePhase::Releasing;
                 self.release_native = true;
             }
-            Some(Err(error)) => self.fail(error),
+            Some(Ok(Some(ack))) => self.fail_owner_ack(MediaError::new(
+                "owner_ack_mismatch",
+                format!(
+                    "qualification destruction acknowledgement generation {} does not match owned attempt 1",
+                    ack.generation.get()
+                ),
+            )),
+            Some(Err(error)) => self.fail_owner_ack(error),
             _ => {}
         }
     }
@@ -447,6 +480,7 @@ mod tests {
             .shutdown_started
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
+        gate.request_close();
         gate.native_released(attempt(1));
         let waiting = gate.poll();
         assert_eq!(waiting.phase, GatePhase::Stopping);
@@ -474,7 +508,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
         gate.request_close();
-        assert!(!gate.poll().release_native);
+        gate.request_close();
+        let waiting = gate.poll();
+        assert!(!waiting.release_native && !waiting.quit);
         driver.initialize_release.send(()).unwrap();
         driver
             .shutdown_started
@@ -490,6 +526,37 @@ mod tests {
         gate.native_released(attempt(1));
         assert!(gate.poll().quit);
     }
+
+    #[test]
+    fn gpui_host_repeated_live_qualification_close_waits_for_matching_retirement() {
+        let (mut gate, driver) = fixture(Config {
+            hold_shutdown: true,
+            ..Default::default()
+        });
+        live(&mut gate, &driver);
+        gate.request_close();
+        driver
+            .shutdown_started
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        gate.request_close();
+        gate.native_released(attempt(1));
+        let waiting = gate.poll();
+        assert_eq!(waiting.phase, GatePhase::Stopping);
+        assert!(!waiting.release_native && !waiting.quit && !gate.owner_ack_failed());
+
+        driver.shutdown_release.send(()).unwrap();
+        let release = until(&mut gate, |update| update.release_native);
+        assert_eq!(release.phase, GatePhase::Releasing);
+        assert!(!release.quit && release.terminal_failure.is_none());
+        gate.request_close();
+        gate.native_released(attempt(2));
+        let waiting = gate.poll();
+        assert!(!waiting.release_native && !waiting.quit);
+        gate.native_released(attempt(1));
+        assert!(gate.poll().quit);
+    }
+
     #[test]
     fn terminal_beats_readiness_and_resume_and_survives_cleanup() {
         let (mut gate, driver) = fixture(Config {
@@ -518,6 +585,10 @@ mod tests {
             final_update.terminal_failure.unwrap().code,
             "event_overflow"
         );
+        assert!(
+            !gate.owner_ack_failed(),
+            "a matching failed outcome still proves retirement"
+        );
     }
     #[test]
     fn surface_loss_retains_error_after_actual_destruction_ack() {
@@ -537,7 +608,7 @@ mod tests {
         assert!(gate.poll().terminal_failure.is_some());
     }
     #[test]
-    fn disconnected_ack_never_authorizes_surface_release() {
+    fn gpui_host_disconnected_ack_never_authorizes_surface_release() {
         let mut gate = QualificationGate::new();
         gate.endpoint = Some(
             OwnerEndpoint::spawn_with_backend(
@@ -550,12 +621,40 @@ mod tests {
         );
         gate.phase = GatePhase::WaitingSurface;
         gate.surface_lost(attempt(1));
-        assert!(gate.wait_for_owner_ack(attempt(1)).is_err());
-        for _ in 0..4 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gate.owner_ack_failed() {
             let update = gate.poll();
             assert!(!update.release_native && !update.quit);
+            assert!(Instant::now() < deadline, "missing ACK not detected");
+            std::thread::yield_now();
         }
+        assert!(gate.wait_for_owner_ack(attempt(1)).is_err());
         gate.native_released(attempt(1));
         assert!(!gate.poll().quit);
+    }
+
+    #[test]
+    fn gpui_host_mismatched_qualification_ack_blocks_release_and_quit() {
+        let (mut gate, driver) = fixture(Config::default());
+        gate.poll();
+        gate.request_close();
+        driver
+            .destroyed
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let owner = gate.endpoint.as_mut().unwrap();
+        owner.wait_for_ack().unwrap();
+        assert!(owner.rewrite_buffered_ack_generation(token(2).generation));
+
+        let update = gate.poll();
+        assert!(gate.owner_ack_failed());
+        assert_eq!(update.phase, GatePhase::Stopping);
+        assert_eq!(update.terminal_failure.unwrap().code, "owner_ack_mismatch");
+        assert!(!update.release_native && !update.quit);
+
+        gate.request_close();
+        gate.native_released(attempt(1));
+        let update = gate.poll();
+        assert!(!update.release_native && !update.quit);
     }
 }

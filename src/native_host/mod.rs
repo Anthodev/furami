@@ -2,6 +2,11 @@
 //! Allowed dependencies: Qt, typed XID/generation/intent exchanges.
 pub use crate::ui::bridge::ffi::NativeFailureKind;
 
+#[cfg(all(target_os = "linux", feature = "gpui-host"))]
+mod gpui;
+#[cfg(all(target_os = "linux", feature = "gpui-host"))]
+pub use self::gpui::GpuiLaunchError;
+
 #[derive(Debug, thiserror::Error)]
 #[error("Qt launch failed with status {exit_code}: {diagnostic}")]
 pub struct NativeLaunchError {
@@ -90,6 +95,47 @@ pub fn run_qualification_application(
             safe_detail: result.safe_detail,
         })
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "gpui-host"))]
+pub fn run_gpui_application(
+    media_prefix: &str,
+    treatment_capabilities: Result<
+        crate::media::render_catalog::RendererCapabilities,
+        crate::media::render_catalog::RendererCatalogError,
+    >,
+    display: &str,
+    startup: crate::app::settings::StartupSelection,
+    persistence: crate::app::settings::PersistenceSession,
+    sources: Vec<crate::domain::capture::AudioSourceIdentity>,
+    diagnostics: crate::diagnostics::DiagnosticsHandle,
+) -> Result<(), GpuiLaunchError> {
+    let runtime = crate::ui::runtime::RuntimeCoordinator::new(
+        media_prefix.to_owned(),
+        treatment_capabilities,
+        startup,
+        persistence,
+        sources,
+        diagnostics,
+    );
+    gpui::run(display, runtime)
+}
+
+#[cfg(all(target_os = "linux", feature = "gpui-host"))]
+pub fn run_gpui_qualification_application(
+    media_prefix: &str,
+    display: &str,
+    video: crate::media::qualification::QualificationVideo,
+    renderer: crate::media::render_catalog::CompiledRendererSettings,
+    diagnostics: crate::diagnostics::DiagnosticsHandle,
+) -> Result<(), GpuiLaunchError> {
+    let runtime = crate::ui::runtime::RuntimeCoordinator::new_qualification(
+        media_prefix.to_owned(),
+        video,
+        renderer,
+        diagnostics,
+    );
+    gpui::run(display, runtime)
 }
 
 pub(crate) fn display_check(

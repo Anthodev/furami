@@ -107,6 +107,13 @@ impl RuntimeCoordinator {
         poll() -> UiUpdate;
         unchanged() -> UiUpdate;
     }
+    #[cfg(all(feature = "gpui-host", target_os = "linux"))]
+    pub(crate) fn owner_ack_failed(&self) -> bool {
+        match self {
+            Self::Capture(runtime) => runtime.owner_ack_failed(),
+            Self::Qualification(runtime) => runtime.owner_ack_failed(),
+        }
+    }
     pub(crate) fn set_volume(&mut self, percent: i32) -> SubmitStatus {
         match self {
             Self::Capture(runtime) => runtime.set_volume(percent),

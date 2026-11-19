@@ -7,7 +7,7 @@ use crate::media::render_catalog::{self, RendererCapabilities, RendererCatalogEr
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub(super) enum SessionKind {
+pub(crate) enum SessionKind {
     #[serde(rename = "capture")]
     Capture,
     #[serde(rename = "qualification-video")]
@@ -15,7 +15,7 @@ pub(super) enum SessionKind {
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Snapshot {
+pub(crate) struct Snapshot {
     pub schema: u32,
     #[serde(rename = "session_kind")]
     pub session_kind: SessionKind,
@@ -47,7 +47,7 @@ pub(super) struct Snapshot {
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Diagnostics {
+pub(crate) struct Diagnostics {
     pub status: &'static str,
     pub path: String,
     pub message: &'static str,
@@ -60,7 +60,7 @@ pub(super) struct Diagnostics {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Selection {
+pub(crate) struct Selection {
     pub source_key: String,
     pub source_label: String,
     pub source_available: bool,
@@ -77,7 +77,7 @@ pub(super) struct Selection {
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct StreamStats {
+pub(crate) struct StreamStats {
     pub identity_text: String,
     pub input_policy: String,
     pub size: Size,
@@ -87,7 +87,7 @@ pub(super) struct StreamStats {
     pub audio_input_label: String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct Size {
+pub(crate) struct Size {
     pub width: u32,
     pub height: u32,
 }
@@ -100,7 +100,7 @@ impl From<FrameSize> for Size {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct Rate {
+pub(crate) struct Rate {
     pub numerator: u32,
     pub denominator: u32,
     pub text: String,
@@ -115,13 +115,13 @@ impl From<FrameRate> for Rate {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct Rational {
+pub(crate) struct Rational {
     pub numerator: u32,
     pub denominator: u32,
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Catalog {
+pub(crate) struct Catalog {
     pub revision: String,
     pub busy: bool,
     pub error: String,
@@ -139,7 +139,7 @@ pub(super) struct Catalog {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct SourceRow {
+pub(crate) struct SourceRow {
     pub key: String,
     pub label: String,
     pub detail: String,
@@ -152,7 +152,7 @@ pub(super) struct SourceRow {
     pub node_label: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct FormatRow {
+pub(crate) struct FormatRow {
     pub key: String,
     pub label: String,
     pub fourcc: String,
@@ -160,7 +160,7 @@ pub(super) struct FormatRow {
     pub reason: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct SizeRow {
+pub(crate) struct SizeRow {
     pub key: String,
     pub label: String,
     pub width: u32,
@@ -169,7 +169,7 @@ pub(super) struct SizeRow {
     pub reason: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct RateRow {
+pub(crate) struct RateRow {
     pub key: String,
     pub label: String,
     pub numerator: u32,
@@ -180,7 +180,7 @@ pub(super) struct RateRow {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct SizeRange {
+pub(crate) struct SizeRange {
     pub format_key: String,
     pub kind: &'static str,
     pub min: Size,
@@ -190,7 +190,7 @@ pub(super) struct SizeRange {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct IntervalRange {
+pub(crate) struct IntervalRange {
     pub format_key: String,
     pub kind: &'static str,
     pub min: Rational,
@@ -198,7 +198,7 @@ pub(super) struct IntervalRange {
     pub step: Option<Rational>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct AudioInputRow {
+pub(crate) struct AudioInputRow {
     pub key: String,
     pub label: String,
     pub eligible: bool,
@@ -206,7 +206,7 @@ pub(super) struct AudioInputRow {
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Live {
+pub(crate) struct Live {
     pub source_label: String,
     pub size_label: String,
     pub rate_label: String,
@@ -218,14 +218,14 @@ pub(super) struct Live {
     pub muted: bool,
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
-pub(super) struct Renderer {
+pub(crate) struct Renderer {
     pub available: bool,
     pub error: String,
     pub fields: Vec<RenderFieldRow>,
     pub notice: String,
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub(super) struct RenderFieldRow {
+pub(crate) struct RenderFieldRow {
     pub key: &'static str,
     pub label: String,
     #[serde(rename = "type")]
@@ -237,7 +237,7 @@ pub(super) struct RenderFieldRow {
     pub notice: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct Choice {
+pub(crate) struct Choice {
     pub key: String,
     pub label: String,
     pub eligible: bool,
@@ -245,7 +245,7 @@ pub(super) struct Choice {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Output {
+pub(crate) struct Output {
     pub revision: String,
     pub rows: Vec<OutputRow>,
     pub selected_key: String,
@@ -255,7 +255,7 @@ pub(super) struct Output {
     pub needs_action: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct OutputRow {
+pub(crate) struct OutputRow {
     pub key: String,
     pub label: String,
     pub name: String,
@@ -263,13 +263,13 @@ pub(super) struct OutputRow {
     pub reason: String,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub(super) struct Recovery {
+pub(crate) struct Recovery {
     pub evidence: String,
     pub stage: String,
     pub candidates: Vec<RecoveryRow>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct RecoveryRow {
+pub(crate) struct RecoveryRow {
     pub key: String,
     pub label: String,
     pub detail: String,
@@ -277,7 +277,7 @@ pub(super) struct RecoveryRow {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Settings {
+pub(crate) struct Settings {
     pub status: String,
     pub attention: String,
     pub path: String,
@@ -287,7 +287,7 @@ pub(super) struct Settings {
     pub reset_token: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct IntentError {
+pub(crate) struct IntentError {
     pub code: &'static str,
     pub action: &'static str,
     pub field: &'static str,

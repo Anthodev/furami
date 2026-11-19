@@ -5,6 +5,7 @@ use crate::domain::{
     capture::{CaptureModeRequest, FrameRate, FrameSize, InputFormatPolicy},
     render::{DitherMode, RendererSettings, ScalerChoice, ScalerKernel},
 };
+use std::rc::Rc;
 
 use crate::{
     app::{
@@ -44,7 +45,9 @@ mod qualification;
 pub(crate) use coordinator::RuntimeCoordinator;
 
 pub(crate) struct UiUpdate {
-    pub ui_snapshot: String,
+    /// Typed product projection, shared with every adapter. `None` means the
+    /// projection is unchanged and the previously published snapshot stands.
+    pub ui_snapshot: Option<Rc<projection::Snapshot>>,
     /// Prepared desktop dispatch; the native launcher must claim it once.
     pub log_folder_request: u64,
     pub log_folder_path: String,
@@ -184,7 +187,7 @@ struct ProductUi {
     state_identity: Option<StateIdentity>,
     state_initialized: bool,
     renderer: projection::Renderer,
-    snapshot: Option<projection::Snapshot>,
+    snapshot: Option<Rc<projection::Snapshot>>,
     error: Option<projection::IntentError>,
     exhausted: bool,
 }
@@ -2352,6 +2355,12 @@ impl CaptureRuntime {
             None => "surface_loss_barrier: no capture engine".into(),
         }
     }
+    #[cfg(all(feature = "gpui-host", target_os = "linux"))]
+    fn owner_ack_failed(&self) -> bool {
+        self.engine
+            .as_ref()
+            .is_some_and(|engine| engine.runner().owner_ack_failed())
+    }
     pub(crate) fn native_released(&mut self, attempt: AttemptId) -> UiUpdate {
         if let Some(engine) = &mut self.engine {
             engine.runner_mut().native_released(attempt);
@@ -3148,9 +3157,9 @@ impl CaptureRuntime {
         if update.changed {
             let projection = self.output_projection();
             let snapshot = self.product_snapshot(&update, &projection);
-            if self.ui.snapshot.as_ref() != Some(&snapshot) {
-                update.ui_snapshot =
-                    serde_json::to_string(&snapshot).expect("finite validated typed UI snapshot");
+            if self.ui.snapshot.as_deref() != Some(&snapshot) {
+                let snapshot = Rc::new(snapshot);
+                update.ui_snapshot = Some(Rc::clone(&snapshot));
                 self.ui.snapshot = Some(snapshot);
             }
             self.last_output = Some(projection.clone());
@@ -3217,7 +3226,7 @@ impl CaptureRuntime {
         let Some(engine) = &mut self.engine else {
             let changed = std::mem::take(&mut self.dirty);
             return UiUpdate {
-                ui_snapshot: String::new(),
+                ui_snapshot: None,
                 log_folder_request: 0,
                 log_folder_path: String::new(),
                 changed,
@@ -3558,7 +3567,7 @@ impl CaptureRuntime {
         }
         let runner = engine.runner_mut();
         UiUpdate {
-            ui_snapshot: String::new(),
+            ui_snapshot: None,
             log_folder_request: 0,
             log_folder_path: String::new(),
             changed,
@@ -3908,6 +3917,7 @@ mod tests {
             test_support::{Config, Driver},
         },
     };
+    use std::rc::Rc;
     use std::sync::mpsc;
 
     /// Captured renderer inventory; production retains the qualified query.
@@ -3969,6 +3979,16 @@ mod tests {
         fail_spawn: Option<u64>,
         snapshot: Option<crate::capture::linux::CaptureSnapshot>,
     ) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
+        runtime_with_owner_config(execute, fail_spawn, snapshot, Config::default)
+    }
+    fn runtime_with_owner_config(
+        execute: fn(
+            ValidationRequest,
+        ) -> (ValidationRequest, Result<PreparedCapture, ApplyFailure>),
+        fail_spawn: Option<u64>,
+        snapshot: Option<crate::capture::linux::CaptureSnapshot>,
+        owner_config: impl Fn() -> Config + 'static,
+    ) -> (CaptureRuntime, mpsc::Receiver<Driver>) {
         let (tx, rx) = mpsc::channel();
         let runner = GateRunner::with_spawner(
             fixture_treatment_capabilities(),
@@ -3985,7 +4005,7 @@ mod tests {
                     .validate_snapshot(&session_fixture(&["/dev/video0"], requested.mode))
                     .unwrap();
                 let requested = input.requested().clone();
-                let (driver, backend) = Driver::pair(Config::default());
+                let (driver, backend) = Driver::pair(owner_config());
                 let backend = backend.with_open_treatments(config.treatment_key, config.treatments);
                 tx.send(driver).unwrap();
                 OwnerEndpoint::spawn_with_backend_requested(generation, requested, move || backend)
@@ -6637,10 +6657,180 @@ mod tests {
     fn product_values(runtime: &mut CaptureRuntime) -> serde_json::Value {
         runtime.dirty = true;
         let update = runtime.poll();
-        if update.ui_snapshot.is_empty() {
-            serde_json::to_value(runtime.ui.snapshot.as_ref().unwrap()).unwrap()
+        let snapshot = update
+            .ui_snapshot
+            .as_deref()
+            .or(runtime.ui.snapshot.as_deref())
+            .expect("product snapshot published");
+        serde_json::to_value(snapshot).unwrap()
+    }
+
+    #[test]
+    fn gpui_host_snapshot_is_shared_only_when_the_typed_projection_changes() {
+        let (mut runtime, _) = product_runtime();
+        let retained = runtime
+            .ui
+            .snapshot
+            .clone()
+            .expect("fixture published a projection");
+
+        // A tick that reports a change but rebuilds the same typed projection
+        // must not republish it nor replace the retained Rc.
+        runtime.dirty = true;
+        let unchanged = runtime.poll();
+        assert!(unchanged.changed, "the dirty tick still reports a change");
+        assert!(
+            unchanged.ui_snapshot.is_none(),
+            "an identical projection is not republished"
+        );
+        assert!(Rc::ptr_eq(
+            &retained,
+            runtime.ui.snapshot.as_ref().expect("retained snapshot")
+        ));
+
+        // A real projection change publishes a fresh typed value and shares it.
+        runtime.ui.public_revision += 1;
+        runtime.dirty = true;
+        let changed = runtime.poll();
+        let published = changed
+            .ui_snapshot
+            .expect("a changed projection is published");
+        assert!(!Rc::ptr_eq(&retained, &published));
+        assert!(Rc::ptr_eq(
+            &published,
+            runtime.ui.snapshot.as_ref().expect("retained snapshot")
+        ));
+        assert_eq!(
+            serde_json::to_value(&*published).unwrap()["selectionRevision"],
+            serde_json::json!(runtime.ui.public_revision.to_string())
+        );
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn gpui_host_cxx_wire_maps_an_absent_snapshot_to_empty_and_a_change_to_schema_two() {
+        let (mut runtime, _) = product_runtime();
+        runtime.dirty = true;
+        let unchanged = runtime.poll();
+        assert!(unchanged.changed && unchanged.ui_snapshot.is_none());
+        let wire = crate::ui::bridge::test_wire_snapshot(unchanged);
+        assert!(
+            wire.is_empty(),
+            "an unchanged projection stays an empty wire string"
+        );
+
+        runtime.ui.public_revision += 1;
+        runtime.dirty = true;
+        let changed = runtime.poll();
+        assert!(changed.ui_snapshot.is_some());
+        let wire = crate::ui::bridge::test_wire_snapshot(changed);
+        let snapshot: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(snapshot["schema"], 2);
+        assert_eq!(snapshot["session_kind"], "capture");
+        cleanup(&mut runtime);
+    }
+
+    #[test]
+    fn gpui_host_create_native_edge_is_delivered_once_and_never_replayed() {
+        let (mut runtime, drivers) = runtime();
+        runtime.poll();
+        let open = runtime.open();
+        let opening = if open.create_native {
+            open
         } else {
-            serde_json::from_str(&update.ui_snapshot).unwrap()
+            await_update(&mut runtime, |update| update.create_native)
+        };
+        assert!(opening.create_native, "the create edge is delivered");
+        let driver = drivers.recv().unwrap();
+        let replay = runtime.poll();
+        assert!(
+            !replay.create_native,
+            "an authorization is never replayed on a later poll"
+        );
+        assert!(
+            drivers.try_recv().is_err(),
+            "a replay would have spawned a second media owner"
+        );
+        cleanup(&mut runtime);
+        driver.destroyed.recv().unwrap();
+    }
+
+    #[test]
+    fn gpui_host_repeated_capture_close_waits_for_owner_and_matching_native_retirement() {
+        use std::time::Duration;
+
+        let timeout = Duration::from_secs(5);
+        for phase in [
+            GatePhase::WaitingSurface,
+            GatePhase::Opening,
+            GatePhase::Ready,
+        ] {
+            let store = WritableSettings::new();
+            let (mut runtime, drivers) =
+                runtime_with_owner_config(validate, None, None, move || Config {
+                    creates_handle: true,
+                    hold_initialize: phase == GatePhase::Opening,
+                    hold_shutdown: true,
+                    hold_quiesce: true,
+                    ..Config::default()
+                });
+            store.bind(&mut runtime);
+            let created = runtime.open();
+            let created = if created.create_native {
+                created
+            } else {
+                await_update(&mut runtime, |update| update.create_native)
+            };
+            let attempt = AttemptId::new(created.generation).unwrap();
+            let driver = drivers.recv_timeout(timeout).unwrap();
+            assert_eq!(created.phase, GatePhase::WaitingSurface);
+            if phase != GatePhase::WaitingSurface {
+                let opening = runtime.surface_ready(SurfaceToken {
+                    generation: Generation::new(attempt.get()).unwrap(),
+                    xid: X11WindowId::new(71).unwrap(),
+                });
+                assert_eq!(opening.phase, GatePhase::Opening);
+                driver.initialized.recv_timeout(timeout).unwrap();
+                if phase == GatePhase::Ready {
+                    let (load, _) = driver.submitted.recv_timeout(timeout).unwrap();
+                    driver.send(BackendEvent::CommandReply {
+                        id: load.get(),
+                        error: 0,
+                    });
+                    driver.send(BackendEvent::FileLoaded);
+                    driver.send(BackendEvent::PlaybackRestart);
+                    driver.confirm_open_treatments();
+                    await_update(&mut runtime, |update| update.can_toggle_pause);
+                }
+            }
+
+            for _ in 0..3 {
+                let closing = runtime.request_application_close();
+                assert!(!closing.release_native && !closing.quit && !closing.create_native);
+            }
+            if phase == GatePhase::Opening {
+                driver.initialize_release.send(()).unwrap();
+            }
+            driver.shutdown_started.recv_timeout(timeout).unwrap();
+            driver.shutdown_release.send(()).unwrap();
+            driver.quiesce_started.recv_timeout(timeout).unwrap();
+            let closing = runtime.native_released(attempt);
+            assert!(!closing.release_native && !closing.quit);
+            assert!(driver.destroyed.try_recv().is_err());
+
+            driver.quiesce_release.send(()).unwrap();
+            let release = await_update(&mut runtime, |update| update.release_native);
+            assert_eq!(release.generation, attempt.get());
+            assert!(!release.quit);
+            driver.destroyed.recv_timeout(timeout).unwrap();
+            let stale = runtime.native_released(AttemptId::new(attempt.get() + 1).unwrap());
+            assert!(!stale.release_native && !stale.quit);
+            let repeated = runtime.request_application_close();
+            assert!(!repeated.release_native && !repeated.quit);
+            let retired = runtime.native_released(attempt);
+            if !retired.quit {
+                await_update(&mut runtime, |update| update.quit);
+            }
         }
     }
     #[test]
@@ -9837,7 +10027,8 @@ mod tests {
         );
         let rejected = runtime.log_folder_result(1, false);
         assert!(rejected.changed);
-        let snapshot: serde_json::Value = serde_json::from_str(&rejected.ui_snapshot).unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::to_value(rejected.ui_snapshot.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["diagnostics"]["folderState"], "Failed");
         assert_eq!(snapshot["diagnostics"]["hasProblem"], true);
         runtime.log_folder_result(1, true);
@@ -9865,7 +10056,8 @@ mod tests {
         assert!(dropped > 0);
         let accepted = runtime.log_folder_result(2, true);
         assert!(accepted.changed);
-        let snapshot: serde_json::Value = serde_json::from_str(&accepted.ui_snapshot).unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::to_value(accepted.ui_snapshot.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["diagnostics"]["folderState"], "OpenRequested");
         assert_eq!(
             snapshot["diagnostics"]["hasProblem"], true,
@@ -9883,7 +10075,8 @@ mod tests {
         let terminated = runtime.log_folder_finished(2, true);
         assert!(terminated.changed);
         assert!(!terminated.create_native && !terminated.release_native);
-        let snapshot: serde_json::Value = serde_json::from_str(&terminated.ui_snapshot).unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::to_value(terminated.ui_snapshot.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["diagnostics"]["folderState"], "Failed");
         assert_eq!(snapshot["diagnostics"]["hasProblem"], true);
         assert_eq!(
@@ -9953,7 +10146,8 @@ mod tests {
         assert!(failed.changed);
         assert!(!failed.create_native && !failed.release_native);
         assert_eq!(failed.log_folder_request, 0);
-        let snapshot: serde_json::Value = serde_json::from_str(&failed.ui_snapshot).unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::to_value(failed.ui_snapshot.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["diagnostics"]["folderState"], "Failed");
         assert_eq!(snapshot["diagnostics"]["hasProblem"], true);
         assert!(
@@ -10044,9 +10238,8 @@ mod tests {
         let mut update = runtime.open_log_folder();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            if !update.ui_snapshot.is_empty() {
-                let snapshot: serde_json::Value =
-                    serde_json::from_str(&update.ui_snapshot).unwrap();
+            if let Some(snapshot) = update.ui_snapshot.as_deref() {
+                let snapshot: serde_json::Value = serde_json::to_value(snapshot).unwrap();
                 if snapshot["diagnostics"]["folderState"] == "Failed" {
                     break;
                 }
@@ -10060,7 +10253,8 @@ mod tests {
         }
         assert!(update.changed);
         assert_eq!(update.log_folder_request, 0);
-        let snapshot: serde_json::Value = serde_json::from_str(&update.ui_snapshot).unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::to_value(update.ui_snapshot.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["diagnostics"]["folderState"], "Failed");
         assert_eq!(snapshot["diagnostics"]["status"], "Unavailable");
         assert!(snapshot["intentError"].is_null());

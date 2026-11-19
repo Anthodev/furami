@@ -92,6 +92,7 @@ pub(crate) struct GateRunner {
     dirty: bool,
     last_blocked: Option<ApplyFailure>,
     fatal_native: Option<ApplyFailure>,
+    owner_ack_failed: bool,
     ended: bool,
     audio: AudioAvailability,
     diagnostics: Option<RuntimeMediaObservation>,
@@ -149,6 +150,7 @@ impl GateRunner {
             dirty: true,
             last_blocked: None,
             fatal_native: None,
+            owner_ack_failed: false,
             ended: false,
             audio: AudioAvailability::Disabled,
             diagnostics: None,
@@ -181,6 +183,10 @@ impl GateRunner {
     }
     pub(crate) fn fatal_native_failure(&self) -> Option<&ApplyFailure> {
         self.fatal_native.as_ref()
+    }
+    #[cfg(any(test, all(feature = "gpui-host", target_os = "linux")))]
+    pub(crate) fn owner_ack_failed(&self) -> bool {
+        self.owner_ack_failed
     }
     pub(crate) fn diagnostics_observation(&self) -> Option<&RuntimeMediaObservation> {
         let key = self.key?;
@@ -339,6 +345,12 @@ impl GateRunner {
                 "surface-loss barrier requires active failed attempt and live owner",
             ));
         }
+        if self.owner_ack_failed {
+            return Err(MediaError::new(
+                "surface_loss_barrier",
+                "owner acknowledgement protocol already failed",
+            ));
+        }
         let result = match self.endpoint.as_mut() {
             Some(endpoint) => endpoint.wait_for_ack(),
             None => Err(MediaError::new(
@@ -346,6 +358,7 @@ impl GateRunner {
                 "surface-loss barrier has no live owner endpoint",
             )),
         };
+        self.owner_ack_failed = result.is_err();
         if let Err(error) = &result
             && let Some(failure) = self.map_failure(error.clone())
         {
@@ -872,7 +885,11 @@ impl SessionRunner for GateRunner {
                 None => self.retained_progress.take(),
             };
             // Genuine terminal acknowledgement is inspected before coalesced progress.
-            let stopped = self.endpoint.as_mut().map(OwnerEndpoint::take_stopped);
+            let stopped = if self.owner_ack_failed {
+                None
+            } else {
+                self.endpoint.as_mut().map(OwnerEndpoint::take_stopped)
+            };
             match stopped {
                 Some(Ok(Some(stopped))) => {
                     // A final ordinary owner snapshot can coalesce between the
@@ -884,6 +901,7 @@ impl SessionRunner for GateRunner {
                         .or_else(|| snapshot.take());
                     let key = self.key?;
                     if stopped.generation.get() != key.attempt.get() {
+                        self.owner_ack_failed = true;
                         let failure = self.map_failure(MediaError::new(
                             "owner_ack_mismatch",
                             format!("destruction acknowledgement generation {} does not match owned attempt {}", stopped.generation.get(), key.attempt.get()),
@@ -941,6 +959,7 @@ impl SessionRunner for GateRunner {
                     );
                 }
                 Some(Err(error)) => {
+                    self.owner_ack_failed = true;
                     let key = self.key?;
                     if let Some(failure) = self.map_failure(error) {
                         let update = self.state.block(key.attempt, failure.clone());
@@ -2431,6 +2450,10 @@ mod tests {
         driver.shutdown_release.send(()).unwrap();
         assert!(runner.wait_for_owner_ack(key(1).attempt).is_ok());
         stopped(&mut runner);
+        assert!(
+            !runner.owner_ack_failed(),
+            "surface loss is not an ACK failure"
+        );
         driver.destroyed.recv().unwrap();
         runner.take_native_update();
         runner.native_released(key(1).attempt);
@@ -2449,7 +2472,7 @@ mod tests {
         );
     }
     #[test]
-    fn missing_owner_ack_never_releases_native_or_allows_next_owner() {
+    fn gpui_host_missing_owner_ack_never_releases_native_or_allows_next_owner() {
         let mut runner = GateRunner::with_spawner(capabilities(), |generation, _| {
             OwnerEndpoint::spawn_with_backend(
                 generation,
@@ -2460,10 +2483,16 @@ mod tests {
         });
         open(&mut runner, 1);
         runner.surface_lost(key(1).attempt);
-        assert!(runner.wait_for_owner_ack(key(1).attempt).is_err());
-        for _ in 0..4 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !runner.owner_ack_failed() {
             runner.poll();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing ACK not detected"
+            );
+            std::thread::yield_now();
         }
+        assert!(runner.wait_for_owner_ack(key(1).attempt).is_err());
         assert!(!runner.take_native_update().release_native);
         runner.native_released(key(1).attempt);
         assert_eq!(runner.attempt(), Some(key(1).attempt));
@@ -2965,11 +2994,13 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_owner_ack_blocks_cleanup_without_native_release() {
+    fn gpui_host_mismatched_owner_ack_blocks_cleanup_without_native_release() {
         let (mut runner, drivers) = runner(Config::default());
         open(&mut runner, 1);
-        let driver = drivers.recv().unwrap();
+        let timeout = std::time::Duration::from_secs(5);
+        let driver = drivers.recv_timeout(timeout).unwrap();
         runner.stop(key(1).attempt, StopReason::Close);
+        driver.destroyed.recv_timeout(timeout).unwrap();
         let endpoint = runner.endpoint.as_mut().unwrap();
         endpoint.wait_for_ack().unwrap();
         assert!(endpoint.rewrite_buffered_ack_generation(Generation::new(2).unwrap()));
@@ -2982,11 +3013,11 @@ mod tests {
             runner.poll(),
             Some(SessionEvent::CleanupBlocked { .. })
         ));
+        assert!(runner.owner_ack_failed());
         assert!(!runner.take_native_update().release_native);
         assert!(runner.endpoint.is_some());
         runner.native_released(key(1).attempt);
         assert_eq!(runner.attempt(), Some(key(1).attempt));
-        driver.destroyed.recv().unwrap();
     }
 
     #[test]
