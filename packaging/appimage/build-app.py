@@ -306,6 +306,7 @@ def input_hashes():
               REPOSITORY / "build.rs", REPOSITORY / "rust-toolchain.toml",
               REPOSITORY / "LICENSE", REPOSITORY / "assets/logo.ico", REPOSITORY / "assets/logo.png",
               REPOSITORY / "assets/logo.svg",
+              *sorted((REPOSITORY / "assets/icons").rglob("*")),
               HERE / "build-app.py", HERE / "app-container-build.sh",
               HERE / "rcc-wrapper.sh",
               STACK_LOCK.with_name("source-patches.py"),

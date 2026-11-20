@@ -147,7 +147,7 @@ Furami is built from source with Rust and Qt. The [media recipe](packaging/media
 
 ## Acknowledgements
 
-Furami's overlay icons come from [Tabler Icons](https://tabler.io/icons) (see [qml/icons/LICENSE-tabler.txt](qml/icons/LICENSE-tabler.txt)), and its default palette is inspired by [Catppuccin](https://catppuccin.com/) Macchiato.
+Furami's overlay icons come from [Tabler Icons](https://tabler.io/icons) (see [assets/icons/LICENSE-tabler.txt](assets/icons/LICENSE-tabler.txt)), and its default palette is inspired by [Catppuccin](https://catppuccin.com/) Macchiato.
 
 ## Contributing
 

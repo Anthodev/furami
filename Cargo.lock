@@ -1721,6 +1721,8 @@ dependencies = [
  "cxx-qt-lib",
  "gpui-pre",
  "gpui-pre-platform",
+ "image",
+ "libc",
  "libloading 0.9.0",
  "parking_lot",
  "raw-window-handle",
@@ -1729,7 +1731,9 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
+ "url",
  "x11rb",
+ "zbus 5.19.0",
 ]
 
 [[package]]
