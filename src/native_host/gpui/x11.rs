@@ -2,11 +2,14 @@
 //! Allowed dependencies: x11rb only.
 //!
 //! The adapter owns a second connection to the same X server as GPUI. It
-//! validates the GPUI client window and parents exactly one borderless video
-//! child under it; every mutation is checked so the host can tell a server
-//! rejection from a transport failure that leaves the outcome uncertain.
+//! validates the GPUI client and its chrome companion separately from the
+//! video child. Every mutation is checked so a server rejection is distinct
+//! from a transport failure that leaves the outcome uncertain.
 
-use std::cell::Cell;
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+};
 
 use x11rb::{
     COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT,
@@ -18,12 +21,17 @@ use x11rb::{
         shape::{ConnectionExt as _, SK, SO},
         xproto::{
             ChangeWindowAttributesAux, ClipOrdering, ConfigureWindowAux, ConnectionExt as _,
-            CreateWindowAux, EventMask, MapState, Rectangle, WindowClass,
+            CreateWindowAux, EventMask, MapState, WindowClass,
         },
     },
     reexports::x11rb_protocol::parse_display::parse_display,
     rust_connection::RustConnection,
 };
+
+mod companion;
+
+use companion::Companion;
+pub(super) use companion::{CompanionFacts, CompanionGeometry, FocusTarget, HitRect};
 
 /// A native window that the checked destroy request proved gone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,7 +42,7 @@ pub(super) enum DestroyOutcome {
     Absent,
 }
 
-/// One relevant native event drained from the parent/child pair.
+/// One relevant native event drained from the owned windows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Event {
     /// The GPUI parent or the video child changed rectangle.
@@ -45,6 +53,26 @@ pub(super) enum Event {
     ChildDestroyed,
     /// The video child now has a parent other than the bound GPUI client.
     ChildReparented,
+    /// The server reported a map or unmap on the current video child.
+    ChildMappingChanged(bool),
+    /// The standalone chrome XID was destroyed or reparented. Not a media ACK.
+    CompanionLost,
+    /// The chrome XID's native map state or geometry may have changed.
+    CompanionChanged,
+    /// Resample settled native focus and viewability after draining the queue.
+    FocusChanged,
+    /// A server-generated Core key press delivered to an owned focus target.
+    KeyPress {
+        target: FocusTarget,
+        time: u32,
+        tab: bool,
+    },
+    /// A server-generated Core key release delivered to an owned focus target.
+    KeyRelease {
+        target: FocusTarget,
+        time: u32,
+        tab: bool,
+    },
 }
 
 /// A failed checked X11 request.
@@ -135,6 +163,17 @@ impl std::error::Error for Error {
 
 /// The X11 keysym for F11.
 const F11_KEYSYM: u32 = 0xffc8;
+const TAB_KEYSYM: u32 = 0xff09;
+const ISO_LEFT_TAB_KEYSYM: u32 = 0xfe20;
+
+fn tab_modifiers(state: x11rb::protocol::xproto::KeyButMask) -> bool {
+    use x11rb::protocol::xproto::KeyButMask;
+
+    // Shift selects direction; the locked and NumLock modifiers must not
+    // suppress ordinary Tab.
+    let shortcuts = KeyButMask::CONTROL | KeyButMask::MOD1 | KeyButMask::MOD4;
+    u16::from(state) & u16::from(shortcuts) == 0
+}
 
 /// The keycodes whose mapping contains `keysym`.
 ///
@@ -144,7 +183,7 @@ fn keysym_keycodes(
     keysyms: &[u32],
     keysyms_per_keycode: u8,
     min_keycode: u8,
-    keysym: u32,
+    candidates: &[u32],
 ) -> Vec<u8> {
     let per_keycode = usize::from(keysyms_per_keycode);
     if per_keycode == 0 {
@@ -153,7 +192,7 @@ fn keysym_keycodes(
     keysyms
         .chunks_exact(per_keycode)
         .enumerate()
-        .filter(|(_, slots)| slots.contains(&keysym))
+        .filter(|(_, slots)| slots.iter().any(|slot| candidates.contains(slot)))
         .filter_map(|(index, _)| u8::try_from(usize::from(min_keycode) + index).ok())
         .collect()
 }
@@ -165,55 +204,16 @@ fn keymap_down(keys: &[u8; 32], keycode: u8) -> bool {
         .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
 }
 
-/// The opaque over-video control, in physical device pixels.
+/// The full, unshaped video child extent in device pixels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Rect {
-    /// Left edge, inclusive.
-    pub(super) left: u16,
-    /// Top edge, inclusive.
-    pub(super) top: u16,
-    /// Right edge, exclusive.
-    pub(super) right: u16,
-    /// Bottom edge, exclusive.
-    pub(super) bottom: u16,
-}
-
-impl Rect {
-    /// The rectangle height in device pixels.
-    pub(super) fn height(self) -> u16 {
-        self.bottom - self.top
-    }
-}
-
-/// The control size in logical pixels.
-const BUTTON_WIDTH: f64 = 160.0;
-/// The control height in logical pixels.
-const BUTTON_HEIGHT: f64 = 48.0;
-/// The control inset from the client right edge in logical pixels.
-const BUTTON_RIGHT_INSET: f64 = 16.0;
-
-/// One committed native layout: the child extent and the control cutout.
-///
-/// Both are snapped to physical device pixels so the opaque GPUI paint and the
-/// X11 bounding shape name the same rectangle. The control rectangle is always
-/// nonempty and lies inside `extent`; a viewport too small to place it keeps a
-/// minimal device-pixel rectangle rather than an unrepresentable one.
-#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Layout {
     /// The video client extent in device pixels.
     pub(super) extent: (u16, u16),
-    /// The control rectangle to cut out, always inside `extent`.
-    pub(super) button: Rect,
 }
 
 impl Layout {
-    /// Snap the layout produced by an observed GPUI scale to device pixels.
-    ///
-    /// Derived from the actual client extent, never from a separate viewport:
-    /// the left/top edges round down and the right/bottom edges round up so the
-    /// cutout covers every pixel the control paints. A zero extent has no
-    /// representable geometry and yields `Ok(None)` without any server request;
-    /// extents and scales outside the checked X11 request range are rejected.
+    /// Check the observed device extent and GPUI scale. A zero extent has no
+    /// representable geometry and yields `Ok(None)` without a server request.
     pub(super) fn new(extent: (u16, u16), scale: f32) -> Result<Option<Self>, Error> {
         let (width, height) = extent;
         if width == 0 || height == 0 {
@@ -230,64 +230,7 @@ impl Layout {
                 "the GPUI scale factor must be finite and positive",
             ));
         }
-        let scale = f64::from(scale);
-        let top_edge = (f64::from(height) - BUTTON_HEIGHT * scale) / 2.0;
-        let mut button = Rect {
-            left: snap_down(
-                f64::from(width) - (BUTTON_RIGHT_INSET + BUTTON_WIDTH) * scale,
-                width,
-            ),
-            top: snap_down(top_edge, height),
-            right: snap_up(f64::from(width) - BUTTON_RIGHT_INSET * scale, width),
-            bottom: snap_up(top_edge + BUTTON_HEIGHT * scale, height),
-        };
-        // A viewport narrower or shorter than the control insets cannot place
-        // the full rectangle; keep a representable pixel rather than none.
-        button.left = button.left.min(width - 1);
-        button.top = button.top.min(height - 1);
-        if button.right <= button.left || button.bottom <= button.top {
-            button.right = button.left + 1;
-            button.bottom = button.top + 1;
-        }
-        Ok(Some(Self { extent, button }))
-    }
-
-    /// The nonempty bounding rectangles of the full extent minus the control.
-    ///
-    /// Descendants of the shaped child are clipped to this region, so the full
-    /// extent must be covered exactly once around the cutout.
-    fn bounding_rectangles(self) -> ([Rectangle; 4], usize) {
-        let (width, height) = self.extent;
-        let button = self.button;
-        let mut rectangles = [Rectangle::default(); 4];
-        let mut count = 0;
-        let button_height = button.height();
-        push_rectangle(&mut rectangles, &mut count, 0, 0, width, button.top);
-        push_rectangle(
-            &mut rectangles,
-            &mut count,
-            0,
-            button.bottom,
-            width,
-            height - button.bottom,
-        );
-        push_rectangle(
-            &mut rectangles,
-            &mut count,
-            0,
-            button.top,
-            button.left,
-            button_height,
-        );
-        push_rectangle(
-            &mut rectangles,
-            &mut count,
-            button.right,
-            button.top,
-            width - button.right,
-            button_height,
-        );
-        (rectangles, count)
+        Ok(Some(Self { extent }))
     }
 }
 
@@ -313,48 +256,21 @@ fn minimum_device_extent(scale: f32) -> Result<(i32, i32), Error> {
     Ok(((480.0 * scale).ceil() as i32, (540.0 * scale).ceil() as i32))
 }
 
-/// Round a device-pixel edge down and clamp it into the client extent.
-fn snap_down(value: f64, limit: u16) -> u16 {
-    value.floor().clamp(0.0, f64::from(limit)) as u16
-}
-
-/// Round a device-pixel edge up and clamp it into the client extent.
-fn snap_up(value: f64, limit: u16) -> u16 {
-    value.ceil().clamp(0.0, f64::from(limit)) as u16
-}
-
-/// Append one nonempty bounding rectangle.
-fn push_rectangle(
-    rectangles: &mut [Rectangle; 4],
-    count: &mut usize,
-    x: u16,
-    y: u16,
-    width: u16,
-    height: u16,
-) {
-    if width == 0 || height == 0 {
-        return;
-    }
-    rectangles[*count] = Rectangle {
-        x: i16::try_from(x).expect("layout validation bounds coordinates"),
-        y: i16::try_from(y).expect("layout validation bounds coordinates"),
-        width,
-        height,
-    };
-    *count += 1;
-}
-
 /// The checked X11 side of the GPUI native host.
 ///
 /// `parent` stays `0` until [`X11::bind`] validated the GPUI client window on
 /// this connection's server.
 pub(super) struct X11 {
     connection: RustConnection,
+    display: Box<str>,
     root: u32,
     parent: u32,
     parent_mapped: Cell<bool>,
     last_extent: Cell<Option<(u32, u16, u16)>>,
-    last_layout: Cell<Option<(u32, Layout)>>,
+    companion: Option<Companion>,
+    pending: RefCell<VecDeque<XEvent>>,
+    last_press: Cell<Option<(FocusTarget, u32)>>,
+    tab_keycodes: RefCell<Vec<u8>>,
     destroyed: Cell<Option<u32>>,
     min_keycode: u8,
     max_keycode: u8,
@@ -390,11 +306,15 @@ impl X11 {
         }
         Ok(Self {
             connection,
+            display: display.into(),
             root,
             parent: 0,
             parent_mapped: Cell::new(false),
             last_extent: Cell::new(None),
-            last_layout: Cell::new(None),
+            companion: None,
+            pending: Default::default(),
+            last_press: Cell::new(None),
+            tab_keycodes: RefCell::default(),
             destroyed: Cell::new(None),
             min_keycode,
             max_keycode,
@@ -432,7 +352,7 @@ impl X11 {
         self.connection
             .change_window_attributes(
                 parent,
-                &ChangeWindowAttributesAux::default().event_mask(EventMask::STRUCTURE_NOTIFY),
+                &ChangeWindowAttributesAux::default().event_mask(companion::owned_events()),
             )
             .map_err(Error::Transport)?
             .check()
@@ -490,7 +410,7 @@ impl X11 {
     /// not prove the physical key was released. Read the server's mapping
     /// and bitmap on key-up, never from a tick.
     pub(super) fn f11_down(&self) -> Result<bool, Error> {
-        let keycodes = self.f11_keycodes()?;
+        let keycodes = self.mapped_keycodes(&[F11_KEYSYM])?;
         if keycodes.is_empty() {
             return Ok(false);
         }
@@ -504,7 +424,7 @@ impl X11 {
         Ok(keycodes.iter().any(|&keycode| keymap_down(&keys, keycode)))
     }
 
-    fn f11_keycodes(&self) -> Result<Vec<u8>, Error> {
+    fn mapped_keycodes(&self, keysyms: &[u32]) -> Result<Vec<u8>, Error> {
         let count = self
             .max_keycode
             .saturating_sub(self.min_keycode)
@@ -519,7 +439,7 @@ impl X11 {
             &reply.keysyms,
             reply.keysyms_per_keycode,
             self.min_keycode,
-            F11_KEYSYM,
+            keysyms,
         ))
     }
 
@@ -552,7 +472,7 @@ impl X11 {
     /// may still have created the XID; see [`Error::is_rejected`].
     pub(super) fn create(&self, xid: u32, extent: (u16, u16)) -> Result<(), Error> {
         let parent = self.bound_parent()?;
-        if xid == 0 || xid == parent || xid == self.root {
+        if self.reserved_xid(xid, parent) {
             return Err(Error::State(
                 "refusing to create a native window with a reserved XID",
             ));
@@ -603,7 +523,6 @@ impl X11 {
             Err(error) => return Err(Error::Transport(error)),
         }
         self.last_extent.set(Some((xid, width, height)));
-        self.last_layout.set(None);
         Ok(())
     }
 
@@ -625,58 +544,36 @@ impl X11 {
 
     /// Apply a committed layout to the native child.
     ///
-    /// A checked resize and the checked bounding shape go out together; the
-    /// empty input shape set by [`X11::create`] is left untouched so pointer
-    /// hit testing stays with the GPUI parent. Unchanged layouts and zero
-    /// extents are skipped without a request.
+    /// Resize the full extent without a bounding shape. The empty input shape
+    /// installed at creation is retained, leaving pointer input with GPUI.
     pub(super) fn apply_layout(&self, xid: u32, layout: Layout) -> Result<(), Error> {
         let parent = self.bound_parent()?;
-        if xid == 0 || xid == parent || xid == self.root {
+        if self.reserved_xid(xid, parent) {
             return Err(Error::State("refusing to lay out a reserved XID"));
         }
         if self.destroyed.get() == Some(xid) {
             return Err(Error::State("refusing to lay out a retired XID"));
         }
         let (width, height) = layout.extent;
-        if width == 0 || height == 0 {
+        if self.last_extent.get() == Some((xid, width, height)) {
             return Ok(());
         }
-        if self.last_layout.get() == Some((xid, layout)) {
-            return Ok(());
-        }
-        if self.last_extent.get() != Some((xid, width, height)) {
-            let configure = ConfigureWindowAux::new()
-                .width(u32::from(width))
-                .height(u32::from(height));
-            self.connection
-                .configure_window(xid, &configure)
-                .map_err(Error::Transport)?
-                .check()
-                .map_err(Error::from_reply)?;
-            self.last_extent.set(Some((xid, width, height)));
-        }
-        let (rectangles, count) = layout.bounding_rectangles();
+        let configure = ConfigureWindowAux::new()
+            .width(u32::from(width))
+            .height(u32::from(height));
         self.connection
-            .shape_rectangles(
-                SO::SET,
-                SK::BOUNDING,
-                ClipOrdering::UNSORTED,
-                xid,
-                0,
-                0,
-                &rectangles[..count],
-            )
+            .configure_window(xid, &configure)
             .map_err(Error::Transport)?
             .check()
             .map_err(Error::from_reply)?;
-        self.last_layout.set(Some((xid, layout)));
+        self.last_extent.set(Some((xid, width, height)));
         Ok(())
     }
 
     /// Map or unmap the native child through a checked request.
     pub(super) fn set_mapped(&self, xid: u32, mapped: bool) -> Result<(), Error> {
         let parent = self.bound_parent()?;
-        if xid == 0 || xid == parent || xid == self.root {
+        if self.reserved_xid(xid, parent) {
             return Err(Error::State("refusing to map or unmap a reserved XID"));
         }
         let cookie = if mapped {
@@ -700,8 +597,8 @@ impl X11 {
         if xid == 0 {
             return Ok(DestroyOutcome::Absent);
         }
-        if xid == parent || xid == self.root {
-            return Err(Error::State("refusing to destroy the GPUI parent window"));
+        if self.reserved_xid(xid, parent) {
+            return Err(Error::State("refusing to destroy a reserved XID"));
         }
         if self.destroyed.get() == Some(xid) {
             return Ok(DestroyOutcome::Absent);
@@ -712,13 +609,6 @@ impl X11 {
             .is_some_and(|(current, _, _)| current == xid)
         {
             self.last_extent.set(None);
-        }
-        if self
-            .last_layout
-            .get()
-            .is_some_and(|(current, _)| current == xid)
-        {
-            self.last_layout.set(None);
         }
         match self
             .connection
@@ -738,22 +628,45 @@ impl X11 {
         }
     }
 
-    /// Drain one relevant event for the bound parent and `child`.
+    /// Drain one relevant event for the parent, companion and `child`.
     ///
     /// Notifications about retired or unrelated XIDs are discarded; `Ok(None)`
     /// means the queue is empty.
     pub(super) fn next_event(&self, child: Option<u32>) -> Result<Option<Event>, Error> {
         let parent = self.bound_parent()?;
         loop {
-            let event = match self.connection.poll_for_event() {
-                Ok(Some(event)) => event,
-                Ok(None) => return Ok(None),
-                Err(error) => return Err(Error::Transport(error)),
+            let pending = self.pending.borrow_mut().pop_front();
+            let event = match pending {
+                Some(event) => event,
+                None => match self.connection.poll_for_event() {
+                    Ok(Some(event)) => event,
+                    Ok(None) => return Ok(None),
+                    Err(error) => return Err(Error::Transport(error)),
+                },
             };
+            if matches!(
+                &event,
+                XEvent::MappingNotify(notify)
+                    if event.server_generated()
+                        && notify.request == x11rb::protocol::xproto::Mapping::KEYBOARD
+            ) {
+                self.refresh_tab_keycodes()?;
+            }
             if let Some(event) = self.interpret(parent, child, event) {
                 return Ok(Some(event));
             }
         }
+    }
+
+    fn refresh_tab_keycodes(&self) -> Result<(), Error> {
+        self.last_press.set(None);
+        self.tab_keycodes
+            .replace(self.mapped_keycodes(&[TAB_KEYSYM, ISO_LEFT_TAB_KEYSYM])?);
+        Ok(())
+    }
+
+    fn reserved_xid(&self, xid: u32, parent: u32) -> bool {
+        xid == 0 || xid == parent || xid == self.root || self.is_companion(xid)
     }
 
     fn bound_parent(&self) -> Result<u32, Error> {
@@ -772,6 +685,8 @@ impl X11 {
             XEvent::DestroyNotify(notify) if server_generated => {
                 if notify.window == parent {
                     Some(Event::ParentDestroyed)
+                } else if self.is_companion(notify.window) {
+                    Some(Event::CompanionLost)
                 } else if child == Some(notify.window) {
                     self.destroyed.set(child);
                     Some(Event::ChildDestroyed)
@@ -784,6 +699,8 @@ impl X11 {
                 // a reparent onto it again is not.
                 if child == Some(notify.window) && notify.parent != parent {
                     Some(Event::ChildReparented)
+                } else if self.is_companion(notify.window) && notify.parent != self.root {
+                    Some(Event::CompanionLost)
                 } else {
                     None
                 }
@@ -796,12 +713,61 @@ impl X11 {
                 self.parent_mapped.set(false);
                 Some(Event::GeometryChanged)
             }
+            XEvent::MapNotify(notify) if server_generated && self.is_companion(notify.window) => {
+                Some(Event::CompanionChanged)
+            }
+            XEvent::UnmapNotify(notify) if server_generated && self.is_companion(notify.window) => {
+                Some(Event::CompanionChanged)
+            }
+            XEvent::MapNotify(notify) if server_generated && child == Some(notify.window) => {
+                Some(Event::ChildMappingChanged(true))
+            }
+            XEvent::UnmapNotify(notify) if server_generated && child == Some(notify.window) => {
+                Some(Event::ChildMappingChanged(false))
+            }
+            XEvent::FocusIn(notify)
+                if server_generated && self.focus_target(notify.event).is_some() =>
+            {
+                Some(Event::FocusChanged)
+            }
+            XEvent::FocusOut(notify)
+                if server_generated && self.focus_target(notify.event).is_some() =>
+            {
+                Some(Event::FocusChanged)
+            }
+            XEvent::PropertyNotify(notify)
+                if server_generated && self.is_visibility_property(notify.window, notify.atom) =>
+            {
+                Some(Event::FocusChanged)
+            }
+            XEvent::KeyPress(notify) if server_generated && notify.root == self.root => {
+                let target = self.focus_target(notify.event)?;
+                let tab = self.tab_keycodes.borrow().contains(&notify.detail)
+                    && tab_modifiers(notify.state);
+                self.last_press.set(tab.then_some((target, notify.time)));
+                Some(Event::KeyPress {
+                    target,
+                    time: notify.time,
+                    tab,
+                })
+            }
+            XEvent::KeyRelease(notify) if server_generated && notify.root == self.root => {
+                let target = self.focus_target(notify.event)?;
+                let tab = self.tab_keycodes.borrow().contains(&notify.detail);
+                Some(Event::KeyRelease {
+                    target,
+                    time: notify.time,
+                    tab,
+                })
+            }
             XEvent::ConfigureNotify(notify) => {
                 // Only the GPUI client's rectangle can change the committed
                 // layout. The child's own ConfigureNotify is an echo of our
                 // checked resize and must not trigger a parent GetGeometry.
                 if notify.window == parent {
                     Some(Event::GeometryChanged)
+                } else if server_generated && self.is_companion(notify.window) {
+                    Some(Event::CompanionChanged)
                 } else {
                     None
                 }
@@ -824,22 +790,6 @@ fn shape_preflight_error(error: ReplyError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use x11rb::protocol::xproto::Rectangle;
-
-    fn committed(extent: (u16, u16), scale: f32) -> Layout {
-        Layout::new(extent, scale)
-            .expect("valid layout arguments")
-            .expect("nonzero extent")
-    }
-
-    fn as_tuple(rectangle: Rectangle) -> (i16, i16, u16, u16) {
-        (rectangle.x, rectangle.y, rectangle.width, rectangle.height)
-    }
-
-    fn corners(rect: Rect) -> (u16, u16, u16, u16) {
-        (rect.left, rect.top, rect.right, rect.bottom)
-    }
-
     fn is_geometry_error(result: Result<Option<Layout>, Error>) -> bool {
         matches!(result, Err(Error::Geometry(_)))
     }
@@ -859,38 +809,11 @@ mod tests {
     }
 
     #[test]
-    fn gpui_host_layout_scale_150_snaps_to_device_pixels() {
-        let layout = committed((960, 540), 1.5);
-        assert_eq!(layout.extent, (960, 540));
-        assert_eq!(corners(layout.button), (696, 234, 936, 306));
-        assert_eq!(layout.button.right - layout.button.left, 240);
-        assert_eq!(layout.button.height(), 72);
-    }
-
-    #[test]
-    fn gpui_host_layout_rounds_fractional_edges_outward() {
-        let layout = committed((999, 541), 1.3);
-        assert_eq!(layout.extent, (999, 541));
-        assert_eq!(corners(layout.button), (770, 239, 979, 302));
-    }
-
-    #[test]
-    fn gpui_host_layout_clamps_control_into_small_viewport() {
-        let layout = committed((100, 40), 1.0);
-        assert_eq!(corners(layout.button), (0, 0, 84, 40));
-        let scaled = committed((200, 60), 2.0);
-        assert_eq!(corners(scaled.button), (0, 0, 168, 60));
-    }
-
-    #[test]
-    fn gpui_host_layout_keeps_minimal_control_when_insets_overflow() {
-        let layout = committed((10, 10), 1.0);
-        assert_eq!(layout.extent, (10, 10));
-        assert_eq!(corners(layout.button), (0, 0, 1, 1));
-        let (rectangles, count) = layout.bounding_rectangles();
-        assert_eq!(count, 2);
-        assert_eq!(as_tuple(rectangles[0]), (0, 1, 10, 9));
-        assert_eq!(as_tuple(rectangles[1]), (1, 0, 9, 1));
+    fn gpui_host_layout_keeps_exact_device_extent_at_any_scale() {
+        for scale in [1.0, 1.3, 1.5, 2.0] {
+            let layout = Layout::new((999, 541), scale).unwrap().unwrap();
+            assert_eq!(layout.extent, (999, 541));
+        }
     }
 
     #[test]
@@ -907,36 +830,39 @@ mod tests {
     }
 
     #[test]
-    fn gpui_host_layout_shape_covers_extent_minus_control() {
-        let layout = committed((960, 540), 1.5);
-        let (rectangles, count) = layout.bounding_rectangles();
-        assert_eq!(count, 4);
-        assert_eq!(as_tuple(rectangles[0]), (0, 0, 960, 234));
-        assert_eq!(as_tuple(rectangles[1]), (0, 306, 960, 234));
-        assert_eq!(as_tuple(rectangles[2]), (0, 234, 696, 72));
-        assert_eq!(as_tuple(rectangles[3]), (936, 234, 24, 72));
-        let covered: u32 = rectangles[..count]
-            .iter()
-            .map(|rectangle| u32::from(rectangle.width) * u32::from(rectangle.height))
-            .sum();
-        let button = layout.button;
-        assert_eq!(
-            covered,
-            u32::from(layout.extent.0) * u32::from(layout.extent.1)
-                - u32::from(button.right - button.left) * u32::from(button.height())
-        );
-    }
-
-    #[test]
     fn gpui_host_f11_keycodes_scan_every_mapping_slot() {
         let keysyms = [
             0xffc8, 0xffc8, 0, // keycode 10
             0, 0xffc8, 0, // keycode 11
             0x0020, 0, 0, // keycode 12
         ];
-        assert_eq!(keysym_keycodes(&keysyms, 3, 10, F11_KEYSYM), vec![10, 11]);
-        assert!(keysym_keycodes(&keysyms, 0, 10, F11_KEYSYM).is_empty());
-        assert!(keysym_keycodes(&[0x0020, 0x00], 2, 10, F11_KEYSYM).is_empty());
+        assert_eq!(
+            keysym_keycodes(&keysyms, 3, 10, &[F11_KEYSYM]),
+            vec![10, 11]
+        );
+        assert!(keysym_keycodes(&keysyms, 0, 10, &[F11_KEYSYM]).is_empty());
+        assert!(keysym_keycodes(&[0x0020, 0x00], 2, 10, &[F11_KEYSYM]).is_empty());
+    }
+
+    #[test]
+    fn gpui_host_core_tab_observation_accepts_backtab_and_locks() {
+        use x11rb::protocol::xproto::KeyButMask;
+
+        assert!(tab_modifiers(
+            KeyButMask::SHIFT | KeyButMask::LOCK | KeyButMask::MOD2
+        ));
+        assert!(!tab_modifiers(KeyButMask::CONTROL | KeyButMask::SHIFT));
+        assert!(!tab_modifiers(KeyButMask::MOD1));
+        assert!(!tab_modifiers(KeyButMask::MOD4));
+        assert_eq!(
+            keysym_keycodes(
+                &[TAB_KEYSYM, ISO_LEFT_TAB_KEYSYM, 0x20, 0],
+                2,
+                23,
+                &[TAB_KEYSYM, ISO_LEFT_TAB_KEYSYM],
+            ),
+            vec![23],
+        );
     }
 
     #[test]

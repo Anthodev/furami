@@ -92,7 +92,9 @@ QtObject {
     readonly property int hoverDuration: 110
 
     // ── Bundled icons ────────────────────────────────────────────────────
-    readonly property string iconRoot: "qrc:/qt/qml/dev/antho/furami/qml/icons/"
+    // Shared with the GPUI frontend: `assets/icons/` is the single owner of
+    // the Tabler SVGs and their attribution.
+    readonly property string iconRoot: "qrc:/qt/qml/dev/antho/furami/assets/icons/"
 
     function icon(name) {
         return iconRoot + name + ".svg"

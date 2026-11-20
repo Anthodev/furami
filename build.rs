@@ -24,6 +24,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FURAMI_MEDIA_PREFIX");
     println!("cargo:rerun-if-changed=packaging/media/stack.lock.json");
     println!("cargo:rerun-if-changed=assets/logo.svg");
+    println!("cargo:rerun-if-changed=assets/icons");
 
     let lock: serde_json::Value =
         serde_json::from_str(include_str!("packaging/media/stack.lock.json"))
@@ -105,10 +106,12 @@ fn main() {
     }));
 
     // Bundled chrome icons and their attribution ship inside the binary; no
-    // icon is ever loaded from a URL or from an OS theme at runtime.
-    let mut resources: Vec<String> = std::fs::read_dir("qml/icons")
-        .expect("qml/icons directory")
-        .map(|entry| entry.expect("qml/icons entry").path())
+    // icon is ever loaded from a URL or from an OS theme at runtime. The same
+    // sources are embedded by the GPUI frontend (`gpui/brume.rs`), so the
+    // shared directory is the single owner of the icon bytes.
+    let mut resources: Vec<String> = std::fs::read_dir("assets/icons")
+        .expect("assets/icons directory")
+        .map(|entry| entry.expect("assets/icons entry").path())
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
     resources.sort();

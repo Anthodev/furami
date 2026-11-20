@@ -1,4 +1,20 @@
 //! GUI-thread GPUI adapter. Only the runtime can authorize native retirement.
+mod brume;
+mod capture_context;
+mod chrome;
+mod companion_view;
+mod controls;
+mod decisions;
+mod device_settings;
+mod idle_inhibitor;
+mod log_folder;
+mod playback_menu;
+mod preferences_page;
+mod renderer_page;
+mod settings_menu;
+mod text_field;
+mod top_chrome;
+mod volume;
 mod x11;
 
 use std::{
@@ -10,9 +26,10 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, GraphicalEnvironment, KeyDownEvent, KeyUpEvent, Render,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowDecorations, WindowOptions, div,
-    prelude::*, px, rgb, size,
+    App, Bounds, Context, FocusHandle, GraphicalEnvironment, KeyDownEvent, KeyUpEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, Render, ScrollEvent, Subscription, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
+    WindowOptions, div, point, prelude::*, px, size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -21,19 +38,20 @@ use crate::{
     domain::state::AttemptId,
     media::controller::{Generation, SurfaceToken, X11WindowId},
     ui::{
-        projection::Snapshot,
+        projection::{SessionKind, Snapshot},
         runtime::{RuntimeCoordinator, UiUpdate},
     },
 };
 
 use self::x11::{DestroyOutcome, Event, Layout, X11};
-// Opaque Brume role colors from qml/Brume.qml.
-const MATTE: u32 = 0x24273a;
-const SURFACE: u32 = 0x363a4f;
-const FOREGROUND: u32 = 0xcad3f5;
-const ACCENT: u32 = 0x8aadf4;
+use self::{
+    chrome::ChromeState,
+    companion_view::{CompanionPaint, CompanionView},
+    x11::{CompanionFacts, CompanionGeometry, FocusTarget},
+};
 
 const TICK: Duration = Duration::from_millis(16);
+const COMPANION_PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
 const FULLSCREEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
@@ -65,6 +83,7 @@ struct Lease {
     xid: Option<X11WindowId>,
     layout: Option<Layout>,
     mapped: bool,
+    observed_mapped: bool,
     prepared_paused: bool,
     poisoned: bool,
     absent: bool,
@@ -81,16 +100,23 @@ impl Lease {
 }
 
 struct ViewState {
+    product_opening: bool,
     phase: GatePhase,
     attempt: Option<AttemptId>,
+    generation: u64,
+    restart_generation: u64,
     snapshot: Option<Rc<Snapshot>>,
     can_open: bool,
+    can_restart: bool,
     can_toggle_pause: bool,
     paused: bool,
     disconnected: bool,
     failed: bool,
     diagnostic: String,
+    decision_diagnostic: String,
     settings_status: String,
+    stats_hidden: bool,
+    logging_enabled: bool,
     close_dialog: String,
     fullscreen: bool,
     closing: bool,
@@ -99,17 +125,24 @@ struct ViewState {
 impl Default for ViewState {
     fn default() -> Self {
         Self {
+            product_opening: false,
             phase: GatePhase::Idle,
             attempt: None,
+            generation: 0,
+            restart_generation: 0,
             snapshot: None,
             can_open: false,
+            can_restart: false,
             can_toggle_pause: false,
             paused: false,
             disconnected: false,
             failed: false,
             diagnostic: String::new(),
+            decision_diagnostic: String::new(),
             settings_status: String::new(),
             close_dialog: String::new(),
+            stats_hidden: false,
+            logging_enabled: false,
             fullscreen: false,
             closing: false,
         }
@@ -178,8 +211,30 @@ impl PendingFullscreen {
 
 struct HostState {
     runtime: RuntimeCoordinator,
+    display: Box<str>,
     x11: Option<X11>,
     root: u32,
+    companion: Option<WindowHandle<CompanionView>>,
+    companion_paint: Rc<RefCell<Option<CompanionPaint>>>,
+    companion_input_popup: Option<chrome::Popup>,
+    remap_popup_focus: Option<chrome::Popup>,
+    keyboard_popup_focus: Option<chrome::Popup>,
+    companion_mode: CompanionMode,
+    companion_geometry: Option<CompanionGeometry>,
+    companion_facts: Option<CompanionFacts>,
+    chrome: ChromeState,
+    volume: volume::VolumeState,
+    top_refresh_due: Option<Instant>,
+    settings_refresh_due: Option<Instant>,
+    log_folder_pending: Option<(u64, String)>,
+    overlay_opacity: f32,
+    overlay_epoch: u64,
+    focus_intent: bool,
+    return_focus_intent: bool,
+    keyboard_intent: Option<(bool, Instant)>,
+    fullscreen_intent: bool,
+    keyboard_time: Option<(FocusTarget, u32, Instant)>,
+    native_fullscreen: bool,
     lease: Option<Lease>,
     last_attempt: Option<AttemptId>,
     last_retired_xid: u32,
@@ -202,12 +257,47 @@ struct HostState {
     qualification_failure: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompanionMode {
+    Unmapped,
+    Preparing(Instant),
+    Visible,
+    Lost,
+}
+
+enum FocusChange {
+    ToChrome { backward: bool },
+    ToVideo,
+}
+
 impl HostState {
-    fn new(runtime: RuntimeCoordinator, x11: Option<X11>) -> Self {
+    fn new(runtime: RuntimeCoordinator, x11: Option<X11>, display: &str) -> Self {
         Self {
             runtime,
+            display: display.into(),
             x11,
             root: 0,
+            companion: None,
+            companion_paint: Rc::default(),
+            companion_input_popup: None,
+            remap_popup_focus: None,
+            keyboard_popup_focus: None,
+            companion_mode: CompanionMode::Unmapped,
+            companion_geometry: None,
+            companion_facts: None,
+            chrome: ChromeState::default(),
+            volume: volume::VolumeState::default(),
+            top_refresh_due: None,
+            settings_refresh_due: None,
+            log_folder_pending: None,
+            overlay_opacity: 0.,
+            overlay_epoch: 0,
+            focus_intent: false,
+            return_focus_intent: false,
+            keyboard_intent: None,
+            fullscreen_intent: false,
+            keyboard_time: None,
+            native_fullscreen: false,
             lease: None,
             last_attempt: None,
             last_retired_xid: 0,
@@ -276,14 +366,19 @@ impl HostState {
             ui_snapshot,
             phase,
             generation,
+            restart_generation,
             product_phase,
             failed,
             can_open,
+            can_restart,
             can_toggle_pause,
             paused,
             context_diagnostic,
+            diagnostic,
             settings_status,
             close_dialog,
+            stats_hidden,
+            logging_enabled,
             fullscreen,
             closing,
             prepared_paused,
@@ -291,6 +386,8 @@ impl HostState {
             create_native,
             release_native,
             quit,
+            log_folder_request,
+            log_folder_path,
             ..
         } = update;
         let attempt = AttemptId::new(generation);
@@ -302,6 +399,8 @@ impl HostState {
         }
         if changed {
             self.view.phase = phase;
+            self.view.generation = generation;
+            self.view.restart_generation = restart_generation;
             // Qualification projects its constant generation even when idle.
             self.view.attempt = attempt.filter(|_| {
                 create_native
@@ -312,13 +411,24 @@ impl HostState {
                     )
             });
             self.view.disconnected = product_phase == "Disconnected";
+            self.view.product_opening =
+                matches!(phase, GatePhase::WaitingSurface | GatePhase::Opening)
+                    || self
+                        .view
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.opening);
             self.view.failed = failed;
             self.view.can_open = can_open;
+            self.view.can_restart = can_restart;
             self.view.can_toggle_pause = can_toggle_pause;
             self.view.paused = paused;
             self.view.diagnostic = context_diagnostic;
+            self.view.decision_diagnostic = diagnostic;
             self.view.settings_status = settings_status;
             self.view.close_dialog = close_dialog;
+            self.view.stats_hidden = stats_hidden;
+            self.view.logging_enabled = logging_enabled;
             self.view.closing = closing;
             self.redraw = true;
         }
@@ -332,6 +442,10 @@ impl HostState {
             && Some(lease.attempt) == attempt
         {
             lease.prepared_paused |= prepared_paused;
+        }
+
+        if log_folder_request != 0 {
+            self.log_folder_pending = Some((log_folder_request, log_folder_path));
         }
 
         // These are delivery edges, independent of scalar/snapshot equality.
@@ -365,6 +479,7 @@ impl HostState {
             xid: None,
             layout: None,
             mapped: false,
+            observed_mapped: false,
             prepared_paused,
             poisoned: false,
             absent: false,
@@ -560,7 +675,18 @@ impl HostState {
     }
 
     fn report_x11_error(&mut self, reason: &'static str, error: &x11::Error) {
-        self.control_lost |= error.is_connection_loss();
+        if error.is_connection_loss() && !self.control_lost {
+            self.control_lost = true;
+            if let Some(x11) = &self.x11
+                && x11.companion_xid().is_some()
+            {
+                if let Err(error) = x11.quarantine_companion_after_connection_loss(&self.display) {
+                    tracing::error!(event_code = "gpui_companion_quarantine_failed", %error);
+                }
+                self.companion_mode = CompanionMode::Lost;
+                self.set_overlay_opacity(0.);
+            }
+        }
         if self.control_lost && self.lease.is_none() {
             self.x11 = None;
         }
@@ -627,6 +753,250 @@ impl HostState {
         self.request_close();
     }
 
+    fn companion_lost(&mut self, reason: &'static str) {
+        if self.companion_mode == CompanionMode::Lost {
+            return;
+        }
+        tracing::error!(event_code = "gpui_companion_loss", reason, root = self.root);
+        self.companion_mode = CompanionMode::Lost;
+        self.overlay_opacity = 0.;
+        self.failure.get_or_insert(GpuiLaunchError::NativeLoss);
+        // The managed root can still display save/durability decisions. The
+        // loss of chrome is neither a lost media surface nor an owner ACK.
+        if !self.quit_authorized {
+            self.request_close();
+        }
+    }
+
+    fn set_overlay_opacity(&mut self, opacity: f32) {
+        if self.overlay_opacity != opacity {
+            self.overlay_opacity = opacity;
+            self.redraw = true;
+        }
+    }
+
+    fn hide_companion(&mut self) -> Result<(), x11::Error> {
+        if matches!(
+            self.companion_mode,
+            CompanionMode::Visible | CompanionMode::Preparing(_)
+        ) {
+            let focus_result = self.x11().return_focus();
+            self.x11().hide_companion()?;
+            self.companion_mode = CompanionMode::Unmapped;
+            self.companion_input_popup = None;
+            self.set_overlay_opacity(0.);
+            self.volume.reset();
+            tracing::info!(
+                event_code = "gpui_companion_hidden",
+                epoch = self.overlay_epoch
+            );
+            focus_result?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_companion(
+        &mut self,
+        native_changed: bool,
+        geometry_changed: bool,
+        companion_changed: bool,
+    ) -> Result<Option<FocusChange>, x11::Error> {
+        if self.companion.is_none() || self.companion_mode == CompanionMode::Lost {
+            return Ok(None);
+        }
+        if native_changed || self.companion_facts.is_none() {
+            self.companion_facts = Some(self.x11().companion_facts()?);
+        }
+        let available = self.accepts_input()
+            && self
+                .companion_facts
+                .as_ref()
+                .is_some_and(|facts| facts.root_viewable && facts.focus.is_some());
+        let now = Instant::now();
+        self.chrome
+            .reconcile(available, self.view.snapshot.as_deref(), now);
+        if available
+            && matches!(
+                self.decision_view().identity(),
+                Some(decisions::Identity::Reset(_))
+            )
+        {
+            if !self
+                .chrome
+                .popup()
+                .is_some_and(|popup| popup.invoker == decisions::RESET_POPUP)
+            {
+                self.chrome.open_popup(decisions::RESET_POPUP, now);
+                self.keyboard_popup_focus = self.chrome.popup();
+                self.redraw = true;
+            }
+        } else if let Some(popup) = self.chrome.popup()
+            && popup.invoker == decisions::RESET_POPUP
+        {
+            self.chrome.dismiss(popup, now);
+            self.return_focus_intent = true;
+            self.redraw = true;
+        }
+        if self.keyboard_popup_focus != self.chrome.popup() {
+            self.keyboard_popup_focus = None;
+        }
+        let resizable_popup = self
+            .chrome
+            .popup()
+            .filter(|popup| popup.invoker != controls::OPTIONS_ID);
+        if self.remap_popup_focus != resizable_popup {
+            self.remap_popup_focus = None;
+        }
+        let opacity = self.chrome.opacity(now);
+        if opacity == 0. {
+            self.hide_companion()?;
+            if !available {
+                self.focus_intent = false;
+                self.return_focus_intent = false;
+                self.keyboard_intent = None;
+                self.keyboard_time = None;
+            }
+            return Ok(None);
+        }
+        if native_changed
+            && matches!(
+                self.companion_mode,
+                CompanionMode::Visible | CompanionMode::Preparing(_)
+            )
+            && self
+                .companion_facts
+                .as_ref()
+                .is_some_and(|facts| !facts.companion_viewable)
+        {
+            self.hide_companion()?;
+            self.companion_geometry = None;
+        }
+        if geometry_changed || companion_changed || self.companion_geometry.is_none() {
+            let geometry = self.x11().companion_geometry()?;
+            let resized = self
+                .companion_geometry
+                .is_some_and(|old| (old.width, old.height) != (geometry.width, geometry.height));
+            if resized {
+                if self
+                    .companion_facts
+                    .as_ref()
+                    .is_some_and(|facts| facts.focus == Some(FocusTarget::Companion))
+                {
+                    self.remap_popup_focus = resizable_popup;
+                }
+                self.hide_companion()?;
+            }
+            if self.x11().place_companion(geometry)? {
+                self.hide_companion()?;
+            }
+            self.companion_geometry = Some(geometry);
+        }
+        let Some(geometry) = self.companion_geometry else {
+            return Ok(None);
+        };
+        let extent = (geometry.width, geometry.height);
+        if self.companion_mode == CompanionMode::Unmapped {
+            if self.x11().map_companion()? {
+                self.overlay_epoch += 1;
+                self.companion_mode = CompanionMode::Preparing(now);
+                self.redraw = true;
+                tracing::info!(
+                    event_code = "gpui_companion_stage",
+                    xid = self.x11().companion_xid(),
+                    epoch = self.overlay_epoch,
+                );
+            }
+            return Ok(None);
+        }
+        // GPUI reports the scene committed by the frame loop; the native
+        // compositor proof separately verifies what actually became visible.
+        let paint = self.companion_paint.borrow_mut().take();
+        let mut focus = None;
+        if let Some(paint) = paint
+            && paint.epoch == self.overlay_epoch
+            && paint.extent == extent
+            && paint.popup == self.chrome.popup()
+            && (self.companion_mode == CompanionMode::Visible || paint.blank)
+        {
+            if !self
+                .x11()
+                .present_companion(self.scale, &paint.hits, paint.modal)?
+            {
+                self.hide_companion()?;
+                self.companion_geometry = None;
+                return Ok(None);
+            }
+            self.companion_input_popup = if !paint.blank && !paint.hits.is_empty() {
+                paint.popup
+            } else {
+                None
+            };
+            // Restore only the popup that lost focus to this resize.
+            // The checked transfer still requires the active, viewable family.
+            if let Some(popup) = self.remap_popup_focus
+                && self.companion_input_popup == Some(popup)
+            {
+                self.remap_popup_focus = None;
+                self.x11().focus_companion()?;
+            }
+            if let Some(popup) = self.keyboard_popup_focus
+                && self.companion_input_popup == Some(popup)
+            {
+                self.keyboard_popup_focus = None;
+                if self.x11().focus_companion()? {
+                    focus = Some(FocusChange::ToChrome { backward: false });
+                }
+            }
+            if matches!(self.companion_mode, CompanionMode::Preparing(_)) {
+                self.companion_mode = CompanionMode::Visible;
+                tracing::info!(
+                    event_code = "gpui_companion_visible",
+                    xid = self.x11().companion_xid(),
+                    epoch = self.overlay_epoch,
+                );
+            }
+        }
+        if let CompanionMode::Preparing(since) = self.companion_mode
+            && now.duration_since(since) >= COMPANION_PREPARE_TIMEOUT
+        {
+            self.hide_companion()?;
+            self.companion_lost("companion-preparation-timeout");
+            return Ok(None);
+        }
+        if self.companion_mode == CompanionMode::Visible {
+            self.set_overlay_opacity(opacity);
+            let key = self
+                .keyboard_time
+                .filter(|(_, _, received)| now.saturating_duration_since(*received) <= TICK * 6);
+            self.keyboard_time = key;
+            if std::mem::take(&mut self.return_focus_intent) {
+                let returned = if let Some((FocusTarget::Companion, time, _)) = key {
+                    self.keyboard_time = None;
+                    self.x11().focus_with_key(FocusTarget::Root, time)?
+                        || self.x11().return_focus()?
+                } else {
+                    self.x11().return_focus()?
+                };
+                if returned {
+                    focus = Some(FocusChange::ToVideo);
+                }
+            } else if std::mem::take(&mut self.focus_intent) {
+                self.x11().focus_companion()?;
+            } else if let Some((backward, _)) = self
+                .keyboard_intent
+                .filter(|(_, requested)| now.saturating_duration_since(*requested) <= TICK * 6)
+                && let Some((FocusTarget::Root, time, _)) = key
+            {
+                self.keyboard_intent = None;
+                self.keyboard_time = None;
+                if self.x11().focus_with_key(FocusTarget::Companion, time)? {
+                    focus = Some(FocusChange::ToChrome { backward });
+                }
+            }
+        }
+        Ok(focus)
+    }
+
     fn force_close(&mut self) {
         self.closing = true;
         self.cancel_fullscreen();
@@ -659,6 +1029,7 @@ impl HostState {
     fn cancel_fullscreen(&mut self) {
         self.f11_down = false;
         self.fullscreen_pending = None;
+        self.fullscreen_intent = false;
     }
 
     fn accepts_input(&self) -> bool {
@@ -671,6 +1042,62 @@ impl HostState {
 
     fn video_mapped(&self) -> bool {
         self.lease.as_ref().is_some_and(|lease| lease.mapped)
+    }
+
+    fn idle_inhibit_wanted(&self) -> bool {
+        !self.root_lost
+            && !self.control_lost
+            && self.accepts_input()
+            && self.view.phase == GatePhase::Ready
+            && !self.view.paused
+            && self.companion_facts.is_some_and(|facts| facts.root_mapped)
+            && self
+                .view
+                .snapshot
+                .as_deref()
+                .is_some_and(|snapshot| !snapshot.paused && snapshot.live.playback_status == "Live")
+            && self.lease.as_ref().is_some_and(|lease| {
+                self.view.attempt == Some(lease.attempt)
+                    && lease.xid.is_some()
+                    && lease.layout.is_some()
+                    && lease.mapped
+                    && lease.observed_mapped
+                    && !lease.poisoned
+                    && !lease.absent
+            })
+    }
+
+    fn decision_view(&self) -> decisions::DecisionView<'_> {
+        decisions::DecisionView {
+            close_dialog: &self.view.close_dialog,
+            settings: self
+                .view
+                .snapshot
+                .as_deref()
+                .map(|snapshot| &snapshot.settings),
+            status: &self.view.settings_status,
+            diagnostic: &self.view.decision_diagnostic,
+        }
+    }
+
+    fn dispatch_decision(
+        &mut self,
+        rendered: decisions::Identity,
+        intent: decisions::Intent,
+    ) -> bool {
+        if self.decision_view().identity() != Some(rendered) || !rendered.accepts(intent) {
+            return false;
+        }
+        let update = match intent {
+            decisions::Intent::DecideReset { token, confirmed } if self.accepts_input() => {
+                self.runtime.decide_reset(token.get(), confirmed)
+            }
+            decisions::Intent::DecideReset { .. } => return false,
+            decisions::Intent::RetrySave => self.runtime.retry_save(),
+            decisions::Intent::CloseWithoutSave => self.runtime.close_without_save(),
+        };
+        self.consume(update);
+        true
     }
 
     fn action(&self) -> Option<Action> {
@@ -728,14 +1155,41 @@ impl HostState {
         }
     }
 
+    fn request_fullscreen(&mut self) {
+        self.fullscreen_intent |= self.f11_press(self.native_fullscreen);
+    }
+
     /// Drain native events first, and return whether to issue the saved-mode
     /// toggle outside this borrow.
-    fn tick(&mut self, scale: f32, fullscreen: bool) -> bool {
-        let mut geometry_changed = std::mem::take(&mut self.bounds_changed);
+    fn tick(&mut self, scale: f32, fullscreen: bool) -> (bool, Option<FocusChange>) {
+        let mut geometry_changed =
+            std::mem::take(&mut self.bounds_changed) || self.native_fullscreen != fullscreen;
+        self.native_fullscreen = fullscreen;
+        let mut native_changed = false;
+        let mut companion_changed = false;
         if !self.root_lost && !self.control_lost {
             loop {
                 match self.x11().next_event(self.xid()) {
                     Ok(Some(Event::GeometryChanged)) => geometry_changed = true,
+                    Ok(Some(Event::CompanionChanged)) => companion_changed = true,
+                    Ok(Some(Event::FocusChanged)) => native_changed = true,
+                    Ok(Some(Event::ChildMappingChanged(mapped))) => {
+                        if let Some(lease) = &mut self.lease {
+                            lease.observed_mapped = mapped;
+                        }
+                    }
+                    Ok(Some(Event::CompanionLost)) => {
+                        let _ = self.x11().hide_companion();
+                        self.companion_lost("companion-destroyed-or-reparented");
+                    }
+                    Ok(Some(Event::KeyPress {
+                        target,
+                        time,
+                        tab: true,
+                    })) => {
+                        self.keyboard_time = Some((target, time, Instant::now()));
+                    }
+                    Ok(Some(Event::KeyPress { .. } | Event::KeyRelease { .. })) => {}
                     Ok(Some(Event::ParentDestroyed)) => {
                         self.report_loss("root-destroyed", false, true);
                         break;
@@ -768,16 +1222,38 @@ impl HostState {
             let update = self.runtime.poll();
             self.consume(update);
         }
-        if self.root_lost || self.control_lost || self.quit_authorized {
-            return false;
+        if self.root_lost || self.control_lost {
+            return (false, None);
         }
+        let focus = match self.reconcile_companion(
+            native_changed || companion_changed || geometry_changed,
+            geometry_changed,
+            companion_changed,
+        ) {
+            Ok(focus) => focus,
+            Err(error) => {
+                tracing::error!(event_code = "gpui_companion_native_failed", %error);
+                if error.is_connection_loss() {
+                    self.report_x11_error("companion-connection-failed", &error);
+                } else {
+                    let _ = self.hide_companion();
+                    self.companion_lost("companion-native-failed");
+                }
+                return (false, None);
+            }
+        };
+        if self.quit_authorized {
+            return (false, None);
+        }
+        self.top_refresh_tick();
+        self.tick_settings_refresh(Instant::now());
         if let Err(error) = self.update_mapping() {
             self.report_x11_error("mapping-failed", &error);
-            return false;
+            return (false, None);
         }
         if !self.accepts_input() {
             self.cancel_fullscreen();
-            return false;
+            return (false, None);
         }
         if let Some(persist) = self
             .fullscreen_pending
@@ -790,7 +1266,7 @@ impl HostState {
                 // authorizes persistence. Refresh server geometry first.
                 if let Err(error) = self.resize(!geometry_changed, scale) {
                     self.report_x11_error("fullscreen-layout-failed", &error);
-                    return false;
+                    return (false, None);
                 }
                 let update = self.runtime.set_fullscreen(fullscreen);
                 self.consume(update);
@@ -804,10 +1280,10 @@ impl HostState {
                     false,
                     Instant::now(),
                 ));
-                return true;
+                return (true, focus);
             }
         }
-        false
+        (std::mem::take(&mut self.fullscreen_intent), focus)
     }
 }
 
@@ -827,20 +1303,19 @@ fn phase_name(phase: GatePhase) -> &'static str {
 struct HostView {
     state: Rc<RefCell<HostState>>,
     focus: FocusHandle,
-    _subscriptions: [Subscription; 3],
+    decision_focus: decisions::DecisionFocus,
+    decision_scroll: gpui::ScrollHandle,
+    idle_inhibitor: idle_inhibitor::IdleInhibitor,
+    _subscriptions: [Subscription; 2],
 }
 
 impl HostView {
     fn new(window: &mut Window, cx: &mut Context<Self>, state: Rc<RefCell<HostState>>) -> Self {
         let focus = cx.focus_handle();
+        let idle_inhibitor = idle_inhibitor::IdleInhibitor::new(cx.background_executor().clone());
         focus.focus(window, cx);
         let bounds = cx.observe_window_bounds(window, |this, _, _| {
             this.state.borrow_mut().bounds_changed = true;
-        });
-        let activation = cx.observe_window_activation(window, |this, window, _| {
-            if !window.is_window_active() {
-                this.state.borrow_mut().f11_down = false;
-            }
         });
         // A control that unmounts (or stops being a tab stop) takes its focus
         // handle with it, which leaves the window with no focused element.
@@ -866,16 +1341,52 @@ impl HostView {
                 let result = cx.update(|window, cx| {
                     let view = view.upgrade()?;
                     Some(view.update(cx, |view, cx| {
-                        let (redraw, quit, restore_fullscreen) = {
+                        let (redraw, quit, toggle_fullscreen, companion, focus, log_folder) = {
                             let mut state = view.state.borrow_mut();
-                            // Keep reading native events while the owner stops.
-                            let restore = state.tick(window.scale_factor(), window.is_fullscreen());
+                            let (toggle, focus) =
+                                state.tick(window.scale_factor(), window.is_fullscreen());
                             let quit = state.quit_authorized && !state.quit_requested;
                             state.quit_requested |= quit;
-                            (std::mem::take(&mut state.redraw), quit, restore)
+                            (
+                                std::mem::take(&mut state.redraw),
+                                quit,
+                                toggle,
+                                state.companion,
+                                focus,
+                                state.log_folder_pending.take().filter(|(request, _)| {
+                                    state.runtime.claim_log_folder_dispatch(*request)
+                                }),
+                            )
                         };
-                        if restore_fullscreen {
+                        view.idle_inhibitor
+                            .reconcile(view.state.borrow().idle_inhibit_wanted());
+                        if let Some((request, path)) = log_folder {
+                            log_folder::launch(cx, request, path);
+                        }
+                        if toggle_fullscreen {
                             window.toggle_fullscreen();
+                        }
+                        if let Some(companion) = companion
+                            && (redraw || focus.is_some())
+                            && !quit
+                            && companion
+                                .update(cx, |view, window, cx| {
+                                    match focus {
+                                        Some(FocusChange::ToChrome { backward }) => {
+                                            view.request_focus(backward, window, cx)
+                                        }
+                                        Some(FocusChange::ToVideo) => {
+                                            view.confirm_video_focus(window, cx)
+                                        }
+                                        None => {}
+                                    }
+                                    cx.notify();
+                                })
+                                .is_err()
+                        {
+                            view.state
+                                .borrow_mut()
+                                .companion_lost("companion-unavailable");
                         }
                         // GPUI can release a control's focus handle before the
                         // next frame reports the loss; keep the host root focused.
@@ -916,7 +1427,10 @@ impl HostView {
         Self {
             state,
             focus,
-            _subscriptions: [bounds, activation, focus_lost],
+            decision_focus: decisions::DecisionFocus::new(cx),
+            decision_scroll: gpui::ScrollHandle::new(),
+            idle_inhibitor,
+            _subscriptions: [bounds, focus_lost],
         }
     }
 
@@ -937,6 +1451,22 @@ impl HostView {
             .unwrap_or_else(|| self.focus.clone());
         target.focus(window, cx);
     }
+
+    fn dismiss_popup(&self, cx: &mut App) -> bool {
+        if self.state.borrow().decision_view().identity().is_some() {
+            return true;
+        }
+        let (companion, popup) = {
+            let state = self.state.borrow();
+            (state.companion, state.chrome.popup())
+        };
+        if let (Some(companion), Some(popup)) = (companion, popup) {
+            let _ = companion.update(cx, |view, window, cx| view.dismiss_popup(popup, window, cx));
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Render for HostView {
@@ -945,21 +1475,103 @@ impl Render for HostView {
             .size_full()
             .relative()
             .track_focus(&self.focus)
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
+                this.state
+                    .borrow_mut()
+                    .chrome
+                    .pointer(event.position, Instant::now());
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    let popup_pending = {
+                        let state = this.state.borrow();
+                        state.chrome.popup().is_some_and(|popup| {
+                            popup.invoker != controls::OPTIONS_ID
+                                && state.companion_input_popup != Some(popup)
+                        })
+                    };
+                    if popup_pending {
+                        // The companion is still installing the panel shape;
+                        // this could be a press inside that panel.
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.dismiss_popup(cx) {
+                        cx.stop_propagation();
+                    } else {
+                        let mut state = this.state.borrow_mut();
+                        state.focus_intent = false;
+                        state.keyboard_intent = None;
+                        // A video press requests video focus, not a playback
+                        // action. The native transfer rechecks family ownership.
+                        state.return_focus_intent = state.companion_mode == CompanionMode::Visible;
+                    }
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let modifiers = event.keystroke.modifiers;
-                if event.keystroke.key == "f11" && !modifiers.modified() {
-                    let request = this.state.borrow_mut().f11_press(window.is_fullscreen());
-                    if request {
-                        window.toggle_fullscreen();
+                let key = event.keystroke.key.as_str();
+                if key == "tab" && modifiers.number_of_modifiers() == u8::from(modifiers.shift) {
+                    let mut state = this.state.borrow_mut();
+                    if let Some(identity) = state.decision_view().identity() {
+                        if let decisions::Identity::Reset(_) = identity {
+                            if !event.is_held {
+                                state.keyboard_popup_focus = state.chrome.popup();
+                            }
+                        } else if !event.is_held {
+                            let current = window.focused(cx);
+                            let target = if identity == decisions::Identity::DurabilityWarning
+                                || current.as_ref() == Some(this.decision_focus.primary())
+                            {
+                                this.decision_focus.secondary()
+                            } else if current.as_ref() == Some(this.decision_focus.secondary()) {
+                                this.decision_focus.primary()
+                            } else {
+                                this.decision_focus.boundary(identity, modifiers.shift)
+                            };
+                            drop(state);
+                            target.focus(window, cx);
+                        }
+                    } else if state.accepts_input() && !event.is_held {
+                        let now = Instant::now();
+                        state.chrome.keyboard(false, now);
+                        state.keyboard_intent = Some((modifiers.shift, now));
                     }
                     cx.stop_propagation();
-                } else if event.keystroke.key == "tab"
-                    && modifiers.number_of_modifiers() == u8::from(modifiers.shift)
-                {
-                    if modifiers.shift {
-                        window.focus_prev(cx);
-                    } else {
-                        window.focus_next(cx);
+                } else if !modifiers.modified() {
+                    match key {
+                        "f11" => {
+                            let mut state = this.state.borrow_mut();
+                            if state.decision_view().identity().is_none() {
+                                state.request_fullscreen();
+                            }
+                        }
+                        "escape" if !event.is_held => {
+                            if !this.dismiss_popup(cx) {
+                                let mut state = this.state.borrow_mut();
+                                if state.accepts_input() {
+                                    let now = Instant::now();
+                                    if matches!(state.runtime, RuntimeCoordinator::Capture(_)) {
+                                        state.open_capture_menu(settings_menu::Section::Index, now);
+                                        state.keyboard_popup_focus = state.chrome.popup();
+                                    } else {
+                                        state.chrome.open_popup(controls::OPTIONS_ID, now);
+                                        state.redraw = true;
+                                    }
+                                }
+                            }
+                        }
+                        "space" if !event.is_held => {
+                            let mut state = this.state.borrow_mut();
+                            if state.decision_view().identity().is_none()
+                                && state.chrome.popup().is_none()
+                                && let Some(action @ Action::TogglePause(..)) = state.action()
+                            {
+                                state.activate(action);
+                            }
+                        }
+                        _ => return,
                     }
                     cx.stop_propagation();
                 }
@@ -968,6 +1580,24 @@ impl Render for HostView {
                 if event.keystroke.key == "f11" {
                     this.state.borrow_mut().f11_release();
                     cx.stop_propagation();
+                }
+            }))
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                let (companion_mode, popup) = {
+                    let state = this.state.borrow();
+                    (state.companion_mode, state.chrome.popup())
+                };
+                // The video/empty viewport routes the wheel whenever the app
+                // family owns input, even if chrome is hidden: the event both
+                // adjusts the gain and reveals the chrome.
+                let outcome = {
+                    let mut state = this.state.borrow_mut();
+                    let active = companion_mode == CompanionMode::Visible || popup.is_some();
+                    state.volume_wheel(event, active)
+                };
+                if outcome != volume::WheelOutcome::Ignore {
+                    this.state.borrow_mut().chrome.wheel(Instant::now());
+                    cx.notify();
                 }
             }));
         let state = self.state.borrow();
@@ -980,131 +1610,99 @@ impl Render for HostView {
             .justify_center()
             .gap_3()
             .p_4()
-            .bg(rgb(MATTE))
-            .text_color(rgb(FOREGROUND));
-        let overlay = if !view.close_dialog.is_empty() {
-            let save_failed = view.close_dialog == "save";
-            panel = panel.child(view.settings_status.clone());
-            if save_failed {
-                panel = panel.child(decision_button("retry-save", "Retry save").on_click(
-                    cx.listener(|this, _, _, cx| {
-                        let mut state = this.state.borrow_mut();
-                        if state.view.close_dialog == "save" {
-                            let update = state.runtime.retry_save();
-                            state.consume(update);
+            .bg(brume::WINDOW)
+            .text_color(brume::FOREGROUND);
+        if let Some(
+            identity @ (decisions::Identity::SaveFailure | decisions::Identity::DurabilityWarning),
+        ) = state.decision_view().identity()
+        {
+            let weak = cx.weak_entity();
+            let dispatch: decisions::Dispatch = Rc::new(move |intent, _, _, cx| {
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |this, cx| {
+                        if this.state.borrow_mut().dispatch_decision(identity, intent) {
                             cx.notify();
                         }
-                    }),
-                ));
+                    });
+                }
+            });
+            if let Some(body) = decisions::paint(
+                state.decision_view(),
+                &self.decision_focus,
+                &controls::HitRegions::new(),
+                Some(&self.decision_scroll),
+                &dispatch,
+            ) {
+                panel = panel.child(
+                    body.w(px(decisions::WIDTH))
+                        .max_w_full()
+                        .p(px(brume::EDGE))
+                        .rounded(px(brume::RADIUS_SURFACE))
+                        .bg(brume::MENU_SURFACE),
+                );
             }
-            panel = panel.child(
-                decision_button(
-                    "close-without-save",
-                    if save_failed {
-                        "Close without saving"
+        } else if !state.video_mapped() {
+            let snapshot = view.snapshot.as_deref();
+            let qualification =
+                snapshot.is_some_and(|data| data.session_kind == SessionKind::QualificationVideo);
+            let (title, detail) = if state.closing || view.closing {
+                ("Closing…", "")
+            } else if view.failed {
+                ("Video unavailable", "")
+            } else if snapshot.is_none() {
+                ("Preparing the interface…", "")
+            } else if view.disconnected {
+                let evidence = snapshot.map_or("", |data| data.recovery.evidence.as_str());
+                (
+                    "Capture disconnected",
+                    if evidence.is_empty() {
+                        "Use Options to reconnect a source."
                     } else {
-                        "Close anyway"
+                        evidence
                     },
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let mut state = this.state.borrow_mut();
-                    if matches!(state.view.close_dialog.as_str(), "save" | "warning") {
-                        let update = state.runtime.close_without_save();
-                        state.consume(update);
-                        cx.notify();
-                    }
-                })),
-            );
-            None
-        } else {
-            let message = if state.closing || view.closing {
-                "Closing…"
-            } else if view.failed || view.disconnected {
-                "Video unavailable"
-            } else if view
-                .snapshot
+            } else if view.product_opening {
+                if qualification {
+                    (
+                        "Opening the qualification video…",
+                        "Preparing local file playback.",
+                    )
+                } else {
+                    ("Opening capture…", "Validating and opening the source.")
+                }
+            } else if state
+                .lease
                 .as_ref()
-                .is_some_and(|snapshot| snapshot.opening)
+                .is_some_and(|lease| lease.prepared_paused)
             {
-                "Opening video…"
-            } else if view.phase == GatePhase::Ready {
-                "Video ready"
+                (
+                    "Capture hidden until resume",
+                    "Capture will resume when resume is requested.",
+                )
+            } else if qualification {
+                ("Qualification video", "")
+            } else if let Some(data) = snapshot
+                && (data.selection.is_some() || data.applied.is_some() || data.last_valid.is_some())
+            {
+                (data.product_phase.as_str(), "")
             } else {
-                "No video open"
+                (
+                    "No capture selected",
+                    "Choose a source in Options: capture opens immediately.",
+                )
             };
-            let mapped = state.video_mapped();
-            if !mapped {
-                panel = panel
-                    .child(message)
-                    .when(!view.diagnostic.is_empty(), |panel| {
-                        panel.child(view.diagnostic.clone())
-                    });
-            }
-            let action = state.action();
-            let label = match action {
-                Some(Action::Open) => "Open capture",
-                Some(Action::TogglePause(_, true)) => "Resume",
-                Some(Action::TogglePause(_, false)) => "Pause",
-                None => message,
-            };
-            state
-                .layout
-                .filter(|_| mapped || action.is_some())
-                .map(|layout| overlay_button(layout, state.scale, label, action, cx))
-        };
-        input.child(panel).children(overlay)
+            panel = panel
+                .child(controls::label(
+                    title.to_owned(),
+                    controls::LabelVariant::Title,
+                ))
+                .when(!detail.is_empty(), |panel| panel.child(detail.to_owned()))
+                .when(!view.diagnostic.is_empty(), |panel| {
+                    panel.child(view.diagnostic.clone())
+                });
+        }
+        input.child(panel)
     }
-}
-
-fn overlay_button(
-    layout: Layout,
-    scale: f32,
-    label: &'static str,
-    action: Option<Action>,
-    cx: &mut Context<HostView>,
-) -> gpui::Stateful<gpui::Div> {
-    let rect = layout.button;
-    let logical = |pixels| px(f32::from(pixels) / scale);
-    div()
-        .id("capture-control")
-        .absolute()
-        .left(logical(rect.left))
-        .top(logical(rect.top))
-        .w(logical(rect.right - rect.left))
-        .h(logical(rect.bottom - rect.top))
-        .overflow_hidden()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgb(SURFACE))
-        .text_color(rgb(FOREGROUND))
-        // Keep the same focus node through a pending pause/resume. It is not
-        // a tab target and has no action until the runtime confirms the edge.
-        .tab_index(0)
-        .tab_stop(action.is_some())
-        .child(label)
-        .when_some(action, |button, action| {
-            // GPUI also invokes this on focused Enter/Space release.
-            button
-                .cursor_pointer()
-                .focus(|style| style.text_color(rgb(ACCENT)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.state.borrow_mut().activate(action);
-                    cx.notify();
-                }))
-        })
-}
-
-fn decision_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .tab_index(0)
-        .cursor_pointer()
-        .bg(rgb(SURFACE))
-        .focus(|style| style.text_color(rgb(ACCENT)))
-        .py_2()
-        .px_4()
-        .child(label)
 }
 
 unsafe extern "C" {
@@ -1150,7 +1748,7 @@ pub(super) fn run(display: &str, runtime: RuntimeCoordinator) -> Result<(), Gpui
             None
         }
     };
-    let mut host = HostState::new(runtime, x11);
+    let mut host = HostState::new(runtime, x11, display);
     if host.x11.is_none() {
         host.drain_without_gui("setup-failed");
         tracing::error!(
@@ -1170,7 +1768,10 @@ pub(super) fn run(display: &str, runtime: RuntimeCoordinator) -> Result<(), Gpui
         gpui_platform::linux(gpui::WindowingModes::X11)
             .with_quit_mode(gpui::QuitMode::Explicit)
             .with_windowing(gpui::WindowingRequest::Windowed(environment))
-            .run(move |cx| launch(cx, launcher));
+            .run(move |cx| {
+                text_field::register_keys(cx);
+                launch(cx, launcher);
+            });
     }));
     let mut state = state.borrow_mut();
     if outcome.is_err() || !state.quit_requested {
@@ -1207,27 +1808,7 @@ fn launch(cx: &mut App, state: Rc<RefCell<HostState>>) {
         std::future::ready(())
     })
     .detach();
-    let bounds = Bounds::centered(None, size(px(960.), px(540.)), cx);
-    let window = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(480.), px(540.))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Furami · GPUI".into()),
-                ..Default::default()
-            }),
-            app_id: Some("dev.antho.furami".into()),
-            window_decorations: Some(WindowDecorations::Server),
-            ..Default::default()
-        },
-        |window, cx| cx.new(|cx| HostView::new(window, cx, Rc::clone(&state))),
-    );
-    if let Ok(window) = window
-        && matches!(
-            window.update(cx, |_, window, _| bind_and_start(window, &state)),
-            Ok(true)
-        )
-    {
+    if start_windows(cx, &state) {
         cx.activate(true);
     } else {
         state.borrow_mut().drain_without_gui("setup-failed");
@@ -1246,21 +1827,87 @@ fn launch(cx: &mut App, state: Rc<RefCell<HostState>>) {
     }
 }
 
-fn bind_and_start(window: &Window, state: &RefCell<HostState>) -> bool {
-    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+fn start_windows(cx: &mut App, state: &Rc<RefCell<HostState>>) -> bool {
+    let icon = match image::load_from_memory_with_format(
+        include_bytes!("../../assets/logo.png"),
+        image::ImageFormat::Png,
+    ) {
+        Ok(icon) => icon.into_rgba8(),
+        Err(error) => {
+            tracing::error!(event_code = "gpui_icon_invalid", %error);
+            return false;
+        }
+    };
+    let bounds = Bounds::centered(None, size(px(960.), px(600.)), cx);
+    let Ok(root) = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(480.), px(540.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Furami".into()),
+                ..Default::default()
+            }),
+            app_id: Some("dev.antho.furami".into()),
+            icon: Some(std::sync::Arc::new(icon)),
+            window_decorations: Some(WindowDecorations::Server),
+            ..Default::default()
+        },
+        |window, cx| cx.new(|cx| HostView::new(window, cx, Rc::clone(state))),
+    ) else {
         return false;
     };
-    let RawWindowHandle::Xcb(handle) = handle.as_raw() else {
+    let Ok(Some((root_xid, scale))) = root.update(cx, |_, window, _| {
+        xcb_id(window).map(|xid| (xid, window.scale_factor()))
+    }) else {
+        return false;
+    };
+    {
+        let mut state = state.borrow_mut();
+        let x11 = state.x11.as_mut().expect("preflighted X11 connection");
+        if x11
+            .bind(root_xid)
+            .and_then(|()| x11.set_minimum_scale(scale))
+            .is_err()
+        {
+            return false;
+        }
+        state.root = x11.parent();
+        state.scale = scale;
+    }
+
+    let mailbox = Rc::clone(&state.borrow().companion_paint);
+    // This GPUI backend maps even with `show: false`. Park both device-pixel
+    // edges outside the X root before applying the checked native quarantine.
+    let origin = -256. / scale;
+    let staging_size = 32. / scale;
+    let parking = Bounds {
+        origin: point(px(origin), px(origin)),
+        size: size(px(staging_size), px(staging_size)),
+    };
+    let Ok(companion) = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(parking)),
+            titlebar: None,
+            focus: false,
+            show: false,
+            kind: WindowKind::PopUp,
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        },
+        |window, cx| cx.new(|cx| CompanionView::new(Rc::clone(state), mailbox, window, cx)),
+    ) else {
+        return false;
+    };
+    let Ok(Some(companion_xid)) = companion.update(cx, |_, window, _| xcb_id(window)) else {
         return false;
     };
     let mut state = state.borrow_mut();
     let x11 = state.x11.as_mut().expect("preflighted X11 connection");
-    let scale = window.scale_factor();
-    if x11.bind(handle.window.get()).is_err() || x11.set_minimum_scale(scale).is_err() {
+    if let Err(error) = x11.bind_companion(companion_xid) {
+        tracing::error!(event_code = "gpui_companion_setup_failed", %error);
         return false;
     }
-    state.root = x11.parent();
-    state.scale = scale;
+    state.companion = Some(companion);
     if state.resize(true, scale).is_err() {
         return false;
     }
@@ -1268,6 +1915,14 @@ fn bind_and_start(window: &Window, state: &RefCell<HostState>) -> bool {
     let update = state.runtime.ui_ready();
     state.consume(update);
     true
+}
+
+fn xcb_id(window: &Window) -> Option<u32> {
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::Xcb(handle) = handle.as_raw() else {
+        return None;
+    };
+    Some(handle.window.get())
 }
 
 #[cfg(test)]
@@ -1300,6 +1955,7 @@ mod tests {
             xid: None,
             layout: None,
             mapped: false,
+            observed_mapped: false,
             prepared_paused: false,
             poisoned: false,
             absent: false,
@@ -1316,6 +1972,7 @@ mod tests {
             xid: None,
             layout: None,
             mapped: false,
+            observed_mapped: false,
             prepared_paused: false,
             poisoned: false,
             absent: false,
