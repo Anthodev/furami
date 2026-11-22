@@ -1,14 +1,4 @@
 {
-  "apk_indexes": {
-    "community": {
-      "sha256": "dce062649785f522deb2ace4834b753dfc0cd72ea9d355461a408855c7c99a1c",
-      "url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/community/x86_64/APKINDEX.tar.gz"
-    },
-    "main": {
-      "sha256": "af2cc74ddaaa4cd11e74a9c617734671149ef7fc7b840b4bf130e8273497df5e",
-      "url": "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz"
-    }
-  },
   "apk_packages": {
     "libcrypto3": {
       "aports_commit": "a254386dfe34f70a05bdb8b2a3d7a5b20b6f076e",
@@ -1342,7 +1332,7 @@
   },
   "platform": "linux/amd64",
   "repository_base_url": "https://dl-cdn.alpinelinux.org/alpine/v3.21",
-  "schema": 1,
+  "schema": 2,
   "linked_source_closure": {
     "file": "alpine-source.lock.json",
     "sha256": "55c672db207237e83740711dec82c52b3c663fbbb9b0660dff17aa208c14449c"

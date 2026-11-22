@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -32,6 +33,8 @@ STATIC_APK = {"musl": "musl-dev", "zstd": "zstd-static",
               "zlib": "zlib-static", "mimalloc": "mimalloc2-dev"}
 LINKED_APK_SOURCES = {**STATIC_APK, "gcc-startup": "gcc"}
 SOURCE_LOCK_FILE = HERE / "alpine-source.lock.json"
+RELINK_RECIPE_FILES = ("build.py", "container-build.sh", "provision.sh", "relink.sh",
+                       "RELINKING.md", "runtime.lock.json", "alpine-source.lock.json")
 ARCHIVE_COMPONENT = {
     "libsquashfuse.a": "squashfuse",
     "libsquashfuse_ll.a": "squashfuse",
@@ -59,31 +62,36 @@ def sha256(path):
 
 
 def verify_lock(lock):
-    if lock.get("schema") != 1 or lock.get("platform") != "linux/amd64":
+    if type(lock.get("schema")) is not int or lock["schema"] != 2 or lock.get("platform") != "linux/amd64":
         raise ValueError("unsupported runtime lock schema or platform")
     if not re.fullmatch(r"docker.io/library/alpine@sha256:[0-9a-f]{64}", lock.get("container", "")):
         raise ValueError("Alpine image must be pinned by its linux/amd64 OCI manifest digest")
     if lock["sources"]["type2_runtime"]["version"] != COMMIT:
         raise ValueError("unexpected type2-runtime commit")
-    if len(lock.get("apk_packages", {})) != 139 or set(lock["apk_indexes"]) != {"main", "community"}:
+    if len(lock.get("apk_packages", {})) != 139:
         raise ValueError("incomplete frozen APK closure")
+    if not lock.get("repository_base_url", "").startswith("https://"):
+        raise ValueError("Alpine package repository must use HTTPS")
     if not isinstance(lock.get("source_date_epoch"), int) or not SHA256.fullmatch(lock.get("base_apk_db_sha256", "")):
         raise ValueError("missing source epoch or base image APK database digest")
     source_lock = lock.get("linked_source_closure", {})
     if source_lock.get("file") != SOURCE_LOCK_FILE.name or not SHA256.fullmatch(source_lock.get("sha256", "")):
         raise ValueError("missing pinned linked Alpine source closure")
-    for name, entry in {**lock["sources"], **lock["notices"], **lock["apk_indexes"]}.items():
+    for name, entry in {**lock["sources"], **lock["notices"]}.items():
         if not entry["url"].startswith("https://") or not SHA256.fullmatch(entry["sha256"]):
             raise ValueError(f"{name}: source URL/SHA256 not pinned")
     for name, entry in lock["apk_packages"].items():
         if not re.fullmatch(r"[a-z0-9][a-z0-9+_.-]*", name):
             raise ValueError(f"invalid APK name {name}")
-        if entry["repository"] not in lock["apk_indexes"] or not SHA256.fullmatch(entry["sha256"]):
+        if entry["repository"] not in {"main", "community"} or not SHA256.fullmatch(entry["sha256"]):
             raise ValueError(f"{name}: missing repository or archive SHA256")
-        if entry["archive"] != f"{name}-{entry['version']}.apk":
+        if (not re.fullmatch(r"[A-Za-z0-9_.+-]+", entry["version"])
+                or entry["archive"] != f"{name}-{entry['version']}.apk"):
             raise ValueError(f"{name}: inconsistent archive name")
         if not re.fullmatch(r"Q1[A-Za-z0-9+/]{27}=", entry["index_checksum"]):
-            raise ValueError(f"{name}: missing signed index checksum")
+            raise ValueError(f"{name}: missing Alpine APK control checksum")
+        if not entry["license"].strip() or not re.fullmatch(r"[0-9a-f]{40}", entry["aports_commit"]):
+            raise ValueError(f"{name}: missing package license or aports commit")
     for entry in lock["sources"].values():
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", entry["archive"]):
             raise ValueError("unsafe source archive name")
@@ -119,7 +127,6 @@ def private_proof_binding(lock):
         "source_lock_sha256": sha256(SOURCE_LOCK_FILE),
         "closure_sha256": hashlib.sha256(json.dumps(
             lock, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-        "indexes_sha256": {name: entry["sha256"] for name, entry in lock.get("apk_indexes", {}).items()},
         "selected_apks_sha256": {entry["archive"]: entry["sha256"]
                                  for entry in lock.get("apk_packages", {}).values()},
         "recipe_sha256": {name: sha256(HERE / name) for name in
@@ -127,30 +134,27 @@ def private_proof_binding(lock):
     }
 
 
-def authenticate(lock, cache, name, script, arguments=()):
-    """Use only the immutable base's keys; never infer trust from a tar member."""
-    proof = cache / "authentication"
-    proof.mkdir(parents=True, exist_ok=True)
+def authenticate_selected_apks(lock, snapshot, proof, selected):
+    """Verify with the immutable base's keys, then index the signed control metadata."""
     binding = private_proof_binding(lock)
     command = ["podman", "run", "--rm", "--pull=missing", "--platform", lock["platform"],
                "--network=none", "--security-opt", "label=disable",
-               "--volume", f"{cache}:/sources:ro", "--volume", f"{proof}:/proof:rw",
+               "--volume", f"{snapshot}:/selected-apks:ro", "--volume", f"{proof}:/proof:rw",
+               "--volume", f"{HERE}:/recipe:ro",
                "--env", f"BASE_APK_DB_SHA256={lock['base_apk_db_sha256']}",
-               lock["container"], "sh", "-c",
-               'set -eu; echo "$BASE_APK_DB_SHA256  /lib/apk/db/installed" | sha256sum -c -; ' + script,
-               "sh", *arguments]
+               lock["container"], "sh", "/recipe/provision.sh", "--index", *selected]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-    (proof / f"{name}.log").write_bytes(result.stdout)
-    (proof / f"{name}.json").write_text(json.dumps({
+    (proof / "APK.log").write_bytes(result.stdout)
+    (proof / "APK.json").write_text(json.dumps({
         "argv": command, "returncode": result.returncode,
         "container": lock["container"], "base_apk_db_sha256": lock["base_apk_db_sha256"],
-        "log_sha256": sha256(proof / f"{name}.log"),
+        "log_sha256": sha256(proof / "APK.log"),
         "input_binding": binding,
         "output_sha256": ({"selected-APKINDEX.tar.gz": sha256(proof / "selected-APKINDEX.tar.gz")}
-                          if name == "APK" and result.returncode == 0 else {}),
+                          if result.returncode == 0 else {}),
     }, indent=2, sort_keys=True) + "\n")
     if result.returncode:
-        raise ValueError(f"{name} authentication failed; see {proof / (name + '.log')}")
+        raise ValueError(f"APK authentication failed; see {proof / 'APK.log'}")
 
 
 def index_records(path):
@@ -167,50 +171,39 @@ def index_records(path):
     return records
 
 
-def verify_signed_indexes(lock, cache):
-    """Authenticate both frozen indexes before accepting any selected metadata."""
-    for repo, entry in lock["apk_indexes"].items():
-        obtain(entry["url"], entry["sha256"], cache / "indexes" / repo / "x86_64" / "APKINDEX.tar.gz")
-    (cache / "indexes" / "repositories").write_text(
-        "".join(f"file:///sources/indexes/{repo}\n" for repo in sorted(lock["apk_indexes"])))
-    authenticate(lock, cache, "index",
-                 'apk --no-network --repositories-file /sources/indexes/repositories verify "$@"; '
-                 'apk --no-network --repositories-file /sources/indexes/repositories update',
-                 [f"/sources/indexes/{repo}/x86_64/APKINDEX.tar.gz"
-                  for repo in sorted(lock["apk_indexes"])])
-    indexed = {repo: index_records(cache / "indexes" / repo / "x86_64" / "APKINDEX.tar.gz")
-               for repo in lock["apk_indexes"]}
-    for name, entry in lock["apk_packages"].items():
-        fields = indexed[entry["repository"]].get((name, entry["version"]))
-        if fields is None or any(fields.get(field) != entry[lock_field] for field, lock_field in
-                                 (("C", "index_checksum"), ("L", "license"), ("c", "aports_commit"))):
-            raise ValueError(f"{name}: package metadata differs from frozen signed index")
-
-
-def selected_apks(lock, cache):
-    selected = []
+def stage_selected_apks(lock, cache, snapshot):
+    """Take an independent snapshot; a cache replacement cannot change what apk opens."""
+    selected, checksums = [], []
     for name, entry in sorted(lock["apk_packages"].items()):
         path = cache / "apks" / entry["archive"]
-        if path.is_symlink() or not path.is_file() or sha256(path) != entry["sha256"]:
-            raise ValueError(f"{name}: selected APK is missing or has changed")
-        selected.append(f"/sources/apks/{entry['archive']}")
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"{name}: selected APK is not a regular file")
+        shutil.copyfile(path, snapshot / path.name, follow_symlinks=False)
+        selected.append(f"/selected-apks/{path.name}")
+        checksums.append(f"{entry['sha256']}  {selected[-1]}\n")
+    (snapshot / "SHA256SUMS").write_text("".join(checksums))
     return selected
 
 
-def verify_selected_apks(lock, cache):
-    selected = selected_apks(lock, cache)
-    authenticate(lock, cache, "APK",
-                 'apk --no-network --repositories-file /sources/indexes/repositories verify "$@"; '
-                 'apk --no-network --repositories-file /sources/indexes/repositories '
-                 'index --output /proof/selected-APKINDEX.tar.gz "$@"', selected)
-    records = index_records(cache / "authentication" / "selected-APKINDEX.tar.gz")
+def check_selected_apk_metadata(lock, path):
+    records = index_records(path)
     if set(records) != {(name, entry["version"]) for name, entry in lock["apk_packages"].items()}:
         raise ValueError("authenticated selected APK identities differ")
     for name, entry in lock["apk_packages"].items():
         fields = records[(name, entry["version"])]
-        if any(fields.get(field) != entry[lock_field] for field, lock_field in
-               (("C", "index_checksum"), ("L", "license"), ("c", "aports_commit"))):
-            raise ValueError(f"{name}: authenticated APK differs from signed index")
+        if (fields.get("A") not in {"x86_64", "noarch"}
+                or any(fields.get(field) != entry[lock_field] for field, lock_field in
+                       (("C", "index_checksum"), ("L", "license"), ("c", "aports_commit")))):
+            raise ValueError(f"{name}: authenticated APK metadata differs from lock")
+
+
+def verify_selected_apks(lock, cache, snapshot):
+    selected = stage_selected_apks(lock, cache, snapshot)
+    root = cache / "authentication"
+    root.mkdir(mode=0o700, exist_ok=True)
+    proof = Path(tempfile.mkdtemp(prefix="run-", dir=root))
+    authenticate_selected_apks(lock, snapshot, proof, selected)
+    check_selected_apk_metadata(lock, proof / "selected-APKINDEX.tar.gz")
     return selected
 
 
@@ -378,13 +371,11 @@ def verify_private_inputs(lock, cache):
             or inventory.get("source_lock_sha256") != sha256(SOURCE_LOCK_FILE)
             or not records):
         raise ValueError("private input inventory does not match the runtime locks")
-    required = {"indexes/repositories", "private/base-oci/index.json", "private/base-oci/oci-layout",
+    required = {"private/base-oci/index.json", "private/base-oci/oci-layout",
                 "private/authentication/selected-APKINDEX.tar.gz",
                 "private/authentication/apk-installed.txt",
                 "private/authentication/restored-base-manifest.log"}
-    pinned = {f"indexes/{repo}/x86_64/APKINDEX.tar.gz": entry["sha256"]
-              for repo, entry in lock["apk_indexes"].items()}
-    pinned.update((f"apks/{entry['archive']}", entry["sha256"]) for entry in lock["apk_packages"].values())
+    pinned = {f"apks/{entry['archive']}": entry["sha256"] for entry in lock["apk_packages"].values()}
     pinned.update((entry["archive"], entry["sha256"])
                   for entry in (*lock["sources"].values(), *lock["notices"].values()))
     for name, source in alpine_sources(lock).items():
@@ -392,7 +383,7 @@ def verify_private_inputs(lock, cache):
         pinned.update((f"alpine-sources/{name}/{item['file']}", item["sha256"])
                       for item in (source["upstream_source"], *source["aports_inputs"]))
     required.update(pinned)
-    for name in ("index", "APK", "offline-restore"):
+    for name in ("APK", "offline-restore"):
         required.update((f"private/authentication/{name}.json", f"private/authentication/{name}.log"))
     required.update(f"private/recipe/{name}" for name in
                     ("build.py", "container-build.sh", "provision.sh", "relink.sh",
@@ -428,20 +419,12 @@ def verify_private_inputs(lock, cache):
                 or (cache / relative).stat().st_size != item["size"]):
             raise ValueError("private input inventory omits base config/layer closure")
     proof_root = cache / "private/authentication"
-    selected_records = index_records(proof_root / "selected-APKINDEX.tar.gz")
-    expected_identities = {(name, entry["version"]) for name, entry in lock["apk_packages"].items()}
-    if set(selected_records) != expected_identities:
-        raise ValueError("private APK proof identities differ from selected closure")
-    for name, entry in lock["apk_packages"].items():
-        fields = selected_records[(name, entry["version"])]
-        if any(fields.get(field) != entry[lock_field] for field, lock_field in
-               (("C", "index_checksum"), ("L", "license"), ("c", "aports_commit"))):
-            raise ValueError(f"{name}: private APK proof differs from selected closure")
+    check_selected_apk_metadata(lock, proof_root / "selected-APKINDEX.tar.gz")
     check_installed(lock, proof_root / "apk-installed.txt")
     if sha256(proof_root / "restored-base-manifest.log") != manifest_sha:
         raise ValueError("private restored manifest proof differs from immutable base")
     binding = private_proof_binding(lock)
-    for name in ("index", "APK", "offline-restore"):
+    for name in ("APK", "offline-restore"):
         receipt = json.loads((cache / f"private/authentication/{name}.json").read_text())
         if (receipt.get("returncode") != 0 or receipt.get("container") != lock["container"]
                 or receipt.get("log_sha256") != records[f"private/authentication/{name}.log"]
@@ -450,8 +433,7 @@ def verify_private_inputs(lock, cache):
         outputs = ({"selected-APKINDEX.tar.gz": records["private/authentication/selected-APKINDEX.tar.gz"]}
                    if name == "APK" else
                    {"apk-installed.txt": records["private/authentication/apk-installed.txt"],
-                    "restored-base-manifest.log": records["private/authentication/restored-base-manifest.log"]}
-                   if name == "offline-restore" else {})
+                    "restored-base-manifest.log": records["private/authentication/restored-base-manifest.log"]})
         if receipt.get("output_sha256") != outputs:
             raise ValueError(f"private input inventory lacks bound {name} output proof")
     return inventory
@@ -493,15 +475,12 @@ def build(output, cache, modified_libfuse=None):
             raise ValueError("modified libfuse source must be a regular absolute archive")
         modified_hash = sha256(modified_libfuse)
     cache.mkdir(parents=True, exist_ok=True)
-    verify_signed_indexes(lock, cache)
-    if sha256(SOURCE_LOCK_FILE) != lock["linked_source_closure"]["sha256"]:
-        raise ValueError("linked Alpine source lock differs from canonical pin")
     if modified_libfuse is None:
-        alpine_sources, source_count = verify_alpine_sources(lock, cache)
+        linked_sources, source_count = verify_alpine_sources(lock, cache)
     else:
         # Relink changes libfuse only. Existing APK static objects are verified;
         # permissive/exception source inputs are not required to compile them.
-        alpine_sources = json.loads(SOURCE_LOCK_FILE.read_text())["linked_sources"]
+        linked_sources = alpine_sources(lock)
         source_count = 0
     downloads = [(entry["url"], entry["sha256"], cache / entry["archive"])
                  for entry in (*lock["sources"].values(), *lock["notices"].values())]
@@ -510,19 +489,22 @@ def build(output, cache, modified_libfuse=None):
                   for entry in lock["apk_packages"].values()]
     with ThreadPoolExecutor(max_workers=8) as workers:
         list(workers.map(lambda download: obtain(*download), downloads))
-    selected = verify_selected_apks(lock, cache)
-    output.mkdir(parents=True)
-    cmd = ["podman", "run", "--rm", "--pull=always", "--platform", lock["platform"],
-           "--network=none", "--security-opt", "label=disable", "--volume", f"{cache}:/sources:ro",
-           "--volume", f"{HERE}:/recipe:ro", "--volume", f"{output}:/out:rw",
-           "--env", f"BASE_APK_DB_SHA256={lock['base_apk_db_sha256']}",
-           "--env", f"RUNTIME_COMMIT={COMMIT}", "--env", f"SOURCE_DATE_EPOCH={lock['source_date_epoch']}",
-           "--env", f"FURAMI_BUILD_JOBS={os.environ.get('FURAMI_BUILD_JOBS', '2')}",
-           *([] if modified_hash is None else ["--volume", f"{modified_libfuse}:/modified-fuse.tar.xz:ro",
-                                                 "--env", "FUSE_ARCHIVE=/modified-fuse.tar.xz"]),
-           lock["container"], "sh", "/recipe/container-build.sh", *selected]
-    with (output / "build.log").open("w") as log:
-        outcome = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=False)
+    with tempfile.TemporaryDirectory(prefix=".selected-apks-", dir=cache) as staged_apks:
+        snapshot = Path(staged_apks)
+        selected = verify_selected_apks(lock, cache, snapshot)
+        output.mkdir(parents=True)
+        cmd = ["podman", "run", "--rm", "--pull=missing", "--platform", lock["platform"],
+               "--network=none", "--security-opt", "label=disable", "--volume", f"{cache}:/sources:ro",
+               "--volume", f"{snapshot}:/selected-apks:ro",
+               "--volume", f"{HERE}:/recipe:ro", "--volume", f"{output}:/out:rw",
+               "--env", f"BASE_APK_DB_SHA256={lock['base_apk_db_sha256']}",
+               "--env", f"RUNTIME_COMMIT={COMMIT}", "--env", f"SOURCE_DATE_EPOCH={lock['source_date_epoch']}",
+               "--env", f"FURAMI_BUILD_JOBS={os.environ.get('FURAMI_BUILD_JOBS', '2')}",
+               *([] if modified_hash is None else ["--volume", f"{modified_libfuse}:/modified-fuse.tar.xz:ro",
+                                                     "--env", "FUSE_ARCHIVE=/modified-fuse.tar.xz"]),
+               lock["container"], "sh", "/recipe/container-build.sh", *selected]
+        with (output / "build.log").open("w") as log:
+            outcome = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=False)
     if outcome.returncode:
         raise RuntimeError(f"runtime container exited {outcome.returncode}; see {output / 'build.log'}")
     artifact = output / "runtime-x86_64"
@@ -541,8 +523,7 @@ def build(output, cache, modified_libfuse=None):
     relink.mkdir()
     for entry in lock["sources"].values():
         shutil.copyfile(cache / entry["archive"], relink / entry["archive"])
-    for name in ("build.py", "container-build.sh", "provision.sh", "relink.sh", "RELINKING.md",
-                 "runtime.lock.json", "alpine-source.lock.json"):
+    for name in RELINK_RECIPE_FILES:
         shutil.copyfile(HERE / name, relink / name)
     (relink / "relink.sh").chmod(0o755)
     if modified_hash is not None:
@@ -562,7 +543,7 @@ def build(output, cache, modified_libfuse=None):
             if name == "libfuse3" and modified_hash is not None:
                 source_url, source_hash = "bundled:relink/modified-libfuse.tar.xz", modified_hash
         else:
-            entry = alpine_sources[source]["upstream_source"]
+            entry = linked_sources[source]["upstream_source"]
             source_url, source_hash = entry["url"], entry["sha256"]
             package_name = STATIC_APK[source]
             package = lock["apk_packages"][package_name]
@@ -577,7 +558,7 @@ def build(output, cache, modified_libfuse=None):
             component["binary_input"] = binary_input
         components.append(component)
 
-    gcc_source = alpine_sources["gcc-startup"]["upstream_source"]
+    gcc_source = linked_sources["gcc-startup"]["upstream_source"]
     gcc_package = lock["apk_packages"]["gcc"]
     gcc_notices = ["licenses/gcc.COPYING3", "licenses/gcc.COPYING.RUNTIME"]
     gcc_component = {"name": "gcc-startup", "spdx": "GPL-3.0-or-later WITH GCC-exception-3.1",
@@ -601,7 +582,9 @@ def build(output, cache, modified_libfuse=None):
                 "lock_sha256": sha256(LOCK_FILE), "container": lock["container"],
                 "source_date_epoch": lock["source_date_epoch"], "sources": lock["sources"],
                 "apk_closure": {"base_apk_db_sha256": lock["base_apk_db_sha256"],
-                                "indexes": lock["apk_indexes"], "base_packages": lock["base_packages"],
+                                "verification": "apk-verify-with-pinned-base-keys",
+                                "repository_base_url": lock["repository_base_url"],
+                                "base_packages": lock["base_packages"],
                                 "direct_packages": lock["direct_apk"], "packages": lock["apk_packages"],
                                 "installed_sha256": records["apk-installed.txt"]},
                 "toolchain": {key: records[key] for key in
@@ -618,12 +601,12 @@ def build(output, cache, modified_libfuse=None):
                     "verified_input_count": source_count,
                     "verified_inputs": {
                         f"{name}/{item['file']}": sha256(cache / "alpine-sources" / name / item["file"])
-                        for name, source in alpine_sources.items()
+                        for name, source in linked_sources.items()
                         for item in (source["upstream_source"], *source["aports_inputs"])
                     } if modified_hash is None else {},
                     "verified_apkbuilds": {
                         f"{name}/APKBUILD": sha256(cache / "alpine-sources" / name / "APKBUILD")
-                        for name in alpine_sources
+                        for name in linked_sources
                     } if modified_hash is None else {},
                     "distribution_status": "local qualification evidence only; full cache not bundled",
                 },

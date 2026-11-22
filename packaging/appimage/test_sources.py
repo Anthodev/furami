@@ -5,7 +5,6 @@ import unittest
 import copy
 import json
 import tempfile
-import gzip
 import shutil
 import hashlib
 import io
@@ -162,7 +161,9 @@ def runtime_source_fixture(repo, cache):
     original = sources.REPO / 'packaging/appimage-runtime'
     target = repo / 'packaging/appimage-runtime'
     target.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(original / 'build.py', target / 'build.py')
+    recipes = ('build.py', 'container-build.sh', 'provision.sh', 'relink.sh', 'RELINKING.md')
+    for name in recipes:
+        shutil.copy2(original / name, target / name)
     runtime = json.loads((original / 'runtime.lock.json').read_text())
     alpine = json.loads((original / 'alpine-source.lock.json').read_text())
     members = {}
@@ -188,26 +189,13 @@ def runtime_source_fixture(repo, cache):
             item['sha512'] + '  ' + item['file'] + '\n' for item in items) + '"\n').encode()
         source['apkbuild']['sha256'] = put('alpine-sources/' + name + '/APKBUILD', recipe)
         members['runtime-inputs/alpine-sources/' + name + '/APKBUILD'] = recipe
-    # Real APKINDEX format: concatenated gzip streams for signature and index.
-    for name, entry in runtime['apk_indexes'].items():
-        chunks = []
-        for member_name in ('.SIGN.RSA.test-key.rsa.pub', 'APKINDEX'):
-            buffer = io.BytesIO()
-            with tarfile.open(fileobj=buffer, mode='w') as tar:
-                member = tarfile.TarInfo(member_name)
-                member.size = 1
-                tar.addfile(member, io.BytesIO(b'x'))
-            chunks.append(gzip.compress(buffer.getvalue(), mtime=0))
-        data = b''.join(chunks)
-        entry['sha256'] = put('indexes/' + name + '/x86_64/APKINDEX.tar.gz', data)
-        members['runtime-inputs/indexes/' + name + '/x86_64/APKINDEX.tar.gz'] = data
     runtime['apk_packages']['abuild']['sha256'] = put(
         'apks/' + runtime['apk_packages']['abuild']['archive'], b'private APK')
     (target / 'alpine-source.lock.json').write_text(json.dumps(alpine))
     runtime['linked_source_closure']['sha256'] = sources.sha(target / 'alpine-source.lock.json')
     (target / 'runtime.lock.json').write_text(json.dumps(runtime))
-    for path in (target / 'runtime.lock.json', target / 'alpine-source.lock.json'):
-        members['furami/packaging/appimage-runtime/' + path.name] = path.read_bytes()
+    for name in (*recipes, 'runtime.lock.json', 'alpine-source.lock.json'):
+        members['furami/packaging/appimage-runtime/' + name] = (target / name).read_bytes()
     policy = json.loads((sources.HERE / 'sources.lock.json').read_text())
     # The fixture exercises delivery mechanics, not the reviewed crate notices.
     policy['cargo_notices'] = []
@@ -265,7 +253,9 @@ class PublicMaterialTests(unittest.TestCase):
                 b'\tlinux-vdso.so.1 (0x1234)\n\tlibmpv.so => /prefix/lib/libmpv.so (0x5678)\n')
         # The assembly hashes ubuntu-terms.lock.json even for an empty fixture.
         (self.recipe / 'ubuntu-terms.lock.json').write_bytes((self.recipe / 'sources.lock.json').read_bytes())
-        self.write_json(self.root / 'runtime/manifest.json', {})
+        self.write_json(self.root / 'runtime/manifest.json',
+                        {'linked_source_closure': {'local_cache_path': str(self.cache),
+                                                   'verified_input_count': 1}})
         for name in ('link.map', 'apk-installed.txt'):
             (self.root / 'runtime' / name).write_text('runtime proof\n')
         self.write_json(self.root / 'stage/ubuntu-sources.json',
@@ -380,12 +370,20 @@ class PublicMaterialTests(unittest.TestCase):
         inventory = sources.source_inventory(output)
         self.assertIn('runtime-inputs/alpine-sources/zlib/' + self.zlib_archive, inventory)
         self.assertFalse(any(name.endswith('.apk') for name in inventory))
+        self.assertFalse(any(name.startswith('runtime-inputs/indexes/') for name in inventory))
         self.assertNotIn(self.apk['sha256'], {row['sha256'] for row in inventory.values()})
         self.assertIs(index['material_policy']['public_offline_bootstrap_complete'], False)
         # Recipient verification must not access this private cache at all.
         import shutil
         shutil.rmtree(self.cache)
         sources.verify_public_materials(output, index)
+
+    def test_recipient_runtime_manifest_does_not_expose_local_cache_path(self):
+        output, _ = self.assemble()
+        manifest = json.loads(self.delivered_members(output)['runtime-evidence/manifest.json'])
+        self.assertEqual(manifest['linked_source_closure'], {'verified_input_count': 1})
+        raw = json.loads((self.root / 'runtime/manifest.json').read_text())
+        self.assertEqual(raw['linked_source_closure']['local_cache_path'], str(self.cache))
 
     def test_actual_missing_linked_source_blocks_completeness(self):
         (self.cache / 'alpine-sources/zlib' / self.zlib_archive).unlink()

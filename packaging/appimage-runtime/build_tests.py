@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import struct
 import subprocess
 import tarfile
@@ -27,12 +28,44 @@ build = load_module("runtime_build", "build.py")
 compare = load_module("runtime_compare", "build-twice.py")
 
 
+def write_apk_index(path, data):
+    with tarfile.open(path, "w:gz") as archive:
+        member = tarfile.TarInfo("APKINDEX")
+        member.size = len(data)
+        archive.addfile(member, io.BytesIO(data))
+
+
 class RuntimeRecipeTests(unittest.TestCase):
     def test_changed_apk_closure_fails_before_container_start(self):
         lock = json.loads((HERE / "runtime.lock.json").read_text())
         lock["apk_packages"]["zstd-static"]["sha256"] = "not-a-digest"
         with self.assertRaisesRegex(ValueError, "missing repository or archive SHA256"):
             build.verify_lock(lock)
+
+    def test_normal_build_acquires_only_exact_archives_before_offline_runtime_container(self):
+        lock = json.loads((HERE / "runtime.lock.json").read_text())
+        packages = lock["apk_packages"]
+        selected = [f"/selected-apks/{entry['archive']}" for _, entry in sorted(packages.items())]
+        with tempfile.TemporaryDirectory() as temp:
+            cache, output = Path(temp) / "sources", Path(temp) / "runtime"
+            with (patch.object(build, "verify_alpine_sources", return_value=({}, 0)),
+                  patch.object(build, "obtain") as obtain,
+                  patch.object(build, "verify_selected_apks", return_value=selected),
+                  patch.object(build.subprocess, "run", return_value=
+                               subprocess.CompletedProcess([], 1)) as run):
+                with self.assertRaisesRegex(RuntimeError, "runtime container exited 1"):
+                    build.build(output, cache)
+            self.assertCountEqual(
+                [call.args for call in obtain.call_args_list],
+                [(entry["url"], entry["sha256"], cache / entry["archive"])
+                 for entry in (*lock["sources"].values(), *lock["notices"].values())]
+                + [(f"{lock['repository_base_url']}/{entry['repository']}/x86_64/{entry['archive']}",
+                    entry["sha256"], cache / "apks" / entry["archive"]) for entry in packages.values()])
+            command, = run.call_args.args
+            self.assertIn("--pull=missing", command)
+            self.assertIn("--network=none", command)
+            self.assertEqual(command[-len(selected):], selected)
+            self.assertFalse((cache / "indexes").exists())
 
     def test_source_provenance_cannot_name_different_signed_apk(self):
         lock = json.loads((HERE / "runtime.lock.json").read_text())
@@ -73,39 +106,62 @@ class RuntimeRecipeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "installed APK closure"):
                     build.check_installed(lock, path)
 
-    def test_forged_signature_member_cannot_authenticate_index(self):
-        with tempfile.TemporaryDirectory() as temp:
-            cache = Path(temp)
-            index = cache / "indexes/main/x86_64/APKINDEX.tar.gz"
-            index.parent.mkdir(parents=True)
-            with tarfile.open(index, "w:gz") as archive:
-                for name, data in ((".SIGN.RSA.forged", b"not a signature"),
-                                   ("APKINDEX", b"P:forged\nV:1\n\n")):
-                    member = tarfile.TarInfo(name)
-                    member.size = len(data)
-                    archive.addfile(member, io.BytesIO(data))
-            lock = {"container": "pinned", "platform": "linux/amd64",
-                    "base_apk_db_sha256": "a" * 64, "apk_packages": {},
-                    "apk_indexes": {"main": {"url": "https://unused.invalid/index",
-                                            "sha256": build.sha256(index)}}}
-            with patch.object(build.subprocess, "run", return_value=
-                              subprocess.CompletedProcess([], 1, b"BAD signature")):
-                with self.assertRaisesRegex(ValueError, "index authentication failed"):
-                    build.verify_signed_indexes(lock, cache)
-
-    def test_selected_archives_ignore_stale_cache_apks(self):
+    def test_selected_snapshot_ignores_stale_apks_and_is_independent_of_cache(self):
         with tempfile.TemporaryDirectory() as temp:
             cache = Path(temp)
             (cache / "apks").mkdir()
             selected = cache / "apks/zlib-1-r1.apk"
             selected.write_bytes(b"selected")
             (cache / "apks/zlib-1-r0.apk").write_bytes(b"stale")
-            lock = {"apk_packages": {"zlib": {"archive": selected.name,
-                                            "sha256": build.sha256(selected)}}}
-            self.assertEqual(build.selected_apks(lock, cache), ["/sources/apks/zlib-1-r1.apk"])
+            checksum = build.sha256(selected)
+            lock = {"apk_packages": {"zlib": {"archive": selected.name, "sha256": checksum}}}
+            snapshot = cache / "snapshot"
+            snapshot.mkdir()
+            self.assertEqual(build.stage_selected_apks(lock, cache, snapshot), ["/selected-apks/zlib-1-r1.apk"])
             selected.write_bytes(b"tampered")
-            with self.assertRaisesRegex(ValueError, "selected APK"):
-                build.selected_apks(lock, cache)
+            self.assertEqual((snapshot / selected.name).read_bytes(), b"selected")
+            self.assertEqual((snapshot / "SHA256SUMS").read_text(), f"{checksum}  /selected-apks/{selected.name}\n")
+            self.assertEqual({path.name for path in snapshot.iterdir()}, {selected.name, "SHA256SUMS"})
+
+    def test_provision_checks_locked_bytes_before_invoking_apk(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            apk = snapshot / "zlib-1.apk"
+            apk.write_bytes(b"locked package")
+            unlisted = snapshot / "extra-1.apk"
+            unlisted.write_bytes(b"unlisted package")
+            (snapshot / "SHA256SUMS").write_text(f"{build.sha256(apk)}  {apk}\n")
+            database = root / "installed"
+            database.write_bytes(b"base database")
+            # Execute the production script without Podman. Remap only its
+            # container paths and observe which commands would reach apk.
+            provision = (HERE / "provision.sh").read_text()
+            script = root / "provision.sh"
+            script.write_text(provision.replace("/selected-apks", str(snapshot))
+                              .replace("/lib/apk/db/installed", str(database)))
+            fake_apk = root / "apk"
+            fake_apk.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$APK_LOG"\n')
+            fake_apk.chmod(0o755)
+            log = root / "apk.log"
+            env = {**os.environ, "BASE_APK_DB_SHA256": build.sha256(database),
+                   "PATH": f"{root}:{os.environ['PATH']}", "APK_LOG": str(log)}
+
+            def run(*archives):
+                return subprocess.run(["sh", script, *archives], env=env, text=True, capture_output=True)
+
+            result = run(apk)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(log.read_text().splitlines(), [
+                f"--no-network --repositories-file /dev/null verify {apk}",
+                f"--no-network --repositories-file /dev/null add --no-cache {apk}"])
+            log.unlink()
+            self.assertNotEqual(run(apk, unlisted).returncode, 0)
+            self.assertFalse(log.exists())
+            apk.write_bytes(b"wrong bytes, same package filename")
+            self.assertNotEqual(run(apk).returncode, 0)
+            self.assertFalse(log.exists())
 
     def test_linked_source_binary_identity_and_apkbuild_inputs_fail_closed(self):
         lock = json.loads((HERE / "runtime.lock.json").read_text())
@@ -154,42 +210,75 @@ class RuntimeRecipeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "private input inventory"):
                 build.verify_private_inputs(lock, cache)
 
-    def test_failed_apk_signature_prevents_identity_acceptance(self):
+    def test_forged_signature_member_cannot_authenticate_apk(self):
         with tempfile.TemporaryDirectory() as temp:
             cache = Path(temp)
             apk = cache / "apks/zlib-1.apk"
             apk.parent.mkdir()
-            apk.write_bytes(b"bad signature")
+            snapshot = cache / "snapshot"
+            snapshot.mkdir()
+            with tarfile.open(apk, "w:gz") as archive:
+                for name, data in ((".SIGN.RSA.forged", b"not a signature"),
+                                   (".PKGINFO", b"pkgname = zlib\npkgver = 1\n")):
+                    member = tarfile.TarInfo(name)
+                    member.size = len(data)
+                    archive.addfile(member, io.BytesIO(data))
             lock = {"platform": "linux/amd64", "container": "immutable",
                     "base_apk_db_sha256": "a" * 64,
                     "apk_packages": {"zlib": {"archive": apk.name, "sha256": build.sha256(apk)}}}
-            with patch.object(build.subprocess, "run", return_value=
-                              subprocess.CompletedProcess([], 1, b"BAD signature")):
+            with (patch.object(build.subprocess, "run", return_value=
+                               subprocess.CompletedProcess([], 1, b"BAD signature")),
+                  patch.object(build, "check_selected_apk_metadata") as metadata):
                 with self.assertRaisesRegex(ValueError, "APK authentication failed"):
-                    build.verify_selected_apks(lock, cache)
+                    build.verify_selected_apks(lock, cache, snapshot)
+                metadata.assert_not_called()
 
-    def test_apk_generated_identity_must_match_authenticated_index(self):
+    def test_verification_needs_no_repository_index_and_rejects_metadata_mismatch(self):
         with tempfile.TemporaryDirectory() as temp:
             cache = Path(temp)
             apk = cache / "apks/zlib-1.apk"
             apk.parent.mkdir()
             apk.write_bytes(b"archive")
-            proof = cache / "authentication"
-            proof.mkdir()
-            data = b"P:zlib\nV:1\nC:local-control-identity\nL:Zlib\nc:commit\n\n"
-            with tarfile.open(proof / "selected-APKINDEX.tar.gz", "w:gz") as archive:
-                member = tarfile.TarInfo("APKINDEX")
-                member.size = len(data)
-                archive.addfile(member, io.BytesIO(data))
+            snapshot = cache / "snapshot"
+            snapshot.mkdir()
+            selected = ["/selected-apks/zlib-1.apk"]
+            proofs = []
+            data = b"P:zlib\nV:1\nA:x86_64\nC:control-identity\nL:Zlib\nc:commit\n\n"
+
+            def run(command, **kwargs):
+                self.assertIn("--network=none", command)
+                self.assertEqual(command[-1:], selected)
+                self.assertIn(f"{snapshot}:/selected-apks:ro", command)
+                self.assertEqual(command[-3:-1], ["/recipe/provision.sh", "--index"])
+                proof = next(Path(arg.removesuffix(":/proof:rw")) for arg in command if arg.endswith(":/proof:rw"))
+                proofs.append(proof)
+                write_apk_index(proof / "selected-APKINDEX.tar.gz", data)
+                return subprocess.CompletedProcess(command, 0, b"OK")
+
             entry = {"archive": apk.name, "sha256": build.sha256(apk), "version": "1",
-                     "index_checksum": "authenticated-upstream-identity", "license": "Zlib",
+                     "index_checksum": "control-identity", "license": "Zlib",
                      "aports_commit": "commit"}
-            lock = {"apk_packages": {"zlib": entry}}
-            with patch.object(build, "authenticate"):
-                with self.assertRaisesRegex(ValueError, "authenticated APK differs"):
-                    build.verify_selected_apks(lock, cache)
-                entry["index_checksum"] = "local-control-identity"
-                self.assertEqual(build.verify_selected_apks(lock, cache), ["/sources/apks/zlib-1.apk"])
+            lock = {"platform": "linux/amd64", "container": "immutable",
+                    "base_apk_db_sha256": "a" * 64, "apk_packages": {"zlib": entry}}
+            with (patch.object(build.urllib.request, "urlopen") as network,
+                  patch.object(build.subprocess, "run", side_effect=run)):
+                self.assertEqual(build.verify_selected_apks(lock, cache, snapshot), selected)
+                for field, changed in (("version", "2"), ("index_checksum", "other"),
+                                       ("license", "MIT"), ("aports_commit", "other")):
+                    with self.subTest(field=field):
+                        actual = lock["apk_packages"]["zlib"]
+                        lock["apk_packages"]["zlib"] = {**actual, field: changed}
+                        with self.assertRaisesRegex(ValueError, "authenticated (selected )?APK"):
+                            build.verify_selected_apks(lock, cache, snapshot)
+                        lock["apk_packages"]["zlib"] = actual
+                data = data.replace(b"x86_64", b"aarch64")
+                with self.assertRaisesRegex(ValueError, "authenticated APK metadata differs"):
+                    build.verify_selected_apks(lock, cache, snapshot)
+                network.assert_not_called()
+            self.assertFalse((cache / "indexes").exists())
+            self.assertEqual(len(proofs), len(set(proofs)))
+            with tarfile.open(proofs[0] / "selected-APKINDEX.tar.gz") as proof:
+                self.assertIn(b"A:x86_64\n", proof.extractfile("APKINDEX").read())
 
     def test_private_inventory_requires_retained_base_layer_bytes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -206,24 +295,19 @@ class RuntimeRecipeTests(unittest.TestCase):
             (cache / "private/base-oci/index.json").write_text(json.dumps({
                 "manifests": [{"digest": f"sha256:{manifest_sha}"}]}))
             (cache / "private/base-oci/oci-layout").write_text('{"imageLayoutVersion":"1.0.0"}')
-            (cache / "indexes").mkdir()
-            (cache / "indexes/repositories").write_text("")
             recipes = cache / "private/recipe"
             recipes.mkdir()
             for name in ("build.py", "container-build.sh", "provision.sh", "relink.sh",
                          "runtime.lock.json", "alpine-source.lock.json", "README.md", "RELINKING.md"):
                 (recipes / name).write_bytes((HERE / name).read_bytes())
-            lock = {"container": f"alpine@sha256:{manifest_sha}", "apk_indexes": {},
+            lock = {"container": f"alpine@sha256:{manifest_sha}",
                     "base_packages": {}, "apk_packages": {}, "sources": {}, "notices": {}}
             auth = cache / "private/authentication"
             auth.mkdir()
             (auth / "apk-installed.txt").write_text("")
             (auth / "restored-base-manifest.log").write_bytes(manifest)
-            with tarfile.open(auth / "selected-APKINDEX.tar.gz", "w:gz") as archive:
-                member = tarfile.TarInfo("APKINDEX")
-                member.size = 0
-                archive.addfile(member, io.BytesIO(b""))
-            for name in ("index", "APK", "offline-restore"):
+            write_apk_index(auth / "selected-APKINDEX.tar.gz", b"")
+            for name in ("APK", "offline-restore"):
                 (auth / f"{name}.log").write_text("verified")
                 (auth / f"{name}.json").write_text(json.dumps({
                     "returncode": 0, "container": lock["container"],
@@ -234,8 +318,7 @@ class RuntimeRecipeTests(unittest.TestCase):
                                       if name == "APK" else
                                       {"apk-installed.txt": build.sha256(auth / "apk-installed.txt"),
                                        "restored-base-manifest.log":
-                                       build.sha256(auth / "restored-base-manifest.log")}
-                                      if name == "offline-restore" else {})}))
+                                           build.sha256(auth / "restored-base-manifest.log")})}))
             inventory = {"schema": 1, "container": lock["container"],
                          "runtime_lock_sha256": build.sha256(HERE / "runtime.lock.json"),
                          "source_lock_sha256": build.sha256(HERE / "alpine-source.lock.json"),
@@ -244,7 +327,7 @@ class RuntimeRecipeTests(unittest.TestCase):
             (cache / "private-inputs.json").write_text(json.dumps(inventory))
             with patch.object(build, "alpine_sources", return_value={}):
                 self.assertEqual(build.verify_private_inputs(lock, cache), inventory)
-                for name in ("selected-APKINDEX.tar.gz", "apk-installed.txt"):
+                for name in ("selected-APKINDEX.tar.gz", "apk-installed.txt", "offline-restore.json"):
                     relative = f"private/authentication/{name}"
                     saved = inventory["files_sha256"].pop(relative)
                     (cache / "private-inputs.json").write_text(json.dumps(inventory))
@@ -253,15 +336,15 @@ class RuntimeRecipeTests(unittest.TestCase):
                     inventory["files_sha256"][relative] = saved
                 (cache / "private-inputs.json").write_text(json.dumps(inventory))
                 changed_lock = {**lock, "source_date_epoch": 1}
-                with self.assertRaisesRegex(ValueError, "lacks successful index proof"):
+                with self.assertRaisesRegex(ValueError, "lacks successful APK proof"):
                     build.verify_private_inputs(changed_lock, cache)
-                receipt_path = auth / "index.json"
+                receipt_path = auth / "APK.json"
                 receipt = json.loads(receipt_path.read_text())
                 receipt["input_binding"]["source_lock_sha256"] = "0" * 64
                 receipt_path.write_text(json.dumps(receipt))
-                inventory["files_sha256"]["private/authentication/index.json"] = build.sha256(receipt_path)
+                inventory["files_sha256"]["private/authentication/APK.json"] = build.sha256(receipt_path)
                 (cache / "private-inputs.json").write_text(json.dumps(inventory))
-                with self.assertRaisesRegex(ValueError, "lacks successful index proof"):
+                with self.assertRaisesRegex(ValueError, "lacks successful APK proof"):
                     build.verify_private_inputs(lock, cache)
                 (blob_root / layer_sha).unlink()
                 with self.assertRaisesRegex(ValueError, "missing or changed file"):

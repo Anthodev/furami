@@ -763,6 +763,10 @@ def verify_runtime_linked_sources(runtime_root, manifest, lock, *, linked_source
     recipe = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(recipe)
     recipe.SOURCE_LOCK_FILE = ALPINE_SOURCE_LOCK
+    for name in recipe.RELINK_RECIPE_FILES:
+        canonical = ALPINE_SOURCE_LOCK if name == ALPINE_SOURCE_LOCK.name else recipe.HERE / name
+        if canonical.is_symlink() or not canonical.is_file() or relink.get("relink/" + name) != digest(canonical):
+            raise ValueError("runtime relink recipe differs from the reviewed recipe: " + name)
     sources = recipe.alpine_sources(lock)
     cache = Path(linked["local_cache_path"]) if linked_source_root is None else linked_source_root
     if cache.is_symlink() or not cache.is_dir():
@@ -817,8 +821,6 @@ def copy_runtime_materials(runtime_root, manifest, appdir, owners, lock, *, link
         names = component.get("notice_files")
         if not isinstance(names, list) or not names or any(name not in notices for name in names):
             raise ValueError(f"runtime component notices unverified: {component.get('name')}")
-    if not any(Path(path).name == "RELINKING.md" for path in relink) or not any(path.endswith(".sh") for path in relink):
-        raise ValueError("runtime source-relink procedure/script missing")
     if manifest.get("sources") != lock["sources"]:
         raise ValueError("runtime sources differ from pinned source lock")
     for key in ("type2_runtime", "libfuse", "squashfuse", "libfuse_patch"):

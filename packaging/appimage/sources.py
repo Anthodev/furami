@@ -45,6 +45,15 @@ def dump(path, value):
     Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
+def public_runtime_manifest_bytes(manifest):
+    """Serialize runtime provenance without the producer's private cache path."""
+    if 'linked_source_closure' in manifest:
+        manifest = {**manifest, 'linked_source_closure': {
+            key: value for key, value in manifest['linked_source_closure'].items()
+            if key != 'local_cache_path'}}
+    return (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode('utf-8')
+
+
 def notice_relative(path):
     return (isinstance(path, str) and path and '\\' not in path and '\0' not in path
             and all(part not in ('', '.', '..') for part in path.split('/')))
@@ -477,7 +486,7 @@ def verify_compressed_tail(stream, signature, name):
 
 
 def reject_private_archive(stream, name):
-    """Recognize renamed binary APK/image archives without extracting payloads."""
+    """Recognize renamed private APK, index and image archives."""
     signature = stream.read(6)
     stream.seek(0)
     if signature.startswith(b'BZh') or signature == b'\xfd7zXZ\x00':
@@ -497,7 +506,8 @@ def reject_private_archive(stream, name):
         with nested:
             for member in nested:
                 relative = member.name.removeprefix('./')
-                if (relative in ('oci-layout', 'manifest.json', 'repositories', '.PKGINFO', 'lib/apk/db/installed')
+                if (relative in ('oci-layout', 'manifest.json', 'repositories', '.PKGINFO', 'APKINDEX',
+                                 'lib/apk/db/installed')
                         or relative.startswith(('blobs/sha256/', '.SIGN.'))):
                     raise ValueError('private Alpine bootstrap archive in public material: ' + name)
             verify_tar_footer(nested, name)
@@ -561,6 +571,12 @@ def verify_public_materials(release, index, *, require_complete=True):
     if type(runtime.get('schema')) is not int or type(alpine.get('schema')) is not int or alpine['schema'] != 1:
         raise ValueError('invalid public runtime/source lock schema')
     runtime_recipe.verify_lock(runtime)
+    for name in runtime_recipe.RELINK_RECIPE_FILES:
+        canonical = runtime_recipe_path.with_name(name)
+        relative = 'furami/packaging/appimage-runtime/' + name
+        if (canonical.is_symlink() or not canonical.is_file()
+                or inventory.get(relative, {}).get('sha256') != sha(canonical)):
+            raise ValueError('public runtime relink recipe differs from reviewed canonical recipe: ' + name)
     linked_sources = runtime_recipe.alpine_sources(runtime)
     if linked_sources != alpine.get('linked_sources'):
         raise ValueError('public linked source closure differs from reviewed canonical pairs')
@@ -578,11 +594,8 @@ def verify_public_materials(release, index, *, require_complete=True):
     # The exact upstream base manifest is also private; OCI blob/layout paths
     # and nested image-archive signatures are rejected below.
     forbidden.update((base['manifest_sha256'], base['config_sha256'], *base['layers_sha256']))
-    public_indexes = {'runtime-inputs/indexes/' + repo + '/x86_64/APKINDEX.tar.gz': entry['sha256']
-                      for repo, entry in runtime['apk_indexes'].items()}
     required = {'runtime-inputs/' + entry['archive']: entry['sha256']
                 for entry in runtime['sources'].values()}
-    required.update(public_indexes)
     for name, source in media_lock['sources'].items():
         if name != 'ca_certificates':
             required['media-inputs/' + source['archive']] = source['sha256']
@@ -640,9 +653,6 @@ def verify_public_materials(release, index, *, require_complete=True):
                         or any(part in ('apks', 'blobs', 'oci-layout') for part in parts)
                         or name.startswith('runtime-inputs/base-image/')):
                     raise ValueError('private Alpine bootstrap material in public archive: ' + name)
-                # Signed index metadata is public, unlike signed binary APKs.
-                if public_indexes.get(name) == row['sha256']:
-                    continue
                 with archive.extractfile(member) as stream:
                     reject_private_archive(stream, name)
     for path in release.iterdir():
@@ -792,12 +802,12 @@ def assemble(provenance, audit, output, caches, acquire):
         for entry in [source['upstream_source'], *source['aports_inputs']]:
             locked({**entry, 'archive': entry['file']}, caches['runtime'] / 'alpine-sources' / name,
                    'runtime-inputs/alpine-sources/' + name + '/' + entry['file'], 'runtime:' + name)
-    for repo, entry in lock['apk_indexes'].items():
-        locked({**entry, 'archive': 'APKINDEX.tar.gz'}, caches['runtime'] / 'indexes' / repo / 'x86_64',
-               'runtime-inputs/indexes/' + repo + '/x86_64/APKINDEX.tar.gz', 'runtime-toolchain', 'build-input')
     for path in sorted((runtime / 'licenses').iterdir()):
         add(path, 'runtime-evidence/licenses/' + path.name, role='license-evidence')
-    for name in ('manifest.json', 'link.map', 'apk-installed.txt'):
+    recipient_manifest = Path(derived.name) / 'runtime-manifest.json'
+    recipient_manifest.write_bytes(public_runtime_manifest_bytes(runtime_manifest))
+    add(recipient_manifest, 'runtime-evidence/manifest.json', role='build-configuration')
+    for name in ('link.map', 'apk-installed.txt'):
         add(runtime / name, 'runtime-evidence/' + name, role='build-configuration')
     # Archive available bytes even when incomplete, plainly marked material set.
     # Each part is independently extractable; no cache paths needed by recipients.

@@ -340,7 +340,8 @@ class CandidateTests(unittest.TestCase):
 
     def test_public_scope_refuses_private_bytes_and_missing_actual_linked_sources(self):
         for mutation in ('apk', 'renamed-apk', 'unknown-apk', 'base-image', 'base-layer', 'flat-apk',
-                         'raw-config', 'raw-layer', 'missing-index', 'missing-source', 'undeclared-extra', 'wrong-hash'):
+                         'renamed-proof', 'stale-relink', 'raw-config', 'raw-layer', 'missing-source',
+                         'undeclared-extra', 'wrong-hash'):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / 'candidate'
                 fixture(root)
@@ -348,27 +349,28 @@ class CandidateTests(unittest.TestCase):
                 members = source_members()
                 if mutation in ('apk', 'renamed-apk'):
                     members['runtime-inputs/' + ('tool.apk' if mutation == 'apk' else 'innocent.txt')] = b'private APK'
-                elif mutation in ('unknown-apk', 'base-image', 'base-layer'):
+                elif mutation in ('unknown-apk', 'base-image', 'base-layer', 'renamed-proof'):
                     blob = io.BytesIO()
-                    with tarfile.open(fileobj=blob, mode='w:gz' if mutation == 'unknown-apk' else 'w') as tar:
+                    with tarfile.open(fileobj=blob,
+                                      mode='w:gz' if mutation in ('unknown-apk', 'renamed-proof') else 'w') as tar:
                         directory = tarfile.TarInfo('./')
                         directory.type = tarfile.DIRTYPE
                         tar.addfile(directory)
-                        marker = '.PKGINFO' if mutation == 'unknown-apk' else (
-                            'lib/apk/db/installed' if mutation == 'base-layer' else 'oci-layout')
+                        marker = {'unknown-apk': '.PKGINFO', 'base-layer': 'lib/apk/db/installed',
+                                  'base-image': 'oci-layout', 'renamed-proof': 'APKINDEX'}[mutation]
                         entry = tarfile.TarInfo(marker)
                         data = b'private bootstrap metadata'
                         entry.size = len(data)
                         tar.addfile(entry, io.BytesIO(data))
                     members['runtime-inputs/innocent.data'] = blob.getvalue()
+                elif mutation == 'stale-relink':
+                    members['furami/packaging/appimage-runtime/provision.sh'] = b'apk update\n'
                 elif mutation in ('raw-config', 'raw-layer'):
                     members['runtime-inputs/innocent.json'] = (
                         b'private base config' if mutation == 'raw-config' else b'private base layer')
                 elif mutation == 'missing-source':
                     members.pop(next(name for name in members if name.startswith('runtime-inputs/alpine-sources/zlib/')
                                      and name.endswith('.tar.gz')))
-                elif mutation == 'missing-index':
-                    members.pop('runtime-inputs/indexes/main/x86_64/APKINDEX.tar.gz')
                 index = write_materials(root, members)
                 if mutation == 'flat-apk':
                     (root / 'NOTICE.txt').write_bytes(b'private APK')

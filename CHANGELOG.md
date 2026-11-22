@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- Verify the AppImage runtime's exact Alpine packages instead of requiring live repository indexes to match historical snapshots. Package signatures, metadata, checksums and the offline installed package set are still checked.
+
 ## [2.0.1] - 2026-11-22
 
 ### Fixes

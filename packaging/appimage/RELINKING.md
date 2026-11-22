@@ -50,7 +50,7 @@ The extracted tree contains:
 - `app-inputs/`, checked Rust distribution and Cargo crate inputs.
 - `media-inputs/`, available frozen mpv/FFmpeg/libplacebo/Vulkan-Headers inputs.
 - `ubuntu-inputs/` and `ubuntu-evidence/`, applicable exact source descriptors/original source/Ubuntu patches, signed-source-index evidence and original component copyright notices.
-- `runtime-inputs/` and `runtime-evidence/`, available type-2 runtime/FUSE/squashfuse sources and patch, the linked Alpine source closure (each pinned `APKBUILD` with its upstream and patch inputs), locked rebuild inputs and original static contributor notices/linkage receipts. The Alpine binary bootstrap packages and the base-image material are not in this material set; its signed index metadata is separate and never substitutes for binary or source coverage.
+- `runtime-inputs/` and `runtime-evidence/`, available type-2 runtime/FUSE/squashfuse sources and patch, the linked Alpine source closure (each pinned `APKBUILD` with its upstream and patch inputs), original static contributor notices and linkage receipts. The recipe lock and runtime manifest record the exact Alpine inputs and how they are authenticated. Neither the binary bootstrap packages nor the base-image material is included; upstream repository indexes are not needed.
 
 Plain checked HTTPS acquisition remains in the recipes, but local developer cache paths are not recipient instructions. A required unavailable historical source/build input blocks publication.
 
@@ -94,7 +94,7 @@ python3 recipient-inputs/furami/packaging/appimage-runtime/build.py \
   --modified-libfuse /absolute/modified-fuse.tar.xz
 ```
 
-The recipe applies the exact frozen mount patch and relinks the complete runtime. Modified-libfuse mode records the new source hash and keeps unrelated APK/source pins checked. Permissive/exception source copies for unchanged compiler/static inputs are optional; the checked binary toolchain stays in a private authenticated cache rather than the material set, so you must supply those pinned inputs yourself to run this recipe, while the signed historical indexes and the required FUSE source/relink inputs remain part of the material set. It does not claim a new modified runtime is the original canonical provider.
+The recipe applies the exact frozen mount patch and relinks the complete runtime. Modified-libfuse mode records the new source hash and keeps unrelated APK/source pins checked. Source copies for unchanged compiler/static inputs are not needed for this mode; supply the exact pinned Alpine binaries yourself, since they are not part of the source material set. The same package signature, metadata and offline installed-closure checks apply, without upstream repository indexes. The modified runtime is not the original canonical provider.
 
 To repack a modified extracted tree, use the pinned appimagetool 1.9.1 asset and a compatible source-built runtime explicitly with `--runtime-file`. Its official asset URL/hash are recorded in the build receipt and `stage.py`; no implicit latest runtime is used:
 

@@ -429,12 +429,18 @@ class StageIntegrityTests(unittest.TestCase):
         notice_paths = ["licenses/" + name for name in names]
         archives = ["type2-runtime.tar.gz", "fuse-3.15.0.tar.xz",
                     "mount.c.diff", "squashfuse-0.5.2.tar.gz"]
-        relink_paths = ["relink/" + name for name in archives + ["RELINKING.md", "build.sh", "alpine-source.lock.json"]]
+        canonical = stage.REPO / "packaging/appimage-runtime"
+        recipe_files = ("build.py", "container-build.sh", "provision.sh", "relink.sh", "RELINKING.md",
+                        "runtime.lock.json", "alpine-source.lock.json")
+        relink_paths = ["relink/" + name for name in (*archives, *recipe_files)]
         records = {}
         for relative in notice_paths + relink_paths:
             file = runtime / relative
             file.parent.mkdir(exist_ok=True)
-            file.write_bytes(("actual:" + relative).encode())
+            if relative.startswith("relink/") and file.name in recipe_files:
+                shutil.copyfile(canonical / file.name, file)
+            else:
+                file.write_bytes(("actual:" + relative).encode())
             records[relative] = stage.digest(file)
         lock = json.loads((stage.REPO / "packaging/appimage-runtime/runtime.lock.json").read_text())
         lock["sources"] = {key: {"archive": name, "sha256": records["relink/" + name]}
@@ -498,6 +504,17 @@ class StageIntegrityTests(unittest.TestCase):
             (runtime / "licenses/gcc.COPYING.RUNTIME").write_text("tampered")
             with self.assertRaisesRegex(ValueError, "runtime licenses bytes/manifest mismatch"):
                 stage.copy_runtime_materials(runtime, manifest, staged, {}, lock)
+
+    def test_stale_runtime_relink_recipe_rejected_even_when_rehashed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime, staged, lock, manifest = self.runtime_materials_fixture(Path(temporary))
+            relative = "relink/provision.sh"
+            path = runtime / relative
+            path.write_text("apk update\n")
+            manifest["relink_files"][relative] = manifest["files_sha256"][relative] = stage.digest(path)
+            with self.assertRaisesRegex(ValueError, "relink recipe differs.*provision.sh"):
+                stage.copy_runtime_materials(runtime, manifest, staged, {}, lock)
+            self.assertFalse(any(staged.iterdir()))
 
 
     def test_runtime_linked_closure_requires_exact_current_sources_and_proof(self):
@@ -566,13 +583,19 @@ class StageIntegrityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             runtime, _, lock, manifest = self.runtime_materials_fixture(root)
+            bundled_lock = runtime / "relink/runtime.lock.json"
+            bundled_lock.write_text(json.dumps(lock))
+            checksum = stage.digest(bundled_lock)
+            manifest["relink_files"]["relink/runtime.lock.json"] = checksum
+            manifest["files_sha256"]["relink/runtime.lock.json"] = checksum
             (runtime / "manifest.json").write_text(json.dumps(manifest))
             original = (runtime / "manifest.json").read_bytes()
             repo = root / "repo"
             recipe = repo / "packaging/appimage-runtime"
             recipe.mkdir(parents=True)
-            shutil.copy2(stage.REPO / "packaging/appimage-runtime/build.py", recipe / "build.py")
-            (recipe / "runtime.lock.json").write_text(json.dumps(lock))
+            for name in ("build.py", "container-build.sh", "provision.sh", "relink.sh", "RELINKING.md",
+                         "runtime.lock.json"):
+                shutil.copy2(runtime / "relink" / name, recipe / name)
             tool = root / "checked-tool"
             tool.write_bytes(b"fixture")
             arguments = ["stage.py", "--media-output", str(root / "media"), "--app-build", str(root / "app"),

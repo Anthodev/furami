@@ -80,13 +80,17 @@ class ComparisonTests(unittest.TestCase):
                 runtime = root / label / 'runtime'
                 (runtime / 'link.map').write_text('LOAD /tmp/runtime-' + token + '.o\n')
                 digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-                manifest = {'files_sha256': {'link.map': digest(runtime / 'link.map')},
-                            'artifact': {'sha256': digest(runtime / 'runtime-x86_64')}}
-                (runtime / 'manifest.json').write_text(json.dumps(manifest))
+                public_manifest = {'files_sha256': {'link.map': digest(runtime / 'link.map')},
+                                   'artifact': {'sha256': digest(runtime / 'runtime-x86_64')},
+                                   'linked_source_closure': {'verified_input_count': 1}}
+                raw_manifest = {**public_manifest, 'linked_source_closure': {
+                    **public_manifest['linked_source_closure'], 'local_cache_path': '/private/runtime-cache'}}
+                (runtime / 'manifest.json').write_text(json.dumps(raw_manifest, indent=2, sort_keys=True) + '\n')
                 archive = root / label / 'release/source-materials-001.tar'
                 with tarfile.open(archive, 'a', format=tarfile.USTAR_FORMAT) as tar:
                     for name in ('link.map', 'manifest.json'):
-                        content = (runtime / name).read_bytes()
+                        content = ((json.dumps(public_manifest, indent=2, sort_keys=True) + '\n').encode()
+                                   if name == 'manifest.json' else (runtime / name).read_bytes())
                         entry = tarfile.TarInfo('runtime-evidence/' + name)
                         entry.size = len(content)
                         entry.mode = 0o644
@@ -134,6 +138,28 @@ class ComparisonTests(unittest.TestCase):
             with patch.object(publisher, 'REPO', canonical):
                 assets = publisher.verify_candidate(release, '0.1.0-rc.1', require_reproducibility=True)
             self.assertEqual(assets, sorted(release.iterdir()))
+
+            archive = release / 'source-materials-001.tar'
+            row = inventory['runtime-evidence/manifest.json']
+            with archive.open('r+b') as stream:
+                stream.seek(row['data_offset'])
+                exact = stream.read(row['size'])
+                changed = exact.replace(b'"verified_input_count": 1', b'"verified_input_count": 2')
+                self.assertNotEqual(exact, changed)
+                stream.seek(row['data_offset'])
+                stream.write(changed)
+            with self.assertRaisesRegex(ValueError, 'not exact runtime provider material: runtime-evidence/manifest'):
+                comparison.compare_outputs(root)
+            with archive.open('r+b') as stream:
+                stream.seek(row['data_offset'])
+                stream.write(exact)
+            reordered = root / 'reordered.tar'
+            with tarfile.open(archive) as original, tarfile.open(reordered, 'w', format=tarfile.USTAR_FORMAT) as shifted:
+                for member in reversed(original.getmembers()):
+                    shifted.addfile(member, original.extractfile(member))
+            reordered.replace(archive)
+            with self.assertRaisesRegex(ValueError, 'runtime source evidence archive coordinates differ'):
+                comparison.compare_outputs(root)
 
     def criteria(self):
         return dict.fromkeys(('image_bytes', 'payload_files_modes_symlinks', 'source_runtime_bytes',

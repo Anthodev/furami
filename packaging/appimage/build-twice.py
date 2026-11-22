@@ -113,14 +113,24 @@ def compare_outputs(out: Path) -> dict:
     material, accepted = runtime_comparator.classify_variance(out / 'first/runtime', out / 'second/runtime', differences)
     if accepted and not material:
         for relative, provider_name in (('runtime-evidence/link.map', 'link.map'), ('runtime-evidence/manifest.json', 'manifest.json')):
-            for index, rows in enumerate((source_a, source_b)):
-                provider = out / ('first' if index == 0 else 'second') / 'runtime' / provider_name
-                if relative not in rows or rows[relative]['sha256'] != digest(provider):
+            rows = (source_a.get(relative), source_b.get(relative))
+            if any(row is None for row in rows):
+                raise ValueError('source evidence is not exact runtime provider material: ' + relative)
+            first_row, second_row = rows
+            if any(first_row[key] != second_row[key] for key in ('archive', 'data_offset', 'size')):
+                raise ValueError('runtime source evidence archive coordinates differ: ' + relative)
+            for label, row in zip(('first', 'second'), rows):
+                provider = out / label / 'runtime' / provider_name
+                if provider_name == 'manifest.json':
+                    projected = sources_recipe.public_runtime_manifest_bytes(json.loads(provider.read_bytes()))
+                    expected = hashlib.sha256(projected).hexdigest()
+                else:
+                    expected = digest(provider)
+                if row['sha256'] != expected:
                     raise ValueError('source evidence is not exact runtime provider material: ' + relative)
-                rows[relative]['sha256'] = '<proven runtime metadata variance>'
-                if index == 0:
-                    row = rows[relative]
-                    permitted_source_ranges.setdefault(row['archive'], []).append((row['data_offset'], row['size']))
+                row['sha256'] = '<proven runtime metadata variance>'
+            permitted_source_ranges.setdefault(first_row['archive'], []).append(
+                (first_row['data_offset'], first_row['size']))
             metadata_variance[relative] = accepted[provider_name]
     criteria = {
         'image_bytes': digest(left) == digest(right),

@@ -5,9 +5,7 @@ export LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH
 JOBS="${FURAMI_BUILD_JOBS:-2}"
 case "$JOBS" in 1|2|3|4) ;; *) echo 'build jobs must be 1..4' >&2; exit 1 ;; esac
 
-# The image database is pinned separately from the fetched APK closure. Alpine
-# verifies signatures on both indexes and packages; --no-network also prevents
-# build-system scripts from silently fetching anything.
+# Provision only the hash-locked and signature-verified archive snapshot.
 sh /recipe/provision.sh "$@"
 apk info -v | sort > /out/apk-installed.txt
 clang --version > /out/clang-version.txt
