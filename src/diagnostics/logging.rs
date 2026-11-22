@@ -990,6 +990,8 @@ fn known_code(code: &str) -> Option<&'static str> {
         "gpui_release",
         "gpui_exit",
         "gpui_layout",
+        "gpui_hyprland_blur_applied",
+        "gpui_hyprland_blur_unavailable",
         "gpui_companion_stage",
         "gpui_companion_visible",
         "gpui_companion_hidden",

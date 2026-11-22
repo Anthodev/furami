@@ -6,6 +6,7 @@ mod companion_view;
 mod controls;
 mod decisions;
 mod device_settings;
+mod hyprland_blur;
 mod idle_inhibitor;
 mod log_folder;
 mod playback_menu;
@@ -28,10 +29,10 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, GraphicalEnvironment, KeyDownEvent, KeyUpEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Render, ScrollEvent, Subscription, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
-    WindowOptions, div, point, prelude::*, px, size,
+    App, BackgroundExecutor, Bounds, Context, FocusHandle, GraphicalEnvironment, KeyDownEvent,
+    KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Render, ScrollEvent, Subscription,
+    TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
+    WindowHandle, WindowKind, WindowOptions, div, point, prelude::*, px, size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -51,9 +52,11 @@ use self::x11::{DestroyOutcome, Event, Layout, X11};
 use self::{
     chrome::ChromeState,
     companion_view::{CompanionPaint, CompanionView},
+    hyprland_blur::BlurOutcome,
     x11::{CompanionFacts, CompanionGeometry, FocusTarget},
 };
 
+const CHROME_APP_ID: &str = "dev.antho.furami.chrome";
 const TICK: Duration = Duration::from_millis(16);
 const COMPANION_PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
 const FULLSCREEN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -224,6 +227,7 @@ struct HostState {
     remap_popup_focus: Option<chrome::Popup>,
     keyboard_popup_focus: Option<chrome::Popup>,
     companion_mode: CompanionMode,
+    companion_blur: Option<CompanionBlur>,
     companion_geometry: Option<CompanionGeometry>,
     companion_facts: Option<CompanionFacts>,
     chrome: ChromeState,
@@ -265,9 +269,46 @@ struct HostState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CompanionMode {
     Unmapped,
+    AwaitingBlur(u64),
     Preparing(Instant),
     Visible,
     Lost,
+}
+
+#[derive(Default)]
+struct CompanionBlur {
+    blur_map_serial: u64,
+    outcome: Option<BlurOutcome>,
+    pending: Option<Receiver<(u64, BlurOutcome)>>,
+}
+
+impl CompanionBlur {
+    fn start(&mut self, background: &BackgroundExecutor) -> CompanionMode {
+        debug_assert!(self.pending.is_none() && self.outcome.is_none());
+        self.blur_map_serial += 1;
+        let serial = self.blur_map_serial;
+        let (tx, rx) = sync_channel(1);
+        self.pending = Some(rx);
+        background
+            .spawn(async move {
+                let outcome = hyprland_blur::apply().await;
+                let _ = tx.try_send((serial, outcome));
+            })
+            .detach();
+        CompanionMode::AwaitingBlur(serial)
+    }
+
+    fn poll(&mut self, mode: CompanionMode) -> Option<BlurOutcome> {
+        let (serial, outcome) = match self.pending.as_ref()?.try_recv() {
+            Ok(reply) => reply,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => (self.blur_map_serial, BlurOutcome::Unavailable),
+        };
+        self.pending = None;
+        // A hide or native demap ends the current phase but leaves the
+        // receiver in flight; only drain it, never settle a stale result.
+        (mode == CompanionMode::AwaitingBlur(serial)).then_some(outcome)
+    }
 }
 
 enum FocusChange {
@@ -288,6 +329,7 @@ impl HostState {
             remap_popup_focus: None,
             keyboard_popup_focus: None,
             companion_mode: CompanionMode::Unmapped,
+            companion_blur: None,
             companion_geometry: None,
             companion_facts: None,
             chrome: ChromeState::default(),
@@ -693,6 +735,7 @@ impl HostState {
                     tracing::error!(event_code = "gpui_companion_quarantine_failed", %error);
                 }
                 self.companion_mode = CompanionMode::Lost;
+                self.companion_blur = None;
                 self.volume.reset();
                 self.set_overlay_opacity(0.);
             }
@@ -769,6 +812,7 @@ impl HostState {
         }
         tracing::error!(event_code = "gpui_companion_loss", reason, root = self.root);
         self.companion_mode = CompanionMode::Lost;
+        self.companion_blur = None;
         self.volume.reset();
         self.overlay_opacity = 0.;
         self.failure.get_or_insert(GpuiLaunchError::NativeLoss);
@@ -789,7 +833,7 @@ impl HostState {
     fn hide_companion(&mut self) -> Result<(), x11::Error> {
         if matches!(
             self.companion_mode,
-            CompanionMode::Visible | CompanionMode::Preparing(_)
+            CompanionMode::Visible | CompanionMode::Preparing(_) | CompanionMode::AwaitingBlur(_)
         ) {
             let focus_result = self.x11().return_focus();
             self.x11().hide_companion()?;
@@ -808,16 +852,42 @@ impl HostState {
         Ok(())
     }
 
+    fn stage_companion(&mut self, now: Instant) {
+        self.overlay_epoch += 1;
+        self.companion_mode = CompanionMode::Preparing(now);
+        self.redraw = true;
+        tracing::info!(
+            event_code = "gpui_companion_stage",
+            xid = self.x11().companion_xid(),
+            epoch = self.overlay_epoch,
+        );
+    }
+
     fn reconcile_companion(
         &mut self,
+        background: &BackgroundExecutor,
         native_changed: bool,
         geometry_changed: bool,
         companion_changed: bool,
+        blur_interrupted: bool,
     ) -> Result<Option<FocusChange>, x11::Error> {
         if self.companion.is_none() || self.companion_mode == CompanionMode::Lost {
             return Ok(None);
         }
-        if native_changed || self.companion_facts.is_none() {
+        let awaiting_blur = matches!(self.companion_mode, CompanionMode::AwaitingBlur(_));
+        if awaiting_blur && blur_interrupted {
+            // Final facts alone can hide an Unmap→Map or focus loss and
+            // regain. Retire this phase before polling the reply and leave
+            // another tick to drain the unmap we are about to issue.
+            self.hide_companion()?;
+            self.companion_facts = Some(self.x11().companion_facts()?);
+            return Ok(None);
+        }
+        let blur_outcome = self
+            .companion_blur
+            .as_mut()
+            .and_then(|blur| blur.poll(self.companion_mode));
+        if native_changed || self.companion_facts.is_none() || blur_outcome.is_some() {
             self.companion_facts = Some(self.x11().companion_facts()?);
         }
         let available = self.accepts_input() && self.owned_family_viewable();
@@ -873,10 +943,10 @@ impl HostState {
             }
             return Ok(None);
         }
-        if native_changed
+        if (native_changed || blur_outcome.is_some())
             && matches!(
                 self.companion_mode,
-                CompanionMode::Visible | CompanionMode::Preparing(_)
+                CompanionMode::Visible | CompanionMode::Preparing(_) | CompanionMode::AwaitingBlur(_)
             )
             && self
                 .companion_facts
@@ -885,6 +955,58 @@ impl HostState {
         {
             self.hide_companion()?;
             self.companion_geometry = None;
+            if awaiting_blur {
+                return Ok(None);
+            }
+        }
+        if matches!(self.companion_mode, CompanionMode::AwaitingBlur(_)) {
+            if let Some(outcome) = blur_outcome {
+                let geometry = match outcome {
+                    BlurOutcome::Applied => Some(self.x11().companion_geometry()?),
+                    BlurOutcome::Unavailable => None,
+                };
+                if self.x11().blur_reply_interrupted(self.xid())? {
+                    // The normal drain will handle the queued interruption
+                    // before this phase can accept another reply.
+                    return Ok(None);
+                }
+                if let Some(geometry) = geometry {
+                    // Still mapped and in the focused family. Resize this XID
+                    // in place: the invalidated 1×1 paint is intentional.
+                    self.x11().place_companion(geometry)?;
+                    self.companion_geometry = Some(geometry);
+                    if let Some(blur) = &mut self.companion_blur {
+                        blur.outcome = Some(outcome);
+                    }
+                    tracing::info!(event_code = "gpui_hyprland_blur_applied");
+                    self.stage_companion(now);
+                } else {
+                    self.hide_companion()?;
+                    if let Some(blur) = &mut self.companion_blur {
+                        blur.outcome = Some(outcome);
+                    }
+                    tracing::warn!(event_code = "gpui_hyprland_blur_unavailable");
+                }
+            }
+            return Ok(None);
+        }
+        if self.companion_mode == CompanionMode::Unmapped
+            && let Some(blur) = &self.companion_blur
+            && blur.outcome.is_none()
+        {
+            if blur.pending.is_none() {
+                self.companion_geometry = None;
+                self.x11()
+                    .place_companion(CompanionGeometry::HYPRLAND_BOOTSTRAP)?;
+                if self.x11().map_hyprland_bootstrap()? {
+                    self.companion_mode = self
+                        .companion_blur
+                        .as_mut()
+                        .expect("verified Hyprland companion")
+                        .start(background);
+                }
+            }
+            return Ok(None);
         }
         if geometry_changed || companion_changed || self.companion_geometry.is_none() {
             let geometry = self.x11().companion_geometry()?;
@@ -912,14 +1034,7 @@ impl HostState {
         let extent = (geometry.width, geometry.height);
         if self.companion_mode == CompanionMode::Unmapped {
             if self.x11().map_companion()? {
-                self.overlay_epoch += 1;
-                self.companion_mode = CompanionMode::Preparing(now);
-                self.redraw = true;
-                tracing::info!(
-                    event_code = "gpui_companion_stage",
-                    xid = self.x11().companion_xid(),
-                    epoch = self.overlay_epoch,
-                );
+                self.stage_companion(now);
             }
             return Ok(None);
         }
@@ -1229,49 +1344,63 @@ impl HostState {
 
     /// Drain native events first, and return whether to issue the saved-mode
     /// toggle outside this borrow.
-    fn tick(&mut self, scale: f32, fullscreen: bool) -> (bool, Option<FocusChange>) {
+    fn tick(
+        &mut self,
+        background: &BackgroundExecutor,
+        scale: f32,
+        fullscreen: bool,
+    ) -> (bool, Option<FocusChange>) {
         let mut geometry_changed =
             std::mem::take(&mut self.bounds_changed) || self.native_fullscreen != fullscreen;
         self.native_fullscreen = fullscreen;
         let mut native_changed = false;
         let mut companion_changed = false;
+        let mut blur_interrupted = false;
         if !self.root_lost && !self.control_lost {
             loop {
-                match self.x11().next_event(self.xid()) {
-                    Ok(Some(Event::GeometryChanged)) => geometry_changed = true,
-                    Ok(Some(Event::CompanionChanged)) => companion_changed = true,
-                    Ok(Some(Event::FocusChanged)) => native_changed = true,
-                    Ok(Some(Event::ChildMappingChanged(mapped))) => {
-                        if let Some(lease) = &mut self.lease {
-                            lease.observed_mapped = mapped;
-                        }
-                    }
-                    Ok(Some(Event::CompanionLost)) => {
-                        let _ = self.x11().hide_companion();
-                        self.companion_lost("companion-destroyed-or-reparented");
-                    }
-                    Ok(Some(Event::KeyPress {
-                        target,
-                        time,
-                        tab: true,
-                    })) => {
-                        self.keyboard_time = Some((target, time, Instant::now()));
-                    }
-                    Ok(Some(Event::KeyPress { .. } | Event::KeyRelease { .. })) => {}
-                    Ok(Some(Event::ParentDestroyed)) => {
-                        self.report_loss("root-destroyed", false, true);
-                        break;
-                    }
-                    Ok(Some(Event::ChildDestroyed)) => {
-                        self.report_loss("child-destroyed", true, false)
-                    }
-                    Ok(Some(Event::ChildReparented)) => {
-                        self.report_loss("child-reparented", false, false)
-                    }
+                let event = match self.x11().next_event(self.xid()) {
+                    Ok(Some(event)) => event,
                     Ok(None) => break,
                     Err(error) => {
                         self.report_x11_error("x11-event-failed", &error);
                         break;
+                    }
+                };
+                blur_interrupted |= event.interrupts_blur();
+                match event {
+                    Event::GeometryChanged | Event::ParentMappingChanged(_) => {
+                        geometry_changed = true;
+                    }
+                    Event::CompanionChanged | Event::CompanionMappingChanged(_) => {
+                        companion_changed = true;
+                    }
+                    Event::FocusChanged | Event::OwnedFocusDeparted => native_changed = true,
+                    Event::ChildMappingChanged(mapped) => {
+                        if let Some(lease) = &mut self.lease {
+                            lease.observed_mapped = mapped;
+                        }
+                    }
+                    Event::CompanionLost => {
+                        let _ = self.x11().hide_companion();
+                        self.companion_lost("companion-destroyed-or-reparented");
+                    }
+                    Event::KeyPress {
+                        target,
+                        time,
+                        tab: true,
+                    } => {
+                        self.keyboard_time = Some((target, time, Instant::now()));
+                    }
+                    Event::KeyPress { .. } | Event::KeyRelease { .. } => {}
+                    Event::ParentDestroyed => {
+                        self.report_loss("root-destroyed", false, true);
+                        break;
+                    }
+                    Event::ChildDestroyed => {
+                        self.report_loss("child-destroyed", true, false)
+                    }
+                    Event::ChildReparented => {
+                        self.report_loss("child-reparented", false, false)
                     }
                 }
                 if self.root_lost || self.control_lost || self.quit_authorized {
@@ -1294,9 +1423,11 @@ impl HostState {
             return (false, None);
         }
         let focus = match self.reconcile_companion(
+            background,
             native_changed || companion_changed || geometry_changed,
             geometry_changed,
             companion_changed,
+            blur_interrupted,
         ) {
             Ok(focus) => focus,
             Err(error) => {
@@ -1368,6 +1499,23 @@ fn phase_name(phase: GatePhase) -> &'static str {
     }
 }
 
+fn install_window_close<V: 'static>(
+    window: &mut Window,
+    cx: &mut Context<V>,
+    state: &Rc<RefCell<HostState>>,
+) {
+    let on_close = Rc::downgrade(state);
+    window.on_window_should_close(cx, move |window, cx| {
+        let on_close = on_close.clone();
+        window.defer(cx, move |_, _| {
+            if let Some(state) = on_close.upgrade() {
+                state.borrow_mut().wm_close();
+            }
+        });
+        false
+    });
+}
+
 struct HostView {
     state: Rc<RefCell<HostState>>,
     focus: FocusHandle,
@@ -1390,16 +1538,7 @@ impl HostView {
         let focus_lost = cx.on_focus_lost(window, |this, window, cx| {
             this.restore_host_focus(window, cx);
         });
-        let on_close = Rc::downgrade(&state);
-        window.on_window_should_close(cx, move |window, cx| {
-            let on_close = on_close.clone();
-            window.defer(cx, move |_, _| {
-                if let Some(state) = on_close.upgrade() {
-                    state.borrow_mut().wm_close();
-                }
-            });
-            false
-        });
+        install_window_close(window, cx, &state);
         let on_window_loss = Rc::downgrade(&state);
         let app = cx.to_async();
         let background = cx.background_executor().clone();
@@ -1411,8 +1550,11 @@ impl HostView {
                     Some(view.update(cx, |view, cx| {
                         let (redraw, quit, toggle_fullscreen, companion, focus, log_folder) = {
                             let mut state = view.state.borrow_mut();
-                            let (toggle, focus) =
-                                state.tick(window.scale_factor(), window.is_fullscreen());
+                            let (toggle, focus) = state.tick(
+                                &background,
+                                window.scale_factor(),
+                                window.is_fullscreen(),
+                            );
                             state.poll_qualification_input();
                             let quit = state.quit_authorized && !state.quit_requested;
                             state.quit_requested |= quit;
@@ -1999,7 +2141,7 @@ fn start_windows(cx: &mut App, state: &Rc<RefCell<HostState>>) -> bool {
     }) else {
         return false;
     };
-    {
+    let hyprland = {
         let mut state = state.borrow_mut();
         let x11 = state.x11.as_mut().expect("preflighted X11 connection");
         if x11
@@ -2009,23 +2151,34 @@ fn start_windows(cx: &mut App, state: &Rc<RefCell<HostState>>) -> bool {
         {
             return false;
         }
+        let hyprland = x11.is_hyprland();
         state.root = x11.parent();
         state.scale = scale;
-    }
+        hyprland
+    };
 
     let mailbox = Rc::clone(&state.borrow().companion_paint);
-    // This GPUI backend maps even with `show: false`. Park both device-pixel
-    // edges outside the X root before applying the checked native quarantine.
-    let origin = -256. / scale;
-    let staging_size = 32. / scale;
-    let parking = Bounds {
-        origin: point(px(origin), px(origin)),
-        size: size(px(staging_size), px(staging_size)),
+    // GPUI maps even with `show: false`. On Hyprland, the backend's +2 X
+    // offset gives exactly (0, 0, 1, 1), which XWayland starts hidden.
+    // Other WMs keep both staging edges outside the X root.
+    let parking = if hyprland {
+        Bounds {
+            origin: point(px(-2. / scale), px(0.)),
+            size: size(px(1. / scale), px(1. / scale)),
+        }
+    } else {
+        let origin = -256. / scale;
+        let staging_size = 32. / scale;
+        Bounds {
+            origin: point(px(origin), px(origin)),
+            size: size(px(staging_size), px(staging_size)),
+        }
     };
     let Ok(companion) = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(parking)),
             titlebar: None,
+            app_id: Some(CHROME_APP_ID.into()),
             focus: false,
             show: false,
             kind: WindowKind::PopUp,
@@ -2041,12 +2194,13 @@ fn start_windows(cx: &mut App, state: &Rc<RefCell<HostState>>) -> bool {
     };
     let mut state = state.borrow_mut();
     let x11 = state.x11.as_mut().expect("preflighted X11 connection");
-    if let Err(error) = x11.bind_companion(companion_xid) {
+    if let Err(error) = x11.bind_companion(companion_xid, hyprland) {
         tracing::error!(event_code = "gpui_companion_setup_failed", %error);
         return false;
     }
     let environment = x11.environment_report();
     state.companion = Some(companion);
+    state.companion_blur = hyprland.then(CompanionBlur::default);
     if state.resize(true, scale).is_err() {
         return false;
     }
@@ -2153,5 +2307,70 @@ mod tests {
             PendingFullscreen::new(true, false, now).observe(true, now),
             Some(false)
         );
+    }
+
+    #[test]
+    fn gpui_host_companion_blur_waits_for_and_discards_a_hidden_map_reply() {
+        let (tx, rx) = sync_channel(1);
+        let mut blur = CompanionBlur {
+            blur_map_serial: 1,
+            pending: Some(rx),
+            ..Default::default()
+        };
+        assert!(blur.poll(CompanionMode::Unmapped).is_none());
+        assert!(blur.pending.is_some());
+        assert!(tx.try_send((1, BlurOutcome::Applied)).is_ok());
+        assert!(blur.poll(CompanionMode::Unmapped).is_none());
+        assert!(blur.pending.is_none());
+    }
+
+    #[test]
+    fn gpui_host_companion_blur_only_accepts_a_readback_for_the_current_map() {
+        let (tx, rx) = sync_channel(1);
+        let mut blur = CompanionBlur {
+            blur_map_serial: 2,
+            pending: Some(rx),
+            ..Default::default()
+        };
+        assert!(tx.try_send((1, BlurOutcome::Applied)).is_ok());
+        assert!(blur.poll(CompanionMode::AwaitingBlur(2)).is_none());
+
+        let (tx, rx) = sync_channel(1);
+        blur.pending = Some(rx);
+        assert!(tx.try_send((2, BlurOutcome::Applied)).is_ok());
+        assert!(matches!(
+            blur.poll(CompanionMode::AwaitingBlur(2)),
+            Some(BlurOutcome::Applied)
+        ));
+
+        let (tx, rx) = sync_channel(1);
+        blur.pending = Some(rx);
+        drop(tx);
+        assert!(matches!(
+            blur.poll(CompanionMode::AwaitingBlur(2)),
+            Some(BlurOutcome::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn gpui_host_companion_blur_bootstrap_is_interrupted_by_a_queued_unmap_then_remap() {
+        for (interruption, recovery) in [
+            (
+                Event::CompanionMappingChanged(false),
+                Event::CompanionMappingChanged(true),
+            ),
+            (
+                Event::ParentMappingChanged(false),
+                Event::ParentMappingChanged(true),
+            ),
+            (Event::OwnedFocusDeparted, Event::FocusChanged),
+        ] {
+            assert!(!recovery.interrupts_blur());
+            let mut interrupted = false;
+            for event in [interruption, recovery, Event::CompanionChanged] {
+                interrupted |= event.interrupts_blur();
+            }
+            assert!(interrupted);
+        }
     }
 }

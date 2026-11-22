@@ -18,6 +18,7 @@ use super::{
     chrome::Popup,
     controls::{self, Activate, Activation, HitRegions, OPTIONS_ID, PAUSE_RESUME_ID},
     decisions::{self, DecisionFocus, Identity},
+    install_window_close,
     settings_menu::{Navigate, Section, SettingsMenu},
     top_chrome::{self, FocusTarget, SelectorKind, TopChrome},
     volume,
@@ -78,9 +79,7 @@ impl CompanionView {
     ) -> Self {
         let root = cx.focus_handle();
         root.focus(window, cx);
-        // Only the managed root can request application close. Actual native
-        // companion destruction still triggers the owner's loss path.
-        window.on_window_should_close(cx, |_, _| false);
+        install_window_close(window, cx, &state);
         let focus_lost = cx.on_focus_lost(window, Self::park_disabled_focus);
         let top = matches!(state.borrow().runtime, RuntimeCoordinator::Capture(_))
             .then(|| TopChrome::new(cx));

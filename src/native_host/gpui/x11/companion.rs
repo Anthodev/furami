@@ -56,8 +56,32 @@ pub(in crate::native_host::gpui) struct CompanionGeometry {
 }
 
 impl CompanionGeometry {
+    pub(in crate::native_host::gpui) const HYPRLAND_BOOTSTRAP: Self = Self {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+    };
+
     fn extent(self) -> (u16, u16) {
         (self.width, self.height)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PlacementTarget {
+    Client(CompanionGeometry),
+    HyprlandBootstrap,
+}
+
+impl PlacementTarget {
+    fn accepts(self, geometry: CompanionGeometry) -> bool {
+        match self {
+            Self::Client(client) => {
+                client != CompanionGeometry::HYPRLAND_BOOTSTRAP && client == geometry
+            }
+            Self::HyprlandBootstrap => geometry == CompanionGeometry::HYPRLAND_BOOTSTRAP,
+        }
     }
 }
 
@@ -103,7 +127,11 @@ pub(super) struct Companion {
 impl X11 {
     /// Quarantine GPUI's unconditionally mapped popup before any on-screen
     /// placement. This connection observes it but never owns or destroys it.
-    pub(in crate::native_host::gpui) fn bind_companion(&mut self, xid: u32) -> Result<(), Error> {
+    pub(in crate::native_host::gpui) fn bind_companion(
+        &mut self,
+        xid: u32,
+        hyprland: bool,
+    ) -> Result<(), Error> {
         let parent = self.bound_parent()?;
         if self.companion.is_some()
             || self.reserved_xid(xid, parent)
@@ -141,7 +169,15 @@ impl X11 {
         check(connection.unmap_window(xid))?;
         if geometry.root != self.root
             || geometry.border_width != 0
-            || !offscreen(geometry.x, geometry.y, geometry.width, geometry.height)
+            || !valid_initial_parking(
+                CompanionGeometry {
+                    x: geometry.x,
+                    y: geometry.y,
+                    width: geometry.width,
+                    height: geometry.height,
+                },
+                hyprland,
+            )
         {
             return Err(Error::Geometry(
                 "GPUI initially placed its companion inside the X11 root",
@@ -160,9 +196,13 @@ impl X11 {
             AtomEnum::WINDOW,
             &[parent],
         ))?;
-        // GPUI identifies PopUp as a notification. Retain only transient
-        // identity; the managed client remains the one application window.
-        check(connection.delete_property(xid, atoms._NET_WM_WINDOW_TYPE))?;
+        // GPUI identifies PopUp as a notification. On other WMs, retain only
+        // transient identity so the managed client stays the one application
+        // window. Hyprland's pointer hit test uses the notification type to
+        // target the focused managed window for compositor-initiated moves.
+        if !hyprland {
+            check(connection.delete_property(xid, atoms._NET_WM_WINDOW_TYPE))?;
+        }
         check(connection.change_window_attributes(
             xid,
             &ChangeWindowAttributesAux::new().event_mask(owned_events()),
@@ -422,9 +462,23 @@ impl X11 {
     /// Map at zero compositor opacity with no input while GPUI prepares a
     /// transparent frame. Never map or raise outside the settled app family.
     pub(in crate::native_host::gpui) fn map_companion(&self) -> Result<bool, Error> {
+        self.map_concealed_companion(false)
+    }
+
+    /// Map the verified 1×1 IPC bootstrap, never a presentation frame.
+    pub(in crate::native_host::gpui) fn map_hyprland_bootstrap(&self) -> Result<bool, Error> {
+        self.map_concealed_companion(true)
+    }
+
+    fn map_concealed_companion(&self, hyprland_bootstrap: bool) -> Result<bool, Error> {
         let companion = self.bound_companion()?;
         let placed = companion.presentation.borrow().placed;
-        if !self.placement_matches(companion, placed)? {
+        let matches = if hyprland_bootstrap {
+            self.matches_placement(companion, placed, PlacementTarget::HyprlandBootstrap)?
+        } else {
+            self.placement_matches(companion, placed)?
+        };
+        if !matches {
             return Ok(false);
         }
         let facts = self.companion_facts()?;
@@ -684,8 +738,18 @@ impl X11 {
         let Some(placed) = placed else {
             return Ok(false);
         };
-        Ok(self.companion_geometry()? == placed
-            && self.read_companion_geometry(companion)? == placed)
+        let target = PlacementTarget::Client(self.companion_geometry()?);
+        self.matches_placement(companion, Some(placed), target)
+    }
+
+    fn matches_placement(
+        &self,
+        companion: &Companion,
+        placed: Option<CompanionGeometry>,
+        target: PlacementTarget,
+    ) -> Result<bool, Error> {
+        Ok(placed.is_some_and(|geometry| target.accepts(geometry))
+            && target.accepts(self.read_companion_geometry(companion)?))
     }
 
     fn read_companion_geometry(&self, companion: &Companion) -> Result<CompanionGeometry, Error> {
@@ -769,7 +833,11 @@ fn placement_invalidated(
     previous.is_some_and(|previous| previous != actual || previous.extent() != desired.extent())
 }
 
-fn offscreen(x: i16, y: i16, width: u16, height: u16) -> bool {
+fn valid_initial_parking(geometry: CompanionGeometry, hyprland_bootstrap: bool) -> bool {
+    if hyprland_bootstrap && geometry == CompanionGeometry::HYPRLAND_BOOTSTRAP {
+        return true;
+    }
+    let CompanionGeometry { x, y, width, height } = geometry;
     width != 0
         && height != 0
         && i32::from(x) + i32::from(width) <= 0
@@ -868,12 +936,48 @@ mod tests {
     }
 
     #[test]
-    fn gpui_host_companion_initial_extent_must_be_entirely_negative_on_both_axes() {
-        assert!(offscreen(-32, -40, 32, 32));
-        assert!(!offscreen(-31, -40, 32, 32));
-        assert!(!offscreen(-40, -31, 32, 32));
-        assert!(!offscreen(-40, 0, 32, 32));
-        assert!(!offscreen(-40, -40, 0, 32));
+    fn gpui_host_companion_bootstrap_geometry_is_not_a_presentation_placement() {
+        let bootstrap = CompanionGeometry::HYPRLAND_BOOTSTRAP;
+        let client = CompanionGeometry {
+            x: 0,
+            y: 0,
+            width: 1258,
+            height: 1378,
+        };
+        let drifted = CompanionGeometry { x: 1, ..client };
+        let accepts =
+            |target: PlacementTarget, placed, actual| target.accepts(placed) && target.accepts(actual);
+        let bootstrap_target = PlacementTarget::HyprlandBootstrap;
+        let client_target = PlacementTarget::Client(client);
+        assert!(accepts(bootstrap_target, bootstrap, bootstrap));
+        assert!(!accepts(bootstrap_target, bootstrap, client));
+        assert!(!accepts(bootstrap_target, client, bootstrap));
+        assert!(!accepts(client_target, bootstrap, bootstrap));
+        assert!(!accepts(
+            PlacementTarget::Client(bootstrap),
+            bootstrap,
+            bootstrap
+        ));
+        assert!(accepts(client_target, client, client));
+        assert!(!accepts(client_target, client, drifted));
+        assert!(!accepts(client_target, drifted, client));
+    }
+
+    #[test]
+    fn gpui_host_companion_initial_parking_checks_both_edges_and_hyprland_exception() {
+        let parked = |x, y, width, height, hyprland| {
+            valid_initial_parking(CompanionGeometry { x, y, width, height }, hyprland)
+        };
+        assert!(parked(-32, -40, 32, 32, false));
+        assert!(parked(-32, -40, 32, 32, true));
+        assert!(!parked(-31, -40, 32, 32, false));
+        assert!(!parked(-40, -31, 32, 32, false));
+        assert!(!parked(-40, 0, 32, 32, false));
+        assert!(!parked(-40, -40, 0, 32, false));
+        assert!(!parked(0, 0, 1, 1, false));
+        assert!(parked(0, 0, 1, 1, true));
+        assert!(!parked(0, 0, 2, 1, true));
+        assert!(!parked(0, 1, 1, 1, true));
     }
 
     #[test]

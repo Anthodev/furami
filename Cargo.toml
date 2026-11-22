@@ -17,6 +17,7 @@ parking_lot = "0.12"
 
 # Registry pins match examples/gpui-poc.
 [target.'cfg(target_os = "linux")'.dependencies]
+async-io = "=2.6.0"
 gpui = { package = "gpui-pre", version = "=0.3.13", default-features = false, features = ["x11"] }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.13", default-features = false, features = ["x11"] }
 image = { version = "=0.25.10", default-features = false, features = ["png"] }

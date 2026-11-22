@@ -24,8 +24,9 @@ use x11rb::{
         ErrorKind, Event as XEvent,
         shape::{ConnectionExt as _, SK, SO},
         xproto::{
-            ChangeWindowAttributesAux, ClipOrdering, ConfigureWindowAux, ConnectionExt as _,
-            CreateWindowAux, EventMask, MapState, WindowClass,
+            Atom, AtomEnum, ChangeWindowAttributesAux, ClipOrdering, ConfigureWindowAux,
+            ConnectionExt as _, CreateWindowAux, EventMask, MapState, NotifyDetail, NotifyMode,
+            WindowClass,
         },
     },
     reexports::x11rb_protocol::parse_display::parse_display,
@@ -51,6 +52,8 @@ pub(super) enum DestroyOutcome {
 pub(super) enum Event {
     /// The GPUI parent or the video child changed rectangle.
     GeometryChanged,
+    /// The server reported a map or unmap on the managed client.
+    ParentMappingChanged(bool),
     /// The GPUI client window was destroyed.
     ParentDestroyed,
     /// The video child was destroyed by someone else.
@@ -61,10 +64,14 @@ pub(super) enum Event {
     ChildMappingChanged(bool),
     /// The standalone chrome XID was destroyed or reparented. Not a media ACK.
     CompanionLost,
-    /// The chrome XID's native map state or geometry may have changed.
+    /// The chrome XID's native geometry may have changed.
     CompanionChanged,
+    /// The server reported a map or unmap on the chrome XID.
+    CompanionMappingChanged(bool),
     /// Resample settled native focus and viewability after draining the queue.
     FocusChanged,
+    /// Real Core keyboard focus left a direct member of Furami's window family.
+    OwnedFocusDeparted,
     /// A server-generated Core key press delivered to an owned focus target.
     KeyPress {
         target: FocusTarget,
@@ -77,6 +84,21 @@ pub(super) enum Event {
         time: u32,
         tab: bool,
     },
+}
+
+impl Event {
+    pub(super) fn interrupts_blur(self) -> bool {
+        matches!(
+            self,
+            Self::ParentMappingChanged(false)
+                | Self::CompanionMappingChanged(false)
+                | Self::OwnedFocusDeparted
+                | Self::ParentDestroyed
+                | Self::CompanionLost
+                | Self::ChildDestroyed
+                | Self::ChildReparented
+        )
+    }
 }
 
 /// A failed checked X11 request.
@@ -325,6 +347,56 @@ impl X11 {
             max_keycode,
             shape_version: (reply.major_version, reply.minor_version),
         })
+    }
+
+    /// Identify the EWMH window manager on this connection's actual X server.
+    pub(super) fn is_hyprland(&self) -> bool {
+        fn atom(connection: &RustConnection, name: &[u8]) -> Option<Atom> {
+            let atom = connection.intern_atom(true, name).ok()?.reply().ok()?.atom;
+            (atom != 0).then_some(atom)
+        }
+
+        fn wm_window(connection: &RustConnection, window: u32, check: Atom) -> Option<u32> {
+            let reply = connection
+                .get_property(false, window, check, AtomEnum::WINDOW, 0, 1)
+                .ok()?
+                .reply()
+                .ok()?;
+            if reply.type_ != u32::from(AtomEnum::WINDOW)
+                || reply.bytes_after != 0
+                || reply.value_len != 1
+            {
+                return None;
+            }
+            reply.value32()?.next().filter(|xid| *xid != 0)
+        }
+
+        let connection = &self.connection;
+        let Some(check) = atom(connection, b"_NET_SUPPORTING_WM_CHECK") else {
+            return false;
+        };
+        let Some(wm) = wm_window(connection, self.root, check) else {
+            return false;
+        };
+        if wm == self.root || wm_window(connection, wm, check) != Some(wm) {
+            return false;
+        }
+        let (Some(name), Some(utf8)) = (
+            atom(connection, b"_NET_WM_NAME"),
+            atom(connection, b"UTF8_STRING"),
+        ) else {
+            return false;
+        };
+        let Ok(cookie) = connection.get_property(false, wm, name, utf8, 0, 3) else {
+            return false;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return false;
+        };
+        reply.type_ == utf8
+            && reply.format == 8
+            && reply.bytes_after == 0
+            && matches!(reply.value.as_slice(), b"Hyprland" | b"Hyprland :D")
     }
 
     pub(super) fn environment_report(&self) -> NativeEnvironmentReport {
@@ -683,10 +755,40 @@ impl X11 {
             ) {
                 self.refresh_tab_keycodes()?;
             }
-            if let Some(event) = self.interpret(parent, child, event) {
+            if let Some(event) = self.interpret(parent, child, &event) {
+                match event {
+                    Event::ParentMappingChanged(mapped) => self.parent_mapped.set(mapped),
+                    Event::ChildDestroyed => self.destroyed.set(child),
+                    Event::KeyPress { target, time, tab } => {
+                        self.last_press.set(tab.then_some((target, time)));
+                    }
+                    _ => {}
+                }
                 return Ok(Some(event));
             }
         }
+    }
+
+    /// Inspect notifications through the preceding native round trip without
+    /// consuming them or applying their side effects ahead of the normal tick.
+    pub(super) fn blur_reply_interrupted(&self, child: Option<u32>) -> Result<bool, Error> {
+        let parent = self.bound_parent()?;
+        let interrupts = |event: &XEvent| {
+            self.interpret(parent, child, event)
+                .is_some_and(Event::interrupts_blur)
+        };
+        let mut pending = self.pending.borrow_mut();
+        if pending.iter().any(&interrupts) {
+            return Ok(true);
+        }
+        while let Some(event) = self.connection.poll_for_event().map_err(Error::Transport)? {
+            let interrupted = interrupts(&event);
+            pending.push_back(event);
+            if interrupted {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn refresh_tab_keycodes(&self) -> Result<(), Error> {
@@ -710,7 +812,7 @@ impl X11 {
         }
     }
 
-    fn interpret(&self, parent: u32, child: Option<u32>, event: XEvent) -> Option<Event> {
+    fn interpret(&self, parent: u32, child: Option<u32>, event: &XEvent) -> Option<Event> {
         let server_generated = event.server_generated();
         match event {
             XEvent::DestroyNotify(notify) if server_generated => {
@@ -719,7 +821,6 @@ impl X11 {
                 } else if self.is_companion(notify.window) {
                     Some(Event::CompanionLost)
                 } else if child == Some(notify.window) {
-                    self.destroyed.set(child);
                     Some(Event::ChildDestroyed)
                 } else {
                     None
@@ -737,18 +838,16 @@ impl X11 {
                 }
             }
             XEvent::MapNotify(notify) if server_generated && notify.window == parent => {
-                self.parent_mapped.set(true);
-                Some(Event::GeometryChanged)
+                Some(Event::ParentMappingChanged(true))
             }
             XEvent::UnmapNotify(notify) if server_generated && notify.window == parent => {
-                self.parent_mapped.set(false);
-                Some(Event::GeometryChanged)
+                Some(Event::ParentMappingChanged(false))
             }
             XEvent::MapNotify(notify) if server_generated && self.is_companion(notify.window) => {
-                Some(Event::CompanionChanged)
+                Some(Event::CompanionMappingChanged(true))
             }
             XEvent::UnmapNotify(notify) if server_generated && self.is_companion(notify.window) => {
-                Some(Event::CompanionChanged)
+                Some(Event::CompanionMappingChanged(false))
             }
             XEvent::MapNotify(notify) if server_generated && child == Some(notify.window) => {
                 Some(Event::ChildMappingChanged(true))
@@ -764,7 +863,7 @@ impl X11 {
             XEvent::FocusOut(notify)
                 if server_generated && self.focus_target(notify.event).is_some() =>
             {
-                Some(Event::FocusChanged)
+                Some(focus_out_event(notify.detail, notify.mode))
             }
             XEvent::PropertyNotify(notify)
                 if server_generated && self.is_visibility_property(notify.window, notify.atom) =>
@@ -775,7 +874,6 @@ impl X11 {
                 let target = self.focus_target(notify.event)?;
                 let tab = self.tab_keycodes.borrow().contains(&notify.detail)
                     && tab_modifiers(notify.state);
-                self.last_press.set(tab.then_some((target, notify.time)));
                 Some(Event::KeyPress {
                     target,
                     time: notify.time,
@@ -805,6 +903,21 @@ impl X11 {
             }
             _ => None,
         }
+    }
+}
+
+fn focus_out_event(detail: NotifyDetail, mode: NotifyMode) -> Event {
+    // Grab/ungrab, pointer and virtual ancestor notifications do not
+    // describe a change away from this XID as the direct focus target.
+    if matches!(mode, NotifyMode::NORMAL | NotifyMode::WHILE_GRABBED)
+        && matches!(
+            detail,
+            NotifyDetail::ANCESTOR | NotifyDetail::INFERIOR | NotifyDetail::NONLINEAR
+        )
+    {
+        Event::OwnedFocusDeparted
+    } else {
+        Event::FocusChanged
     }
 }
 
@@ -908,5 +1021,42 @@ mod tests {
         keys[0] = 1 << 5;
         assert!(keymap_down(&keys, 5));
         assert!(!keymap_down(&keys, 13));
+    }
+
+    #[test]
+    fn gpui_host_bootstrap_counts_only_direct_keyboard_focus_departures() {
+        for detail in [
+            NotifyDetail::ANCESTOR,
+            NotifyDetail::INFERIOR,
+            NotifyDetail::NONLINEAR,
+        ] {
+            assert!(focus_out_event(detail, NotifyMode::NORMAL).interrupts_blur());
+            assert!(focus_out_event(detail, NotifyMode::WHILE_GRABBED).interrupts_blur());
+            assert!(!focus_out_event(detail, NotifyMode::GRAB).interrupts_blur());
+            assert!(!focus_out_event(detail, NotifyMode::UNGRAB).interrupts_blur());
+        }
+        for detail in [
+            NotifyDetail::VIRTUAL,
+            NotifyDetail::NONLINEAR_VIRTUAL,
+            NotifyDetail::POINTER,
+            NotifyDetail::POINTER_ROOT,
+            NotifyDetail::NONE,
+        ] {
+            assert!(!focus_out_event(detail, NotifyMode::NORMAL).interrupts_blur());
+        }
+    }
+
+    #[test]
+    fn gpui_host_bootstrap_interrupts_on_surface_loss_but_not_normal_child_mapping() {
+        for event in [
+            Event::ParentDestroyed,
+            Event::CompanionLost,
+            Event::ChildDestroyed,
+            Event::ChildReparented,
+        ] {
+            assert!(event.interrupts_blur());
+        }
+        assert!(!Event::ChildMappingChanged(false).interrupts_blur());
+        assert!(!Event::GeometryChanged.interrupts_blur());
     }
 }
