@@ -1,7 +1,10 @@
+import bz2
+import gzip
 import hashlib
 import importlib.util
 import io
 import json
+import lzma
 import os
 from pathlib import Path
 import shutil
@@ -475,11 +478,11 @@ class CandidateTests(unittest.TestCase):
                 if mutation.startswith('nested'):
                     payload = benign.getvalue() + b'private APK'
                     if mutation == 'nested-gzip':
-                        payload = support.gzip.compress(benign.getvalue(), mtime=0) + support.gzip.compress(b'private APK', mtime=0)
+                        payload = gzip.compress(benign.getvalue(), mtime=0) + gzip.compress(b'private APK', mtime=0)
                     elif mutation == 'nested-xz':
-                        payload = support.sources.lzma.compress(benign.getvalue()) + b'private APK'
+                        payload = lzma.compress(benign.getvalue()) + b'private APK'
                     elif mutation == 'nested-bz2':
-                        payload = support.sources.bz2.compress(benign.getvalue()) + b'private APK'
+                        payload = bz2.compress(benign.getvalue()) + b'private APK'
                     members['runtime-inputs/ordinary-source.tar'] = payload
                 index = write_materials(root, members)
                 archive = root / 'source-materials-001.tar'
@@ -521,11 +524,11 @@ class CandidateTests(unittest.TestCase):
                         archive.addfile(member, io.BytesIO(b'x'))
                     payload = replace_end_marker(buffer.getvalue())
                     if container == 'gzip':
-                        payload = support.gzip.compress(payload, mtime=0)
+                        payload = gzip.compress(payload, mtime=0)
                     elif container == 'xz':
-                        payload = support.sources.lzma.compress(payload)
+                        payload = lzma.compress(payload)
                     elif container == 'bz2':
-                        payload = support.sources.bz2.compress(payload)
+                        payload = bz2.compress(payload)
                     members['runtime-inputs/ordinary-source.tar'] = payload
                 index = write_materials(root, members)
                 archive = root / 'source-materials-001.tar'
