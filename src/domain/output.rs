@@ -1,7 +1,7 @@
 //! Pure output-routing values: validated stable sink identity, live sink
 //! targets, catalog observations and desired output plans.
 //!
-//! Allowed dependencies: `std`, `serde` (Serialize only). No Qt, no Pulse
+//! Allowed dependencies: `std`, `serde` (Serialize only). No UI framework, no Pulse
 //! pointers, no live state. Live values (indices, object serials, catalogs)
 //! are callback-owned copies and are never persisted; only `SinkIdentity` is
 //! persistence-shaped, and persistence must rebuild it through the validating

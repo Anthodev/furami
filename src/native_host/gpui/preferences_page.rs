@@ -981,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn session_line_matches_the_qml_join() {
+    fn session_line_matches_the_join() {
         let snapshot = snapshot(false);
         let model = PreferencesModel::project(&facts(Some(&snapshot)));
         assert_eq!(

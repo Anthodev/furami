@@ -1,7 +1,7 @@
 //! Responsibility: Closed, validated, serializable SDR renderer settings for the pinned
 //! gpu-next/Vulkan build: scaler kernels, chroma/downscale choices, anti-ringing, dither,
 //! deband and interpolation.
-//! Allowed dependencies: pure types, `serde`/`serde_json` and `thiserror`; no Qt, and no
+//! Allowed dependencies: pure types, `serde`/`serde_json` and `thiserror`; no UI framework, and no
 //! mpv pointers or native property names (those live in `media::render_catalog`).
 //!
 //! Bounds and defaults are product decisions grounded in the pinned stack: the mpv v0.41.0

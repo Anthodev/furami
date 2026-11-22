@@ -1624,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_notes_follow_the_qml_visibility_rules() {
+    fn audio_notes_follow_the_input_selection_rules() {
         let mut value = selection();
         assert!(missing_input_note(&value));
         value.audio_enabled = true;

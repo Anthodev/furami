@@ -1,5 +1,5 @@
 //! Lifetime subscriptions and bounded, epoch-correlated recovery observations.
-//! This worker never touches Qt or media. Its shared slots contain owned data;
+//! This worker never touches the UI or media. Its shared slots contain owned data;
 //! validation requests a fresh subscribed scan instead of trusting cached paths.
 
 use parking_lot::{Condvar, Mutex};
@@ -194,7 +194,7 @@ impl Observer {
         self.0.changed.notify_all();
     }
 
-    /// One accepted validator waits here, not on Qt. The selection token is
+    /// One accepted validator waits here, not on the UI thread. The selection token is
     /// consumed before requesting a new scan, then exact physical locators are
     /// rechecked by tuple validation. Any concurrent loss makes it stale.
     pub(super) fn fresh(

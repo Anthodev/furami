@@ -790,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_matches_the_qml_join_order() {
+    fn subtitle_matches_the_join_order() {
         let live = Live {
             source_label: "ShadowCast 3".into(),
             size_label: "1920×1080".into(),

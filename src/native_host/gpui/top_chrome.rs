@@ -2082,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn gpui_host_top_chrome_selector_keys_map_to_the_qml_popup_names() {
+    fn gpui_host_top_chrome_selector_keys_map_to_the_popup_invokers() {
         assert_eq!(SelectorKind::Source.invoker(), "source");
         assert_eq!(SelectorKind::Output.invoker(), "output");
         assert_eq!(SelectorKind::Size.invoker(), "size");

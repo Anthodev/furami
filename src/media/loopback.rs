@@ -1165,7 +1165,7 @@ fn write_owned_target(
     pulse.check_lifetime()?;
     audio_child.alive()?;
     let spawned = OwnedChild::spawn(&mut command, shared, HelperKind::PwMetadata);
-    drop(guard); // Never retain Qt's intent mutex through child/PA waits.
+    drop(guard); // Never retain the intent mutex through child/PA waits.
     let mut writer = spawned?;
     // Command owns a duplicate of stderr's writer FD; close it after spawn so
     // actual child exit can produce EOF on our nonblocking diagnostics reader.
