@@ -24,7 +24,7 @@ Connect a USB capture card to watch your console and hear its audio in one deskt
 </p>
 
 > [!NOTE]
-> Tested on Fedora with KDE Plasma and Hyprland (Wayland); other distributions and desktops are untested.
+> The GPUI AppImage was tested on Fedora with KDE Plasma and a ShadowCast 3. This does not qualify other distributions or desktops for Furami 2.
 
 ![Furami displaying a Nintendo Switch capture with its on-screen controls](assets/furami_screenshot.png)
 
@@ -33,6 +33,8 @@ Connect a USB capture card to watch your console and hear its audio in one deskt
 ## 📺 About
 
 Furami is a Linux app for streaming your console through a USB capture card, with a focus on **image quality** and **very low latency**. Connect your console to the card over HDMI and the card to your PC over USB, then watch and listen directly in Furami.
+
+Furami 2 uses GPUI as its only frontend. It runs on X11, including through XWayland in a Wayland session.
 
 ```mermaid
 flowchart LR
@@ -62,7 +64,7 @@ flowchart LR
 | Console and capture card | A game console on HDMI and a USB capture card that exposes a UVC (V4L2) capture node. |
 | Operating system | Linux x86_64. See the [portability notes](packaging/appimage/PORTABILITY.md). |
 | Graphics | A host Vulkan loader and a working driver for your GPU. Software rendering is not supported. |
-| Wayland sessions | A running XWayland server and a reachable `DISPLAY`. |
+| Display | A reachable X11 display with the SHAPE 1.1 extension. Wayland sessions need XWayland. |
 | Audio (optional) | An existing host PipeWire session providing `pw-loopback` and `pw-metadata`. Video-only viewing works without audio. See the [media recipe](packaging/media/README.md#host-audio-helpers-runtime-requirement-audio-enabled-only). |
 
 Download the AppImage from the [Releases page](https://github.com/Anthodev/furami/releases) and check it against the `SHA256SUMS` file published alongside it. Then make the file executable — for example, right-click it in your file manager, open **Properties → Permissions** and enable **Allow executing file as a program** — and launch it by double-clicking.
@@ -71,7 +73,7 @@ Then everything happens in the window:
 
 1. Connect the console to the capture card with HDMI, and the card to the PC over USB.
 2. Select **Source**.
-3. Adjust **Résolution** and **Framerate** if the automatic choice is not what you want.
+3. Adjust **Resolution** and **Framerate** if the automatic choice is not what you want.
 4. Select the **Audio** output you want to listen on.
 
 #### If the AppImage does not mount
@@ -87,28 +89,30 @@ Rename the downloaded file to `Furami.AppImage`, then extract it without FUSE:
 
 ## 🎮 Controls
 
-Move the pointer over the window to reveal the ribbon. **Source**, **Résolution** and **Framerate** select the capture immediately; **Audio** chooses the playback output independently of capture. Open **Options** for capture actions, compatible input formats and renderer controls.
+Move the pointer over the window to reveal the ribbon. **Source**, **Resolution** and **Framerate** select the capture immediately; **Audio** chooses the playback output independently of capture. Open **Options** for capture actions, compatible input formats and renderer controls.
 
 | Input | Action |
 | --- | --- |
-| `Space` | **Mettre en pause** / **Reprendre** at video focus, outside text entry and popups |
-| `F11` | Same as **Fenêtre** / **Plein écran**, for the Furami window only |
-| `Esc` | Open **Réglages** when no popup is open; otherwise dismiss the ordinary popup, without leaving fullscreen |
+| `Space` | **Pause** / **Resume** at video focus, outside text entry and popups |
+| `F11` | Toggle **Windowed** / **Full screen** for the Furami window only |
+| `Esc` | Open **Settings** when no popup is open; otherwise dismiss the ordinary popup, without leaving fullscreen |
 | `Tab` / `Shift+Tab` | Move focus between controls |
 | **Volume slider** | Furami's playback volume, 0–100, immediate; arrow keys change it by 1 point |
 | **Wheel over the video or the volume rail** | Change playback volume by 5 points per notch, bounded to 0–100 |
 | **Mute / Unmute** | Furami's playback output only |
-| **Reconnecter la capture** in **Options** | Retry the last selection, or wait for an ongoing reconnection |
+| **Reconnect capture** in **Options** | Retry the last selection, or wait for an ongoing reconnection |
 
 Text entry takes priority: shortcuts use unmodified presses, ignore auto-repeat and never act globally — `Esc` never leaves fullscreen and never dismisses a mandatory decision. The wheel adjusts volume only over the video or the volume rail, while Furami is active and no popup is open. Volume and mute stay independent, and neither touches your desktop mixer or output selection.
 
 Pausing freezes the picture and silences the output, and resuming jumps to the console's current scene. **Audio** prefers an available EasyEffects output when Auto routing is active, otherwise the current default output; choosing a concrete output switches to manual routing. If a manually chosen output disappears, the sound stops with no automatic fallback and you select one again. This playback output is not the capture card's audio input.
 
-**Reconnecter la capture** reconnects the last applied selection when the same card returns; an ambiguous match waits for your choice.
+**Reconnect capture** reconnects the last applied selection when the same card returns; an ambiguous match waits for your choice.
 
 ## 🔧 Preferences
 
 Furami keeps one settings file: a saved profile per capture card, plus global preferences that source changes never replace.
+
+When upgrading from 1.x, keep your existing settings file; capture profiles need no conversion. If a launch script passes `--gpui`, remove that argument: GPUI is always used.
 
 | Scope | Contents |
 | --- | --- |
@@ -124,7 +128,7 @@ The file lives at `$XDG_CONFIG_HOME/furami/settings.json`, or `$HOME/.config/fur
 
 ## 🔎 Troubleshooting and privacy
 
-Furami can write diagnostic logs and a sanitized session report that help describe a problem without a debugger. Logging is **off by default**, and you can enable **Activer les journaux de diagnostic** in **Options → Réglages → Préférences**; the change takes effect immediately, and existing logs are kept when you turn it off. Review a report before sharing it, because it keeps technical audio endpoint names, device IDs and capture modes while omitting raw device paths and USB identity.
+Furami can write diagnostic logs and a sanitized session report that help describe a problem without a debugger. Logging is **off by default**, and you can enable **Diagnostic logging** in **Options → Settings → Preferences**; the change takes effect immediately, and existing logs are kept when you turn it off. Review a report before sharing it, because it keeps technical audio endpoint names, device IDs and capture modes while omitting raw device paths and USB identity.
 
 <details>
 <summary>Where logs live</summary>
@@ -137,7 +141,7 @@ Furami can write diagnostic logs and a sanitized session report that help descri
 
 ## 🚧 Limitations
 
-- **GPUI AppImage tested on Fedora with KDE Plasma and ShadowCast 3.** The app requires hardware Vulkan and, in Wayland sessions, XWayland. It does not run as a native Wayland client.
+- **No native Wayland support.** Furami uses X11 and needs XWayland in Wayland sessions.
 - **Capture recovery is not fully qualified.** Normal close and saved-profile reload were tested on KDE. Forced loss of the video child or X server is not covered by that result.
 - **Performance measurements are pending.** Latency, audio/video synchronisation and long-session stability have not been measured; very low latency is a design priority, not a guaranteed figure.
 

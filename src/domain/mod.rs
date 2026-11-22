@@ -1,5 +1,5 @@
 //! Responsibility: Typed identities, rational modes, validated profiles and processing, states and intents.
-//! Allowed dependencies: Pure types and validation; no Qt, no mpv pointers.
+//! Allowed dependencies: Pure types and validation; no UI framework, no mpv pointers.
 
 pub mod capture;
 pub mod failure;

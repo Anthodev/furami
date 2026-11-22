@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "furami"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "cxx",
  "cxx-build",

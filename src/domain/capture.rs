@@ -1,7 +1,7 @@
 //! Pure capture-domain model: USB identity, native video tuples and explicit
 //! audio source identity, selection and playback gain.
 //!
-//! Allowed dependencies: `std`, `serde` (Serialize only), `thiserror`. No Qt, no
+//! Allowed dependencies: `std`, `serde` (Serialize only), `thiserror`. No UI framework, no
 //! native pointers or Linux access. Ephemeral route authorizations carry physical
 //! locators, never persisted identities. Fraction arithmetic is exact
 //! (`u128` intermediates); no floats, no sampling, no cartesian products.

@@ -1,4 +1,5 @@
-//! One bounded latest-request worker; Linux/Pulse discovery and exact ioctls never run on Qt.
+//! One bounded latest-request worker; Linux/Pulse discovery and exact ioctls
+//! never run on the UI thread.
 use super::projection::*;
 use crate::{
     capture::{audio, linux},

@@ -2,9 +2,14 @@
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-22
+
 ### Features
 
-- Make GPUI on X11/XWayland the Linux frontend and remove Qt/QML from the application and the AppImage. Capture, playback and preferences retain the shared Rust runtime; existing capture profiles need no conversion. `--gpui` is no longer needed or accepted ([#53](https://github.com/Anthodev/furami/issues/53), [#54](https://github.com/Anthodev/furami/issues/54)).
+- Make GPUI on X11/XWayland the only Linux frontend and remove Qt/QML from the application and the AppImage ([#57](https://github.com/Anthodev/furami/pull/57)). The earlier GPUI previews ([#55](https://github.com/Anthodev/furami/pull/55), [#56](https://github.com/Anthodev/furami/pull/56)) are now superseded.
+- **Breaking:** Remove `--gpui` from launch scripts and shortcuts; Furami always starts with GPUI and no longer accepts the flag. Existing capture profiles need no conversion.
+
+Full changelog: [v1.1.0...v2.0.0](https://github.com/Anthodev/furami/compare/v1.1.0...v2.0.0)
 
 ## [1.1.0] - 2026-10-19
 
