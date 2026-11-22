@@ -946,7 +946,9 @@ impl HostState {
         if (native_changed || blur_outcome.is_some())
             && matches!(
                 self.companion_mode,
-                CompanionMode::Visible | CompanionMode::Preparing(_) | CompanionMode::AwaitingBlur(_)
+                CompanionMode::Visible
+                    | CompanionMode::Preparing(_)
+                    | CompanionMode::AwaitingBlur(_)
             )
             && self
                 .companion_facts
@@ -1396,12 +1398,8 @@ impl HostState {
                         self.report_loss("root-destroyed", false, true);
                         break;
                     }
-                    Event::ChildDestroyed => {
-                        self.report_loss("child-destroyed", true, false)
-                    }
-                    Event::ChildReparented => {
-                        self.report_loss("child-reparented", false, false)
-                    }
+                    Event::ChildDestroyed => self.report_loss("child-destroyed", true, false),
+                    Event::ChildReparented => self.report_loss("child-reparented", false, false),
                 }
                 if self.root_lost || self.control_lost || self.quit_authorized {
                     break;

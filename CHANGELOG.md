@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-11-22
+
+### Fixes
+
+- fix(ui): preserve sharp video and window dragging under Hyprland ([a0d297ae](https://github.com/Anthodev/furami/commit/a0d297ae)). Keep the video sharp while the controls are visible, let Hyprland move the main window using the user's configured binding, and route close requests from either Furami window through the same shutdown path.
+
+Full changelog: [v2.0.0...v2.0.1](https://github.com/Anthodev/furami/compare/v2.0.0...v2.0.1)
+
 ## [2.0.0] - 2026-11-22
 
 ### Features

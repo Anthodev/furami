@@ -244,7 +244,11 @@ async fn request<'a>(
     verify_peer(stream.get_ref(), uid)?;
     check_deadline(deadline)?;
     let command = command.as_bytes();
-    if stream.write_with(|mut socket| socket.write(command)).await? != command.len() {
+    if stream
+        .write_with(|mut socket| socket.write(command))
+        .await?
+        != command.len()
+    {
         return Err(io::ErrorKind::WriteZero.into());
     }
     let mut len = 0;

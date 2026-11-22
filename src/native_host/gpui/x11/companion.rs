@@ -837,7 +837,12 @@ fn valid_initial_parking(geometry: CompanionGeometry, hyprland_bootstrap: bool) 
     if hyprland_bootstrap && geometry == CompanionGeometry::HYPRLAND_BOOTSTRAP {
         return true;
     }
-    let CompanionGeometry { x, y, width, height } = geometry;
+    let CompanionGeometry {
+        x,
+        y,
+        width,
+        height,
+    } = geometry;
     width != 0
         && height != 0
         && i32::from(x) + i32::from(width) <= 0
@@ -945,8 +950,9 @@ mod tests {
             height: 1378,
         };
         let drifted = CompanionGeometry { x: 1, ..client };
-        let accepts =
-            |target: PlacementTarget, placed, actual| target.accepts(placed) && target.accepts(actual);
+        let accepts = |target: PlacementTarget, placed, actual| {
+            target.accepts(placed) && target.accepts(actual)
+        };
         let bootstrap_target = PlacementTarget::HyprlandBootstrap;
         let client_target = PlacementTarget::Client(client);
         assert!(accepts(bootstrap_target, bootstrap, bootstrap));
@@ -966,7 +972,15 @@ mod tests {
     #[test]
     fn gpui_host_companion_initial_parking_checks_both_edges_and_hyprland_exception() {
         let parked = |x, y, width, height, hyprland| {
-            valid_initial_parking(CompanionGeometry { x, y, width, height }, hyprland)
+            valid_initial_parking(
+                CompanionGeometry {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+                hyprland,
+            )
         };
         assert!(parked(-32, -40, 32, 32, false));
         assert!(parked(-32, -40, 32, 32, true));
