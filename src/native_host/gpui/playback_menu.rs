@@ -1,20 +1,20 @@
 //! Brume Capture root menu for the GPUI frontend.
 //!
-//! `qml/MenuView.qml` (root section only) is the parity contract: title,
-//! compiled version, live playback summary, then Pause/Resume, Restart,
-//! Reconnect, Open, Settings, Open logs folder and Close. The settings index
-//! and its sections are not implemented here; Settings activation is handed to
-//! the parent through one callback so this file never fabricates a page.
+//! The menu is title, compiled version, live playback summary, then
+//! Pause/Resume, Restart, Reconnect, Open, Settings, Open logs folder and
+//! Close. The settings index and its sections are not implemented here;
+//! Settings activation is handed to the parent through one callback so this
+//! file never fabricates a page.
 //!
-//! Identity rules carried over from the QML view:
+//! Identity rules:
 //!
 //! - Each row is built with the *rendered* projection: the pausable attempt
 //!   comes from [`HostState::action`], Restart and Reconnect bind
 //!   `ViewState::restart_generation` (`UiUpdate::restart_generation`, the token
-//!   `host.cpp` hands `gate_restart`/`gate_reconnect`), and Close binds
-//!   `ViewState::generation` (`UiUpdate::generation`, the token
-//!   `closeCapture()` hands `gate_close`). The snapshot's `generation` string is
-//!   a UI guard only and is never used as a dispatch token.
+//!   the runtime gate consumes for restart/reconnect), and Close binds
+//!   `ViewState::generation` (`UiUpdate::generation`, the token close dispatch
+//!   uses). The snapshot's `generation` string is a UI guard only and is never
+//!   used as a dispatch token.
 //! - Every dispatch re-checks the rendered popup identity and the current
 //!   runtime guards before handing the intent to `RuntimeCoordinator`; the
 //!   returned `UiUpdate` goes through `HostState::consume`.
@@ -49,8 +49,7 @@ use super::{
     top_chrome::FocusTarget,
 };
 
-/// Stable element identities, matching the QML `objectName`s so the two
-/// frontends expose the same accessible names.
+/// Stable element identities, so the accessible names stay put across paints.
 pub(super) const ROOT_ID: &str = "menu-root";
 pub(super) const SUBTITLE_ID: &str = "menuSubtitle";
 pub(super) const PAUSE_ID: &str = "menuPauseResume";
@@ -87,7 +86,7 @@ struct MenuFacts<'a> {
 }
 
 /// The Capture root menu's rendered model. Visibility and enablement come from
-/// the QML gates; `*_generation` fields are the exact tokens the row binds.
+/// the runtime gates; `*_generation` fields are the exact tokens the row binds.
 struct MenuModel {
     title: &'static str,
     version: &'static str,
@@ -131,17 +130,17 @@ impl MenuModel {
             ),
             paused: snapshot.map_or(facts.paused, |snapshot| snapshot.paused),
             pause: facts.pause,
-            // Restart is hidden for the qualification video (QML `visible`).
+            // Restart is hidden for the qualification video.
             show_restart: !facts.qualification,
-            // The dispatch token is `UiUpdate.restart_generation`, exactly
-            // what `host.cpp::restartCapture` hands `gate_restart`.
+            // The dispatch token is `UiUpdate.restart_generation`, the same
+            // token the runtime's restart gate consumes.
             restart_generation: facts.restart_generation,
             restart_enabled: !facts.qualification && facts.can_restart,
             reconnect_visible,
             // Reconnect shares the restart token (`reconnectCapture`).
             reconnect_generation: facts.restart_generation,
             // Enabled while the session can reconnect and no close is in
-            // flight (QML `canReconnect && !closing`).
+            // flight (`canReconnect && !closing`).
             reconnect_enabled: reconnect_visible && !closing,
             // `openable && !canReconnect`; `openable` is the projected
             // `UiUpdate.can_open`, carried by `ViewState`, not the snapshot.
@@ -207,8 +206,8 @@ static EMPTY_LIVE: Live = Live {
     muted: false,
 };
 
-/// `qml/Projection.qml::productPhaseText`: display-only vocabulary. Unknown
-/// tokens are shown verbatim; this never decides action legality.
+/// Display-only product phase vocabulary. Unknown tokens are shown verbatim;
+/// this never decides action legality.
 fn product_phase_text(phase: &str) -> &str {
     match phase {
         "Idle" => "No capture",
@@ -240,8 +239,8 @@ fn product_phase_text(phase: &str) -> &str {
     }
 }
 
-/// `qml/MenuView.qml` subtitle: the product phase plus the verified live
-/// source, size and rate labels, each joined with " · " exactly as QML does.
+/// The menu subtitle: the product phase plus the verified live source, size
+/// and rate labels, each joined with " · ".
 fn subtitle(product_phase: &str, live: &Live) -> String {
     let mut text = product_phase_text(product_phase).to_owned();
     for label in [&live.source_label, &live.size_label] {
@@ -338,8 +337,8 @@ impl PlaybackMenu {
         }
     }
 
-    /// The popup's Tab chain in QML creation order, skipping hidden and
-    /// disabled rows.
+    /// The popup's Tab chain in paint order, skipping hidden and disabled
+    /// rows.
     pub(super) fn focus_targets(&self, state: &HostState) -> Vec<FocusTarget> {
         let model = MenuModel::from_host(state);
         let mut targets = Vec::new();
@@ -700,7 +699,7 @@ mod tests {
         facts.native_generation = 42;
         let model = MenuModel::project(&facts);
         // Restart/Reconnect use the state-identity restart token; Close uses
-        // the projected native generation, exactly like host.cpp.
+        // the projected native generation.
         assert_eq!(model.restart_generation, 7);
         assert_eq!(model.reconnect_generation, 7);
         assert_eq!(model.close_generation, 42);

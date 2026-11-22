@@ -20,7 +20,7 @@ Connect a USB capture card to watch your console and hear its audio in one deskt
   <a href="https://github.com/Anthodev/furami/actions/workflows/ci.yml"><img src="https://github.com/Anthodev/furami/actions/workflows/ci.yml/badge.svg?branch=develop" alt="Linux CI"></a>
   <img src="https://img.shields.io/badge/platform-Linux%20x86__64-informational" alt="Linux x86-64">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Anthodev/furami?label=source%20license" alt="Furami-authored source license"></a>
-  <img src="https://img.shields.io/badge/Qt-6.11.2-informational" alt="Qt 6.11.2">
+  <img src="https://img.shields.io/badge/frontend-GPUI%2FX11-informational" alt="GPUI on X11">
 </p>
 
 > [!NOTE]
@@ -137,13 +137,13 @@ Furami can write diagnostic logs and a sanitized session report that help descri
 
 ## 🚧 Limitations
 
-- **Tested on Fedora with KDE Plasma.** Other distributions and desktops have not been tested. Hardware Vulkan is required, along with XWayland in Wayland sessions.
-- **Capture shutdown and recovery still need work.** Closing a capture session can crash. Saving and restoring settings during playback, adapting saved settings on startup, and recovering picture and sound after unplugging the card still need testing.
+- **GPUI AppImage tested on Fedora with KDE Plasma and ShadowCast 3.** The app requires hardware Vulkan and, in Wayland sessions, XWayland. It does not run as a native Wayland client.
+- **Capture recovery is not fully qualified.** Normal close and saved-profile reload were tested on KDE. Forced loss of the video child or X server is not covered by that result.
 - **Performance measurements are pending.** Latency, audio/video synchronisation and long-session stability have not been measured; very low latency is a design priority, not a guaranteed figure.
 
 ## 🔨 Building from source
 
-Furami is built from source with Rust and Qt. The [media recipe](packaging/media/README.md) covers the pinned dependencies; the [AppImage documentation](packaging/appimage/README.md) covers application builds and packaging.
+Furami uses Rust and GPUI. The [media recipe](packaging/media/README.md) covers the pinned toolchain, native dependencies and media provider; the [AppImage documentation](packaging/appimage/README.md) covers packaging and validation.
 
 ## Acknowledgements
 
@@ -155,4 +155,4 @@ Contributions are welcome through issues and pull requests against the `develop`
 
 ## 📄 License
 
-Furami-authored source is [MIT](LICENSE) — the badge above reports that source license only. The pinned media build includes GPL mpv/FFmpeg and LGPL libplacebo/Qt, so a combined executable is not MIT-only; the [core license audit](packaging/media/LICENSE-AUDIT.md) records build flags and distribution obligations for redistribution. The [RELINKING](packaging/appimage/RELINKING.md) notes and the [public material scope](packaging/appimage/README.md#public-material-scope) describe what a distributed image and its downloads do and do not carry.
+Furami-authored source is [MIT](LICENSE) — the badge above reports that source license only. The pinned media build includes GPL mpv/FFmpeg and LGPL libplacebo, so a combined executable is not MIT-only. The [core license audit](packaging/media/LICENSE-AUDIT.md) records build flags and distribution obligations. The [RELINKING](packaging/appimage/RELINKING.md) notes and [public material scope](packaging/appimage/README.md#public-material-scope) describe what a distributed image and its downloads carry.

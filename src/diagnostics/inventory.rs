@@ -1063,12 +1063,20 @@ mod tests {
             serde_json::from_str(SOURCE_RECIPE_JSON).expect("recipe projection parses");
         if let Availability::Observed(facts) = &recipe {
             assert!(hex64(&facts.lock_sha256));
-            assert!(facts.sources.contains_key("mpv"));
-            let mut keys: Vec<&str> = facts.sources.keys().map(String::as_str).collect();
-            keys.sort_unstable();
-            let mut expected = KNOWN_SOURCES.to_vec();
-            expected.sort_unstable();
-            assert_eq!(keys, expected, "recipe source set must be exactly known");
+            // The provider allowlist also accepts historical Qt-bearing
+            // manifests; the current recipe is strictly media-only.
+            let keys: Vec<&str> = facts.sources.keys().map(String::as_str).collect();
+            assert_eq!(
+                keys,
+                [
+                    "ca_certificates",
+                    "ffmpeg",
+                    "libplacebo",
+                    "mpv",
+                    "vulkan_headers"
+                ],
+                "recipe source set must match the media-only lock"
+            );
             assert_bounded_sources(&facts.sources);
         }
 

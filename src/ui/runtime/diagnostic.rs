@@ -632,39 +632,10 @@ impl CaptureRuntime {
             self.report_cache.publication_stopped = true;
         }
     }
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn native_environment(
         &mut self,
-        qt_version: &str,
-        platform: &str,
-        x_vendor: &str,
-        x_release: u32,
-        x_protocol_major: u32,
-        x_protocol_minor: u32,
-        shape_major: u32,
-        shape_minor: u32,
+        observed: dto::NativeEnvironmentReport,
     ) -> UiUpdate {
-        let observed = dto::NativeEnvironmentReport {
-            qt_runtime_version: dto::Observation::Observed {
-                value: dto::bounded_text(qt_version, 128),
-            },
-            qt_platform: dto::Observation::Observed {
-                value: dto::bounded_text(platform, 128),
-            },
-            x_server: dto::Observation::Observed {
-                value: dto::XServerReport {
-                    vendor: dto::bounded_text(x_vendor, 256),
-                    release: x_release,
-                    protocol_major: x_protocol_major,
-                    protocol_minor: x_protocol_minor,
-                    shape_major,
-                    shape_minor,
-                },
-            },
-            xwayland_version: dto::Observation::Unavailable {
-                reason: dto::UnavailableReason::NotExposed,
-            },
-        };
         if self.report_cache.environment.native != observed {
             self.report_cache.environment.native = observed;
             self.report_cache.environment_dirty = true;

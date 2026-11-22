@@ -21,7 +21,8 @@ macro_rules! capture_intents {
     )*};
 }
 macro_rules! shared_intents {
-    ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {$(
+    ($($(#[$attr:meta])* $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {$(
+        $(#[$attr])*
         pub(crate) fn $name(&mut self, $($arg: $ty),*) -> $ret {
             match self {
                 Self::Capture(runtime) => runtime.$name($($arg),*),
@@ -39,7 +40,6 @@ impl RuntimeCoordinator {
         >,
         startup: StartupSelection,
         persistence: PersistenceSession,
-        sources: Vec<AudioSourceIdentity>,
         diagnostics: crate::diagnostics::DiagnosticsHandle,
     ) -> Self {
         Self::Capture(CaptureRuntime::new(
@@ -47,7 +47,6 @@ impl RuntimeCoordinator {
             capabilities,
             startup,
             persistence,
-            sources,
             diagnostics,
         ))
     }
@@ -103,11 +102,15 @@ impl RuntimeCoordinator {
         wait_for_owner_ack(attempt: AttemptId) -> String;
         native_released(attempt: AttemptId) -> UiUpdate;
         pause(attempt: AttemptId) -> SubmitStatus;
-        qualification_command(line: &str) -> UiUpdate;
         poll() -> UiUpdate;
-        unchanged() -> UiUpdate;
     }
-    #[cfg(all(feature = "gpui-host", target_os = "linux"))]
+    pub(crate) fn qualification_command(&mut self, command: QualificationCommand) -> UiUpdate {
+        match self {
+            Self::Qualification(runtime) => runtime.qualification_command(command),
+            Self::Capture(runtime) => runtime.poll(),
+        }
+    }
+    #[cfg(target_os = "linux")]
     pub(crate) fn owner_ack_failed(&self) -> bool {
         match self {
             Self::Capture(runtime) => runtime.owner_ack_failed(),
@@ -138,42 +141,13 @@ impl RuntimeCoordinator {
             Self::Qualification(_) => false,
         }
     }
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "CXX positional environment boundary."
-    )]
     pub(crate) fn native_environment(
         &mut self,
-        qt_version: &str,
-        platform: &str,
-        x_vendor: &str,
-        x_release: u32,
-        x_protocol_major: u32,
-        x_protocol_minor: u32,
-        shape_major: u32,
-        shape_minor: u32,
+        report: crate::diagnostics::report::NativeEnvironmentReport,
     ) -> UiUpdate {
         match self {
-            Self::Capture(runtime) => runtime.native_environment(
-                qt_version,
-                platform,
-                x_vendor,
-                x_release,
-                x_protocol_major,
-                x_protocol_minor,
-                shape_major,
-                shape_minor,
-            ),
-            Self::Qualification(runtime) => runtime.native_environment(
-                qt_version,
-                platform,
-                x_vendor,
-                x_release,
-                x_protocol_major,
-                x_protocol_minor,
-                shape_major,
-                shape_minor,
-            ),
+            Self::Capture(runtime) => runtime.native_environment(report),
+            Self::Qualification(runtime) => runtime.native_environment(report),
         }
     }
 }

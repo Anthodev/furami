@@ -13,7 +13,7 @@ use gpui::{
 };
 
 use super::{
-    Action, CompanionMode, HostState, RuntimeCoordinator, brume,
+    Action, HostState, RuntimeCoordinator, brume,
     capture_context::{self, CaptureContext},
     chrome::Popup,
     controls::{self, Activate, Activation, HitRegions, OPTIONS_ID, PAUSE_RESUME_ID},
@@ -687,9 +687,18 @@ impl CompanionView {
             &self.volume_slider,
             &self.volume_mute,
             regions,
+            state.volume.drag_handle(),
             hover,
             dispatch,
         )
+        .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+            let outcome = this.state.borrow_mut().volume_wheel(event, true);
+            if outcome != volume::WheelOutcome::Ignore {
+                this.state.borrow_mut().chrome.wheel(Instant::now());
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }))
     }
 }
 
@@ -1039,6 +1048,9 @@ impl Render for CompanionView {
                         return;
                     }
                     let mut state = this.state.borrow_mut();
+                    if event.button == MouseButton::Left {
+                        state.volume.cancel_drag();
+                    }
                     if event.button == MouseButton::Left && accepts_chrome(&state) {
                         this.suspended_focus = None;
                         state.chrome.leave_keyboard(Instant::now());
@@ -1050,33 +1062,26 @@ impl Render for CompanionView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, _| {
-                    this.state.borrow_mut().chrome.press(false, Instant::now());
+                    let mut state = this.state.borrow_mut();
+                    state.volume.cancel_drag();
+                    state.chrome.press(false, Instant::now());
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, _| {
-                    this.state.borrow_mut().chrome.press(false, Instant::now());
+                    let mut state = this.state.borrow_mut();
+                    state.volume.cancel_drag();
+                    state.chrome.press(false, Instant::now());
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
                 let mut state = this.state.borrow_mut();
+                if event.pressed_button != Some(MouseButton::Left) {
+                    state.volume.cancel_drag();
+                }
                 state.volume.pointer();
                 state.chrome.pointer(event.position, Instant::now());
-            }))
-            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
-                let companion_mode = {
-                    let state = this.state.borrow();
-                    state.companion_mode
-                };
-                let outcome = {
-                    let mut state = this.state.borrow_mut();
-                    state.volume_wheel(event, companion_mode == CompanionMode::Visible)
-                };
-                if outcome != volume::WheelOutcome::Ignore {
-                    this.state.borrow_mut().chrome.wheel(Instant::now());
-                    cx.notify();
-                }
             }))
             .child(chrome)
             .child(paint_marker(

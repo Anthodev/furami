@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Audit exact AppImage bytes, independently extracted payload and provenance."""
 import argparse
-import hashlib
 import importlib.util
 import json
-import os
 from pathlib import Path
 import re
 import shutil
@@ -47,181 +45,38 @@ def versions(path):
             'provided': sorted(set(re.findall(pattern, defined)))}
 
 
-def qml_backing_evidence(media, mapping, documents):
-    """Join installed QML backing-target exports to checked vendor SPDX files.
-
-    Built-in modules have no separate plugin. Module terms establish provenance,
-    not a file-level license for generated qmldir/typeinfo output.
-    """
-    result = {}
-    by_document = {item['path'].removeprefix('prefix/'): item for item in documents}
-    for path in sorted((media / 'prefix/lib/cmake').rglob('*Targets.cmake')):
-        text = path.read_text()
-        for block in re.findall(r'set_target_properties\((.*?)\n\)', text, re.S):
-            properties = dict(re.findall(r'^\s+(_qt_[A-Za-z0-9_]+)\s+"([^"]*)"\s*$', block, re.M))
-            if properties.get('_qt_qml_module_is_backing_target') != 'TRUE':
-                continue
-            qmldir = properties.get('_qt_qml_module_installed_qmldir_path')
-            document = by_document.get(properties.get('_qt_sbom_spdx_v2_document_json_relative_path'))
-            if not qmldir or not document:
-                continue
-            package = next((item for item in document['packages']
-                            if item['SPDXID'] == properties.get('_qt_sbom_spdx_id')), None)
-            if not package or package.get('versionInfo') != properties.get('_qt_sbom_package_version'):
-                continue
-            contains = [row for row in document['relationships']
-                        if row['spdxElementId'] == package['SPDXID'] and row['relationshipType'] == 'CONTAINS']
-            file_ids = {row['relatedSpdxElement'] for row in contains}
-            backends = [item for item in mapping.values()
-                        if item['evidence'] == document['path'] and item['file_spdx_id'] in file_ids]
-            backends = [item for item in backends if item.get('checksum_verified')]
-            original = media / 'prefix' / qmldir
-            if not backends or not original.is_file():
-                continue
-            declarations = [line.split('#', 1)[0].split() for line in original.read_text().splitlines()]
-            uri = properties.get('_qt_qml_module_uri')
-            if ['module', uri] not in declarations:
-                continue
-            generated = {Path(qmldir).name}
-            generated.update(row[1] for row in declarations if len(row) == 2 and row[0] == 'typeinfo')
-            result[str(Path(qmldir).parent)] = {
-                'component_id': backends[0]['component_id'],
-                'module_license_expression': package.get('licenseConcluded'),
-                'evidence': {'SPDX_document': document['path'], 'package': package,
-                             'SPDX_document_sha256': document['sha256'],
-                             'Qt_vendor_version': package['versionInfo'], 'relationships': contains,
-                             'backend_files': backends, 'qml_module_uri': uri,
-                             'CMake_export': {'path': path.relative_to(media).as_posix(), 'sha256': stage.digest(path)},
-                             'qmldir': {'path': 'prefix/' + qmldir, 'sha256': stage.digest(original)}},
-                'generated_files': generated}
-    return result
-
-
-def qt_evidence(media, owners, root):
-    documents = []
-    mapping = {}
-    for path in sorted((media / 'prefix/sbom').glob('*.spdx.json')):
-        document = read_json(path)
-        documents.append({'path': path.relative_to(media).as_posix(), 'sha256': stage.digest(path),
-                          'name': document['name'], 'packages': document.get('packages', []),
-                          'relationships': document.get('relationships', []),
-                          'extracted_license_texts': document.get('hasExtractedLicensingInfos', [])})
-        for file in document.get('files', []):
-            relative = file['fileName'].removeprefix('./')
-            original = media / 'prefix' / relative
-            if not original.is_file():
-                continue
-            verified = False
-            for checksum in file.get('checksums', []):
-                algorithm = checksum['algorithm'].lower()
-                if algorithm not in ('sha1', 'sha256'):
-                    continue
-                with original.open('rb') as stream:
-                    actual = hashlib.file_digest(stream, algorithm).hexdigest()
-                if actual != checksum['checksumValue']:
-                    raise ValueError(f'Qt vendor SBOM checksum mismatch: {relative}')
-                verified = True
-            mapping[relative] = {'component_id': 'qt:' + path.name.split('-6.11.2')[0],
-                                 'file_spdx_id': file['SPDXID'], 'license_expression': file.get('licenseConcluded'),
-                                 'evidence': path.relative_to(media).as_posix(), 'checksum_verified': verified,
-                                 'path': 'prefix/' + relative, 'sha256': stage.digest(original)}
-    if len(documents) != 4:
-        raise ValueError('four frozen Qt vendor SBOM documents required')
-    qml_backends = qml_backing_evidence(media, mapping, documents)
+def media_evidence(media, owners):
+    prefix = (media / 'prefix').resolve()
+    terms = {'mpv': 'GPL-2.0-or-later', 'ffmpeg': 'GPL-2.0-or-later',
+             'libplacebo': 'LGPL-2.1-or-later'}
+    basis = 'frozen checked source and build configuration; packaging/media/LICENSE-AUDIT.md'
+    ffmpeg = None
     for relative, owner in owners.items():
         if owner['owner'] != 'media':
             continue
         source = owner['source']
-        original = media / 'prefix' / source
-        if original.is_symlink():
-            canonical = original.resolve()
-            if not canonical.is_relative_to((media / 'prefix').resolve()):
-                raise ValueError(f'Qt/media source symlink escaped prefix: {source}')
-            source = canonical.relative_to(media / 'prefix').as_posix()
-        if source in mapping:
-            owner['components'] = [mapping[source]]
-        elif source.startswith('qml/'):
-            module = qml_backends.get(str(Path(source).parent))
-            if module and Path(source).name in module['generated_files']:
-                linked_files = [module['evidence']['CMake_export'], module['evidence']['qmldir'],
-                                {'path': module['evidence']['SPDX_document'],
-                                 'sha256': module['evidence']['SPDX_document_sha256']},
-                                {'path': 'prefix/' + source, 'sha256': stage.digest(original)},
-                                *module['evidence']['backend_files']]
-                for linked in linked_files:
-                    expected = read_json(media / 'manifest.json').get('artifacts', {}).get(
-                        linked['path'].removeprefix('prefix/'), {}).get('sha256')
-                    if expected != linked['sha256']:
-                        raise ValueError('Qt QML provenance hash mismatch: ' + linked['path'])
-                evidence = {**module['evidence'], 'generated_metadata': {
-                    'path': 'prefix/' + source, 'sha256': stage.digest(original),
-                    'terms_basis': 'vendor module provenance; generated-file terms not asserted by binary SBOM'}}
-                if source.endswith('.qmltypes'):
-                    generator = re.search(r'auto-generated by ([A-Za-z0-9_-]+)\.', original.read_text())
-                    if generator:
-                        evidence['generator'] = {'name': generator[1], 'packages': [
-                            {'SPDX_document': document['path'], 'package': package}
-                            for document in documents for package in document['packages']
-                            if package.get('name') == generator[1]]}
-                owner['components'] = [{'component_id': module['component_id'], 'license_expression': None,
-                                         'module_license_expression': module['module_license_expression'],
-                                         'evidence': evidence, 'role': 'generated-QML-metadata',
-                                         'terms_rule': 'qt-qml-metadata-inherits-module-terms',
-                                         'terms_basis': 'explicit FUR-025 module-terms rule; hash-linked module/URI/backing target/SBOM; no individual file license asserted'}]
-                continue
-            if Path(source).name == 'qmldir' or source.endswith('.qmltypes'):
-                owner['components'] = [{'component_id': 'qt:unresolved', 'license_expression': None,
-                                         'module_license_expression': None,
-                                         'evidence': {'generated_metadata': {'path': 'prefix/' + source,
-                                                                          'sha256': stage.digest(original)}},
-                                         'role': 'generated-QML-metadata'}]
-                continue
-            directory = str(Path(source).parent)
-            candidates = [entry for name, entry in mapping.items() if str(Path(name).parent) == directory]
-            while not candidates and directory != "qml":
-                directory = str(Path(directory).parent)
-                candidates = [entry for name, entry in mapping.items() if str(Path(name).parent) == directory]
-            if not candidates:
-                raise ValueError(f'QML module lacks vendor plugin attribution: {source}')
-            owner['components'] = [{'component_id': candidates[0]['component_id'],
-                                     'module_license_expression': candidates[0]['license_expression'],
-                                     'license_expression': candidates[0]['license_expression'],
-                                     'evidence': candidates[0]['evidence'],
-                                     'scope': 'containing Qt QML module; source SPDX retains file-level terms'}]
-        elif Path(source).name.startswith(('libicu',)):
-            icu = read_json(HERE / 'sources.lock.json')['icu_notice']
-            notice = root / 'usr/share/licenses/icu/LICENSE'
-            if stage.digest(notice) != icu['sha256']:
-                raise ValueError('actual ICU notice does not match checked source receipt')
-            owner['components'] = [{'component_id': 'icu:73.2', 'license_expression': icu['license_ref'],
-                                     'evidence': {'url': icu['url'], 'sha256': icu['sha256'],
-                                                  'custom_license_texts': {icu['license_ref']: notice.read_text()},
-                                                  'Qt_vendor_version': '73.2', 'source_required': False}}]
-        elif source.startswith(('sbom/', 'config_')):
-            owner['components'] = [{'component_id': 'qt-license-evidence',
-                                     'license_expression': None,
-                                     'role': 'vendor-license-evidence',
-                                     'evidence': source}]
-        else:
-            name = Path(source).name
-            # The seeded provider program is mapped by its exact manifest source,
-            # never by basename; other provider programs stay refused.
-            component = ('mpv' if source == 'bin/mpv' or name.startswith('libmpv')
-                         else 'libplacebo' if name.startswith('libplacebo')
-                         else 'ffmpeg' if name.startswith(('libav', 'libsw')) else None)
-            if component:
-                evidence = 'frozen checked source and build configuration; packaging/media/LICENSE-AUDIT.md'
-                if component == 'ffmpeg':
-                    manifest = read_json(media / 'manifest.json')
-                    stage.source_patches.verify_provider(media, manifest, manifest['sources'])
-                    evidence = {'basis': evidence, 'upstream_source': manifest['sources'][component],
-                                'source_patch_receipt': manifest.get('source_patches')}
-                owner['components'] = [{'component_id': component,
-                                        'license_expression': {'mpv': 'GPL-2.0-or-later', 'ffmpeg': 'GPL-2.0-or-later', 'libplacebo': 'LGPL-2.1-or-later'}[component],
-                                        'evidence': evidence}]
-            else:
-                raise ValueError(f'media owner lacks component mapping: {relative} <- {source}')
-    return documents
+        original = prefix / source
+        canonical = original.resolve()
+        if not canonical.is_relative_to(prefix):
+            raise ValueError(f'media source escaped prefix: {source}')
+        component = None
+        if (source, relative) in stage.MEDIA_PROGRAMS:
+            component = 'mpv'
+        elif relative == 'usr/' + source and canonical.parent == prefix / 'lib':
+            name = canonical.name
+            component = ('mpv' if name.startswith('libmpv.so')
+                         else 'libplacebo' if name.startswith('libplacebo.so')
+                         else 'ffmpeg' if re.fullmatch(r'lib(?:av(?:codec|device|filter|format|util)|sw(?:resample|scale))\.so(?:\..*)?', name)
+                         else None)
+        if component is None:
+            raise ValueError(f'media owner lacks component mapping: {relative} <- {source}')
+        if component == 'ffmpeg' and ffmpeg is None:
+            manifest = read_json(media / 'manifest.json')
+            stage.source_patches.verify_provider(media, manifest, manifest['sources'])
+            ffmpeg = {'basis': basis, 'upstream_source': manifest['sources'][component],
+                      'source_patch_receipt': manifest.get('source_patches')}
+        owner['components'] = [{'component_id': component, 'license_expression': terms[component],
+                                'evidence': ffmpeg if component == 'ffmpeg' else basis}]
 
 
 def verify_executables(root, relatives):
@@ -229,6 +84,45 @@ def verify_executables(root, relatives):
         executable = root / relative
         if not executable.is_file() or executable.stat().st_mode & 0o111 != 0o111:
             raise ValueError(f'AppImage launch entry is not executable by recipients: {relative}')
+
+
+def verify_payload_owners(root, actual, owners):
+    for relative, owner in owners.items():
+        if owner['owner'].startswith('ubuntu:') and actual.get(relative, {}).get('type') not in ('file', 'symlink'):
+            raise ValueError(f'Ubuntu owner path absent from final image: {relative}')
+    for relative, metadata in actual.items():
+        if metadata['type'] == 'directory':
+            continue
+        owner = owners.get(relative)
+        if not owner and metadata['type'] == 'symlink':
+            resolved = (root / relative).resolve().relative_to(root).as_posix()
+            owner = owners.get(resolved)
+        if not owner:
+            raise ValueError(f'final image file owner missing: {relative}')
+        if metadata['type'] == 'file' and owner.get('shipped_sha256') != metadata['sha256']:
+            raise ValueError(f'final image owner hash mismatch: {relative}')
+
+
+def verify_crate_notices(app_root, root, actual, owners):
+    app = read_json(app_root / 'manifest.json')
+    records, expected_owners, _ = stage.crate_notice_inventory(app_root, app)
+    offer = read_json(root / 'usr/share/licenses/furami/source-offer.json')
+    if offer.get('rust_crates') != records:
+        raise ValueError('final crate source offer differs from verified notice inputs')
+    prefix = 'usr/share/licenses/rust/'
+    extracted = {path for path, entry in actual.items()
+                 if path.startswith(prefix)
+                 and not path.startswith(prefix + 'rust-std-1.97.1/')
+                 and entry['type'] != 'directory'}
+    if extracted != set(expected_owners):
+        raise ValueError('final crate notice inventory differs from verified notice inputs')
+    if {path for path, owner in owners.items() if owner['owner'] == 'app-crate-source'} != extracted:
+        raise ValueError('crate notice ownership exists outside the verified inventory')
+    for path, expected in expected_owners.items():
+        digest = expected['source_sha256']
+        if (actual[path]['type'] != 'file' or actual[path].get('sha256') != digest
+                or owners.get(path) != {**expected, 'shipped_sha256': digest}):
+            raise ValueError(f'final crate notice bytes or provenance differ: {path}')
 
 
 def audit(image, provenance, output):
@@ -263,6 +157,7 @@ def audit(image, provenance, output):
     elf, errors = inventory.read_elf_metadata(str(root), paths, 'readelf')
     if errors:
         raise ValueError('; '.join(errors))
+    inventory.require_qt_free(actual, elf)
     dependency_warnings = []
     dependencies = inventory.resolve_dependency_closure(str(root), elf,
         {item['path']: item['sha256'] for item in files}, symlinks, ['usr/lib'], dependency_warnings)
@@ -308,45 +203,27 @@ def audit(image, provenance, output):
     if any(tuple(map(int, name.split('_')[1].split('.'))) > (2, 39) for name in glibc):
         raise ValueError('shipped ELF requires glibc newer than frozen Ubuntu 24.04 baseline 2.39')
     owners = receipt['component_sources']
-    for relative, metadata in actual.items():
-        if metadata['type'] == 'directory':
-            continue
-        owner = owners.get(relative)
-        if not owner and metadata['type'] == 'symlink':
-            resolved = (root / relative).resolve().relative_to(root).as_posix()
-            owner = owners.get(resolved)
-        if not owner:
-            raise ValueError(f'final image file owner missing: {relative}')
-        if metadata['type'] == 'file' and owner.get('shipped_sha256') != metadata['sha256']:
-            raise ValueError(f'final image owner hash mismatch: {relative}')
-    qt = qt_evidence(providers['media'], owners, root)
+    verify_payload_owners(root, actual, owners)
+    verify_crate_notices(providers['app'], root, actual, owners)
+    media_evidence(providers['media'], owners)
     static_warnings = []
     static = inventory.collect_static_components(str(root), str(providers['media'] / 'work/placebo-build/build.ninja'),
         str(providers['media'] / 'prefix/lib/pkgconfig/libplacebo.pc'), static_warnings)
     if static['status'] != 'link-inputs-matched-objects-unverified':
         raise ValueError('libplacebo static link-input ownership incomplete: ' + '; '.join(static_warnings))
-    scanner = providers['media'] / 'prefix/libexec/qmlimportscanner'
-    scanned = json.loads(stage.run([scanner, '-rootPath', providers['app'] / 'source-snapshot/qml', '-importPath', root / 'usr/qml'],
-        env={**os.environ, 'LD_LIBRARY_PATH': str(providers['media'] / 'prefix/lib')}))
-    for item in scanned:
-        if item.get('type') != 'module' or item.get('name') == 'dev.antho.furami':
-            continue
-        location = Path(item.get('path', ''))
-        if not location.is_absolute() or not location.resolve().is_relative_to((root / 'usr/qml').resolve()) or not location.is_dir():
-            raise ValueError(f'extracted QML import unresolved: {item}')
     if not (root / 'usr/lib/libmpv.so').is_file():
         raise ValueError('canonical dlopen libmpv root missing')
     notices = [item for item in files if item['path'].startswith(('usr/share/licenses/', 'usr/share/doc/ubuntu/', 'usr/share/furami/runtime-compliance/licenses/'))]
     attribution = load('components')
-    registry, runtime_components, external_notices = attribution.registry(providers, owners, qt, static, stage.digest)
+    registry, runtime_components, external_notices = attribution.registry(
+        providers, owners, static, stage.digest, payload_root=root, elf_paths=paths)
     header['components'] = [registry[identifier] for identifier in runtime_components]
     manifest = {'schema': 1, 'image': {'path': image.name, 'sha256': stage.digest(image)}, 'outer_runtime': header,
                 'payload': actual, 'owners': owners, 'provider_manifest_sha256': ids}
     result = {'schema': 1, 'image_sha256': stage.digest(image), 'technical_pass': True, 'elf': elf,
               'dependencies': dependencies, 'host_ABI_allowlist': sorted(stage.HOST_LIBS),
               'symbol_requirements': sorted(requirements), 'glibc_baseline': '2.39',
-              'qml': {'scanner_imports': scanned, 'staging_closure': receipt['qml']},
-              'dlopen_roots': ['usr/lib/libmpv.so'], 'Qt_vendor_SBOM': qt,
+              'dlopen_roots': list(stage.DLOPEN_ROOTS),
               'static_libplacebo': static, 'static_warnings': static_warnings,
               'app_static': read_json(providers['app'] / 'manifest.json')['binary'],
               'runtime_static': read_json(providers['runtime'] / 'manifest.json')['components'],
@@ -357,7 +234,7 @@ def audit(image, provenance, output):
                          'Static archive input ownership established conservatively; all contributor source/notices required, no retained-function claim.']}
     dump(output / 'manifest.json', manifest)
     dump(output / 'audit.json', result)
-    dump(output / 'components.json', {'schema': 1, 'files': owners, 'components': registry, 'Qt_vendor_SBOM': qt,
+    dump(output / 'components.json', {'schema': 1, 'files': owners, 'components': registry,
                                       'libplacebo_static': static, 'runtime': result['runtime_static'], 'application': result['app_static']})
     with (output / 'NOTICE.txt').open('w') as notice:
         notice.write('Furami combined executable uses GPL-compatible terms subject to release-ready.json. Authored Furami source remains MIT.\n\n')
@@ -373,10 +250,6 @@ def audit(image, provenance, output):
             notice.write('\n===== signed Ubuntu component ' + path.name + ' =====\n')
             notice.write(path.read_text())
             notice.write('\n')
-        for document in qt:
-            for item in document['extracted_license_texts']:
-                notice.write('\n===== Qt ' + item['licenseId'] + ' =====\n')
-                notice.write(item.get('extractedText', '') + '\n')
     return result
 
 

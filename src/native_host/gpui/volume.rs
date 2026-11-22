@@ -1,11 +1,10 @@
 //! Right-centre Brume volume rail and wheel policy for the GPUI frontend.
 //!
-//! `qml/VolumeChromeContent.qml` is the parity contract: a
-//! `Brume.volumeWidth` (44 px) tool at the right window margin, vertically
-//! centred, that grows from the 48 px ribbon extent to 216 logical px while the
-//! pointer hovers it, it owns keyboard focus, or keyboard navigation expanded
-//! it. The gain slider and the independent mute button step by one bounded
-//! integer point, and neither keeps an optimistic local value: every change is
+//! The rail is a 44 px tool at the right window margin, vertically centred,
+//! that grows from the 48 px ribbon extent to 216 logical px while the pointer
+//! hovers it, it owns keyboard focus, or keyboard navigation expanded it. The
+//! gain slider and the independent mute button step by one bounded integer
+//! point, and neither keeps an optimistic local value: every change is
 //! dispatched through `RuntimeCoordinator` and the rail paints only the
 //! published projection.
 //!
@@ -32,10 +31,10 @@
 use std::{cell::Cell, rc::Rc};
 
 use gpui::{
-    AccessibleAction, App, Bounds, ClickEvent, Div, FocusHandle, HoverListenerMode, Hsla,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Orientation, Pixels,
-    Point, Role, ScrollDelta, ScrollEvent, SharedString, Size, Stateful, TouchPhase,
-    TransformationMatrix, Window, canvas, div, prelude::*, px,
+    AccessibleAction, App, Bounds, ClickEvent, DispatchPhase, Div, FocusHandle, HoverListenerMode,
+    Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Orientation, Pixels, Point,
+    Role, ScrollDelta, ScrollEvent, SharedString, Size, Stateful, TouchPhase, TransformationMatrix,
+    Window, canvas, div, prelude::*, px,
 };
 
 use crate::app::ports::SubmitStatus;
@@ -49,27 +48,27 @@ use super::{
 pub(super) const SLIDER_ID: &str = "volume-slider";
 /// Stable GPUI/accessibility identity of the mute button.
 pub(super) const MUTE_ID: &str = "volume-mute";
-/// Accessible name of the gain slider (the QML control's `Accessible.name`).
+/// Accessible name of the gain slider.
 const SLIDER_LABEL: &str = "Playback volume";
-/// Accessible name of the mute button (`VolumeChromeContent.qml` toggles it).
+/// Accessible name of the mute button; it toggles with the mute state.
 const MUTE_LABEL: &str = "Mute";
 const UNMUTE_LABEL: &str = "Unmute";
 
-/// Collapsed rail extent (`Brume.ribbonHeight`).
+/// Collapsed rail extent (the ribbon height).
 const RAIL_COLLAPSED: f32 = brume::RIBBON_HEIGHT;
-/// Expanded rail extent (`VolumeChromeContent.qml`).
+/// Expanded rail extent.
 const RAIL_EXPANDED: f32 = 216.0;
-/// Slider extent inside the rail (`implicitWidth - 8`, `implicitHeight`).
+/// Slider extent inside the rail: 8 px narrower than the rail, 140 px tall.
 const SLIDER_WIDTH: f32 = brume::VOLUME_WIDTH - 8.0;
 const SLIDER_HEIGHT: f32 = 140.0;
-/// QML handle and undragged track widths.
+/// Handle and undragged track widths.
 const HANDLE: f32 = 18.0;
 const TRACK_WIDTH: f32 = 6.0;
 
 /// Bounds of the projected gain range.
 const MIN_VOLUME: i32 = 0;
 const MAX_VOLUME: i32 = 100;
-/// One wheel detent is 5 percentage points (`notches * 5` in the QML adapter).
+/// One wheel detent is 5 percentage points.
 const POINTS_PER_NOTCH: i32 = 5;
 /// Vertical lines in one detent from the pinned GPUI X11 backend: discrete
 /// buttons and fractional XInput2 valuators both arrive scaled to `SCROLL_LINES`
@@ -107,19 +106,20 @@ pub(super) enum WheelOutcome {
 
 /// Rail interaction state. `hovered` only changes the painted extent and is
 /// never treated as activity: a stationary pointer must still let the chrome
-/// fade. `keyboard_expanded` mirrors the QML flag that survives until real
-/// pointer activity clears keyboard navigation mode.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// fade. `keyboard_expanded` survives until real pointer activity clears
+/// keyboard navigation mode.
+#[derive(Debug, Default)]
 pub(super) struct VolumeState {
     hovered: bool,
     keyboard_expanded: bool,
+    slider_pressed: Rc<Cell<bool>>,
     wheel: WheelAccumulator,
 }
 
 impl VolumeState {
     /// Whether the rail paints the 216 px extent.
     pub(super) fn expanded(&self, focused: bool) -> bool {
-        self.hovered || focused || self.keyboard_expanded
+        self.hovered || focused || self.keyboard_expanded || self.slider_pressed.get()
     }
 
     /// Record a hover transition. Returns whether the extent changed, so the
@@ -133,7 +133,7 @@ impl VolumeState {
     }
 
     /// Tab entered the volume tool: keep it expanded while keyboard navigation
-    /// continues, exactly like `VolumeChromeContent.qml::focusBoundary`.
+    /// continues.
     pub(super) fn keyboard_expand(&mut self) {
         self.keyboard_expanded = true;
     }
@@ -144,12 +144,26 @@ impl VolumeState {
         self.keyboard_expanded = false;
     }
 
+    /// Event handlers from successive frames share the same physical drag.
+    pub(super) fn drag_handle(&self) -> Rc<Cell<bool>> {
+        Rc::clone(&self.slider_pressed)
+    }
+
+    pub(super) fn cancel_drag(&self) {
+        self.slider_pressed.set(false);
+    }
+
+    pub(super) fn reset_wheel(&mut self) {
+        self.wheel.reset();
+    }
+
     /// Concealment or focus-family loss: no rail is on screen, so nothing may
     /// stay expanded and no sub-notch remainder may survive the boundary.
     pub(super) fn reset(&mut self) {
         self.hovered = false;
         self.keyboard_expanded = false;
-        self.wheel.reset();
+        self.cancel_drag();
+        self.reset_wheel();
     }
 }
 
@@ -226,24 +240,28 @@ fn vertical_lines(delta: &ScrollDelta) -> Option<f32> {
 impl HostState {
     /// The single wheel entry point for the video/empty viewport and the rail.
     ///
-    /// `active` is the host's family-active and chrome-visible fact; the rest of
-    /// the gain guard is read from the published projection here so both windows
-    /// cannot drift. A consumed outcome re-arms chrome activity, an ignored one
-    /// leaves regular list scrolling alone.
-    pub(super) fn volume_wheel(&mut self, event: &ScrollEvent, active: bool) -> WheelOutcome {
+    /// Check the active and viewable application family, not chrome visibility,
+    /// for viewport input. Only consumed input re-arms chrome activity.
+    pub(super) fn volume_wheel(&mut self, event: &ScrollEvent, companion: bool) -> WheelOutcome {
         let snapshot = self.view.snapshot.as_deref();
-        let eligible = active
-            && self.accepts_input()
-            && self.chrome.popup().is_none()
-            && snapshot.is_some_and(|snapshot| {
-                snapshot.can_set_gain && !snapshot.closing && !snapshot.opening
-            });
+        let eligible = self.wheel_family_viewable(companion);
         let volume = snapshot.map_or(MIN_VOLUME, |snapshot| snapshot.live.volume_percent);
         let outcome = self.volume.wheel.apply(event, eligible, volume);
         if let WheelOutcome::Set(percent) = outcome {
             self.apply_volume(VolumeIntent::Volume(percent));
         }
         outcome
+    }
+
+    pub(super) fn volume_pointer_available(&self) -> bool {
+        self.accepts_input()
+            && self.chrome.popup().is_none()
+            && self.view.close_dialog.is_empty()
+            && self
+                .view
+                .snapshot
+                .as_deref()
+                .is_some_and(|snapshot| snapshot.can_set_gain)
     }
 
     /// Dispatch one gain change through the runtime and consume the resulting
@@ -304,9 +322,10 @@ pub(super) fn rail(
     slider_focus: &FocusHandle,
     mute_focus: &FocusHandle,
     regions: &HitRegions,
+    pressed: Rc<Cell<bool>>,
     hover: Hover,
     dispatch: Dispatch,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     let height = if rail.expanded {
         RAIL_EXPANDED
     } else {
@@ -327,8 +346,8 @@ pub(super) fn rail(
         .justify_center()
         .gap(px(brume::GAP_SMALL))
         .on_hover(move |hovered, window, cx| hover(*hovered, window, cx))
-        // Hover is the physical pointer position, like the QML HoverHandler:
-        // keyboard modality must not collapse a rail the pointer still covers.
+        // Hover is the physical pointer position: keyboard modality must not
+        // collapse a rail the pointer still covers.
         .hover_listener_mode(HoverListenerMode::InputModalityIndependent)
         .when(rail.expanded, |element| {
             element.child(slider(
@@ -336,6 +355,7 @@ pub(super) fn rail(
                 rail.enabled,
                 rail.visual_focus,
                 slider_focus,
+                pressed,
                 dispatch.clone(),
             ))
         })
@@ -351,12 +371,12 @@ fn slider(
     enabled: bool,
     visual_focus: bool,
     focus: &FocusHandle,
+    pressed: Rc<Cell<bool>>,
     dispatch: Dispatch,
 ) -> impl IntoElement {
     let percent = percent.clamp(MIN_VOLUME, MAX_VOLUME);
     let value = percent as f32 / 100.0;
     let bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
-    let pressed = Rc::new(Cell::new(false));
 
     let track_left = (SLIDER_WIDTH - TRACK_WIDTH) / 2.0;
     let track = div()
@@ -447,18 +467,14 @@ fn slider(
                 }
             }
         };
-        let release = {
-            let pressed = Rc::clone(&pressed);
-            move |_: &MouseUpEvent, _: &mut Window, _: &mut App| pressed.set(false)
-        };
         let keys = {
             let dispatch = dispatch.clone();
             move |event: &KeyDownEvent, window: &mut Window, cx: &mut App| {
                 if event.keystroke.modifiers.modified() {
                     return;
                 }
-                // Vertical orientation: only Up/Down move the handle, matching
-                // `QQuickSlider::keyPressEvent` (stepSize 1). Keys repeat.
+                // Vertical orientation: only Up/Down move the handle, one
+                // point per press. Keys repeat.
                 let step = match event.keystroke.key.as_str() {
                     "up" => 1,
                     "down" => -1,
@@ -478,10 +494,8 @@ fn slider(
         element = element
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, press)
-            .on_mouse_move(drag)
-            .on_mouse_up(MouseButton::Left, release.clone())
-            .on_mouse_up_out(MouseButton::Left, release)
-            .on_key_down(keys);
+            .on_key_down(keys)
+            .child(measure_slider(bounds, drag));
         let increment = {
             let dispatch = dispatch.clone();
             move |_: Option<&gpui::accesskit::ActionData>, window: &mut Window, cx: &mut App| {
@@ -515,15 +529,11 @@ fn slider(
             .on_a11y_action(AccessibleAction::Decrement, decrement);
     }
 
-    element
-        .child(track)
-        .child(fill)
-        .child(handle)
-        .child(measure(bounds))
+    element.child(track).child(fill).child(handle)
 }
 
-/// Independent mute toggle: 44 x 48 rounded control (the tool is 44 px wide, so
-/// that is the real QML hit target) with the 20 px Tabler glyph.
+/// Independent mute toggle: 44 x 48 rounded control filling the tool width,
+/// with the 20 px Tabler glyph.
 fn mute_button(
     muted: bool,
     enabled: bool,
@@ -606,10 +616,9 @@ fn mute_button(
     element
 }
 
-/// One bundled SVG glyph painted at its stable asset path, exactly like the gate
-/// controls. The tint follows `BrumeIconButton.qml`: secondary at rest, the
-/// foreground while the pointer is over the 44 x 48 affordance (not merely the
-/// 20 px glyph), disabled text when the gain is not settable.
+/// One bundled SVG glyph painted at its stable asset path. Tint is secondary at
+/// rest, foreground while the pointer is over the 44 x 48 affordance (not
+/// merely the 20 px glyph), and disabled text when the gain is not settable.
 fn glyph(
     icon: brume::Icon,
     size: f32,
@@ -640,9 +649,9 @@ fn glyph(
     .size(px(size))
 }
 
-/// Mandatory rail input hole: the whole tool extent, like the QML tool window.
-/// The column is transparent, but presses and hover inside it still belong to
-/// the volume surface rather than the video child.
+/// Mandatory rail input hole over the whole tool extent. The column is
+/// transparent, but presses and hover inside it still belong to the volume
+/// surface rather than the video child.
 fn hit_area(regions: &HitRegions) -> impl IntoElement {
     let regions = regions.clone();
     canvas(move |bounds, _, _| regions.record(bounds), |_, _, _, _| {})
@@ -650,17 +659,35 @@ fn hit_area(regions: &HitRegions) -> impl IntoElement {
         .inset_0()
 }
 
-/// Record the slider's painted bounds so pointer positions map to values in the
-/// same coordinate space GPUI delivered them in.
 fn measure(cell: Rc<Cell<Option<Bounds<Pixels>>>>) -> impl IntoElement {
     canvas(|_, _, _| (), move |bounds, (), _, _| cell.set(Some(bounds)))
         .absolute()
         .inset_0()
 }
 
-/// Map a window position to the bounded integer percentage the QML slider would
-/// report for the same pointer position: the vertical visual position is
-/// inverted, and `stepSize: 1` rounds to whole points.
+/// Measure the track on each frame and see window-wide motion while the
+/// slider owns a left-button gesture, including beyond the track's edges.
+fn measure_slider(
+    cell: Rc<Cell<Option<Bounds<Pixels>>>>,
+    drag: impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            cell.set(Some(bounds));
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble {
+                    drag(event, window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// Map a window position to the bounded integer percentage: the vertical
+/// visual position is inverted and the result rounds to whole points.
 fn value_at(bounds: &Bounds<Pixels>, position: Point<Pixels>) -> i32 {
     let y = f32::from(position.y - bounds.origin.y).clamp(0.0, SLIDER_HEIGHT);
     let visual = 1.0 - y / SLIDER_HEIGHT;
@@ -694,6 +721,23 @@ mod tests {
         volume: i32,
     ) -> WheelOutcome {
         accumulator.apply(event, true, volume)
+    }
+
+    #[test]
+    fn gpui_host_volume_drag_survives_new_frame_and_cancels_on_reset() {
+        let mut volume = VolumeState::default();
+        let pressed_frame = volume.drag_handle();
+        pressed_frame.set(true);
+
+        let redrawn_frame = volume.drag_handle();
+        assert!(redrawn_frame.get(), "a redraw must not end the gesture");
+
+        volume.reset();
+        assert!(!redrawn_frame.get(), "the next frame sees the cancellation");
+        assert!(
+            !pressed_frame.get(),
+            "old handlers also see the cancellation"
+        );
     }
 
     #[test]

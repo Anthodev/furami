@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "media_lock_sha256": "6ee70cabb2811fe00b4d942a45a74dd73ee7ea0be34062bf2638466b376a24c6",
+  "media_lock_sha256": "87d6286bfa66a22c0ba712e0ae4feabdebd28823a79f6b90a6de66dcbba02caf",
   "container": "docker.io/library/ubuntu@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3",
   "apt_snapshot": "20260920T000000Z",
   "scope": "stage-only build tools; not included in AppDir or AppImage",

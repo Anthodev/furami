@@ -4,7 +4,7 @@
 
 ### Features
 
-- Add an experimental Linux GPUI/XWayland host behind `gpui-host` and `--gpui` ([#53](https://github.com/Anthodev/furami/issues/53)). It reuses the existing Rust runtime and bundled libmpv. Qt/QML remains the default and AppImage staging is unchanged.
+- Make GPUI on X11/XWayland the Linux frontend and remove Qt/QML from the application and the AppImage. Capture, playback and preferences retain the shared Rust runtime; existing capture profiles need no conversion. `--gpui` is no longer needed or accepted ([#53](https://github.com/Anthodev/furami/issues/53), [#54](https://github.com/Anthodev/furami/issues/54)).
 
 ## [1.1.0] - 2026-10-19
 

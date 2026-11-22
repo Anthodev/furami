@@ -15,11 +15,7 @@ jobs:
   linux:
     name: Build, test and lint (Avrea Ubuntu 24.04 x86_64)
     runs-on: avrea-ubuntu-24.04-2-vcpu
-    # The pinned toolchain selects rust-lld for x86_64-unknown-linux-gnu, which
-    # rejects the GNU-only -Wl,--require-defined=cxx_qt_init_crate_furami that
-    # build.rs emits to force the CXX-Qt QML init root out of the archives.
-    # Keep that flag (never weaken it to -u) and select the GNU BFD linker for
-    # every Cargo step instead.
+    # Match the pinned AppImage compiler's GNU BFD linker selection.
     env:
       RUSTFLAGS: "-Clinker-features=-lld -Clink-arg=-fuse-ld=bfd"
     steps:
@@ -37,23 +33,10 @@ jobs:
             libx11-dev \
             libpulse0 \
             libxcb1-dev \
-            libxcb-shape0-dev
-
-      - name: Read qualified Qt version
-        run: |
-          python3 -c 'import json; print("QT_VERSION=" + json.load(open("packaging/media/stack.lock.json"))["sources"]["qt"]["version"])' >> "$GITHUB_ENV"
-
-      - name: Install pinned Qt via aqtinstall
-        run: |
-          python3 -m venv "$RUNNER_TEMP/aqt-venv"
-          "$RUNNER_TEMP/aqt-venv/bin/pip" install --no-cache-dir aqtinstall==3.3.0
-          "$RUNNER_TEMP/aqt-venv/bin/aqt" install-qt linux desktop "$QT_VERSION" linux_gcc_64 --outputdir "$RUNNER_TEMP/Qt" --modules qtshadertools
-
-      - name: Export Qt environment
-        run: |
-          echo "QMAKE=$RUNNER_TEMP/Qt/$QT_VERSION/gcc_64/bin/qmake" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/Qt/$QT_VERSION/gcc_64/lib" >> "$GITHUB_ENV"
-          echo "$RUNNER_TEMP/Qt/$QT_VERSION/gcc_64/bin" >> "$GITHUB_PATH"
+            libxcb-shape0-dev \
+            libfontconfig1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
 
       - name: Isolate Rust toolchain state
         # Keep toolchains separate from the runner's preinstalled Rust state.

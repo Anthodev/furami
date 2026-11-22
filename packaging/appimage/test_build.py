@@ -321,10 +321,6 @@ class UploadIsolationTests(unittest.TestCase):
             (output / 'source-snapshot').mkdir()
             (output / 'source-snapshot/Cargo.toml').write_bytes(b'fixture manifest')
             inputs = {'Cargo.toml': hashlib.sha256(b'fixture manifest').hexdigest()}
-            for name in ('bin/qmake6', 'libexec/rcc'):
-                tool = media / 'prefix' / name
-                tool.parent.mkdir(parents=True, exist_ok=True)
-                tool.write_bytes(b'fixture Qt tool')
             stack = json.loads(app.STACK_LOCK.read_text())
             commands = []
             real_run = subprocess.run

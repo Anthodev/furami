@@ -464,6 +464,45 @@ fn tracing_never_formats_debug_display_or_private_text_in_file_or_console() {
 }
 
 #[test]
+fn qualification_reader_events_keep_codes_and_errno_without_private_input() {
+    let directory = Directory::new();
+    let mut harness = Harness::new(directory.config());
+    publish(&harness.handle, report(1, "Running"));
+    tracing::dispatcher::with_default(&harness.handle.test_dispatch(), || {
+        tracing::info!(event_code = "qualification_stdin_enabled");
+        tracing::warn!(
+            event_code = "qualification_stdin_read_failed",
+            errno = 5,
+            input = "private-stdin-marker"
+        );
+        tracing::warn!(event_code = "qualification_invalid_utf8");
+        tracing::warn!(event_code = "qualification_line_oversized");
+        tracing::info!(event_code = "qualification_stdin_eof");
+    });
+    harness.drain();
+    let entries = records(&directory.logs().join("furami.log"));
+    let events: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| entry["event_code"].as_str())
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "qualification_stdin_enabled",
+            "qualification_stdin_read_failed",
+            "qualification_invalid_utf8",
+            "qualification_line_oversized",
+            "qualification_stdin_eof",
+        ]
+    );
+    let failure = entries
+        .iter()
+        .find(|entry| entry["event_code"] == "qualification_stdin_read_failed")
+        .unwrap();
+    assert_eq!(failure["fields"], serde_json::json!({"errno": 5}));
+}
+
+#[test]
 fn native_boundary_keeps_exact_ids_and_geometry_but_never_arbitrary_tokens() {
     let directory = Directory::new();
     let mut harness = Harness::new(directory.config());

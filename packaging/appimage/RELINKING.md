@@ -1,6 +1,6 @@
 # Replacing libraries and rebuilding Furami
 
-Furami-authored source is MIT. The distributed combined executable uses GPL-compatible terms with the selected Qt/media/runtime terms recorded in `components.json` and original notices in `NOTICE.txt`. `release-ready.json` is the source/license completeness gate, evaluated on the complete internal candidate. A non-ready local smoke artifact is not a cleared release or a complete Corresponding Source offer, and the four future release downloads carry the retained evidence set described below — notices, licenses and receipts — but not the dependency sources themselves.
+Furami-authored source is MIT. The distributed combined executable uses GPL-compatible terms with the selected application, media and runtime terms recorded in `components.json` and original notices in `NOTICE.txt`. `release-ready.json` is the source/license completeness gate, evaluated on the complete internal candidate. A non-ready local smoke artifact is not a cleared release or a complete Corresponding Source offer, and the four future release downloads carry the retained evidence set described below — notices, licenses and receipts — but not the dependency sources themselves.
 
 ## Releases and local verification
 
@@ -42,16 +42,13 @@ done
 
 The material set is complete only when the release gate says it is. Missing files are never represented by empty archives or future source-offer promises.
 
-For qtbase, the official source archive remains byte-for-byte unchanged. Copy the contents of `qt-inputs/qtbase-git-metadata/` into the extracted qtbase root, preserving relative paths. The eight Git metadata files are bound to the kit's exact upstream commit and vendor source SPDX checksums. The overlay includes original REUSE annotations, copyrights and BSD-3-Clause/MIT license texts; no individual Qt `LicenseConcluded: NOASSERTION` field is rewritten as an upstream license conclusion.
-
 The two media loader-resolution reports are derived build-environment evidence, not raw `ldd` transcripts or a promise about recipient runtime resolution. Original address-bearing transcripts and raw-to-derived hash linkage stay in local build evidence. When the candidate carries a `reproducibility.json` whose `evidence_origin.mode` is `source-reassembly`, the evidence consists of retained original cold binaries plus independent new source assemblies, not execution of two updated full cold recipes. Original controlling recipes are supplied separately under `original-cold-recipes/`, alongside current assembly recipes under `furami/packaging/`.
 
 The extracted tree contains:
 
-- `furami/`, the exact authored Rust, C++, headers, QML, Cargo files, build script, toolchain pin, license, supplied application artwork (`assets/logo.svg`, `assets/logo.png`, `assets/logo.ico`) distributed under the user-confirmed Furami MIT terms, verified Cargo vendor source and packaging recipes/templates.
+- `furami/`, the exact authored Rust, C++ and headers, Cargo files, build script, toolchain pin, license, supplied application artwork (`assets/logo.svg`, `assets/logo.png`, `assets/logo.ico`) distributed under the user-confirmed Furami MIT terms, verified Cargo vendor source, pinned supplemental notices and packaging recipes/templates.
 - `app-inputs/`, checked Rust distribution and Cargo crate inputs.
-- `media-inputs/`, available frozen mpv/FFmpeg/libplacebo/Vulkan-Headers inputs and the verified official Qt build kit.
-- `qt-inputs/` and `qt-evidence/`, applicable checked Qt source archives, vendor source SPDX, third-party license evidence and original configure options/summaries. `sources-index.json.qt_correspondence` records source/code/license checksum reconciliation against vendor source SPDX. This does not claim a bit-identical Qt rebuild.
+- `media-inputs/`, available frozen mpv/FFmpeg/libplacebo/Vulkan-Headers inputs.
 - `ubuntu-inputs/` and `ubuntu-evidence/`, applicable exact source descriptors/original source/Ubuntu patches, signed-source-index evidence and original component copyright notices.
 - `runtime-inputs/` and `runtime-evidence/`, available type-2 runtime/FUSE/squashfuse sources and patch, the linked Alpine source closure (each pinned `APKBUILD` with its upstream and patch inputs), locked rebuild inputs and original static contributor notices/linkage receipts. The Alpine binary bootstrap packages and the base-image material are not in this material set; its signed index metadata is separate and never substitutes for binary or source coverage.
 
@@ -61,19 +58,19 @@ That material set carries corresponding sources, not the Alpine binary bootstrap
 
 ## Replace shared libraries without rebuilding the app
 
-Qt, libmpv, libplacebo, FFmpeg and bundled application dependencies are ordinary separate ELF shared libraries under `usr/lib/`. Extract the image without FUSE:
+libmpv, libplacebo, FFmpeg and bundled application dependencies are ordinary separate ELF shared libraries under `usr/lib/`. Extract the image without FUSE:
 
 ```sh
-./Furami-v1.0.0-Linux-x64.AppImage --appimage-extract
+/absolute/path/to/Furami.AppImage --appimage-extract
 ```
 
-Replace the appropriate shared object with an ABI-compatible modified build. Preserve its SONAME and relative symlink chain. Rebuild Qt from the supplied module sources using the vendor configuration evidence when modifying Qt, and retain corresponding compatible plugins/QML. Do not mix unrelated Qt major/minor versions or host Qt plugins into the bundle.
+Replace the appropriate shared object with an ABI-compatible modified build. Preserve its SONAME and relative symlink chain.
 
-Launch `./squashfs-root/AppRun`. It uses the extracted `usr/` as `FURAMI_MEDIA_PREFIX`, its libraries and isolated Qt/QML paths. There is no signature/hash enforcement preventing compatible replacement libraries at application startup. The original release checksums no longer describe modified bytes; do not present them as the original release.
+Launch `./squashfs-root/AppRun`. It sets `FURAMI_MEDIA_PREFIX` to the extracted `usr/` and uses `usr/lib/` as its library search path. There is no signature/hash enforcement preventing compatible replacement libraries at application startup. The original release checksums no longer describe modified bytes; do not present them as the original release.
 
 ## Rebuild the application
 
-When matching source materials are separately available, the source tree includes the full controlling scripts. The canonical build recipe uses frozen container/APT/source pins, not the recipient's installed Qt/mpv/FFmpeg. Set absolute input-cache paths from the extracted material set, copy the already checked `app-inputs/ca-certificates.deb` into `media-inputs/` if needed, and run:
+When matching source materials are separately available, the source tree includes the full controlling scripts. The canonical build recipe uses frozen container/APT/source pins, not the recipient's installed mpv or FFmpeg. Set absolute input-cache paths from the extracted material set, copy the already checked `app-inputs/ca-certificates.deb` into `media-inputs/` if needed, and run:
 
 ```sh
 python3 recipient-inputs/furami/packaging/appimage/build.py \
@@ -81,7 +78,6 @@ python3 recipient-inputs/furami/packaging/appimage/build.py \
   --source-cache /absolute/recipient-inputs/app-inputs \
   --media-source-cache /absolute/recipient-inputs/media-inputs \
   --runtime-source-cache /absolute/recipient-inputs/runtime-inputs \
-  --compliance-cache /absolute/recipient-inputs/qt-inputs \
   --jobs 2
 ```
 

@@ -5,26 +5,9 @@ edition = "2024"
 rust-version = "1.97.1"
 license = "MIT"
 
-[features]
-default = []
-# Opt-in GPUI/XWayland host. The Qt/QML application remains the default; the
-# release staging scripts never enable this feature.
-gpui-host = [
-    "dep:gpui",
-    "dep:gpui_platform",
-    "dep:image",
-    "dep:libc",
-    "dep:raw-window-handle",
-    "dep:url",
-    "dep:x11rb",
-    "dep:zbus",
-]
-
 [dependencies]
 cxx = "=1.0.202"
-cxx-qt = "=0.10.0"
 libloading = "=0.9.0"
-cxx-qt-lib = { version = "=0.10.0", default-features = false, features = ["qt_gui", "qt_qml"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
@@ -32,20 +15,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.12"
 
-# Registry pins match examples/gpui-poc. Linux-only and optional: the
-# `gpui-host` feature activates them, AppRun never does, and the lock still
-# records them for the filtered Linux resolve.
+# Registry pins match examples/gpui-poc.
 [target.'cfg(target_os = "linux")'.dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.13", default-features = false, features = ["x11"], optional = true }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.13", default-features = false, features = ["x11"], optional = true }
-image = { version = "=0.25.10", default-features = false, features = ["png"], optional = true }
-libc = { version = "=0.2.189", optional = true }
-raw-window-handle = { version = "=0.6.2", optional = true }
-url = { version = "=2.5.8", optional = true }
-x11rb = { version = "=0.13.2", features = ["shape"], optional = true }
-zbus = { version = "=5.19.0", default-features = false, features = ["async-io"], optional = true }
+gpui = { package = "gpui-pre", version = "=0.3.13", default-features = false, features = ["x11"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.13", default-features = false, features = ["x11"] }
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+libc = "=0.2.189"
+raw-window-handle = "=0.6.2"
+url = "=2.5.8"
+x11rb = { version = "=0.13.2", features = ["shape"] }
+zbus = { version = "=5.19.0", default-features = false, features = ["async-io"] }
 
 [build-dependencies]
 cxx-build = "=1.0.202"
-cxx-qt-build = "=0.10.0"
 serde_json = "1"

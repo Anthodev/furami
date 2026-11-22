@@ -25,6 +25,21 @@ NEEDED_RE = re.compile(
     r"(?:Shared library|Library soname|Library rpath|Library runpath):\s+\[(.*)\]"
 )
 HEADER_RE = re.compile(r"^\s+(Class|Machine|Type):\s+(.+?)\s*$")
+QT_LIBRARY = re.compile(r"^libQt(?:[0-9]+)?[A-Z].*\.so(?:\..*)?$")
+
+
+def require_qt_free(payload, elf):
+    """Reject Qt/QML artifacts and even bundled, otherwise-resolvable Qt edges."""
+    for relative in payload:
+        path = Path(relative)
+        if (QT_LIBRARY.fullmatch(path.name) or path.name in ("qt.conf", "qmldir")
+                or path.suffix in (".qml", ".qmltypes", ".qmlc", ".jsc")
+                or any(part.lower() in ("qt", "qt5", "qt6", "qml") for part in path.parts)):
+            raise ValueError(f"Qt/QML artifact in payload: {relative}")
+    for item in elf:
+        for name in (*item["needed"], item.get("soname") or ""):
+            if QT_LIBRARY.fullmatch(Path(name).name):
+                raise ValueError(f"Qt ELF dependency or SONAME in {item['path']}: {name}")
 
 
 def run_cmd(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:

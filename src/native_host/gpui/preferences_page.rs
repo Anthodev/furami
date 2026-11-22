@@ -1,21 +1,20 @@
 //! Brume Preferences settings body for the GPUI frontend.
 //!
-//! `qml/PreferencesSettingsView.qml` (rendered by `qml/MenuView.qml` into the
-//! `prefs` section) is the parity contract: the immediate playback preferences
-//! (show stream statistics, diagnostic logging), the saved-file reset intent,
-//! and a local never-persisted "Technical details" disclosure. Persistence
-//! attention stays outside the disclosure for the same reason as QML: a
-//! refusal, pending legacy migration, write durability problem or startup
-//! restoration fault must be visible whatever the disclosure state is.
+//! The page holds the immediate playback preferences (show stream statistics,
+//! diagnostic logging), the saved-file reset intent, and a local
+//! never-persisted "Technical details" disclosure. Persistence attention stays
+//! outside the disclosure: a refusal, pending legacy migration, write
+//! durability problem or startup restoration fault must be visible whatever
+//! the disclosure state is.
 //!
-//! Identity rules carried over from the QML view:
+//! Identity rules:
 //!
 //! - "Show stream statistics" is the positive control: it is checked while
 //!   the persisted `stats_hidden` preference is false, and a genuine toggle
 //!   dispatches `set_stats_hidden` with the *rendered* checked value (checked
 //!   means visible). Diagnostic logging dispatches the newly selected state.
 //! - Both toggles are gated by a published snapshot and a non-closing
-//!   session, exactly `Projection.ready && !profile.closing`.
+//!   session.
 //! - Reset only asks the runtime for its existing confirmation decision; the
 //!   token-checked dialog belongs to the mandatory-decision surface and is
 //!   implemented nowhere in this file.
@@ -55,8 +54,7 @@ use super::{
     top_chrome::FocusTarget,
 };
 
-/// Stable element identities, matching the QML `objectName`s so the two
-/// frontends expose the same accessible names.
+/// Stable element identities, so the accessible names stay put across paints.
 pub(super) const ROOT_ID: &str = "preferences-root";
 pub(super) const ATTENTION_ID: &str = "preferencesAttention";
 pub(super) const STATS_ID: &str = "preferencesStatsHidden";
@@ -68,7 +66,7 @@ pub(super) const STARTUP_ID: &str = "preferencesStartup";
 pub(super) const PATH_ID: &str = "preferencesPath";
 pub(super) const IMMEDIATE_ID: &str = "preferencesImmediate";
 
-/// `Brume.settingsWidth`: the shared settings page baseline.
+/// The shared settings page width.
 #[allow(
     dead_code,
     reason = "integration surface for the parent's settings panel sizing"
@@ -144,9 +142,8 @@ impl PreferencesModel {
             attention: settings
                 .map(|settings| settings.attention.clone())
                 .unwrap_or_default(),
-            // `checked: !statsHiddenPreference`; a genuine toggle resolves to
-            // `setStatsHidden(!checked)` after Qt flips it, which equals this
-            // rendered checked value.
+            // A genuine toggle dispatches `set_stats_hidden(!checked)`, so the
+            // rendered checked value means visible.
             stats_checked: !facts.stats_hidden,
             stats_enabled: editable,
             logging_checked: facts.logging_enabled,
@@ -254,8 +251,7 @@ pub(super) struct PreferencesPage {
     details: FocusHandle,
     expanded: Rc<Cell<bool>>,
     /// Identity of the surface this page was last painted in. A replacement
-    /// popup must not inherit the old page's disclosure state; QML destroys
-    /// and recreates the section view on the same transition.
+    /// popup must not inherit the old page's disclosure state.
     surface: Cell<Option<Popup>>,
 }
 
@@ -272,17 +268,16 @@ impl PreferencesPage {
     }
 
     /// Integration hook for the parent: collapse the disclosure when the
-    /// settings section is left or its popup closes, exactly like the QML
-    /// section view being destroyed. The local state is never persisted.
+    /// settings section is left or its popup closes. The local state is never
+    /// persisted.
     #[allow(dead_code, reason = "integration surface for parent-owned navigation")]
     pub(super) fn reset_disclosure(&self) {
         self.expanded.set(false);
         self.surface.set(None);
     }
 
-    /// The page's Tab chain in QML creation order, skipping disabled
-    /// controls. The disclosure itself is never disabled, matching
-    /// `BrumeButton` with no `enabled` binding.
+    /// The page's Tab chain in paint order, skipping disabled controls. The
+    /// disclosure itself is never disabled.
     pub(super) fn focus_targets(&self, state: &HostState) -> Vec<FocusTarget> {
         let model = PreferencesModel::from_host(state, self.expanded.get());
         let mut targets = Vec::new();
@@ -499,12 +494,11 @@ fn disclosure_activation(
     })
 }
 
-/// `BrumeToggle.qml` checkbox: 20 px indicator, 36 px control height and the
-/// full row as hit target. The focus ring is drawn on the row (Brume draws it
-/// on the indicator) because GPUI focus styling applies to the pressed node;
-/// the accent ring and the checked fill are the same tokens. The shared
-/// control module has no toggle primitive yet; it should absorb this when its
-/// consumer slice lands.
+/// Brume toggle: 20 px indicator, 36 px control height and the full row as hit
+/// target. The focus ring is drawn on the row rather than the indicator because
+/// GPUI focus styling applies to the pressed node; the accent ring and the
+/// checked fill are the same tokens. The shared control module has no toggle
+/// primitive yet; it should absorb this when its consumer slice lands.
 fn toggle(
     id: &'static str,
     label_text: &'static str,
@@ -595,8 +589,8 @@ fn toggle(
     row
 }
 
-/// `BrumeButton` with the disclosure chevron as its trailing icon:
-/// sentence-case label, 36 px box, visible focus ring and real hover/press.
+/// Disclosure button with the chevron as its trailing icon: sentence-case
+/// label, 36 px box, visible focus ring and real hover/press.
 fn disclosure_button(
     expanded: bool,
     focus: &FocusHandle,
@@ -740,9 +734,9 @@ enum Tone {
     Error,
 }
 
-/// Plain-text Brume label (`qml/BrumeLabel.qml` note/secondary/error
-/// variants). GPUI text is never interpreted as markup, so persistence
-/// status, paths and startup reasons paint directly.
+/// Plain-text Brume label in the note, secondary or error variant. GPUI text is
+/// never interpreted as markup, so persistence status, paths and startup
+/// reasons paint directly.
 fn note_label(text: impl Into<SharedString>, tone: Tone) -> Div {
     let text: SharedString = text.into();
     let (size, color) = match tone {
@@ -760,7 +754,7 @@ fn note_strong_label(text: impl Into<SharedString>) -> Div {
     note_label(text, Tone::Note).font_weight(brume::FONT_WEIGHT_STRONG)
 }
 
-/// Body-size section heading (`BrumeLabel` with `fontWeightStrong`).
+/// Body-size section heading in the strong note weight.
 fn section_title(text: impl Into<SharedString>) -> Div {
     let text: SharedString = text.into();
     div()

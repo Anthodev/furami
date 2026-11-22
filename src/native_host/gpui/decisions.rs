@@ -1,11 +1,10 @@
 //! Mandatory decision panels for the GPUI frontend.
 //!
-//! `qml/ResetSettingsView.qml` and `qml/SaveFailureView.qml` are the parity
-//! contract. They are rendered in the companion's `save`/`reset` popup slots,
+//! The panels are rendered in the companion's `save`/`reset` popup slots,
 //! never dismissed by Escape or an outside press, and own no lifecycle of
 //! their own: the runtime keeps the pending token and the owner barrier.
 //!
-//! Identity precedence is the QML `Chrome.mandatoryPopup` rule:
+//! Identity precedence for the bottom decision surface:
 //!
 //! 1. `settings.closeDialog == "save"` → [`Identity::SaveFailure`]
 //! 2. `settings.closeDialog == "warning"` → [`Identity::DurabilityWarning`]
@@ -20,8 +19,8 @@
 //!
 //! Host integration surface: [`DecisionFocus::new`] creates the two
 //! caller-owned focus handles, [`DecisionFocus::initial`] and
-//! [`DecisionFocus::boundary`] reproduce the QML `focusBoundary`, and
-//! [`paint`] renders one panel for the identity derived from the current
+//! [`DecisionFocus::boundary`] implement the forward/backward focus boundary,
+//! and [`paint`] renders one panel for the identity derived from the current
 //! projection.
 
 use std::{num::NonZeroU64, rc::Rc};
@@ -35,7 +34,7 @@ use super::{
     controls::{self, Activate, Activation, HitRegions, LabelVariant},
 };
 
-/// Popup invoker keys used by `qml/Chrome.qml` for the two mandatory surfaces.
+/// Popup invoker keys for the two mandatory surfaces.
 #[allow(
     dead_code,
     reason = "integration surface for the parent's popup registration"
@@ -47,15 +46,15 @@ pub(super) const SAVE_POPUP: &str = "save";
 )]
 pub(super) const RESET_POPUP: &str = "reset";
 
-/// `Brume.settingsWidth`: the shared settings baseline these panels inherit.
+/// The shared settings width these panels inherit.
 #[allow(
     dead_code,
     reason = "integration surface for the parent's panel sizing"
 )]
 pub(super) const WIDTH: f32 = brume::SETTINGS_WIDTH;
 
-/// Stable element identities. The button ids are the QML `objectName`s; the
-/// remaining ids keep the same accessible nodes across paints.
+/// Stable element identities, so every control keeps the same accessible node
+/// across paints.
 pub(super) const RESET_ID: &str = "resetSettingsPanel";
 pub(super) const RESET_TITLE_ID: &str = "resetSettingsTitle";
 pub(super) const RESET_PATH_ID: &str = "resetSettingsPath";
@@ -87,9 +86,9 @@ pub(super) enum Identity {
 }
 
 impl Identity {
-    /// Resolve the identity with `qml/Chrome.qml` precedence. `close_dialog`
-    /// wins over a pending reset token, and any unknown dialog value refuses
-    /// to invent a panel.
+    /// Resolve the identity in precedence order: `close_dialog` wins over a
+    /// pending reset token, and any unknown dialog value refuses to invent a
+    /// panel.
     pub(super) fn resolve(close_dialog: &str, settings: Option<&Settings>) -> Option<Self> {
         match close_dialog {
             "save" => Some(Self::SaveFailure),
@@ -152,7 +151,7 @@ pub(super) struct DecisionView<'a> {
     pub(super) settings: Option<&'a Settings>,
     /// `UiUpdate.settings_status` (`ViewState::settings_status`).
     pub(super) status: &'a str,
-    /// `UiUpdate.diagnostic`, as `SaveFailureView.qml` reads it.
+    /// `UiUpdate.diagnostic`; the save panel paints it as its diagnostic line.
     pub(super) diagnostic: &'a str,
 }
 
@@ -188,9 +187,9 @@ impl DecisionFocus {
         &self.secondary
     }
 
-    /// The first focus target on open, matching `ResetSettingsView` and
-    /// `SaveFailureView` `focusBoundary(false)`. The durability warning has a
-    /// single Close button.
+    /// The first focus target on open: the primary button for reset and save
+    /// failure, the secondary for the durability warning, which has a single
+    /// Close button.
     #[allow(
         dead_code,
         reason = "integration surface for the parent's focus restoration"
@@ -203,7 +202,7 @@ impl DecisionFocus {
     }
 
     /// The focus target for a Tab/Backtab boundary press: forward keeps the
-    /// QML first button, backward always lands on the last button.
+    /// first button, backward always lands on the last button.
     #[allow(
         dead_code,
         reason = "integration surface for the parent's focus restoration"
@@ -221,7 +220,7 @@ impl DecisionFocus {
 /// decision, so the parent must not map a mandatory surface.
 ///
 /// The caller places and scrolls the returned element inside the companion
-/// popup; `scroll` only binds the QML body's own viewport when supplied.
+/// popup; `scroll` only binds the body's own viewport when supplied.
 pub(super) fn paint(
     view: DecisionView<'_>,
     focus: &DecisionFocus,
@@ -379,9 +378,8 @@ fn save_panel(
     )
 }
 
-/// QML `ScrollView`: cap the body at the shared list height and scroll it when
-/// the parent owns the handle; without one the body clips instead of growing
-/// past the popup.
+/// Cap the body at the shared list height and scroll it when the parent owns
+/// the handle; without one the body clips instead of growing past the popup.
 fn scrollable(message: Div, scroll: Option<&ScrollHandle>) -> gpui::Stateful<Div> {
     let message = message
         .id("decision-message")
@@ -448,8 +446,8 @@ fn activation(dispatch: &Dispatch, intent: Intent) -> Activate {
     Rc::new(move |source, window, cx| dispatch(intent, source, window, cx))
 }
 
-/// Canonical unsigned decimal token, matching `Projection.u64`: no sign, no
-/// whitespace, no leading zero except `0` itself, and u64-bounded.
+/// Canonical unsigned decimal token: no sign, no whitespace, no leading zero
+/// except `0` itself, and u64-bounded.
 fn canonical_u64(value: &str) -> Option<u64> {
     if value.is_empty()
         || !value.bytes().all(|byte| byte.is_ascii_digit())

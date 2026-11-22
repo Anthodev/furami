@@ -1,9 +1,5 @@
 use std::{path::Path, path::PathBuf, process::Command};
 
-use cxx_qt_build::{
-    CppFile, CxxQtBuilder, MocArguments, QResource, QResources, QmlFile, QmlModule,
-};
-
 fn tool_output(command: &mut Command, name: &str) -> String {
     let result = command
         .output()
@@ -20,35 +16,14 @@ fn tool_output(command: &mut Command, name: &str) -> String {
 }
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=QMAKE");
     println!("cargo:rerun-if-env-changed=FURAMI_MEDIA_PREFIX");
     println!("cargo:rerun-if-changed=packaging/media/stack.lock.json");
-    println!("cargo:rerun-if-changed=assets/logo.svg");
-    println!("cargo:rerun-if-changed=assets/icons");
 
     let lock: serde_json::Value =
         serde_json::from_str(include_str!("packaging/media/stack.lock.json"))
             .expect("invalid pinned media stack lock");
-    let qt_version = lock["sources"]["qt"]["version"]
-        .as_str()
-        .expect("media stack lock has no Qt version");
-    let qmake = std::env::var_os("QMAKE").unwrap_or_else(|| "qmake6".into());
-    let actual_qt = tool_output(Command::new(&qmake).args(["-query", "QT_VERSION"]), "qmake");
-    assert_eq!(
-        actual_qt, qt_version,
-        "Qt kit differs from the frozen media stack"
-    );
-
     if let Some(prefix) = std::env::var_os("FURAMI_MEDIA_PREFIX") {
         let prefix = Path::new(&prefix);
-        let expected_qmake = prefix.join("bin/qmake6");
-        let actual_qmake = Path::new(&qmake);
-        assert!(
-            actual_qmake.is_absolute()
-                && actual_qmake.canonicalize().ok() == expected_qmake.canonicalize().ok()
-                && expected_qmake.is_file(),
-            "QMAKE must point to the frozen prefix's bin/qmake6"
-        );
         let api = lock["sources"]["mpv"]["client_api"]
             .as_str()
             .expect("media stack lock has no libmpv client API");
@@ -80,88 +55,6 @@ fn main() {
         "src/capture/linux/v4l2.cpp",
     ] {
         println!("cargo:rerun-if-changed={source}");
-    }
-
-    let native_flags = tool_output(
-        Command::new("pkg-config").args(["--cflags", "x11", "xcb", "xcb-shape"]),
-        "X11/XCB/XCB-SHAPE development prerequisites",
-    );
-    // Every QML file in qml/ is registered explicitly in the module. The three
-    // token, projection and chrome-visibility files are singletons.
-    let mut qml_files: Vec<std::path::PathBuf> = std::fs::read_dir("qml")
-        .expect("qml directory")
-        .map(|entry| entry.expect("qml entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "qml"))
-        .collect();
-    qml_files.sort();
-    assert!(!qml_files.is_empty(), "no QML files found to register");
-    let singletons = ["qml/Brume.qml", "qml/Chrome.qml", "qml/Projection.qml"];
-    let qml_module = QmlModule::new("dev.antho.furami").qml_files(qml_files.iter().map(|path| {
-        let file = QmlFile::from(path.clone());
-        if path.to_str().is_some_and(|name| singletons.contains(&name)) {
-            file.singleton(true)
-        } else {
-            file
-        }
-    }));
-
-    // Bundled chrome icons and their attribution ship inside the binary; no
-    // icon is ever loaded from a URL or from an OS theme at runtime. The same
-    // sources are embedded by the GPUI frontend (`gpui/brume.rs`), so the
-    // shared directory is the single owner of the icon bytes.
-    let mut resources: Vec<String> = std::fs::read_dir("assets/icons")
-        .expect("assets/icons directory")
-        .map(|entry| entry.expect("assets/icons entry").path())
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect();
-    resources.sort();
-    // The Furami brand mark is embedded as the scalable SVG and set as the
-    // application window icon; the preflighted Qt SVG icon engine rasterizes it
-    // into the standard icon sizes, so no raster copy is pushed per window.
-    resources.push("assets/logo.svg".to_owned());
-
-    let builder = CxxQtBuilder::new_qml_module(qml_module)
-        .qrc_resources(QResources::new().resource(QResource::new().files(resources)))
-        .file("src/ui/bridge.rs")
-        .qt_module("Quick")
-        .qt_module("DBus")
-        .cpp_file("src/native_host/host.cpp")
-        .cpp_file(
-            CppFile::from("src/native_host/host.h")
-                .compile(false)
-                .moc(true)
-                .moc_arguments(MocArguments::default().uri("dev.antho.furami")),
-        )
-        .include_dir("src/native_host");
-    // SAFETY: With CXX-Qt pinned to 0.10.0, this closure only appends pkg-config's
-    // native prerequisite flags. It does not replace generated inputs or change
-    // CXX-Qt's compiler language, C++ standard, or ownership configuration.
-    let builder = unsafe {
-        builder.cc_builder(move |compiler| {
-            for flag in native_flags.split_whitespace() {
-                compiler.flag(flag);
-            }
-        })
-    };
-    builder.build();
-    // --require-defined forces GNU ld to extract the root CXX-Qt initializer
-    // (cxx_qt_init_crate_furami) from the rlibs archives: it sits semantically
-    // before archive traversal, and pulls in the provider archives that bundle
-    // the QML module, cxx_qt_lib and Qt glue for all final targets
-    // (bin, tests and examples alike).
-    println!("cargo:rustc-link-arg=-Wl,--require-defined=cxx_qt_init_crate_furami");
-    // The generated CXX-Qt static archive (libfurami_cxxqt_generated.a) is emitted
-    // before any Qt6Quick or Qt6DBus reference is resolved. With --as-needed (the default
-    // final-campaign link command), a shared library is retained only if it
-    // satisfies an undefined symbol from objects already seen at its position on
-    // the link line — so the .qt_module("Quick") and .qt_module("DBus") directives
-    // emitted by builder.build() are dropped before the archive that needs them
-    // is scanned. Re-emitting these modules here places them after the archive,
-    // so the linker sees its undefined Qt symbols first and retains the libraries.
-    println!("cargo:rustc-link-lib=Qt6Quick");
-    println!("cargo:rustc-link-lib=Qt6DBus");
-    for library in ["X11", "xcb", "xcb-shape"] {
-        println!("cargo:rustc-link-lib={library}");
     }
 }
 

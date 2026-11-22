@@ -112,7 +112,6 @@ impl QualificationGate {
             ));
         }
     }
-    #[cfg(any(test, all(feature = "gpui-host", target_os = "linux")))]
     pub(crate) fn owner_ack_failed(&self) -> bool {
         self.owner_ack_failed
     }

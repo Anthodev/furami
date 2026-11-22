@@ -13,7 +13,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
 import urllib.request
 from pathlib import Path
 
@@ -26,6 +25,9 @@ TOOL_SHA256 = "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
 PATCH_SPEC = importlib.util.spec_from_file_location("furami_stage_media_patches", STACK_LOCK.with_name("source-patches.py"))
 source_patches = importlib.util.module_from_spec(PATCH_SPEC)
 PATCH_SPEC.loader.exec_module(source_patches)
+APP_BUILD_SPEC = importlib.util.spec_from_file_location("furami_stage_app_build", HERE / "build-app.py")
+app_build = importlib.util.module_from_spec(APP_BUILD_SPEC)
+APP_BUILD_SPEC.loader.exec_module(app_build)
 # The only non-prefix absolute loader path observed in 84 staged ELF objects.
 # Both byte hashes came from the signed-snapshot libpulse0 .deb below.
 PULSE_DIR = "/usr/lib/x86_64-linux-gnu/pulseaudio"
@@ -35,18 +37,10 @@ PULSE_ELF_SHA256 = {
     "libpulse.so.0": "3d78bd6bfcebccb7d4e65bac298c3aef5b0906fc4c6a4bebcd761c845f4c3c4a",
     "libpulsecommon-16.1.so": "00ab68a64ecbb5d6e0d4b5b35707a83a9040cdb373008e487176e49d184cf22f",
 }
-XCB_PLUGINS = (
-    "plugins/platforms/libqxcb.so",
-    "plugins/xcbglintegrations/libqxcb-egl-integration.so",
-    "plugins/xcbglintegrations/libqxcb-glx-integration.so",
-    "plugins/imageformats/libqsvg.so",
-    "plugins/iconengines/libqsvgicon.so",
-)
-# Provider programs seeded into the AppDir at their packaged path. The renderer
-# runs this exact program through FURAMI_MEDIA_PREFIX=$HERE/usr, so it must come
-# from the same prefix manifest as the shared libraries; no other provider
-# program (bin/ffmpeg, bin/ffprobe, any bin/*) is shipped.
+# Retain the provider mpv executable as part of the package contract. Furami
+# itself loads libmpv; no other provider executables are shipped.
 MEDIA_PROGRAMS = (("bin/mpv", "usr/bin/mpv"),)
+DLOPEN_ROOTS = ("usr/lib/libmpv.so",)
 # Exact host ABI contract. X11/XCB/xkbcommon belong to pinned application closure.
 HOST_LIBS = frozenset({
     "ld-linux-x86-64.so.2", "libc.so.6", "libm.so.6", "libdl.so.2",
@@ -58,13 +52,6 @@ HOST_LIBS = frozenset({
 NEEDED = re.compile(r"\(NEEDED\).*?\[([^]]+)\]")
 PATH_TAG = re.compile(r"\((RUNPATH|RPATH)\).*?\[([^]]*)\]")
 SONAME = re.compile(r"\(SONAME\).*?\[([^]]*)\]")
-# Upstream KDAB v0.10.0 tag commit 61562797ba25558a7c7dba8017deca038f3ee9e4.
-# These are upstream LICENSES/* bytes, not fabricated LICENSE files in .crate archives.
-KDAB_LICENSE_SHA256 = {
-    "MIT.txt": "b85dcd3e453d05982552c52b5fc9e0bdd6d23c6f8e844b984a88af32570b0cc0",
-    "Apache-2.0.txt": "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff",
-}
-KDAB_TAG = "61562797ba25558a7c7dba8017deca038f3ee9e4"
 
 
 def digest(path):
@@ -347,65 +334,17 @@ def stage_media_programs(prefix, manifest, appdir, owners):
         copy_prefix(prefix, manifest, source, appdir, destination, owners)
 
 
-def stage_xcb_plugins(prefix, manifest, appdir, owners):
-    # xcb alone can create the QML root but not Qt Quick's GL context.
-    for relative in XCB_PLUGINS:
-        entry = manifest.get(relative)
-        original = prefix / relative
-        if (not isinstance(entry, dict) or entry.get("type") != "file"
-                or not original.is_file() or original.is_symlink()
-                or digest(original) != entry.get("sha256")):
-            raise ValueError(f"required pinned Qt XCB graphics plugin missing/mismatched: {relative}")
-        category = relative.split("/", 1)[1]
-        copy_prefix(prefix, manifest, relative, appdir, "usr/lib/qt6/plugins/" + category, owners)
-
-
-def scan_qml(prefix, appdir, manifest, owners):
-    scanner = prefix / "libexec/qmlimportscanner"
-    if not scanner.is_file():
-        scanner = prefix / "bin/qmlimportscanner"
-    if not scanner.is_file():
-        raise ValueError("matching Qt qmlimportscanner absent from media prefix")
-    # Explicit Basic selection: QML Controls style lookup otherwise depends on
-    # system/user configuration and escapes scanner's static module closure.
-    with tempfile.TemporaryDirectory() as tmp:
-        qml = Path(tmp)
-        (qml / "style.qml").write_text("import QtQuick\nimport QtQuick.Controls.Basic\nItem {}\n")
-        env = {**os.environ, "LD_LIBRARY_PATH": str(prefix / "lib")}
-        data = json.loads(run([scanner, "-rootPath", REPO / "qml", "-importPath", prefix / "qml"], env=env))
-        data += json.loads(run([scanner, "-rootPath", qml, "-importPath", prefix / "qml"], env=env))
-    modules = {}
-    for entry in data:
-        if entry.get("type") != "module":
-            continue
-        location = entry.get("path")
-        if entry.get("name") == "dev.antho.furami" and not location:
-            continue  # CXX-Qt module compiled into app, not a deployable Qt directory.
-        if not location or not Path(location).is_relative_to(prefix / "qml") or not Path(location).is_dir():
-            raise ValueError(f"QML import unresolved outside pinned Qt: {entry}")
-        module = Path(location).relative_to(prefix / "qml").as_posix()
-        modules[module] = {"name": entry.get("name"), "version": entry.get("version")}
-    for required in ("QtQuick", "QtQuick/Controls", "QtQuick/Controls/Basic",
-                     "QtQuick/Controls/impl", "QtQuick/Templates"):
-        if required not in modules:
-            # Scanner may not list implicit control dependencies: seed only
-            # known runtime style imports; never claim scanner observed them.
-            if not (prefix / "qml" / required / "qmldir").is_file():
-                raise ValueError(f"required Qt QML module missing: {required}")
-            modules[required] = {"name": required.replace("/", "."), "implicit_style": True}
-    for module in sorted(modules):
-        base = prefix / "qml" / module
-        for parent, dirs, files in os.walk(base, followlinks=False):
-            current = Path(parent)
-            # Adjacent nested qmldir entries are separate QML modules, never
-            # silently stage unscanned Controls styles or unrelated modules.
-            dirs[:] = sorted(d for d in dirs if not (current / d / "qmldir").exists())
-            for name in sorted(files):
-                entry = current / name
-                rel = entry.relative_to(prefix).as_posix()
-                copy_prefix(prefix, manifest, rel, appdir, "usr/" + rel, owners)
-    return {"scanner": scanner.relative_to(prefix).as_posix(), "imports": data,
-            "modules": modules, "style": "Basic"}
+def stage_elf_roots(prefix, manifest, app_root, appdir, owners):
+    """Seed exactly the same loader roots for observation and release."""
+    copy_component(app_root, "bin/furami", appdir, "usr/bin/furami", owners, "app")
+    for pattern in ("libmpv.so*", "libplacebo.so*", "libav*.so*", "libsw*.so*"):
+        matches = sorted((prefix / "lib").glob(pattern))
+        if not matches:
+            raise ValueError(f"missing mandatory shared component {pattern}")
+        for match in matches:
+            rel = match.relative_to(prefix).as_posix()
+            copy_prefix(prefix, manifest, rel, appdir, "usr/" + rel, owners)
+    stage_media_programs(prefix, manifest, appdir, owners)
 
 
 def host_library(soname):
@@ -600,114 +539,123 @@ def cached_download(cache, filename, url, expected):
     return target
 
 
-def crate_notices(app_root, app_manifest, appdir, owners, kdab_licenses=None):
-    records = []
-    for crate in app_manifest.get("crates", []):
-        vendor_rel = crate.get("vendor_path")
-        if vendor_rel is None and crate.get("name") == "furami" and crate.get("source") is None:
-            records.append({"name": "furami", "version": crate["version"], "role": crate["role"],
-                            "source": "repository/LICENSE", "checksum": crate.get("checksum"),
-                            "license_expression": crate.get("license_expression"),
-                            "notices": ["usr/share/licenses/furami/LICENSE"]})
+def crate_notice_inventory(app_root, app_manifest):
+    """Recompute the notice paths, owners and bytes without trusting staged files."""
+    from sources import (cargo_notice_snapshot, crate_identity, notice_file,
+                         notice_relative, registry_crate)
+
+    locked, supplemental, _ = cargo_notice_snapshot(app_root, app_manifest, REPO)
+    records, owners, payload = [], {}, {}
+    missing, seen = [], set()
+    for crate in app_manifest["crates"]:
+        name, version, source, checksum = identity = crate_identity(crate)
+        role = crate["role"]
+        vendor_rel = crate["vendor_path"]
+        slug = f"{name}-{version}"
+        if slug in seen or role not in ("shipped-code-candidate", "build-only", "not-selected"):
+            raise ValueError(f"invalid or duplicate crate notice identity: {slug}")
+        seen.add(slug)
+        record = {"name": name, "version": version, "role": role, "source": source,
+                  "checksum": checksum, "license_expression": crate.get("license_expression"), "notices": []}
+        records.append(record)
+        if name == "furami" and vendor_rel is None and source is None:
+            record.update(source="repository/LICENSE", notices=["usr/share/licenses/furami/LICENSE"])
             continue
-        if (not isinstance(vendor_rel, str) or vendor_rel !=
-                f"first/vendor/{crate.get('name')}-{crate.get('version')}" or ".." in Path(vendor_rel).parts):
-            raise ValueError(f"crate vendor provenance missing/unsafe: {crate.get('name')}")
-        root = app_root / vendor_rel
-        if not root.is_dir() or root.is_symlink():
-            raise ValueError(f"crate source unavailable: {vendor_rel}")
-        special = crate["name"] in ("cxx-qt", "cxx-qt-lib") and crate["version"] == "0.10.0"
-        notices, provenance = [], {}
-        if special and crate["role"] == "shipped-code-candidate":
-            archive = app_root / "sources" / f"{crate['name']}-{crate['version']}.crate"
-            if not archive.is_file() or archive.is_symlink():
-                raise ValueError(f"crate source archive unavailable: {archive}")
-            if digest(archive) != crate.get("checksum"):
-                raise ValueError(f"crate archive checksum mismatch: {archive}")
-            metadata = tomllib.loads((root / "Cargo.toml").read_text())["package"]
-            if any(metadata.get(key) != crate.get(field) for key, field in
-                   (("name", "name"), ("version", "version"), ("license", "license_expression"))):
-                raise ValueError(f"crate Cargo metadata differs: {vendor_rel}")
-            with tarfile.open(archive, "r:gz") as original:
-                cargo = original.extractfile(f"{crate['name']}-{crate['version']}/Cargo.toml")
-                if cargo is None or tomllib.loads(cargo.read().decode())["package"]["license"] != metadata["license"]:
-                    raise ValueError(f"crate archive Cargo metadata differs: {vendor_rel}")
-                checksums = json.loads((root / ".cargo-checksum.json").read_text())["files"]
-                for relative, expected in checksums.items():
-                    if not relative.startswith(("src/", "include/")) or Path(relative).suffix not in (".rs", ".cpp", ".h"):
-                        continue
-                    member = original.getmember(f"{crate['name']}-{crate['version']}/{relative}")
-                    if not member.isfile() or hashlib.sha256(original.extractfile(member).read()).hexdigest() != expected:
-                        raise ValueError(f"crate archive source hash mismatch: {vendor_rel}/{relative}")
-            if metadata["license"] != "MIT OR Apache-2.0" or kdab_licenses is None:
-                raise ValueError(f"linked KDAB license source unavailable: {vendor_rel}")
-            checksums = json.loads((root / ".cargo-checksum.json").read_text())["files"]
-            attribution = []
-            for relative, expected in sorted(checksums.items()):
-                if not relative.startswith(("src/", "include/")) or Path(relative).suffix not in (".rs", ".cpp", ".h"):
+        if not registry_crate(identity) or identity not in locked or vendor_rel != f"first/vendor/{slug}":
+            raise ValueError(f"crate notice identity differs from Cargo.lock: {slug}")
+        if role == "not-selected":
+            continue
+        declared = crate.get("license_file")
+        if declared is not None and not notice_relative(declared):
+            raise ValueError(f"declared crate license missing/unsafe: {slug}: {declared}")
+        row = supplemental.get(identity, {})
+        additions = row.get("notices", [])
+        borrowed = {notice["crate_member"] for notice in additions if "crate_member" in notice}
+        archive_rel = f"sources/{slug}.crate"
+        archive_path = notice_file(app_root, archive_rel)
+        if digest(archive_path) != checksum:
+            raise ValueError(f"crate archive SHA256 mismatch: {archive_rel}")
+
+        def add(relative, data, source_ref, **extra):
+            destination = f"usr/share/licenses/rust/{slug}/{relative}"
+            if destination in payload:
+                raise ValueError(f"crate notice destination collision: {destination}")
+            payload[destination] = data
+            owners[destination] = {"owner": "app-crate-source", "source": source_ref,
+                                   "source_sha256": hashlib.sha256(data).hexdigest(),
+                                   "crate": dict(zip(("name", "version", "source", "checksum"), identity)),
+                                   **extra}
+            record["notices"].append(destination)
+
+        present = set()
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for member in archive:
+                prefix, _, relative = member.name.partition("/")
+                if prefix != slug or not relative:
                     continue
-                source = root / relative
-                if source.is_symlink() or not source.is_file() or digest(source) != expected:
-                    raise ValueError(f"crate source unavailable or mismatched: {vendor_rel}/{relative}")
-                headers = [line for line in source.read_text().splitlines()[:20] if "SPDX-" in line]
-                if (not any("SPDX-FileCopyrightText:" in line for line in headers)
-                        or not any("SPDX-License-Identifier: MIT OR Apache-2.0" in line for line in headers)):
-                    raise ValueError(f"linked KDAB attribution missing: {vendor_rel}/{relative}")
-                attribution.extend((f"{relative} sha256:{expected}", *headers, ""))
-                provenance[relative] = expected
-            if not provenance:
-                raise ValueError(f"linked KDAB attribution absent: {vendor_rel}")
-            destination = f"usr/share/licenses/rust/{crate['name']}-{crate['version']}/SPDX-NOTICES.txt"
-            target = appdir / destination
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("\n".join(attribution))
-            owners[destination] = {"owner": "app-crate-source", "source": vendor_rel + "/src,include SPDX headers",
-                                   "source_sha256": digest(target), "source_files_sha256": provenance,
-                                   "crate_archive_sha256": crate["checksum"]}
-            notices.append(destination)
-            for filename, expected in KDAB_LICENSE_SHA256.items():
-                source = kdab_licenses / filename
-                if source.is_symlink() or not source.is_file() or digest(source) != expected:
-                    raise ValueError(f"upstream KDAB license bytes unavailable/mismatched: {filename}")
-                destination = f"usr/share/licenses/rust/{crate['name']}-{crate['version']}/{filename}"
-                target = appdir / destination
-                shutil.copy2(source, target)
-                owners[destination] = {"owner": "KDAB-cxx-qt-v0.10.0",
-                                       "source": f"https://github.com/KDAB/cxx-qt/blob/{KDAB_TAG}/LICENSES/{filename}",
-                                       "source_sha256": expected}
-                notices.append(destination)
-        else:
-            paths = {p for p in root.iterdir() if p.is_file() and p.name.upper().startswith(("LICENSE", "COPYING", "NOTICE"))}
-            if crate.get("license_file"):
-                declared = root / crate["license_file"]
-                if not declared.is_file() or not declared.resolve().is_relative_to(root.resolve()):
-                    raise ValueError(f"declared crate license missing/unsafe: {vendor_rel}: {crate['license_file']}")
-                paths.add(declared)
-            for source in sorted(paths):
-                relative = source.relative_to(root).as_posix()
-                destination = f"usr/share/licenses/rust/{crate['name']}-{crate['version']}/{relative}"
-                target = appdir / destination
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target)
-                owners[destination] = {"owner": "app-crate-source", "source": f"{vendor_rel}/{relative}",
-                                       "source_sha256": digest(source)}
-                notices.append(destination)
-        if crate["role"] == "shipped-code-candidate" and not notices:
-            raise ValueError(f"linked crate attribution missing: {vendor_rel}")
-        records.append({"name": crate["name"], "version": crate["version"], "role": crate["role"],
-                        "source": crate.get("source"), "checksum": crate.get("checksum"),
-                        "license_expression": crate.get("license_expression"), "notices": notices,
-                        **({"source_files_sha256": provenance, "upstream_tag": KDAB_TAG} if special and provenance else {})})
+                is_notice = relative == declared or (
+                    "/" not in relative and not member.isdir()
+                    and relative.upper().startswith(("LICENSE", "COPYING", "NOTICE")))
+                if not is_notice and relative not in borrowed:
+                    continue
+                if not notice_relative(relative) or not member.isfile() or relative in present:
+                    raise ValueError(f"crate notice member must be unique and regular: {member.name}")
+                present.add(relative)
+                if is_notice:
+                    with archive.extractfile(member) as stream:
+                        add(relative, stream.read(), f"{archive_rel}:{member.name}", crate_member=relative)
+        if declared is not None and declared not in present:
+            raise ValueError(f"declared crate license missing/unsafe: {slug}: {declared}")
+        if borrowed - present:
+            raise ValueError(f"supplemental Cargo notice lacks source members: {slug}: {sorted(borrowed - present)}")
+        for notice in additions:
+            data = notice_file(app_root / "source-snapshot", notice["file"]).read_bytes()
+            extra = {"origin": notice["origin"]}
+            if "crate_member" in notice:
+                extra["crate_member"] = notice["crate_member"]
+            add(Path(notice["file"]).name, data, notice["file"], **extra)
+        record["notices"].sort()
+        if role == "shipped-code-candidate" and (not record["notices"] or row.get("unresolved")):
+            missing.append(slug + (f" ({row['unresolved']})" if row.get("unresolved") else ""))
+    if missing:
+        raise ValueError("linked crate attribution missing: " + "; ".join(sorted(missing)))
+    return records, owners, payload
+
+
+def crate_notices(app_root, app_manifest, appdir, owners):
+    records, notice_owners, payload = crate_notice_inventory(app_root, app_manifest)
+    for destination in payload:
+        target = appdir / destination
+        if (destination in owners or target.is_symlink() or target.exists()
+                or any(parent.is_symlink() or (parent.exists() and not parent.is_dir())
+                       for parent in target.parents)
+                or any(p.is_relative_to(appdir) and p.relative_to(appdir).as_posix() in payload
+                       for p in target.parents)):
+            raise ValueError(f"crate notice destination collision or unsafe parent: {destination}")
+    for destination, data in payload.items():
+        target = appdir / destination
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("xb") as sink:
+            sink.write(data)
+    owners.update(notice_owners)
     return records
 
 
-def rust_std_notices(app_root, app_manifest, appdir, owners):
+def rust_std_notices(app_root, app_manifest, appdir, owners, *, app_lock=None):
+    if app_lock is None:
+        app_lock = json.loads(app_build.APP_LOCK.read_text())
     std = app_manifest.get("binary", {}).get("rust_standard_library")
     toolchain = app_manifest.get("toolchain", {})
-    if (not isinstance(std, dict) or std.get("version") != "1.97.1"
-            or std.get("target") != "x86_64-unknown-linux-gnu"
-            or std.get("license_expression") != "MIT OR Apache-2.0"):
+    license_info = app_lock["rust_standard_library"]
+    if (not isinstance(std, dict) or std.get("version") != app_lock["rust_version"]
+            or std.get("target") != app_lock["target"]
+            or std.get("license_expression") != license_info["license_expression"]):
         raise ValueError("linked Rust standard library manifest missing/invalid")
+    if any(toolchain.get(name) != app_lock["toolchain"][name] for name in ("rust-src", "rust-std")):
+        raise ValueError("Rust std toolchain differs from app lock")
+    if std.get("notices") != license_info["notices"]:
+        raise ValueError("Rust std notice manifest differs from app lock")
+    verified_notices = app_build.verified_rust_std_notices(app_root / "sources", app_lock)
     source = std.get("source", {})
     if (source.get("archive") != toolchain.get("rust-src", {}).get("archive")
             or source.get("sha256") != toolchain.get("rust-src", {}).get("sha256")
@@ -748,15 +696,12 @@ def rust_std_notices(app_root, app_manifest, appdir, owners):
             member = sources.getmember(source["path"] + "/" + archive["source_path"] + "/Cargo.toml")
             if not member.isfile():
                 raise ValueError(f"Rust std crate source missing: {archive['source_path']}")
-            metadata = tomllib.loads(sources.extractfile(member).read().decode())["package"]
-            declared = metadata.get("license")
+            declared, expression = app_build.rust_std_crate_license(
+                archive["name"], archive["source_path"], sources.extractfile(member).read(), app_lock)
             if archive.get("declared_license", archive["license_expression"]) != declared:
                 raise ValueError(f"Rust std crate license differs from source: {archive['source_path']}")
-            if (declared != archive["license_expression"]
-                    and not (archive["name"] == "rustc_demangle"
-                             and declared == "MIT/Apache-2.0"
-                             and archive["license_expression"] == "MIT OR Apache-2.0")):
-                raise ValueError(f"Rust std crate license normalization unrecognized: {archive['source_path']}")
+            if archive["license_expression"] != expression:
+                raise ValueError(f"Rust std crate license derivation differs from source: {archive['source_path']}")
             if archive["source_path"].startswith("vendor/"):
                 directory = source["path"] + "/" + archive["source_path"] + "/"
                 found = []
@@ -781,33 +726,16 @@ def rust_std_notices(app_root, app_manifest, appdir, owners):
                 component_notices[archive["name"]] = sorted(found)
     if not any(name.startswith("libstd-") for name in names):
         raise ValueError("linked Rust standard library libstd absent")
-    expected = {"LICENSE-APACHE", "LICENSE-MIT", "COPYRIGHT"}
-    notices = std.get("notices")
     notice_archive = toolchain.get("rust-std", {})
-    if (not isinstance(notices, list) or {Path(item.get("path", "")).name for item in notices} != expected
-            or any(item.get("archive") != notice_archive.get("archive")
-                   or item.get("path") != f"{notice_archive['archive'][:-7]}/{Path(item.get('path', '')).name}"
-                   for item in notices)):
-        raise ValueError("Rust std notice manifest missing/invalid")
-    archive_path = app_root / "sources" / notice_archive["archive"]
-    if not archive_path.is_file() or digest(archive_path) != notice_archive.get("sha256"):
-        raise ValueError("Rust std distribution archive missing/mismatched")
     results = []
-    with tarfile.open(archive_path, "r:xz") as bundle:
-        for item in sorted(notices, key=lambda row: row["path"]):
-            member = bundle.getmember(item["path"])
-            if not member.isfile():
-                raise ValueError(f"Rust std notice member not a regular file: {item['path']}")
-            content = bundle.extractfile(member).read()
-            if hashlib.sha256(content).hexdigest() != item.get("sha256"):
-                raise ValueError(f"Rust std notice hash mismatch: {item['path']}")
-            destination = "usr/share/licenses/rust/rust-std-1.97.1/" + Path(item["path"]).name
-            target = appdir / destination
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-            owners[destination] = {"owner": "rust-std-1.97.1", "source": f"{notice_archive['archive']}:{item['path']}",
-                                   "source_archive_sha256": notice_archive["sha256"], "source_sha256": item["sha256"]}
-            results.append(destination)
+    for item, content in verified_notices:
+        destination = "usr/share/licenses/rust/rust-std-1.97.1/" + Path(item["path"]).name
+        target = appdir / destination
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        owners[destination] = {"owner": "rust-std-1.97.1", "source": f"{notice_archive['archive']}:{item['path']}",
+                               "source_archive_sha256": notice_archive["sha256"], "source_sha256": item["sha256"]}
+        results.append(destination)
     return {"version": std["version"], "target": std["target"], "license_expression": std["license_expression"],
             "source": source, "linked_archives": archives, "notices": results,
             "vendored_component_notices": component_notices}
@@ -933,11 +861,14 @@ def stage_source_patches(media_root, media, appdir, owners):
                             "source_sha256": row["sha256"]}
 
 
-def internal(media_root, app_root, runtime_root, out, version, linked_source_root):
+def internal(media_root, app_root, runtime_root, out, version, linked_source_root, *,
+             capture_ubuntu_only=False):
     ids, media = check_inputs(media_root, app_root, runtime_root)
-    if {p.name for p in out.iterdir()} != {"ubuntu-apt.log", "base-image-provenance.json",
-                                             "stage-tool-closure.json"}:
-        raise ValueError(f"qualification output must contain only Ubuntu APT/base/tool provenance logs: {out}")
+    expected = {"ubuntu-apt.log", "base-image-provenance.json"}
+    if not capture_ubuntu_only:
+        expected.add("stage-tool-closure.json")
+    if {p.name for p in out.iterdir()} != expected:
+        raise ValueError(f"staging output must contain only the expected Ubuntu provenance logs: {out}")
     base_origin = json.loads((out / "base-image-provenance.json").read_text())
     closure = json.loads((REPO / "packaging/media/build-apt-closure.json").read_text())
     if (base_origin.get("image") != media["container"]
@@ -945,6 +876,18 @@ def internal(media_root, app_root, runtime_root, out, version, linked_source_roo
             or base_origin.get("installed_rows_checked") != len(closure["installed"])
             or base_origin.get("downloaded_deb_rows") != len(closure["downloaded_debs"])):
         raise ValueError("Ubuntu base OCI provenance differs from pinned media closure")
+    prefix = media_root / "prefix"
+    if capture_ubuntu_only:
+        # No persistent AppDir, appimagetool, crate notices, or release receipts.
+        from sources import observe_ubuntu
+        app_manifest, _ = read_manifest(app_root)
+        with tempfile.TemporaryDirectory(prefix="furami-ubuntu-observation-") as scratch:
+            appdir = Path(scratch)
+            owners = {}
+            stage_elf_roots(prefix, media["artifacts"], app_root, appdir, owners)
+            stage_libraries(prefix, media["artifacts"], appdir, owners, base_origin)
+            observe_ubuntu(appdir, owners, app_manifest, media["apt_snapshot"], out)
+        return
     tool_lock = json.loads((HERE / "tool-closure.lock.json").read_text())
     tool_receipt = json.loads((out / "stage-tool-closure.json").read_text())
     if (tool_receipt.get("schema") != 1
@@ -971,18 +914,7 @@ def internal(media_root, app_root, runtime_root, out, version, linked_source_roo
     appdir.mkdir()
     appdir.chmod(0o755)
     owners = {}
-    prefix = media_root / "prefix"
-    copy_component(app_root, "bin/furami", appdir, "usr/bin/furami", owners, "app")
-    for pattern in ("libmpv.so*", "libplacebo.so*", "libav*.so*", "libsw*.so*"):
-        matches = sorted((prefix / "lib").glob(pattern))
-        if not matches:
-            raise ValueError(f"missing mandatory shared component {pattern}")
-        for match in matches:
-            rel = match.relative_to(prefix).as_posix()
-            copy_prefix(prefix, media["artifacts"], rel, appdir, "usr/" + rel, owners)
-    stage_media_programs(prefix, media["artifacts"], appdir, owners)
-    stage_xcb_plugins(prefix, media["artifacts"], appdir, owners)
-    qml = scan_qml(prefix, appdir, media["artifacts"], owners)
+    stage_elf_roots(prefix, media["artifacts"], app_root, appdir, owners)
     for name in ("mpv", "ffmpeg", "libplacebo"):
         source = media["sources"][name]
         archive = Path("/media-sources") / source["archive"]
@@ -1005,24 +937,11 @@ def internal(media_root, app_root, runtime_root, out, version, linked_source_roo
         if not count:
             raise ValueError(f"core source archive lacks upstream notices: {name}")
     stage_source_patches(media_root, media, appdir, owners)
-    for relative in sorted(media["artifacts"]):
-        if relative.startswith("sbom/") or relative.startswith("config_"):
-            if (prefix / relative).is_file() and not (prefix / relative).is_symlink():
-                copy_prefix(prefix, media["artifacts"], relative, appdir,
-                            "usr/share/licenses/qt/" + relative, owners)
-    icu = json.loads((HERE / "sources.lock.json").read_text())["icu_notice"]
-    source = Path("/icu-LICENSE")
-    if source.is_symlink() or digest(source) != icu["sha256"]:
-        raise ValueError("checked ICU 73.2 notice bytes differ")
-    target = appdir / "usr/share/licenses/icu/LICENSE"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
-    owners[target.relative_to(appdir).as_posix()] = {
-        "owner": "checked-ICU-notice", "source": icu["url"], "source_sha256": icu["sha256"]}
     for src, dest in ((HERE / "AppRun", "AppRun"), (HERE / "furami.desktop", "usr/share/applications/furami.desktop"),
                       (REPO / "assets/logo.svg", "usr/share/icons/hicolor/scalable/apps/furami.svg"),
                       (REPO / "assets/logo.png", "usr/share/icons/hicolor/1024x1024/apps/furami.png"),
-                      (HERE / "qt.conf", "usr/bin/qt.conf"), (REPO / "LICENSE", "usr/share/licenses/furami/LICENSE"),
+                      (REPO / "LICENSE", "usr/share/licenses/furami/LICENSE"),
+                      (REPO / "assets/icons/LICENSE-tabler.txt", "usr/share/licenses/tabler/LICENSE-tabler.txt"),
                       (HERE / "RELINKING.md", "usr/share/licenses/furami/RELINKING.md"),
                       (REPO / "packaging/media/LICENSE-AUDIT.md", "usr/share/licenses/furami/STACK-AUDIT.md")):
         target = appdir / dest
@@ -1030,14 +949,15 @@ def internal(media_root, app_root, runtime_root, out, version, linked_source_roo
         shutil.copy2(src, target)
         if dest == "AppRun":
             target.chmod(0o755)
-        owners[dest] = {"owner": "qualification-template", "source": str(src.relative_to(REPO)), "source_sha256": digest(src)}
+        owners[dest] = {"owner": "tabler-notice" if dest.startswith("usr/share/licenses/tabler/") else "qualification-template",
+                        "source": str(src.relative_to(REPO)), "source_sha256": digest(src)}
     (appdir / "furami.desktop").symlink_to("usr/share/applications/furami.desktop")
     (appdir / "furami.svg").symlink_to("usr/share/icons/hicolor/scalable/apps/furami.svg")
     (appdir / "furami.png").symlink_to("usr/share/icons/hicolor/1024x1024/apps/furami.png")
     (appdir / ".DirIcon").symlink_to("furami.png")
     dependencies = stage_libraries(prefix, media["artifacts"], appdir, owners, base_origin)
     app_manifest, _ = read_manifest(app_root)
-    rust_crates = crate_notices(app_root, app_manifest, appdir, owners, Path("/kdab-licenses"))
+    rust_crates = crate_notices(app_root, app_manifest, appdir, owners)
     rust_standard_library = rust_std_notices(app_root, app_manifest, appdir, owners)
     for license_name in ("GPL-2", "GPL-3", "LGPL-2.1", "LGPL-3", "Apache-2.0"):
         source = Path("/usr/share/common-licenses") / license_name
@@ -1077,7 +997,7 @@ def internal(media_root, app_root, runtime_root, out, version, linked_source_roo
                                                                     if key != "local_cache_path"}},
                     "runtime_build_flags": runtime_manifest.get("build_flags"),
                     "runtime_lgpl_warning": runtime_manifest.get("license_note"),
-                    "qt_and_media_shared_libraries": "replaceable separate ELF .so files in usr/lib; isolated AppRun loader path",
+                    "media_shared_libraries": "replaceable separate ELF .so files in usr/lib; isolated AppRun loader path",
                     "ubuntu_notices": "usr/share/doc/ubuntu/<binary-package>/copyright for every copied Ubuntu ELF"}
     offer_path = appdir / "usr/share/licenses/furami/source-offer.json"
     offer_path.write_text(json.dumps(source_offer, indent=2, sort_keys=True) + "\n")
@@ -1142,8 +1062,8 @@ def internal(media_root, app_root, runtime_root, out, version, linked_source_roo
                 "appdir": {"path": "AppDir", "source_date_epoch": source_epoch,
                            "artifacts": payload},
                 "extraction": {"comparison": "byte/symlink/mode exact", "artifacts": len(payload)},
-                "component_sources": owners, "qml": qml, "loader": dependencies,
-                "runtime_loads": ["usr/lib/libmpv.so"]}
+                "component_sources": owners, "loader": dependencies,
+                "runtime_loads": list(DLOPEN_ROOTS)}
     (out / "evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
     print(f"Qualified {image}; {len(payload)} payload files/symlinks")
 
@@ -1153,43 +1073,47 @@ def main():
     parser.add_argument("--media-output", type=Path, required=True)
     parser.add_argument("--app-build", type=Path, required=True)
     parser.add_argument("--runtime-build", type=Path, required=True)
-    parser.add_argument("--media-source-cache", type=Path, required=True)
+    parser.add_argument("--media-source-cache", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--tool-cache", type=Path, default=Path.home() / ".cache/furami-qualification")
+    parser.add_argument("--capture-ubuntu-only", action="store_true",
+                        help="record frozen Ubuntu ELF ownership, source and notice facts without building an image")
     parser.add_argument("--in-container", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--runtime-linked-sources", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if not args.capture_ubuntu_only and args.media_source_cache is None:
+        parser.error("--media-source-cache is required for image staging")
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", args.version):
         raise ValueError("unsafe image version")
     media, app, runtime, out = (p.resolve() for p in (args.media_output, args.app_build, args.runtime_build, args.output))
     if args.in_container:
-        if args.runtime_linked_sources is None or not args.runtime_linked_sources.is_absolute():
-            raise ValueError("container staging requires the explicit source-only linked-input mount")
-        internal(media, app, runtime, out, args.version, args.runtime_linked_sources)
+        if not args.capture_ubuntu_only:
+            if args.runtime_linked_sources is None or not args.runtime_linked_sources.is_absolute():
+                raise ValueError("container staging requires the explicit source-only linked-input mount")
+        internal(media, app, runtime, out, args.version, args.runtime_linked_sources,
+                 capture_ubuntu_only=args.capture_ubuntu_only)
         return
     _, media_manifest = check_inputs(media, app, runtime)
-    runtime_manifest = json.loads((runtime / "manifest.json").read_text())
-    runtime_lock = json.loads((REPO / "packaging/appimage-runtime/runtime.lock.json").read_text())
-    verify_runtime_linked_sources(runtime, runtime_manifest, runtime_lock)
-    linked_sources = Path(runtime_manifest["linked_source_closure"]["local_cache_path"]).resolve()
-    if ":" in str(linked_sources):
-        raise ValueError("runtime linked source path must be mount-safe")
     if out.exists() and any(out.iterdir()):
         raise ValueError(f"qualification output must be empty: {out}")
     lock = json.loads(STACK_LOCK.read_text())
     cache = args.tool_cache.resolve()
-    tool = cached_download(cache, "appimagetool-1.9.1-x86_64.AppImage", TOOL_URL, TOOL_SHA256)
-    tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+    release_mounts = []
+    if not args.capture_ubuntu_only:
+        runtime_manifest = json.loads((runtime / "manifest.json").read_text())
+        runtime_lock = json.loads((REPO / "packaging/appimage-runtime/runtime.lock.json").read_text())
+        verify_runtime_linked_sources(runtime, runtime_manifest, runtime_lock)
+        linked_sources = Path(runtime_manifest["linked_source_closure"]["local_cache_path"]).resolve()
+        if ":" in str(linked_sources):
+            raise ValueError("runtime linked source path must be mount-safe")
+        tool = cached_download(cache, "appimagetool-1.9.1-x86_64.AppImage", TOOL_URL, TOOL_SHA256)
+        tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+        release_mounts = ["--volume", f"{linked_sources}:/runtime-linked-sources:ro",
+                          "--volume", f"{args.media_source_cache.resolve()}:/media-sources:ro",
+                          "--volume", f"{tool}:/tool/appimagetool:ro"]
     ca = lock["sources"]["ca_certificates"]
     trust = cached_download(cache, ca["archive"], ca["url"], ca["sha256"])
-    kdab_dir = cache / "kdab-cxx-qt-v0.10.0"
-    for filename, expected in KDAB_LICENSE_SHA256.items():
-        cached_download(kdab_dir, filename,
-                        f"https://raw.githubusercontent.com/KDAB/cxx-qt/{KDAB_TAG}/LICENSES/{filename}",
-                        expected)
-    icu = json.loads((HERE / "sources.lock.json").read_text())["icu_notice"]
-    icu_notice = cached_download(cache, icu["archive"], icu["url"], icu["sha256"])
     base_origin = base_image_provenance(media_manifest["container"])
     out.mkdir(parents=True, exist_ok=True)
     (out / "base-image-provenance.json").write_text(json.dumps(base_origin, indent=2, sort_keys=True) + "\n")
@@ -1197,11 +1121,7 @@ def main():
             "--security-opt", "label=disable", "--volume", f"{REPO}:/workspace:ro",
             "--volume", f"{media}:/media:ro", "--volume", f"{app}:/app:ro",
             "--volume", f"{runtime}:/runtime:ro", "--volume", f"{out}:/out",
-            "--volume", f"{linked_sources}:/runtime-linked-sources:ro",
-            "--volume", f"{args.media_source_cache.resolve()}:/media-sources:ro",
-            "--volume", f"{tool}:/tool/appimagetool:ro",
-            "--volume", f"{kdab_dir}:/kdab-licenses:ro",
-            "--volume", f"{icu_notice}:/icu-LICENSE:ro",
+            *release_mounts,
             "--volume", f"{trust}:/bootstrap-ca.deb:ro", "--workdir", "/workspace",
             "--env", f"CA_SHA256={ca['sha256']}",
             "--env", f"APT_SNAPSHOT={lock['apt_snapshot']}",
@@ -1209,6 +1129,8 @@ def main():
             "--env", f"APT_DEBS_SHA256={lock['apt_closure']['downloaded_debs_sha256']}",
             "--env", f"FURAMI_VERSION={args.version}",
             media_manifest["container"], "bash", "packaging/appimage/setup-ubuntu.sh"]
+    if args.capture_ubuntu_only:
+        argv.append("--capture-ubuntu-only")
     with (out / "ubuntu-apt.log").open("w") as log:
         status = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, check=False).returncode
     if status:
@@ -1218,5 +1140,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, OSError, KeyError, json.JSONDecodeError) as error:
+    except (ValueError, OSError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as error:
         sys.exit(f"qualification failed: {error}")

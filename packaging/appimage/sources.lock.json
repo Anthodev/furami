@@ -1,6 +1,5 @@
 {
   "schema": 1,
-  "required_qt_modules": ["qtbase", "qtdeclarative", "qtsvg"],
   "alpine_private_bootstrap": {
     "image": "docker.io/library/alpine@sha256:3c81aa9a3d770b316568f4499e30461a5cd3fbd7180bd89e28e34894c7845832",
     "manifest_sha256": "3c81aa9a3d770b316568f4499e30461a5cd3fbd7180bd89e28e34894c7845832",
@@ -10,144 +9,520 @@
     ],
     "basis": "Exact original OCI manifest/config/compressed-layer identities verified during authenticated private bootstrap retention; identity-only exclusion facts, not public redistribution clearance."
   },
-  "qt_sources": {
-    "qtbase": {
-      "version": "6.11.2",
-      "archive": "qtbase-everywhere-src-6.11.2.tar.xz",
-      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz",
-      "sha256": "5b2e00eccaf5a4d8c14134ffa0ea8dfd0a35ae1ffc7f8d87fa4305a1ed23cf22",
-      "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz.mirrorlist",
-      "kit_source_commit": "ef55f427f2c8b410d34f8a7681020a3000cf6866",
-      "supplemental_metadata": {
-        "commit": "ef55f427f2c8b410d34f8a7681020a3000cf6866",
-        "archive_sha256": "5b2e00eccaf5a4d8c14134ffa0ea8dfd0a35ae1ffc7f8d87fa4305a1ed23cf22",
-        "spdx_sha256": "756ed1c39c0f8acfbba13c2d4473a5e84cab7a433f1605f3cf1d7a035a2f43ea",
-        "files": {
-          "src/3rdparty/.gitattributes": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-00.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/3rdparty/.gitattributes",
-            "sha256": "61710d3e049d7346b42f70ef15bbd272d0bb75d4e26f034b3da16f5a20ed3e07",
-            "sha1": "44ae8ff49edf854049431d1410b940227bbd6616",
-            "recipient": "qt-inputs/qtbase-git-metadata/src/3rdparty/.gitattributes"
-          },
-          "src/3rdparty/tinycbor/.gitignore": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-01.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/3rdparty/tinycbor/.gitignore",
-            "sha256": "4eef1f6e5775ae2605ef91fd0d36284a751303f2db78acb150978b7e01ea3abc",
-            "sha1": "231fd6069da29dc2f732a2208ee5c3d6efba8b21",
-            "recipient": "qt-inputs/qtbase-git-metadata/src/3rdparty/tinycbor/.gitignore"
-          },
-          "src/3rdparty/tinycbor/tests/.gitignore": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-02.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/3rdparty/tinycbor/tests/.gitignore",
-            "sha256": "2044f4e5abc4ee4a881df20e375dadeae820f615c6892ef34cd35dc470fa3efe",
-            "sha1": "79a4750d883d4684503bb6335c906fd64326bb74",
-            "recipient": "qt-inputs/qtbase-git-metadata/src/3rdparty/tinycbor/tests/.gitignore"
-          },
-          "src/android/jar/.gitignore": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-03.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/android/jar/.gitignore",
-            "sha256": "3a428cfeb8258e4575fa778fb73f482b00ed14c445a56cbd9c4c510cf7f71892",
-            "sha1": "230fbab6f0a3c7de4035af8b1b71bd2bb4337739",
-            "recipient": "qt-inputs/qtbase-git-metadata/src/android/jar/.gitignore"
-          },
-          "src/android/templates/.gitignore": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-04.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/android/templates/.gitignore",
-            "sha256": "34c41cd103929b13e8e0f904577bc544ab2a886570735221e128762be77a475e",
-            "sha1": "aa27e8a17ca87e892c7df0d2a25c3fa9a0869cc0",
-            "recipient": "qt-inputs/qtbase-git-metadata/src/android/templates/.gitignore"
-          },
-          "src/corelib/serialization/.gitignore": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-05.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/corelib/serialization/.gitignore",
-            "sha256": "78a981762a2418f5bc4d7e23e248fcbc4f8fd68f67201ae7e9a978e8c5b24d3c",
-            "sha1": "4546b27af61e650390e6c84b8a247b9f983647b8",
-            "recipient": "qt-inputs/qtbase-git-metadata/src/corelib/serialization/.gitignore"
-          },
-          "src/network/android/jar/.gitignore": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-06.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/network/android/jar/.gitignore",
-            "sha256": "cd91fd1346f2bbdd6c16c404f296cb3b503427a998bb9957d8ab3bbb29bede84",
-            "sha1": "032387ceb1895268a2bae1b61a3bd41a752b7482",
-            "recipient": "qt-inputs/qtbase-git-metadata/src/network/android/jar/.gitignore"
-          },
-          "src/plugins/networkinformation/android/jar/.gitignore": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-07.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/plugins/networkinformation/android/jar/.gitignore",
-            "sha256": "cd91fd1346f2bbdd6c16c404f296cb3b503427a998bb9957d8ab3bbb29bede84",
-            "sha1": "032387ceb1895268a2bae1b61a3bd41a752b7482",
-            "recipient": "qt-inputs/qtbase-git-metadata/src/plugins/networkinformation/android/jar/.gitignore"
+  "cargo_notices": [
+    {
+      "name": "accesskit",
+      "version": "0.24.1",
+      "checksum": "d3b7f7f85a7e5f68090000ed7622545829afd484d210358702ae4cb97dd0c320",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969",
+            "path": "LICENSE-MIT"
           }
         },
-        "license_evidence": {
-          "REUSE.toml": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-08.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/REUSE.toml",
-            "sha256": "56a2d79d2e56893411d04becd342312b3c1c1ff67096aaed5639ff3d0fb0d490",
-            "sha1": "f89e5a097fd53c7b3e3e246d64dd43ed359cef95",
-            "recipient": "qt-inputs/qtbase-git-metadata/REUSE.toml"
-          },
-          "src/3rdparty/tinycbor/REUSE.toml": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-09.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/3rdparty/tinycbor/REUSE.toml",
-            "sha256": "434b9d897d314261691e2546a1238b7ec9ceb10608a68d4a215250579464b20d",
-            "sha1": "6365d4e66ae96ef8f68ec970886e198f369ea13e",
-            "recipient": "qt-inputs/qtbase-git-metadata/src/3rdparty/tinycbor/REUSE.toml"
-          },
-          "LICENSES/BSD-3-Clause.txt": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-10.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/LICENSES/BSD-3-Clause.txt",
-            "sha256": "9f0490f18656c6f2435bd14f603ef0c96434d1825615363dce43abb42ed1dcce",
-            "sha1": "b073f11f0c81a95ab5e32aa6b5d23a5955a95274",
-            "recipient": "qt-inputs/qtbase-git-metadata/LICENSES/BSD-3-Clause.txt"
-          },
-          "src/3rdparty/tinycbor/LICENSE": {
-            "archive": "qtbase-ef55f427f2c8b410d34f8a7681020a3000cf6866-11.metadata",
-            "url": "https://raw.githubusercontent.com/qt/qtbase/ef55f427f2c8b410d34f8a7681020a3000cf6866/src/3rdparty/tinycbor/LICENSE",
-            "sha256": "3c6ba0b5bfa7830505301ffb336a17b0748e0d61c4d34216e9dc98f10e40395e",
-            "sha1": "744aeb214e5bd02d894c0390cb505be56847b6be",
-            "recipient": "qt-inputs/qtbase-git-metadata/src/3rdparty/tinycbor/LICENSE"
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969",
+            "path": "LICENSE-APACHE"
           }
         },
-        "selected_terms": {
-          "qt_metadata": "BSD-3-Clause",
-          "tinycbor_metadata": "MIT"
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE.chromium",
+          "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969",
+            "path": "LICENSE.chromium"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "accesskit_atspi_common",
+      "version": "0.19.1",
+      "checksum": "023da0e5097f46df7092d5280b02efb9bbf8d93298daeced42652463e357d636",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+            "path": "LICENSE-MIT"
+          }
         },
-        "basis": "Pinned root REUSE.toml Git metadata annotation; closer tinycbor REUSE.toml MIT annotation. Original notices and complete license texts accompany the overlay; SPDX LicenseConcluded remains NOASSERTION."
-      }
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+            "path": "LICENSE-APACHE"
+          }
+        },
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE.chromium",
+          "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+            "path": "LICENSE.chromium"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
-    "qtdeclarative": {
-      "version": "6.11.2",
-      "archive": "qtdeclarative-everywhere-src-6.11.2.tar.xz",
-      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtdeclarative-everywhere-src-6.11.2.tar.xz",
-      "sha256": "215b7b70517e380123eabc6b92243f3c47b6f016a91d126057dbe53551c6b430",
-      "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtdeclarative-everywhere-src-6.11.2.tar.xz.mirrorlist",
-      "kit_source_commit": "4e3399c26ec57246c08de019cfcbda8d23604cfa"
+    {
+      "name": "accesskit_consumer",
+      "version": "0.38.0",
+      "checksum": "5d10a236f96f87d70732e44520046785431ef01d5bcd6b041317bfadd2f88245",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+            "path": "LICENSE-MIT"
+          }
+        },
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+            "path": "LICENSE-APACHE"
+          }
+        },
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE.chromium",
+          "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+            "path": "LICENSE.chromium"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
-    "qtsvg": {
-      "version": "6.11.2",
-      "archive": "qtsvg-everywhere-src-6.11.2.tar.xz",
-      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtsvg-everywhere-src-6.11.2.tar.xz",
-      "sha256": "d594337feca84c26fb67fe87b85e6a5c12fda404b611d905f9d138210c311876",
-      "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtsvg-everywhere-src-6.11.2.tar.xz.mirrorlist",
-      "kit_source_commit": "17ca512f903f935282ebeca496aac5d11ba4199a"
+    {
+      "name": "accesskit_unix",
+      "version": "0.22.1",
+      "checksum": "03e156ed3802e35eefe894ef2671bc6c889303d8a7e110b5e1b48f504b91362f",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+            "path": "LICENSE-MIT"
+          }
+        },
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+            "path": "LICENSE-APACHE"
+          }
+        },
+        {
+          "file": "packaging/appimage/notices/accesskit/LICENSE.chromium",
+          "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/AccessKit/accesskit",
+            "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+            "path": "LICENSE.chromium"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
-    "qtshadertools": {
-      "version": "6.11.2",
-      "archive": "qtshadertools-everywhere-src-6.11.2.tar.xz",
-      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtshadertools-everywhere-src-6.11.2.tar.xz",
-      "sha256": "805046b8b7757665586890b375940047e874ae3ab00adb6d3f2b38fc6b200b1c",
-      "hash_evidence": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtshadertools-everywhere-src-6.11.2.tar.xz.mirrorlist",
-      "kit_source_commit": null
+    {
+      "name": "gpui-pre",
+      "version": "0.3.13",
+      "checksum": "e17ece47c15edeca5889096947ddc73a86fb29318f811a8c7a64a8ddd6364247",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/gpui/microsoft-terminal-LICENSE",
+          "sha256": "5d177f23ecfeb0ea8e050b6a5a16355e1ae9a0b286436ca8f83ed08b3795be6b",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/microsoft/terminal",
+            "revision": "1283c0f5b99a2961673249fa77c6b986efb5086c",
+            "path": "LICENSE"
+          },
+          "crate_member": "src/platform.rs"
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "gpui-pre-wgpu",
+      "version": "0.3.13",
+      "checksum": "7d1505797c4019f72e65ad5a23c585a3acbe6a574531794e5690d083ee19d3c8",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/gpui/microsoft-terminal-LICENSE",
+          "sha256": "5d177f23ecfeb0ea8e050b6a5a16355e1ae9a0b286436ca8f83ed08b3795be6b",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/microsoft/terminal",
+            "revision": "1283c0f5b99a2961673249fa77c6b986efb5086c",
+            "path": "LICENSE"
+          },
+          "crate_member": "src/shaders.wgsl"
+        },
+        {
+          "file": "packaging/appimage/notices/gpui/slug-LICENSE-MIT",
+          "sha256": "8b284b866415649e107444b72f35f6931ba2adcddef2febb83b25ed99b10f0f0",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/EricLengyel/Slug",
+            "revision": "be3c13eb7d63f9e8aa5c583e42d92c374cb91d98",
+            "path": "LICENSE-MIT"
+          },
+          "crate_member": "src/shaders.wgsl"
+        },
+        {
+          "file": "packaging/appimage/notices/gpui/slug-NOTICE",
+          "sha256": "37d1aff22dfd8feae3ec59fe279ede7f3309c4078ddc1f48662c7be48f26c628",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/EricLengyel/Slug",
+            "revision": "be3c13eb7d63f9e8aa5c583e42d92c374cb91d98",
+            "path": "NOTICE"
+          },
+          "crate_member": "src/shaders.wgsl"
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "harfrust",
+      "version": "0.5.2",
+      "checksum": "9da2e5ae821f6e96664977bf974d6d6a2d6682f9ccee23e62ec1d134246845f9",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/harfrust/LICENSE",
+          "sha256": "3a7c3f0b887abb7c638faf022d29257418458614c6724b120ceeffb279f9c7d2",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/harfbuzz/harfrust",
+            "revision": "efdae3142ab76a2f1524d72cff9e3dfdc5afd7ca",
+            "path": "LICENSE"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "lyon_geom",
+      "version": "1.0.20",
+      "checksum": "d82dd26aa4dc0b5b70b9115de59824842bcb43cf4a28e1b1e6d0ad148c93f93e",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/lyon/LICENSE-MIT",
+          "sha256": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/nical/lyon",
+            "revision": "db98d26a1a90076a7a894262dcb51117eef643c8",
+            "path": "LICENSE-MIT"
+          }
+        },
+        {
+          "file": "packaging/appimage/notices/lyon/LICENSE-APACHE",
+          "sha256": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/nical/lyon",
+            "revision": "db98d26a1a90076a7a894262dcb51117eef643c8",
+            "path": "LICENSE-APACHE"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "lyon_path",
+      "version": "1.0.19",
+      "checksum": "5c463f9c428b7fc5ec885dcd39ce4aa61e29111d0e33483f6f98c74e89d8621e",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/lyon/LICENSE-MIT",
+          "sha256": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/nical/lyon",
+            "revision": "56219c95c658d4f39de7b190d98e57d5773ba241",
+            "path": "LICENSE-MIT"
+          }
+        },
+        {
+          "file": "packaging/appimage/notices/lyon/LICENSE-APACHE",
+          "sha256": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/nical/lyon",
+            "revision": "56219c95c658d4f39de7b190d98e57d5773ba241",
+            "path": "LICENSE-APACHE"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "pathfinder_geometry",
+      "version": "0.5.1",
+      "checksum": "0b7b7e7b4ea703700ce73ebf128e1450eb69c3a8329199ffbfb9b2a0418e5ad3",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/pathfinder_geometry/copyright",
+          "sha256": "35aadf3ea3108cddd08dab781a88d7e836f2eda1287debf86813244f14b59544",
+          "origin": {
+            "kind": "distribution",
+            "url": "https://deb.debian.org/debian/pool/main/r/rust-pathfinder-geometry/rust-pathfinder-geometry_0.5.1-1.debian.tar.xz",
+            "archive_sha256": "5ed560100e57c9ac49353f31ad567e30b1a7ab8768a3c2bb517bea8c4a97a9d2",
+            "descriptor_sha256": "9b54338f9181d27b2a1c75dcdd19c8930dd8b0f9879b1a8155b13e068601aa84",
+            "path": "debian/copyright"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "pathfinder_simd",
+      "version": "0.5.6",
+      "checksum": "4500030c302e4af1d423f36f3b958d1aecb6c04184356ed5a833bf6b60435777",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/pathfinder_simd/LICENSE-MIT",
+          "sha256": "0621878e61f0d0fda054bcbe02df75192c28bde1ecc8289cbd86aeba2dd72720",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/servo/pathfinder",
+            "revision": "6c3c0466f451c5bd2007087728cd168798cd64e8",
+            "path": "LICENSE-MIT"
+          }
+        },
+        {
+          "file": "packaging/appimage/notices/pathfinder_simd/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/servo/pathfinder",
+            "revision": "6c3c0466f451c5bd2007087728cd168798cd64e8",
+            "path": "LICENSE-APACHE"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "profiling",
+      "version": "1.0.18",
+      "checksum": "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/profiling/LICENSE-MIT",
+          "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/aclysma/profiling",
+            "revision": "8271551172eb6fa4cba47369aedd93790c623df9",
+            "path": "LICENSE-MIT"
+          }
+        },
+        {
+          "file": "packaging/appimage/notices/profiling/LICENSE-APACHE",
+          "sha256": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/aclysma/profiling",
+            "revision": "8271551172eb6fa4cba47369aedd93790c623df9",
+            "path": "LICENSE-APACHE"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "profiling-procmacros",
+      "version": "1.0.18",
+      "checksum": "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb",
+      "notices": [],
+      "unresolved": "upstream repository aclysma/profiling at 8271551172eb6fa4cba47369aedd93790c623df9 contains no license or notice file for this member",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "seahash",
+      "version": "4.1.0",
+      "checksum": "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/seahash/copyright",
+          "sha256": "268296361f3ec03e3dfb8a893c35318226119c818f5e8b7866d209e24beda60f",
+          "origin": {
+            "kind": "distribution",
+            "url": "https://deb.debian.org/debian/pool/main/r/rust-seahash/rust-seahash_4.1.0-1.debian.tar.xz",
+            "archive_sha256": "bd8490a3aef4cf814241d9eb97527d8476ce15c6b215b976dfe280ac43998f1c",
+            "descriptor_sha256": "bc60af49bc098ed417bb8a85bdfe10a1390cb2389a6e5b2130fa0081e8c82f5f",
+            "path": "debian/copyright"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "simd_helpers",
+      "version": "0.1.0",
+      "checksum": "95890f873bec569a0362c235787f3aca6e1e887302ba4840839bcc6459c42da6",
+      "notices": [],
+      "unresolved": "upstream repository lu-zero/simd_helpers at ca1a2f84aa386d758e98f8a609d990263932fb85 contains no license or notice file",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "spirv",
+      "version": "0.4.0+sdk-1.4.341.0",
+      "checksum": "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/spirv/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/gfx-rs/rspirv",
+            "revision": "8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4",
+            "path": "LICENSE"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "svg_fmt",
+      "version": "0.4.5",
+      "checksum": "0193cc4331cfd2f3d2011ef287590868599a2f33c3e69bc22c1a3d3acf9e02fb",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/svg_fmt/LICENSE",
+          "sha256": "7e98bed7f100747aaae7d82ab94fbe6b76fd6b84b09a3aaa413bff8196d0fbb1",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/nical/rust_debug",
+            "revision": "93f414cd572b5c2781df93dbdc068ed13443d05a",
+            "path": "LICENSE"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "taffy",
+      "version": "0.15.1",
+      "checksum": "31f7bd2d97198df05186f93a3a3c306845f40e8b3c22bf9279cdd7e5cf5fea7d",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/taffy/LICENSE",
+          "sha256": "f97daf1a0124413dccf399a4e6626b4b74acd05282f80b6d64ac82225650b77a",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/DioxusLabs/taffy",
+            "revision": "0064bd54cbe38bf1d8bcd6ec6ab0704d45fb048a",
+            "path": "LICENSE"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "xim-ctext",
+      "version": "0.3.0",
+      "checksum": "2ac61a7062c40f3c37b6e82eeeef835d5cc7824b632a72784a89b3963c33284c",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/xim/LICENSE",
+          "sha256": "efa1224931b98468f5005f77285457f8d2eab0a77a15941aa10abbab1ae9a74e",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/Riey/xim-rs",
+            "revision": "65f77e44524ba487285a63aac4080faf2c05b4ed",
+            "path": "LICENSE"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "xim-parser",
+      "version": "0.2.2",
+      "checksum": "5dcee45f89572d5a65180af3a84e7ddb24f5ea690a6d3aa9de231281544dd7b7",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/xim/LICENSE",
+          "sha256": "efa1224931b98468f5005f77285457f8d2eab0a77a15941aa10abbab1ae9a74e",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/Riey/xim-rs",
+            "revision": "7300de35a111de2df1a694bf70454532a8419685",
+            "path": "LICENSE"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "zune-inflate",
+      "version": "0.2.54",
+      "checksum": "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02",
+      "notices": [
+        {
+          "file": "packaging/appimage/notices/zune-inflate/LICENSE-ZLIB",
+          "sha256": "7fa429541e55b1509909e058f2d21a37467e4958ec713b357f6e0cf9dc4ee352",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/etemesi254/zune-image",
+            "revision": "69502ce83fdfecdd0beefd677e2abb3781b29d98",
+            "path": "LICENSE-ZLIB"
+          }
+        },
+        {
+          "file": "packaging/appimage/notices/zune-inflate/LICENSE.md",
+          "sha256": "e870d7fd7819a9f0453c62798cb52ae95d148a8c91dc2de1d983f997143c72de",
+          "origin": {
+            "kind": "upstream",
+            "repository": "https://github.com/etemesi254/zune-image",
+            "revision": "69502ce83fdfecdd0beefd677e2abb3781b29d98",
+            "path": "LICENSE.md"
+          }
+        }
+      ],
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
     }
-  },
-  "icu_notice": {
-    "version": "73.2",
-    "archive": "ICU-73.2-LICENSE",
-    "url": "https://raw.githubusercontent.com/unicode-org/icu/680f521746a3bd6a86f25f25ee50a62d88b489cf/icu4c/LICENSE",
-    "sha256": "f3005e195ff74d8812cc1f182a1c446fab678d70a10e3dada497585befee5416",
-    "license_ref": "LicenseRef-ICU-73.2-Notice",
-    "scope": "Exact original Unicode/ICU aggregate permission and third-party notices; source copy optional under these permissive terms."
-  }
+  ]
 }

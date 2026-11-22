@@ -1,17 +1,15 @@
 //! Product top chrome for the GPUI frontend: the Brume ribbon and the
 //! immediate selector surfaces.
 //!
-//! `qml/TopChromeContent.qml`, `SourceSelectorView.qml`,
-//! `OutputSelectorView.qml` and `SizeRateSelectorView.qml` are the parity
-//! contract. The ribbon shows the confirmed live selection; every selection is
-//! applied immediately through the checked `RuntimeCoordinator` intents, so
-//! nothing here keeps a pending draft. The host (`gpui.rs` and
-//! `companion_view.rs`) owns native geometry, input shape, focus transfers and
-//! lifetime; this module renders GPUI chrome only, reports the committed
-//! selector-panel rectangle for the X input region, and never invents a second
-//! navigation or media policy.
+//! The ribbon shows the confirmed live selection; every selection is applied
+//! immediately through the checked `RuntimeCoordinator` intents, so nothing
+//! here keeps a pending draft. The host (`gpui.rs` and `companion_view.rs`)
+//! owns native geometry, input shape, focus transfers and lifetime; this
+//! module renders GPUI chrome only, reports the committed selector-panel
+//! rectangle for the X input region, and never invents a second navigation or
+//! media policy.
 //!
-//! Identity rules carried over from the QML views:
+//! Identity rules:
 //!
 //! - Row callbacks bind the opaque row key and the revisions *as rendered*; a
 //!   valid stale pair still reaches the runtime guard, which refuses it.
@@ -54,7 +52,7 @@ use super::{
     text_field::TextField,
 };
 
-/// Popup invoker keys (qml/Chrome.qml `popup` names, top region).
+/// Popup invoker keys for the top-region selectors.
 pub(super) const SOURCE_ID: &str = "source";
 /// Popup invoker key of the audio output selector.
 pub(super) const OUTPUT_ID: &str = "output";
@@ -63,15 +61,13 @@ pub(super) const SIZE_ID: &str = "size";
 /// Popup invoker key of the framerate selector.
 pub(super) const RATE_ID: &str = "rate";
 
-/// Catalog refresh cadence while a source/size/rate popup is open
-/// (qml/TopChromeContent.qml timer).
+/// Catalog refresh cadence while a source/size/rate popup is open.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-/// Ribbon cells wrap to two rows of three below this logical width
-/// (`TopChromeContent.compactRibbon`, measured on the ribbon extent, i.e. the
-/// client width minus the two window margins).
+/// Ribbon cells wrap to two rows of three below this logical width, measured
+/// on the ribbon extent (the client width minus the two window margins).
 const COMPACT_RIBBON_MAX: f32 = 660.;
-/// Selector surface width: content (`Brume.popupMaxWidth`) plus the popup
-/// padding, clamped to the ribbon extent by the caller.
+/// Selector surface width: the shared max content width plus both edge insets,
+/// clamped to the ribbon extent by the caller.
 const POPUP_TOTAL_WIDTH: f32 = brume::POPUP_MAX_WIDTH + 2. * brume::EDGE;
 
 /// Which selector surface a popup invoker names.
@@ -95,7 +91,7 @@ impl SelectorKind {
     }
 
     /// The surface named by a popup invoker, or `None` for any other popup
-    /// (the qualification gate Options surface, future menu/dialog popups).
+    /// (the Options surface, menu and dialog popups).
     pub(super) fn from_invoker(invoker: &'static str) -> Option<Self> {
         match invoker {
             SOURCE_ID => Some(Self::Source),
@@ -108,7 +104,7 @@ impl SelectorKind {
 }
 
 /// One entry of the companion's chrome Tab chain, with the scroll reveal that
-/// keeps keyboard focus visible (qml/BrumeScrollView `revealActiveFocus`).
+/// keeps keyboard focus visible.
 #[derive(Clone, Debug)]
 pub(super) struct FocusTarget {
     pub(super) handle: FocusHandle,
@@ -243,8 +239,8 @@ impl HostState {
     }
 }
 
-/// Dispatch one catalog refresh (qml/Chrome.qml `refreshCatalogs` guards only
-/// the closing state; the button adds its own busy gate).
+/// Dispatch one catalog refresh. Only the closing state is guarded here; the
+/// button adds its own busy gate.
 fn dispatch_refresh(state: &mut HostState) {
     let update = state.runtime.refresh_catalogs();
     state.consume(update);
@@ -685,7 +681,7 @@ fn valid_exact_rate(text: &str) -> bool {
 }
 
 /// The ribbon focus handle a selector popup returns focus to when it is
-/// dismissed (qml/TopChromeContent `invoker` restore).
+/// dismissed.
 pub(super) fn restore_handle(top: &TopChrome, invoker: &'static str) -> Option<FocusHandle> {
     let handle = match invoker {
         SOURCE_ID => &top.source,
@@ -698,8 +694,7 @@ pub(super) fn restore_handle(top: &TopChrome, invoker: &'static str) -> Option<F
 }
 
 /// The popup panel's own focus handle, used when a selector surface has no
-/// reachable control (qml/BrumePopup::focusBoundary falls back to the content
-/// item).
+/// reachable control and focus lands on the panel itself.
 pub(super) fn popup_root(top: &TopChrome) -> FocusHandle {
     top.popup_root.clone()
 }
@@ -724,7 +719,7 @@ pub(super) fn chrome_targets(top: &TopChrome, state: &HostState, cx: &App) -> Ve
 }
 
 fn ribbon_targets(top: &TopChrome, state: &HostState) -> Vec<FocusTarget> {
-    // Projection.ready gates every ribbon control.
+    // The projected snapshot gates every ribbon control.
     if state.view.snapshot.is_none() {
         return Vec::new();
     }
@@ -847,7 +842,7 @@ fn retain_rows(top: &TopChrome, keys: &[String]) {
 // ── Painting ────────────────────────────────────────────────────────────────
 
 /// Render the capture-mode top chrome: the Brume ribbon and, while a selector
-/// popup is open, its surface. The qualification gate keeps its own verified
+/// popup is open, its surface. Qualification mode keeps its own verified
 /// companion rendering; `enabled` is the companion's `accepts_chrome` fact.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint(
@@ -868,8 +863,8 @@ pub(super) fn paint(
         top.editor = None;
     }
     if !enabled {
-        // Mandatory decisions paint no top chrome, matching the QML tool
-        // visibility while a session dialog owns the window.
+        // Mandatory decisions paint no top chrome while a session dialog owns
+        // the window.
         return div();
     }
     let mut root = div().child(paint_ribbon(
@@ -906,8 +901,8 @@ fn paint_ribbon(
     let weak = cx.weak_entity();
     let state = host.borrow();
     let Some(snapshot) = state.view.snapshot.as_deref() else {
-        // No projection yet: the disabled ribbon still paints its cells
-        // (qml/TopChromeContent, `enabled: Projection.ready`).
+        // No projection yet: the ribbon is disabled but still paints its
+        // cells.
         let source = ribbon_cell(
             "ribbon-source",
             "camera",
@@ -1094,9 +1089,8 @@ fn ribbon_surface(
     rate: AnyElement,
     fullscreen: AnyElement,
 ) -> Div {
-    // Row-major like the QML GridLayout: five columns, or two rows of three
-    // cells when the ribbon extent is below the compact threshold; the sixth
-    // cell stays empty.
+    // Row-major grid: five columns, or two rows of three cells when the ribbon
+    // extent is below the compact threshold; the sixth cell stays empty.
     let row = |cells: Vec<AnyElement>| {
         div()
             .w_full()
@@ -1473,7 +1467,7 @@ fn paint_selector(
             retain_rows(top, &keys);
             // The producer already filters by the policy and runtime support;
             // a manual format keeps only that format's real ranges, and the
-            // empty note sees the filtered list like the QML view does.
+            // empty note sees the filtered list.
             let range_texts: Vec<String> = if size_mode {
                 filtered_ranges(&snapshot.catalog.size_ranges, snapshot)
                     .iter()

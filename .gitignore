@@ -1,13 +1,6 @@
 # Rust build output; keep Cargo.lock tracked for this application.
 /target/
 
-# Qt and QML generated files.
-.qmake.stash
-.qmlcache/
-.qmlls.ini
-moc_*
-qrc_*
-
 # Generated Python bytecode from media build and inventory tools.
 __pycache__/
 *.pyc

@@ -22,10 +22,10 @@ use url::Url;
 
 use super::HostView;
 
-/// Qt/QML search-path overrides injected by the bundled AppRun. They are
-/// removed from the launcher child only, so a system tool never resolves
-/// Furami's private Qt build. PATH, the session bus, display and XDG variables
-/// keep the inherited values.
+/// Launch-environment overrides a packaged launcher may inject: the dynamic
+/// library path and the Qt/QML search paths. They are removed from the opener
+/// child only, so a system tool never resolves Furami's private libraries.
+/// PATH, the session bus, display and XDG variables keep the inherited values.
 const SCRUBBED_ENV: [&str; 5] = [
     "LD_LIBRARY_PATH",
     "QT_PLUGIN_PATH",
