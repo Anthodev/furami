@@ -65,7 +65,7 @@ def verify_lock(lock):
         raise ValueError("Alpine image must be pinned by its linux/amd64 OCI manifest digest")
     if lock["sources"]["type2_runtime"]["version"] != COMMIT:
         raise ValueError("unexpected type2-runtime commit")
-    if len(lock.get("apk_packages", {})) != 138 or set(lock["apk_indexes"]) != {"main", "community"}:
+    if len(lock.get("apk_packages", {})) != 139 or set(lock["apk_indexes"]) != {"main", "community"}:
         raise ValueError("incomplete frozen APK closure")
     if not isinstance(lock.get("source_date_epoch"), int) or not SHA256.fullmatch(lock.get("base_apk_db_sha256", "")):
         raise ValueError("missing source epoch or base image APK database digest")

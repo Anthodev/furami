@@ -510,8 +510,9 @@ class StageIntegrityTests(unittest.TestCase):
                 linked = manifest["linked_source_closure"]
                 cache = Path(linked["local_cache_path"])
                 source_lock = json.loads((runtime / "relink/alpine-source.lock.json").read_text())
-                patch_input, = source_lock["linked_sources"]["zlib"]["aports_inputs"]
-                patch_path = cache / "zlib" / patch_input["file"]
+                patch_input = source_lock["linked_sources"]["musl"]["aports_inputs"][0]
+                patch_key = "musl/" + patch_input["file"]
+                patch_path = cache / patch_key
                 if mutation == "count":
                     linked["verified_input_count"] -= 1
                 elif mutation == "boolean-count":
@@ -521,7 +522,7 @@ class StageIntegrityTests(unittest.TestCase):
                 elif mutation == "extra-proof":
                     linked["verified_inputs"]["zlib/not-in-source-lock.patch"] = "0" * 64
                 elif mutation == "proof-hash":
-                    linked["verified_inputs"]["zlib/" + patch_input["file"]] = "0" * 64
+                    linked["verified_inputs"][patch_key] = "0" * 64
                 elif mutation == "recipe-proof":
                     linked["verified_apkbuilds"].pop("zlib/APKBUILD")
                 elif mutation == "missing-patch":
@@ -538,7 +539,7 @@ class StageIntegrityTests(unittest.TestCase):
                     patch_path.unlink()
                     patch_path.symlink_to(outside)
                 elif mutation == "old-binary":
-                    lock["apk_packages"]["zlib-static"]["version"] = "1.3.2-r0"
+                    lock["apk_packages"]["zlib-static"]["version"] = "0-r0"
                 elif mutation == "lock-pin":
                     lock["linked_source_closure"]["sha256"] = "0" * 64
                 if mutation == "none":

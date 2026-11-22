@@ -107,11 +107,10 @@ class RuntimeRecipeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "selected APK"):
                 build.selected_apks(lock, cache)
 
-    def test_zlib_source_and_patch_correspondence_fail_closed(self):
+    def test_linked_source_binary_identity_and_apkbuild_inputs_fail_closed(self):
         lock = json.loads((HERE / "runtime.lock.json").read_text())
         sources = json.loads((HERE / "alpine-source.lock.json").read_text())
-        zlib = sources["linked_sources"]["zlib"]
-        for key, changed in (("binary_sha256", "a" * 64), ("version", "1.3.2-r0"),
+        for key, changed in (("binary_sha256", "a" * 64), ("version", "0-r0"),
                              ("aports_commit", "0" * 40)):
             altered = json.loads(json.dumps(sources))
             altered["linked_sources"]["zlib"][key] = changed
@@ -124,20 +123,23 @@ class RuntimeRecipeTests(unittest.TestCase):
                 with patch.object(build, "SOURCE_LOCK_FILE", source_lock):
                     with self.assertRaisesRegex(ValueError, "zlib: Alpine source does not match"):
                         build.alpine_sources(changed_lock)
-        with tempfile.TemporaryDirectory() as temp:
-            recipe = Path(temp) / "APKBUILD"
-            items = [zlib["upstream_source"], *zlib["aports_inputs"]]
-            recipe.write_text('sha512sums="\n' + "".join(
-                f"{item['sha512']}  {item['file']}\n" for item in items) + '"\n')
-            self.assertEqual(build.verify_alpine_recipe("zlib", zlib, recipe), items)
-            altered = json.loads(json.dumps(zlib))
-            altered["aports_inputs"] = []
-            with self.assertRaisesRegex(ValueError, "aports input list changed"):
-                build.verify_alpine_recipe("zlib", altered, recipe)
-            altered = json.loads(json.dumps(zlib))
-            altered["aports_inputs"][0]["sha512"] = "f" * 128
-            with self.assertRaisesRegex(ValueError, "checksum differs"):
-                build.verify_alpine_recipe("zlib", altered, recipe)
+        for name in ("zlib", "musl"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                source = sources["linked_sources"][name]
+                recipe = Path(temp) / "APKBUILD"
+                items = [source["upstream_source"], *source["aports_inputs"]]
+                recipe.write_text('sha512sums="\n' + "".join(
+                    f"{item['sha512']}  {item['file']}\n" for item in items) + '"\n')
+                self.assertEqual(build.verify_alpine_recipe(name, source, recipe), items)
+                if name == "musl":
+                    altered = json.loads(json.dumps(source))
+                    altered["aports_inputs"].pop()
+                    with self.assertRaisesRegex(ValueError, "aports input list changed"):
+                        build.verify_alpine_recipe(name, altered, recipe)
+                    altered = json.loads(json.dumps(source))
+                    altered["aports_inputs"][0]["sha512"] = "f" * 128
+                    with self.assertRaisesRegex(ValueError, "checksum differs"):
+                        build.verify_alpine_recipe(name, altered, recipe)
 
     def test_missing_private_bootstrap_never_counts_as_complete(self):
         lock = json.loads((HERE / "runtime.lock.json").read_text())

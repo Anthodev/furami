@@ -9,6 +9,10 @@
 - Make GPUI on X11/XWayland the only Linux frontend and remove Qt/QML from the application and the AppImage ([#57](https://github.com/Anthodev/furami/pull/57)). The earlier GPUI previews ([#55](https://github.com/Anthodev/furami/pull/55), [#56](https://github.com/Anthodev/furami/pull/56)) are now superseded.
 - **Breaking:** Remove `--gpui` from launch scripts and shortcuts; Furami always starts with GPUI and no longer accepts the flag. Existing capture profiles need no conversion.
 
+### Fixes
+
+- Restore AppImage runtime builds after the Alpine 3.21 package indexes moved. Refresh the signed indexes, affected APK pins and matching musl and zlib sources without weakening signature or checksum verification.
+
 Full changelog: [v1.1.0...v2.0.0](https://github.com/Anthodev/furami/compare/v1.1.0...v2.0.0)
 
 ## [1.1.0] - 2026-10-19
