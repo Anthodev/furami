@@ -581,9 +581,6 @@ fn disabled_callbacks_skip_sequences_buffers_json_and_all_oversize_loss_accounti
     handle.event(EventLevel::Info, "apply_runtime", &fields);
     native_event(&handle, "qt_geometry", 1, &native_oversize);
     native_event(&handle, "qt_geometry", 1, "{invalid JSON");
-    for severity in 0..=5 {
-        qt_message(&handle, severity);
-    }
     tracing::dispatcher::with_default(&handle.test_dispatch(), overflow_event);
     assert_eq!(handle.health(), before);
     assert_eq!(handle.shared.sequence.load(Ordering::Relaxed), 0);

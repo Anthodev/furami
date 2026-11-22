@@ -1,9 +1,9 @@
 //! Shared Brume controls for the GPUI frontend.
 //!
-//! Scoped to what the native-composition gate actually renders: a title
-//! label and one text/icon button primitive shared by Pause/Resume, Options
-//! and the qualification close action. Rows, choices, toggles, sliders, scroll
-//! views, fields and popups arrive with the real views that consume them.
+//! Scoped to a title label and one text/icon button primitive shared by
+//! Pause/Resume, Options and the qualification close action. Rows, choices,
+//! toggles, sliders, scroll views, fields and popups arrive with the real views
+//! that consume them.
 //!
 //! Every control is layout-neutral: it sizes itself from the Brume tokens and
 //! the caller may further position it (`.absolute().left(...)`, `.w(...)`) on
@@ -26,7 +26,7 @@ use gpui::{
 
 use super::brume;
 
-/// Human FPS label for the exact projected `N` or `N/D` (QML `rateFps`).
+/// Human FPS label for the exact projected `N` or `N/D`.
 /// This approximation is presentation-only; intents use the original text.
 pub(super) fn rate_fps(exact: &str) -> String {
     let (numerator, denominator) = exact.split_once('/').unwrap_or((exact, "1"));
@@ -40,7 +40,7 @@ pub(super) fn rate_fps(exact: &str) -> String {
     let (Some(numerator), Some(denominator)) = (parse(numerator), parse(denominator)) else {
         return exact.to_owned();
     };
-    // Match the QML safe integer bound before converting to float.
+    // Bound both components to the largest exactly representable integer.
     const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
     if denominator == 0 || numerator > MAX_SAFE_INTEGER || denominator > MAX_SAFE_INTEGER {
         return exact.to_owned();
@@ -64,20 +64,21 @@ pub(super) enum Activation {
     Accessibility,
 }
 
-/// The runtime dispatch a control performs. It must contain the same guard the
-/// QML action uses; controls never touch host state themselves.
+/// The runtime dispatch a control performs. The closure owns the runtime guard
+/// for its action; controls never touch host state themselves.
 pub(super) type Activate = Rc<dyn Fn(Activation, &mut Window, &mut App)>;
 
-/// Stable identity of the gate Pause/Resume (or Open) control.
+/// Stable identity of the Pause/Resume (or Open) control.
 pub(super) const PAUSE_RESUME_ID: &str = "gate-pause-resume";
-/// Stable identity of the gate Options control.
+/// Stable identity of the Options control.
 pub(super) const OPTIONS_ID: &str = "gate-options";
 
 /// Frame-scoped collection of rendered hit rectangles, in logical window
 /// pixels.
 ///
-/// The host creates a fresh collector for each render, passes it to the gate
-/// controls, and reads [`HitRegions::rects`] once that frame is prepainted.
+/// The host creates a fresh collector for each render, passes it to the
+/// rendered controls, and reads [`HitRegions::rects`] once that frame is
+/// prepainted.
 /// Only enabled controls record; a disabled control is not an input hole, so
 /// presses over it reach whatever is underneath (the video child or the
 /// companion's empty input region).
@@ -110,7 +111,7 @@ impl HitRegions {
 }
 
 /// Brume label variants. Body, secondary, note and error arrive with the
-/// views that consume them; the gate opens with the dialog title.
+/// views that consume them; only the title variant is rendered so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LabelVariant {
     Title,

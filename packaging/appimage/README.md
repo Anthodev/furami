@@ -1,6 +1,6 @@
 # Furami AppImage recipe
 
-Builds the current x86_64 Furami application against the frozen Ubuntu 24.04 media and Qt providers. The host needs Python 3.11+, rootless Podman, binutils `readelf`, HTTPS access and free space for the locked inputs and build outputs. No host Qt, mpv or FFmpeg is used to compile the application.
+Builds the x86_64 Furami AppImage with the GPUI/X11 frontend against the frozen Ubuntu 24.04 media provider. The host needs Python 3.11+, rootless Podman, binutils `readelf`, HTTPS access and free space for the locked inputs and build outputs. No host Qt, mpv or FFmpeg is used to compile the application.
 
 ## Source-only reassembly of retained cold builds
 
@@ -13,7 +13,7 @@ The parent has independent `first/` and `second/` cold outputs. This route invok
 
 Recipient materials contain two explicitly derived `media-evidence/*.loader-resolution.txt` reports instead of the two raw media `ldd` transcripts. Only recognized terminal glibc process addresses are removed; dependency paths, names and ordering remain. Raw transcripts stay in the original local providers. Raw-to-derived hashes and assembler identity are retained in local `source-assets-local-assembly.json`, outside release assets.
 
-The exact eight qtbase Git metadata files omitted from the official archive are supplied separately under `qt-inputs/qtbase-git-metadata/`, with original relative paths, pinned commit and SHA1/SHA256 checks. Root and tinycbor REUSE annotations, BSD and MIT notices accompany them. The official archive is unchanged; overlay this subtree onto its extracted qtbase root. Offline verification checks actual archive/SPDX/supplement bytes, not only a success receipt.
+Where a selected crate omits its notice text, `sources.lock.json` binds the reviewed supplement to the exact crate checksum and records its provenance. Staging and independent audit verify the same notice bytes, and the public source archive includes the locked supplements. A Debian copyright record is distribution evidence, not a recovered upstream notice.
 
 ## Build one image
 
@@ -41,17 +41,9 @@ Media input is a build root containing `manifest.json`, `prefix/` and the locked
 
 `--acquire-sources` explicitly requests missing checked source/relink inputs. Omit it for the local smoke image: unavailable large source inputs are recorded, not silently downloaded. Cold CI release builds use it. `--compliance-cache` controls the corresponding-source cache; `--source-cache` controls pinned Rust/Cargo crate inputs. Download cache entries are rechecked before reuse.
 
-Compilation uses a fresh allowlist-only writable copy of the immutable snapshot at `app/first/workspace/`, mounted as `/workspace`; the host checkout is not mounted into the application build. Ignored developer artifacts are never imported. CXX-Qt generates its genuine `.qmlls.ini` only in that private workspace, and all recorded source bytes are checked again after successful compilation before the executable is accepted. The snapshot remains separate from generated build output.
+Compilation mounts an allowlist-only copy of the immutable application snapshot at `/workspace` read-only and writes generated artifacts separately under `/build`. The host checkout is not mounted and ignored developer artifacts are never imported.
 
-Each fresh application build writes `app/build-inputs.json` and `app/source-snapshot/` before compilation. They bind current source files, build recipes, locked source archives and media receipt. Sources, snapshot hashes and frozen media bytes are rechecked after compilation. `app/first/evidence/container-command.json` records the exact build invocation as `{"schema": 1, "command": [...]}`; Qt tool hashes and RCC calls have separate receipts. CI diagnostic evidence collects only allowlisted JSON objects and the application container's `app/first/build.log`, including failed builds. Logs retain at most the last 8 MiB; `executed-inputs.json` records original/stored sizes, omitted byte count and both SHA256 hashes. Container failures also print a bounded tail (120 lines / 16 KiB) to stderr without changing the failure result. Media/runtime logs, binaries and private bootstrap caches are not collected.
-
-## Frozen qmake and reproducible RCC
-
-`QMAKE` is the actual `/out/prefix/bin/qmake6`, not a wrapper. Furami's existing `build.rs` guard verifies its canonical identity against the frozen prefix. The earlier qmake wrapper changed that identity and correctly failed the guard.
-
-Locked `qt-build-utils` 0.10.0 clears the environment for both RCC compilation and listing, without forwarding `QT_RCC_SOURCE_DATE_OVERRIDE` or `SOURCE_DATE_EPOCH`. Its qmake-backed discovery exposes no RCC path override. See [the pinned RCC implementation](https://github.com/KDAB/cxx-qt/blob/v0.10.0/crates/qt-build-utils/src/tool/rcc.rs). Normalizing only source mtimes would not cover build-generated resources.
-
-The recipe uses one read-only container file bind over the RCC discovery path. `rcc-wrapper.sh` embeds the locked epoch, logs the exact arguments, then executes the unchanged original RCC through a second read-only provider mount. Original RCC retains its relative library layout and `$ORIGIN/../lib` RUNPATH. The host prefix, qmake queries, vendored crates and runtime library bytes remain unchanged. [Qt 6.11.2 RCC](https://github.com/qt/qtbase/blob/v6.11.2/src/tools/rcc/rcc.cpp) supports both epoch variables for resource timestamps. `first/evidence/qt-build-tools.json` records qmake, original RCC and wrapper hashes; `rcc-commands.txt` records actual calls.
+Each fresh application build writes `app/build-inputs.json` and `app/source-snapshot/` before compilation. They bind source files, recipes, locked Cargo archives and the media receipt, which are rechecked after compilation. `app/first/evidence/container-command.json` records the build invocation. Diagnostic uploads retain allowlisted JSON and a bounded application build log; they exclude provider binaries and private bootstrap caches.
 
 ## Output and publication boundary
 
@@ -59,8 +51,8 @@ The recipe uses one read-only container file bind over the RCC discovery path. `
 
 - `Furami-v<version>-Linux-x64.AppImage` and `SHA256SUMS`.
 - `manifest.json`, binding the final image hash, independently extracted file/mode/symlink manifest, owners and outer runtime.
-- `audit.json`, recording ELF dependencies, interpreter and GLIBC/GLIBCXX/CXXABI requirements, known `dlopen` roots, QML scanner closure and static contributor evidence.
-- `components.json` and `NOTICE.txt`, retaining original Cargo, Ubuntu, Qt and runtime license provenance. Every actual file has a component mapping; unresolved applicable terms are not replaced with guessed licenses.
+- `audit.json`, recording ELF dependencies, interpreter and GLIBC/GLIBCXX/CXXABI requirements, known `dlopen` roots and static contributor evidence.
+- `components.json` and `NOTICE.txt`, retaining original Cargo, Ubuntu and runtime license provenance. Every actual file has a component mapping; unresolved applicable terms are not replaced with guessed licenses.
 - `sources-index.json`, available checked source/material files, missing required inputs and optional unavailable sources.
 - Independently extractable `source-materials-###.tar` files, containing only real available bytes. These are not described as complete Corresponding Source when the index says otherwise.
 - `RELINKING.md` and `release-ready.json`.
@@ -69,16 +61,15 @@ This is the complete internal candidate. Publication uploads only the AppImage, 
 
 `release-ready.json.ready=false` means **not publishable**, even if the image runs and the technical audit passes. Its reasons name missing required source/relink inputs or unresolved actual component terms. A successful local artifact build is not release clearance or multi-distribution GUI qualification. Permissive-only source absence is reported separately; original required notices are retained. The combined distribution uses a GPL-compatible route, while Furami-authored source remains MIT.
 
-Two license determinations apply to the candidate chain and are recorded as data, not as guessed licenses:
+The Ubuntu terms lock records license determinations as data, not as guessed licenses:
 
 - Every pinned Ubuntu package of the application closure, permissive ones included, is covered by `ubuntu-terms.lock.json` and requires its corresponding source. The lock pins each binary/source identity, notice SHA-256, retained license expression and exception, and the shipped objects attributed to it; a missing entry, a changed notice hash or an unexplained object is a refusal, never a fallback to a text heuristic.
-- Built-in QML generated metadata inherits the terms of its backing module. The file's own `license_expression` stays `null`; `selected_terms` records `LGPL-3.0-only` only when the module/backing target and URI, its SBOM and the recorded `qmldir`, generated-file and CMake-export hashes all agree, under the documented `qt-qml-metadata-inherits-module-terms` rule. This is Furami's user-authorized reading of the module's declared terms — it is not a per-file Qt attestation, and a missing module term, backend or hash leaves the file unresolved instead.
 
 ### Public material scope
 
-The complete candidate's material set carries corresponding sources, not build tooling binaries. It holds the Furami application tree (Rust, C++, headers, QML, packaging recipes and Cargo inputs), the frozen media and verified Qt sources, the runtime/FUSE sources and patch, the full linked Alpine source closure (each pinned `APKBUILD` with its upstream and patch inputs), the recipes/locks, the original notices and the provenance receipts.
+The complete candidate's material set carries corresponding sources, not build tooling binaries. It holds the application source and locked Cargo inputs, frozen media sources, runtime/FUSE sources and patch, the linked Alpine source closure (each pinned `APKBUILD` with its upstream and patch inputs), recipes, locks, original notices and provenance receipts.
 
-Those corresponding sources are not uploaded as release downloads. A release uploads four files — the AppImage, `manifest.json`, `Furami-v<version>-Linux-x64-materials.tar` and `SHA256SUMS` — and the materials archive deliberately omits the `source-materials-*.tar` archives that hold the material set above. It retains byte-for-byte the candidate's internal `SHA256SUMS`, `sources-index.json`, `release-ready.json`, `audit.json`, `components.json`, `NOTICE.txt` and `RELINKING.md`, plus `reproducibility.json` whenever the candidate carries one — the original notices, licenses, audit and provenance receipts, not the dependency sources they index. A tag build is a single frozen-recipe build, so a released candidate normally carries no comparison receipt and none is invented for it. The archived internal `SHA256SUMS` and `sources-index.json` therefore name files the downloads do not supply, and the retained receipts were produced for the complete candidate: they do not certify that the reduced public distribution satisfies every applicable source or relinking obligation, nor do GitHub's automatic `Source code` archives (which snapshot the tagged repository only, without the fetched Qt/media/runtime dependencies) replace them.
+Those corresponding sources are not uploaded as release downloads. A release uploads four files — the AppImage, `manifest.json`, `Furami-v<version>-Linux-x64-materials.tar` and `SHA256SUMS` — and the materials archive deliberately omits the `source-materials-*.tar` archives that hold the material set above. It retains byte-for-byte the candidate's internal `SHA256SUMS`, `sources-index.json`, `release-ready.json`, `audit.json`, `components.json`, `NOTICE.txt` and `RELINKING.md`, plus `reproducibility.json` whenever the candidate carries one — the original notices, licenses, audit and provenance receipts, not the dependency sources they index. A tag build is a single frozen-recipe build, so a released candidate normally carries no comparison receipt and none is invented for it. The archived internal `SHA256SUMS` and `sources-index.json` therefore name files the downloads do not supply, and the retained receipts were produced for the complete candidate: they do not certify that the reduced public distribution satisfies every applicable source or relinking obligation. GitHub's automatic `Source code` archives snapshot the tagged repository only; they do not include the fetched Cargo, media or runtime inputs.
 
 Alpine **binary** bootstrap packages and base-image material are deliberately excluded: they are not publicly distributed, they stay in a private authenticated cache outside the candidate and CI upload roots, and they are not recorded as license-cleared. The public assets therefore are **not** a complete offline bootstrap of the AppImage runtime — a recipient needs those pinned binary inputs to rebuild the runtime. The candidate records this policy as data in its sources index (`material_policy` with `alpine_bootstrap: "private"` and `public_offline_bootstrap_complete: false`) and lists exactly which checked files are supplied; signed index metadata stays separate and never substitutes for binary or source coverage, and an absent actual corresponding source in the **complete internal candidate** still blocks readiness rather than being replaced by a private-cache reference. The deliberate omission of those materials from the public downloads does not by itself block readiness, because the guard evaluates that complete internal candidate: it does not certify the four public downloads as a complete Corresponding Source offer.
 
@@ -97,9 +88,9 @@ If the original audit failed before delivery, the image remains under `OUTPUT/st
 
 ## Runtime layout
 
-`AppRun` preserves the working directory and argument vector. It sets `FURAMI_MEDIA_PREFIX` to its own `usr/`, replaces inherited `LD_LIBRARY_PATH` and Qt/QML lookup paths, selects bundled Basic Controls and xcb, and clears Qt theme/style/plugin injection variables. User session, configuration, audio and deliberate loader/Vulkan diagnostic variables remain intact. This is path isolation, not a security sandbox.
+`AppRun` preserves the working directory and arguments. It sets `FURAMI_MEDIA_PREFIX` to its own `usr/` and replaces `LD_LIBRARY_PATH` with `usr/lib` inside the image. Display, user configuration, audio and Vulkan environment are passed through. This is path isolation, not a security sandbox.
 
-Qt, QML, libmpv and other application libraries are bundled. X11/XCB/xkbcommon libraries come from the pinned application closure. An exact allowlist keeps glibc/loader and host Vulkan/GL/EGL/DRM/GBM providers outside the image; GPU drivers and ICD manifests are never bundled. See [portability prerequisites](PORTABILITY.md).
+The image bundles GPUI/X11, libmpv and the pinned application libraries, including its X11/XCB/xkbcommon dependencies. It contains no Qt or QML. An exact allowlist keeps glibc/loader and host Vulkan/GL/EGL/DRM/GBM providers outside the image; GPU drivers and ICD manifests are never bundled. See [portability prerequisites](PORTABILITY.md).
 
 The media provider's own `mpv` program is staged at `usr/bin/mpv` from the same frozen prefix manifest as its shared libraries, and enters the same recursive ELF closure/RPATH relocation and audit as every other shipped object. That is the program the renderer qualification runs through `FURAMI_MEDIA_PREFIX`; no other provider program (`bin/ffmpeg`, `bin/ffprobe`) is shipped.
 

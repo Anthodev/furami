@@ -5,30 +5,86 @@ import re
 import hashlib
 
 
-def registry(providers, owners, qt, static, digest):
+UBUNTU_TERMS = Path(__file__).with_name('ubuntu-terms.lock.json')
+
+
+def verify_ubuntu_terms(ubuntu, owners, elf_paths, source_only_labels):
+    terms_bytes = UBUNTU_TERMS.read_bytes()
+    terms = json.loads(terms_bytes)
+    receipt_identities = {f'{row["binary_package"]}@{row["binary_version"]}' for row in ubuntu['packages']}
+    if (receipt_identities != set(terms['packages']) or len(receipt_identities) != len(ubuntu['packages']) or
+            ubuntu.get('terms_lock_sha256') != hashlib.sha256(terms_bytes).hexdigest()):
+        raise ValueError('Ubuntu component terms lock/set mismatch')
+
+    expected = {}
+    for row in ubuntu['packages']:
+        package, version = row['binary_package'], row['binary_version']
+        pinned = terms['packages'][f'{package}@{version}']
+        refs = re.findall(r'LicenseRef-[A-Za-z0-9.-]+', pinned['license_expression'])
+        pinned_texts = {**terms['custom_license_texts'], **pinned.get('custom_license_texts', {})}
+        if row.get('custom_license_texts') != {name: pinned_texts[name] for name in refs}:
+            raise ValueError('Ubuntu component custom license texts changed')
+        if (row['source_package'] != pinned['source_package']['name'] or
+                row['source_version'] != pinned['source_package']['version'] or
+                any(row.get(key) != pinned[key] for key in
+                    ('notice', 'license_expression', 'license_exception', 'source_required', 'shipped_objects')) or
+                row.get('terms_selection_resolved') is not True):
+            raise ValueError(f'Ubuntu component pinned terms correspondence mismatch: {package}={version}')
+        expected[f'ubuntu:{package}={version}'] = set(pinned['shipped_objects'])
+
+    # Only inspected regular ELFs count as shipped objects, not notice files or aliases.
+    observed = {label: set() for label in source_only_labels}
+    for path in elf_paths:
+        owner = owners[path]
+        label = owner['owner']
+        if label.startswith('ubuntu:'):
+            if (('package' in owner or 'version' in owner) and
+                    label != f'ubuntu:{owner.get("package")}={owner.get("version")}'):
+                raise ValueError(f'Ubuntu owner package/version evidence disagrees with label: {path}: {label}')
+            observed.setdefault(label, set()).add(path)
+    if observed.keys() != expected.keys():
+        raise ValueError(f'Ubuntu component observed identity set mismatch: '
+                         f'missing={sorted(expected.keys() - observed.keys())}, '
+                         f'unexpected={sorted(observed.keys() - expected.keys())}')
+    for label, paths in expected.items():
+        actual = observed[label]
+        if actual != paths:
+            raise ValueError(f'Ubuntu component ELF paths mismatch for {label}: '
+                             f'missing={sorted(paths - actual)}, unexpected={sorted(actual - paths)}')
+    return observed
+
+
+def verify_ubuntu_notices(ubuntu, owners, observed, payload_root, digest):
+    """Require the packaged copyright bytes for every package that ships an ELF."""
+    for row in ubuntu['packages']:
+        label = f'ubuntu:{row["binary_package"]}={row["binary_version"]}'
+        if not observed.get(label):
+            continue
+        relative = f'usr/share/doc/ubuntu/{row["binary_package"]}/copyright'
+        owner = owners.get(relative)
+        if owner is None:
+            raise ValueError(f'Ubuntu component extracted copyright has no owner: {relative}')
+        if owner.get('owner') != label:
+            raise ValueError(f'Ubuntu component extracted copyright owner mismatch: {relative}: {owner.get("owner")}')
+        if owner.get('shipped_sha256') != row['notice']['sha256']:
+            raise ValueError(f'Ubuntu component extracted copyright bytes differ: {relative}')
+        path = payload_root / relative
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f'Ubuntu component extracted copyright is not a regular file: {relative}')
+        if digest(path) != row['notice']['sha256']:
+            raise ValueError(f'Ubuntu component extracted copyright bytes differ: {relative}')
+
+
+def registry(providers, owners, static, digest, *, payload_root, elf_paths):
     components = {}
     app = json.loads((providers['app'] / 'manifest.json').read_text())
     runtime = json.loads((providers['runtime'] / 'manifest.json').read_text())
     ubuntu = json.loads((providers['stage'] / 'ubuntu-sources.json').read_text())
-    if ubuntu['packages']:
-        terms_path = Path(__file__).with_name('ubuntu-terms.lock.json')
-        terms = json.loads(terms_path.read_text())
-        actual_identities = {row['binary_package'] + '@' + row['binary_version'] for row in ubuntu['packages']}
-        if (actual_identities != set(terms['packages']) or len(actual_identities) != len(ubuntu['packages']) or
-                ubuntu.get('terms_lock_sha256') != hashlib.sha256(terms_path.read_bytes()).hexdigest()):
-            raise ValueError('Ubuntu component terms lock/set mismatch')
-        for row in ubuntu['packages']:
-            pinned = terms['packages'][row['binary_package'] + '@' + row['binary_version']]
-            refs = re.findall(r'LicenseRef-[A-Za-z0-9.-]+', pinned['license_expression'])
-            pinned_texts = {**terms['custom_license_texts'], **pinned.get('custom_license_texts', {})}
-            if row.get('custom_license_texts') != {name: pinned_texts[name] for name in refs}:
-                raise ValueError('Ubuntu component custom license texts changed')
-            if (row['source_package'] != pinned['source_package']['name'] or
-                    row['source_version'] != pinned['source_package']['version'] or
-                    any(row.get(key) != pinned[key] for key in
-                        ('notice', 'license_expression', 'license_exception', 'source_required', 'shipped_objects')) or
-                    row.get('terms_selection_resolved') is not True):
-                raise ValueError('Ubuntu component pinned terms correspondence mismatch')
+    static_labels = [f'ubuntu:{item["package"]}={item["version"]}' for item in static['components']]
+    crt_labels = [f'ubuntu:{package["name"]}={package["version"]}'
+                  for package in (item['binary_package'] for item in app['binary']['direct_objects'])]
+    observed = verify_ubuntu_terms(ubuntu, owners, elf_paths, static_labels + crt_labels)
+    verify_ubuntu_notices(ubuntu, owners, observed, payload_root, digest)
     package_components = {}
     external_notices = []
 
@@ -41,6 +97,9 @@ def registry(providers, owners, qt, static, digest):
     authored = add('furami', 'MIT', 'usr/share/licenses/furami/LICENSE',
                    source_refs=['furami/source-snapshot'], role='authored-source')
     app_components = [authored]
+    if 'usr/share/licenses/tabler/LICENSE-tabler.txt' in owners:
+        app_components.append(add('tabler-icons', 'MIT', 'usr/share/licenses/tabler/LICENSE-tabler.txt',
+                                  source_refs=['furami/assets/icons'], role='embedded-icons'))
     for crate in app['crates']:
         if crate['name'] == 'furami' or crate['role'] == 'not-selected':
             continue
@@ -72,7 +131,7 @@ def registry(providers, owners, qt, static, digest):
                          version=record['source_version'])
         components[identifier]['license_exception'] = record.get('license_exception')
         components[identifier]['terms_selection_resolved'] = record['terms_selection_resolved']
-        package_components[record['binary_package']] = identifier
+        package_components[f'ubuntu:{record["binary_package"]}={record["binary_version"]}'] = identifier
         external_notices.append(notice)
     runtime_components = []
     for item in runtime['components']:
@@ -81,35 +140,32 @@ def registry(providers, owners, qt, static, digest):
                                        'linked_archives': runtime['linked_archives'], 'linked_objects': runtime['linked_objects']},
                                       source_refs=[{'url': item['source_url'], 'sha256': item['source_sha256']}],
                                       role='outer-runtime-static'))
-    static_components = [package_components[item['package']] for item in static['components']]
+    static_components = [package_components[label] for label in static_labels]
     mapped_owners = {}
     for path, owner in owners.items():
         label = owner['owner']
-        if owner.get('components'):
+        if label.startswith('ubuntu:'):
+            if label not in package_components:
+                raise ValueError(f'Ubuntu owner missing source/notice identity: {path}: {label}')
+            identifiers = [package_components[label]]
+        elif owner.get('components'):
             identifiers = []
             for item in owner['components']:
-                base = item['component_id']
-                identifier = base + '@' + owner['source'] if base.startswith('qt:') else base
-                identifier = add(identifier, item.get('license_expression'), item['evidence'],
-                                 file_spdx_id=item.get('file_spdx_id'), source_component_id=base,
-                                 role=item.get('role', 'runtime-file'))
-                if item.get('terms_rule'):
-                    components[identifier].update({key: item[key] for key in
-                                                   ('terms_rule', 'terms_basis', 'module_license_expression')})
+                identifier = add(item['component_id'], item['license_expression'], item['evidence'],
+                                 role='runtime-file')
                 identifiers.append(identifier)
             if 'libplacebo' in identifiers:
                 identifiers += static_components
         elif label == 'app':
             identifiers = app_components
-        elif label.startswith('ubuntu:'):
-            package = label.split(':', 1)[1].split('=', 1)[0]
-            if package not in package_components:
-                raise ValueError(f'Ubuntu owner missing source/notice identity: {label}')
-            identifiers = [package_components[package]]
         elif label == 'source-built-runtime':
             identifiers = runtime_components
-        elif label.startswith(('app-crate-source', 'KDAB-cxx-qt')):
-            identifiers = app_components
+        elif label == 'app-crate-source':
+            crate = owner['crate']
+            identifier = f'cargo:{crate["name"]}@{crate["version"]}'
+            if identifier not in app_components:
+                raise ValueError(f'crate notice owner missing from active graph: {path}: {identifier}')
+            identifiers = [identifier]
         elif label.startswith('rust-std'):
             identifiers = [identifier for identifier in app_components if identifier.startswith('rust-std:')]
         elif label == 'checked-source-notice':
@@ -121,10 +177,8 @@ def registry(providers, owners, qt, static, digest):
             if name != 'ffmpeg':
                 raise ValueError('unknown patched source component: ' + name)
             identifiers = [add(name, 'GPL-2.0-or-later', owner['source'])]
-        elif label == 'checked-ICU-notice':
-            item = next(item for other in owners.values() for item in other.get('components', [])
-                        if item['component_id'] == 'icu:73.2')
-            identifiers = [add('icu:73.2', item['license_expression'], item['evidence'])]
+        elif label == 'tabler-notice':
+            identifiers = ['tabler-icons']
         elif label in ('qualification-template', 'qualification-generated'):
             identifiers = [authored]
         elif label == 'ubuntu-license-text':
@@ -137,48 +191,10 @@ def registry(providers, owners, qt, static, digest):
             raise ValueError(f'empty actual component mapping: {path}')
     for path, mapped in mapped_owners.items():
         owners[path]['components'] = mapped
-    # Follow runtime module DEPENDS_ON only. Root CONTAINS would include unshipped
-    # build tools and styles, falsely broadening distribution obligations.
-    for document in qt:
-        packages = {item['SPDXID']: item for item in document['packages']}
-        texts = {item['licenseId']: item.get('extractedText') for item in document['extracted_license_texts']}
-        selected_sources = {owner['source'] for path, owner in owners.items()
-                            if owner['owner'] == 'media' and not path.startswith('usr/share/')}
-        original = json.loads((providers['media'] / document['path']).read_text())
-        selected_files = {file['SPDXID'] for file in original['files']
-                          if file['fileName'].removeprefix('./') in selected_sources}
-        queue = [row['spdxElementId'] for row in document['relationships']
-                 if row['relationshipType'] == 'CONTAINS' and row['relatedSpdxElement'] in selected_files]
-        visited = set()
-        incorporated = []
-        while queue:
-            identifier = queue.pop()
-            if identifier in visited:
-                continue
-            visited.add(identifier)
-            package = packages.get(identifier)
-            if package and '-qt-3rdparty-' in identifier and '-system-' not in identifier:
-                incorporated.append(add('qt-static:' + identifier, package.get('licenseConcluded'),
-                                        {'SPDX_document': document['path'], 'package': package,
-                                         'custom_license_texts': texts}, role='Qt-incorporated-source',
-                                        source_refs=[package.get('downloadLocation')]))
-            queue.extend(row['relatedSpdxElement'] for row in document['relationships']
-                         if row['spdxElementId'] == identifier and row['relationshipType'] == 'DEPENDS_ON')
-        module = 'qt:' + document['path'].split('/')[-1].split('-6.11.2')[0]
-        for path, owner in owners.items():
-            if owner['owner'] == 'media' and not path.startswith('usr/share/') and any(
-                    item.get('source_component_id') == module for item in owner['components']):
-                owner['components'].extend(components[identifier] for identifier in incorporated)
     for identifier, record in components.items():
         expression = record['license_expression']
-        legal_material = record['role'] in ('verbatim-license-notice', 'vendor-license-evidence') if 'role' in record else False
-        # Published Qt public module alternatives permit LGPLv3 selection without
-        # selecting Qt Commercial or GPLv2-only. No custom terms are invented.
-        selected = 'LGPL-3.0-only' if isinstance(expression, str) and 'LGPL-3.0-only' in expression.split(' OR ') else expression
-        if record.get('terms_rule') == 'qt-qml-metadata-inherits-module-terms':
-            module_expression = record.get('module_license_expression')
-            selected = ('LGPL-3.0-only' if isinstance(module_expression, str) and
-                        'LGPL-3.0-only' in module_expression.split(' OR ') else None)
+        legal_material = record.get('role') == 'verbatim-license-notice'
+        selected = expression
         custom = re.findall(r'LicenseRef-[A-Za-z0-9.-]+', selected or '') if isinstance(selected, str) else []
         evidence = record['license_evidence']
         available_custom = evidence.get('custom_license_texts', {}) if isinstance(evidence, dict) else {}

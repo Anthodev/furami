@@ -1,9 +1,3 @@
-#[cfg(not(any(cxxqt_qt_version_at_least_6_8, cxxqt_qt_version_at_least_7)))]
-compile_error!("Furami requires Qt 6.8 or newer");
-
-// Keep the library's generated QML registration linked into the executable.
-extern crate furami as _;
-
 mod profiles;
 use furami::diagnostics::report::{ReportSnapshot, StartupFailure, StartupTuple};
 use furami::diagnostics::{DiagnosticsConfig, DiagnosticsHandle, DiagnosticsRuntime};
@@ -36,8 +30,6 @@ enum StartupError {
     #[error("FURAMI_MEDIA_PREFIX must be an absolute existing directory")]
     InvalidMediaPrefix,
     #[error(transparent)]
-    NativeLaunch(#[from] furami::native_host::NativeLaunchError),
-    #[error(transparent)]
     CaptureArguments(#[from] CaptureArgumentError),
     #[error("capture startup discovery failed")]
     CaptureDiscovery {
@@ -64,20 +56,13 @@ enum StartupError {
         source: Box<StartupError>,
     },
     #[error(
-        "qualification_arguments: qualification video cannot be combined with capture arguments"
+        "qualification_arguments: --qualification-stdin requires --qualification-video, which cannot be combined with capture or inventory arguments"
     )]
     QualificationArguments,
     #[error(transparent)]
     QualificationVideo(#[from] furami::media::qualification::QualificationVideoError),
     #[error("qualification_renderer: default renderer could not be compiled")]
     QualificationRenderer,
-    #[error(
-        "gpui_arguments: --gpui cannot be repeated or combined with --qualification-stdin or --list-audio-sources"
-    )]
-    GpuiArguments,
-    #[error("gpui_unavailable: this build does not include the GPUI host")]
-    GpuiUnavailable,
-    #[cfg(all(target_os = "linux", feature = "gpui-host"))]
     #[error(transparent)]
     Gpui(#[from] furami::native_host::GpuiLaunchError),
 }
@@ -86,7 +71,7 @@ enum StartupError {
 /// property `PULSE_PROP_node.dont-fallback=true`, otherwise libpulse routes a
 /// captured stream to the default source when the requested source disappears.
 /// The property must already be present in the process environment *before*
-/// any logging, Qt, libpulse or worker setup, so the very first action re-execs
+/// any logging, frontend, libpulse or worker setup, so the first action re-execs
 /// this exact executable with the same arguments plus the variable set. The
 /// replacement is `exec`, not a child process: there is no supervisor and no
 /// shell. Only the exact value `true` short-circuits; any other value is
@@ -156,9 +141,6 @@ fn main() -> ExitCode {
         let code = failure.code;
         let stage = failure.stage;
         eprintln!("furami: startup failed ({code} at {stage})");
-        if let Some(detail) = error.plugin_detail() {
-            eprintln!("furami: {detail}");
-        }
         if let Some(mut report) = initial_report(&handle) {
             report.session.phase = "StartupFailed".into();
             report.session.startup_failure = Some(failure);
@@ -166,7 +148,7 @@ fn main() -> ExitCode {
         }
         tracing::error!(event_code = "startup_failed", code, stage);
     }
-    // Qt returns only after its existing owner acknowledgement/teardown barrier.
+    // The native host returns only after its owner acknowledgement/teardown barrier.
     diagnostics.begin_shutdown();
     diagnostics.finish_shutdown(std::time::Duration::from_millis(250));
     if result.is_ok() {
@@ -186,22 +168,6 @@ fn initial_report(diagnostics: &DiagnosticsHandle) -> Option<ReportSnapshot> {
 }
 
 impl StartupError {
-    fn plugin_detail(&self) -> Option<&str> {
-        match self {
-            Self::WithRequest { source, .. } => source.plugin_detail(),
-            Self::NativeLaunch(native)
-                if matches!(
-                    native.failure_kind,
-                    furami::native_host::NativeFailureKind::QtPluginMissing
-                        | furami::native_host::NativeFailureKind::QtPluginInvalid
-                        | furami::native_host::NativeFailureKind::QtPluginLoad
-                ) =>
-            {
-                Some(&native.safe_detail)
-            }
-            _ => None,
-        }
-    }
     fn diagnostic(&self) -> StartupFailure {
         let (code, stage, requested) = match self {
             Self::WithRequest { request, source } => {
@@ -223,17 +189,6 @@ impl StartupError {
             }
             Self::MediaPrefixEnvironment(_) => ("MediaPrefixEnvironment", "MediaStartup", None),
             Self::InvalidMediaPrefix => ("InvalidMediaPrefix", "MediaStartup", None),
-            Self::NativeLaunch(error) => (
-                match error.failure_kind {
-                    furami::native_host::NativeFailureKind::QtPluginMissing => "qt_plugin_missing",
-                    furami::native_host::NativeFailureKind::QtPluginInvalid => "qt_plugin_invalid",
-                    furami::native_host::NativeFailureKind::QtPluginLoad => "qt_plugin_load",
-                    furami::native_host::NativeFailureKind::Qualification => "qualification",
-                    _ => "NativeLaunch",
-                },
-                "NativeStartup",
-                None,
-            ),
             Self::NoFallbackExec(_) => ("NoFallbackExec", "Reexec", None),
             Self::QualificationArguments => ("qualification_arguments", "Arguments", None),
             Self::QualificationVideo(
@@ -243,9 +198,6 @@ impl StartupError {
                 furami::media::qualification::QualificationVideoError::Format,
             ) => ("qualification_format", "Arguments", None),
             Self::QualificationRenderer => ("qualification_renderer", "MediaStartup", None),
-            Self::GpuiArguments => ("gpui_arguments", "Arguments", None),
-            Self::GpuiUnavailable => ("gpui_unavailable", "Arguments", None),
-            #[cfg(all(target_os = "linux", feature = "gpui-host"))]
             Self::Gpui(error) => (error.code(), "NativeStartup", None),
         };
         StartupFailure {
@@ -264,13 +216,7 @@ struct StartupArguments {
     list_audio_sources: bool,
     qualification_stdin: bool,
     qualification_video: Option<std::path::PathBuf>,
-    gpui: bool,
 }
-
-/// Whether this executable was compiled with the opt-in GPUI/XWayland host.
-/// `--gpui` is always parsed so an unsupported build refuses it explicitly
-/// instead of silently falling back to Qt.
-const GPUI_HOST_SUPPORTED: bool = cfg!(all(target_os = "linux", feature = "gpui-host"));
 
 impl StartupArguments {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, StartupError> {
@@ -279,12 +225,7 @@ impl StartupArguments {
             .iter()
             .any(|argument| argument == "--qualification-video");
         Self::parse_inner(args).map_err(|error| {
-            if qualification
-                && !matches!(
-                    error,
-                    StartupError::GpuiArguments | StartupError::GpuiUnavailable
-                )
-            {
+            if qualification {
                 StartupError::QualificationArguments
             } else {
                 error
@@ -298,7 +239,6 @@ impl StartupArguments {
         let (mut audio_off, mut list_audio_sources, mut qualification_stdin) =
             (false, false, false);
         let mut qualification_video = None;
-        let mut gpui = false;
         while let Some(flag) = args.next() {
             let text = flag.to_str().ok_or_else(|| {
                 CaptureArgumentError::InvalidArgument("flag must be UTF-8".into())
@@ -349,12 +289,6 @@ impl StartupArguments {
                     }
                     *slot = true;
                 }
-                "--gpui" => {
-                    if gpui {
-                        return Err(StartupError::GpuiArguments);
-                    }
-                    gpui = true;
-                }
                 "--capture-node" | "--capture-fourcc" | "--capture-size" | "--capture-rate" => {
                     let value = args.next().ok_or_else(|| {
                         CaptureArgumentError::InvalidArgument(format!("missing value for {text}"))
@@ -370,16 +304,14 @@ impl StartupArguments {
                 }
             }
         }
-        if gpui && (qualification_stdin || list_audio_sources) {
-            return Err(StartupError::GpuiArguments);
-        }
-        if qualification_video.is_some()
-            && (!video_args.is_empty() || audio_source.is_some() || audio_off || list_audio_sources)
+        if (qualification_stdin && qualification_video.is_none())
+            || (qualification_video.is_some()
+                && (!video_args.is_empty()
+                    || audio_source.is_some()
+                    || audio_off
+                    || list_audio_sources))
         {
             return Err(StartupError::QualificationArguments);
-        }
-        if gpui && !GPUI_HOST_SUPPORTED {
-            return Err(StartupError::GpuiUnavailable);
         }
         Ok(Self {
             video: CaptureArguments::parse(video_args)?,
@@ -388,7 +320,6 @@ impl StartupArguments {
             list_audio_sources,
             qualification_stdin,
             qualification_video,
-            gpui,
         })
     }
     fn capture_audio(
@@ -467,22 +398,7 @@ fn run_qualification(
         &capabilities,
     )
     .map_err(|_| StartupError::QualificationRenderer)?;
-    #[cfg(all(target_os = "linux", feature = "gpui-host"))]
-    if arguments.gpui {
-        furami::native_host::run_gpui_qualification_application(
-            &prefix,
-            &display,
-            video,
-            renderer,
-            diagnostics,
-        )?;
-        return Ok(());
-    }
-    #[cfg(not(all(target_os = "linux", feature = "gpui-host")))]
-    if arguments.gpui {
-        return Err(StartupError::GpuiUnavailable);
-    }
-    furami::native_host::run_qualification_application(
+    furami::native_host::run_gpui_qualification_application(
         &prefix,
         &display,
         video,
@@ -512,10 +428,7 @@ fn run_with_arguments(
             .as_ref()
             .is_some_and(|settings| settings.audio.enabled());
     let mut restore_audio_error = None;
-    let audio_sources = if arguments.audio_source.is_some()
-        || restore_audio
-        || (arguments.qualification_stdin && arguments.video.is_some())
-    {
+    let audio_sources = if arguments.audio_source.is_some() || restore_audio {
         match audio::discover() {
             Ok(sources) => sources,
             Err(error) if arguments.audio_source.is_none() => {
@@ -642,37 +555,17 @@ fn run_with_arguments(
     if !prefix.is_absolute() || !prefix.is_dir() {
         return Err(StartupError::InvalidMediaPrefix);
     }
-    // Query once, before Qt starts. Apply uses only this immutable typed result;
+    // Query once, before starting the frontend. Apply uses only this immutable typed result;
     // a query refusal remains visible without pretending capabilities exist.
     let treatment_capabilities =
         furami::media::render_catalog::query_qualified_capabilities(prefix);
     tracing::info!(event_code = "application_starting");
-    #[cfg(all(target_os = "linux", feature = "gpui-host"))]
-    if arguments.gpui {
-        furami::native_host::run_gpui_application(
-            &media_prefix,
-            treatment_capabilities,
-            &x11_display,
-            startup,
-            persistence,
-            sources,
-            diagnostics,
-        )?;
-        tracing::info!(event_code = "application_exited");
-        return Ok(());
-    }
-    #[cfg(not(all(target_os = "linux", feature = "gpui-host")))]
-    if arguments.gpui {
-        return Err(StartupError::GpuiUnavailable);
-    }
-    furami::native_host::run_application(
+    furami::native_host::run_gpui_application(
         &media_prefix,
         treatment_capabilities,
         &x11_display,
         startup,
         persistence,
-        sources,
-        arguments.qualification_stdin,
         diagnostics,
     )?;
     tracing::info!(event_code = "application_exited");
@@ -716,20 +609,6 @@ mod tests {
             assert!(!encoded.contains("private-startup-marker"));
             assert!(!encoded.contains("untrusted argument text"));
         }
-    }
-
-    #[test]
-    fn startup_failure_report_does_not_publish_request_path_or_error_text() {
-        let error = StartupError::NativeLaunch(furami::native_host::NativeLaunchError {
-            exit_code: 1,
-            diagnostic: "/dev/private-startup-marker personal backend text".into(),
-            failure_kind: furami::native_host::NativeFailureKind::Generic,
-            safe_detail: String::new(),
-        });
-        let encoded = serde_json::to_string(&error.diagnostic()).unwrap();
-        assert!(!encoded.contains("private-startup-marker"));
-        assert!(!encoded.contains("/dev/"));
-        assert!(encoded.contains("NativeLaunch"));
     }
 
     #[test]
@@ -973,11 +852,10 @@ mod tests {
             "--capture-audio-source",
             "exact.usb.source",
             "--capture-audio-off",
-            "--qualification-stdin",
         ]))
         .unwrap();
         assert_eq!(disabled.audio_source.as_deref(), Some("exact.usb.source"));
-        assert!(disabled.audio_off && disabled.qualification_stdin);
+        assert!(disabled.audio_off);
         assert!(
             StartupArguments::parse(args(&["--list-audio-sources"]))
                 .unwrap()
@@ -998,7 +876,6 @@ mod tests {
                 "other",
             ],
             vec!["--capture-audio-off", "--capture-audio-off"],
-            vec!["--qualification-stdin", "--qualification-stdin"],
             vec!["--list-audio-sources", "--list-audio-sources"],
             vec!["--capture-audio-source", "--capture-audio-off"],
         ] {
@@ -1021,6 +898,17 @@ mod tests {
         assert_eq!(parsed.qualification_video.unwrap().as_os_str(), path);
         assert!(parsed.video.is_none() && parsed.qualification_stdin);
         for values in [
+            vec!["--qualification-stdin"],
+            vec!["--list-audio-sources", "--qualification-stdin"],
+            vec![
+                "--capture-node",
+                "/dev/video0",
+                "--capture-size",
+                "320x180",
+                "--capture-rate",
+                "30",
+                "--qualification-stdin",
+            ],
             vec!["--qualification-video"],
             vec![
                 "--qualification-video",
@@ -1051,131 +939,21 @@ mod tests {
                 .unwrap_err()
                 .diagnostic();
             assert_eq!(failure.code, "qualification_arguments", "{values:?}");
-        }
-    }
-    #[test]
-    fn typed_plugin_failure_survives_capture_request_wrapper_without_exposing_other_errors() {
-        use furami::native_host::{NativeFailureKind, NativeLaunchError};
-        for (kind, code) in [
-            (NativeFailureKind::QtPluginMissing, "qt_plugin_missing"),
-            (NativeFailureKind::QtPluginInvalid, "qt_plugin_invalid"),
-            (NativeFailureKind::QtPluginLoad, "qt_plugin_load"),
-        ] {
-            let arguments = StartupArguments::parse(args(&[
-                "--capture-node",
-                "/dev/video0",
-                "--capture-size",
-                "320x180",
-                "--capture-rate",
-                "30",
-            ]))
-            .unwrap();
-            let error = StartupError::WithRequest {
-                request: arguments.video.unwrap().mode,
-                source: Box::new(StartupError::NativeLaunch(NativeLaunchError {
-                    exit_code: 1,
-                    diagnostic: "private backend text".into(),
-                    failure_kind: kind,
-                    safe_detail: "platform: <media-prefix> plugin refused".into(),
-                })),
-            };
-            assert_eq!(error.diagnostic().code, code);
-            assert_eq!(
-                error.plugin_detail(),
-                Some("platform: <media-prefix> plugin refused")
-            );
-        }
-        let generic = StartupError::NativeLaunch(NativeLaunchError {
-            exit_code: 1,
-            diagnostic: "private text".into(),
-            failure_kind: NativeFailureKind::Generic,
-            safe_detail: "must not be printed".into(),
-        });
-        assert!(generic.plugin_detail().is_none());
-    }
-
-    #[test]
-    fn gpui_cli_is_explicit_and_refuses_unsupported_builds() {
-        assert!(!StartupArguments::parse(args(&[])).unwrap().gpui);
-        let parsed = StartupArguments::parse(args(&["--gpui"]));
-        if cfg!(all(target_os = "linux", feature = "gpui-host")) {
-            assert!(parsed.unwrap().gpui);
-        } else {
-            let failure = parsed.unwrap_err().diagnostic();
-            assert_eq!(failure.code, "gpui_unavailable");
-            assert_eq!(failure.stage, "Arguments");
-            assert!(failure.requested.is_none());
-        }
-        let with_capture = StartupArguments::parse(args(&[
-            "--gpui",
-            "--capture-node",
-            "/dev/video0",
-            "--capture-size",
-            "1920x1080",
-            "--capture-rate",
-            "60/1",
-            "--capture-audio-off",
-        ]));
-        if cfg!(all(target_os = "linux", feature = "gpui-host")) {
-            let with_capture = with_capture.unwrap();
-            assert!(with_capture.gpui && with_capture.video.is_some());
-        } else {
-            assert_eq!(
-                with_capture.unwrap_err().diagnostic().code,
-                "gpui_unavailable"
-            );
-        }
-    }
-
-    #[test]
-    fn gpui_cli_rejects_repetition_and_stdio_companions() {
-        for values in [
-            vec!["--gpui", "--gpui"],
-            vec!["--gpui", "--qualification-stdin"],
-            vec!["--gpui", "--list-audio-sources"],
-            vec![
-                "--gpui",
-                "--qualification-video",
-                "/tmp/a.y4m",
-                "--list-audio-sources",
-            ],
-        ] {
-            let failure = StartupArguments::parse(args(&values))
-                .unwrap_err()
-                .diagnostic();
-            assert_eq!(failure.code, "gpui_arguments", "{values:?}");
             assert_eq!(failure.stage, "Arguments", "{values:?}");
         }
     }
 
     #[test]
-    fn gpui_qualification_video_is_permitted_and_keeps_gpui_errors() {
-        let parsed = StartupArguments::parse(args(&[
-            "--gpui",
+    fn qualification_accepts_stdin_and_inventory_remains_separate() {
+        let qualification = StartupArguments::parse(args(&[
             "--qualification-video",
             "/tmp/qualification.y4m",
-        ]));
-        if cfg!(all(target_os = "linux", feature = "gpui-host")) {
-            let parsed = parsed.unwrap();
-            assert!(parsed.gpui);
-            assert_eq!(
-                parsed.qualification_video.as_deref(),
-                Some(std::path::Path::new("/tmp/qualification.y4m"))
-            );
-        } else {
-            let failure = parsed.unwrap_err().diagnostic();
-            assert_eq!(failure.code, "gpui_unavailable");
-            assert_eq!(failure.stage, "Arguments");
-        }
-        // The qualification remap must not hide the GPUI argument refusal.
-        let failure = StartupArguments::parse(args(&[
-            "--qualification-video",
-            "/tmp/qualification.y4m",
-            "--gpui",
             "--qualification-stdin",
         ]))
-        .unwrap_err()
-        .diagnostic();
-        assert_eq!(failure.code, "gpui_arguments");
+        .unwrap();
+        assert!(qualification.qualification_video.is_some() && qualification.qualification_stdin);
+
+        let inventory = StartupArguments::parse(args(&["--list-audio-sources"])).unwrap();
+        assert!(inventory.list_audio_sources && inventory.qualification_video.is_none());
     }
 }

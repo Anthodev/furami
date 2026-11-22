@@ -42,8 +42,7 @@ def equal_except_metadata(left, right, ranges):
 
 def accepted_criteria(criteria: dict) -> bool:
     required = ('image_bytes', 'payload_files_modes_symlinks', 'source_runtime_bytes',
-                'source_assets_content', 'source_archive_bytes_except_proven_metadata',
-                'generated_CPP_headers')
+                'source_assets_content', 'source_archive_bytes_except_proven_metadata')
     if not isinstance(criteria, dict) or any(type(criteria.get(key)) is not bool for key in required):
         return False
     if 'image_known_metadata_only' in criteria and type(criteria['image_known_metadata_only']) is not bool:
@@ -146,11 +145,6 @@ def compare_outputs(out: Path) -> dict:
                 'cause': 'pinned appimagetool documented metadata write; digest semantics unverified'}
         else:
             criteria['image_known_metadata_only'] = False
-    generated = []
-    for label in ('first', 'second'):
-        app = json.loads((out / label / 'app/manifest.json').read_text())
-        generated.append(app['builds']['generated_cpp_first'])
-    criteria['generated_CPP_headers'] = generated[0] == generated[1]
     passed = accepted_criteria(criteria)
     identical = passed and criteria['image_bytes'] and raw_source_hashes[0] == raw_source_hashes[1]
     verdict = {'schema': 1, 'status': 'identical' if identical else 'documented_metadata_variance' if passed else 'mismatch',

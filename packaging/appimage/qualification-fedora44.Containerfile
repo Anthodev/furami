@@ -23,9 +23,9 @@ LABEL org.furami.qualification="fedora44-kwin-wayland-appimage-smoke" \
       org.furami.qualification.base="${FEDORA_BASE}"
 
 # System prerequisites only: KWin Wayland with its virtual backend and XWayland,
-# Spectacle for region captures, the reference D-Bus daemon (dbus-run-session),
-# the Mesa Vulkan/GL stack, fonts for Qt text, Python+Pillow for the in-session
-# harness, and basic process/file inspection tools.
+# Spectacle for captures, xprop/xwininfo for native X11 observation, the
+# reference D-Bus daemon (dbus-run-session), the Mesa Vulkan/GL stack, fonts
+# and Python+Pillow for the in-session harness, and process inspection tools.
 #
 # install_weak_deps=False keeps optional pulls (including media providers) out.
 # No mpv/ffmpeg/ffprobe program may enter this image: the candidate must run on
@@ -44,6 +44,8 @@ LABEL org.furami.qualification="fedora44-kwin-wayland-appimage-smoke" \
 RUN dnf --setopt=install_weak_deps=False -y install \
         kwin-wayland \
         xorg-x11-server-Xwayland \
+        xprop \
+        xwininfo \
         spectacle \
         dbus-daemon \
         mesa-vulkan-drivers \
@@ -52,6 +54,7 @@ RUN dnf --setopt=install_weak_deps=False -y install \
         mesa-libEGL \
         libglvnd-glx \
         libglvnd-egl \
+        libglvnd-gles \
         vulkan-loader \
         vulkan-tools \
         fontconfig \
@@ -68,6 +71,8 @@ RUN dnf --setopt=install_weak_deps=False -y install \
        done \
     && test -x /usr/bin/kwin_wayland \
     && test -x /usr/bin/Xwayland \
+    && test -x /usr/bin/xprop \
+    && test -x /usr/bin/xwininfo \
     && test -x /usr/bin/spectacle \
     && test -x /usr/bin/dbus-run-session \
     && test -x /usr/bin/vulkaninfo \
@@ -80,7 +85,7 @@ RUN rpm -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | LC_ALL=
         > /etc/furami-qualification-rpms.txt
 
 # The compositor and screenshot tool live outside any application loader
-# environment; nothing here exports AppImage Qt/LD paths.
+# environment; nothing here exports AppImage loader paths.
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     KWIN_BACKEND=virtual

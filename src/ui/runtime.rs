@@ -1,4 +1,4 @@
-//! Qt-thread composition: product coordinator plus capture/media adapters.
+//! GUI-thread composition: product coordinator plus capture/media adapters.
 
 use super::{catalog as capture_catalog, projection};
 use crate::domain::{
@@ -7,10 +7,14 @@ use crate::domain::{
 };
 use std::rc::Rc;
 
+#[cfg(test)]
+use crate::{
+    app::control::{self, Command, ExpectedCleanup, ExpectedState},
+    domain::capture::AudioSourceIdentity,
+};
 use crate::{
     app::{
         apply::{ApplyCoordinator, VerifiedApplied},
-        control::{self, Command, ExpectedCleanup, ExpectedState},
         gate::GatePhase,
         output::OutputPolicy,
         ports::SubmitStatus,
@@ -19,9 +23,8 @@ use crate::{
     capture::CaptureValidator,
     domain::{
         capture::{
-            AudioAvailability, AudioSelection, AudioSilence, AudioSourceIdentity, CandidateId,
-            LossEvidence, ObservationEpoch, PlaybackGain, RecoveryCandidate, SelectionToken,
-            WatchId, WatchStamp,
+            AudioAvailability, AudioSelection, AudioSilence, CandidateId, LossEvidence,
+            ObservationEpoch, PlaybackGain, SelectionToken, WatchId, WatchStamp,
         },
         output::{
             LiveSinkTarget, OutputRevision, OutputSilence, PersistentOutputChoice, SinkCatalog,
@@ -43,6 +46,7 @@ use diagnostic::{ProfileSeed, ReportCache};
 mod coordinator;
 mod qualification;
 pub(crate) use coordinator::RuntimeCoordinator;
+pub(crate) use qualification::{QualificationCommand, log_qualification_rejection};
 
 pub(crate) struct UiUpdate {
     /// Typed product projection, shared with every adapter. `None` means the
@@ -62,18 +66,13 @@ pub(crate) struct UiUpdate {
     /// truthful while no media is open.
     pub product_phase: String,
     pub audio_status: String,
-    pub audio_source: String,
-    pub audio_desired: String,
     pub audio_diagnostic: String,
     pub failed: bool,
     pub diagnostic: String,
     pub context_diagnostic: String,
-    pub recovery_evidence: String,
-    pub recovery_stage: String,
-    pub candidates: Vec<String>,
     pub paused: bool,
     /// This exact native attempt was opened paused, not paused after live playback.
-    /// C++ latches concealment for its host until normal native retirement.
+    /// The native host latches concealment until normal native retirement.
     pub prepared_paused: bool,
     pub volume_percent: i32,
     pub muted: bool,
@@ -85,33 +84,11 @@ pub(crate) struct UiUpdate {
     pub quit: bool,
     pub terminal_failure: bool,
     pub settings_status: String,
-    pub settings_path: String,
-    pub settings_refused: bool,
-    pub saved_selection: String,
-    pub startup_reason: String,
     pub close_dialog: String,
-    pub reset_token: u64,
     pub fullscreen: bool,
     pub stats_hidden: bool,
     pub logging_enabled: bool,
     pub closing: bool,
-    /// Legacy audio output selector projection: JSON plain-text rows (the
-    /// reserved `auto` row first), the observed catalog revision and selected
-    /// action key, the
-    /// confirmed routed sink name, the typed silence reason text and whether
-    /// the runtime needs an explicit reselection. Plain text only; empty
-    /// fields mean unchanged since the last published update.
-    pub output_rows: String,
-    pub output_catalog_revision: u64,
-    pub output_selected: String,
-    /// Opaque action key of the current choice: "auto" for the reserved row,
-    /// the unique compatible catalog row key for a manual choice, empty when
-    /// the manual choice matches no observed sink (unavailable). Actions
-    /// echo keys, never names.
-    pub output_selected_key: String,
-    pub output_effective: String,
-    pub output_status: String,
-    pub output_needs_action: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -227,6 +204,7 @@ pub(crate) struct CaptureRuntime {
     next_log_folder_request: Option<crate::diagnostics::FolderRequestId>,
     engine: Option<Engine>,
     ui: ProductUi,
+    #[cfg(test)]
     sources: Vec<AudioSourceIdentity>,
     dirty: bool,
     last_state: Option<(
@@ -260,7 +238,6 @@ pub(crate) struct CaptureRuntime {
     /// Row descriptors behind the serialized projection rows: opaque
     /// revision-scoped keys mapped to their exact observed identities.
     last_rows: Vec<OutputRow>,
-    last_output: Option<OutputProjection>,
     /// Shutdown requested for the catalog worker; a stopped watch is never
     /// restarted and only its completion closes the quit barrier.
     catalog_stopping: bool,
@@ -279,17 +256,13 @@ const AUTO_ROW_KEY: &str = "auto";
 const INTERPOLATION_INACTIVE_TEXT: &str =
     "Interpolation is stored but inactive with the current low-latency timing.";
 
-/// One selector row. `identity` stays runtime-side (never serialized): the
-/// opaque `key` is the only thing the UI echoes back for actions. `name` is
-/// serialized so the UI can match a saved manual choice against observed
-/// sinks for display and reconnection, never as an action key.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+/// Internal lookup row: only its opaque key may return as an action token.
+#[derive(Debug, PartialEq, Eq)]
 struct OutputRow {
     key: String,
     label: String,
     name: String,
     eligible: bool,
-    #[serde(skip)]
     identity: Option<SinkIdentity>,
 }
 
@@ -297,7 +270,6 @@ struct OutputRow {
 /// polls so an unchanged selector never republishes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OutputProjection {
-    rows: String,
     catalog_revision: u64,
     selected: String,
     selected_key: String,
@@ -1786,7 +1758,6 @@ impl CaptureRuntime {
         >,
         startup: StartupSelection,
         persistence: PersistenceSession,
-        sources: Vec<AudioSourceIdentity>,
         diagnostics: crate::diagnostics::DiagnosticsHandle,
     ) -> Self {
         Self::new_with_catalog(
@@ -1794,7 +1765,6 @@ impl CaptureRuntime {
             treatment_capabilities,
             startup,
             persistence,
-            sources,
             diagnostics,
             OutputCatalogWatch::start,
         )
@@ -1807,7 +1777,6 @@ impl CaptureRuntime {
         >,
         startup: StartupSelection,
         persistence: PersistenceSession,
-        sources: Vec<AudioSourceIdentity>,
         diagnostics: crate::diagnostics::DiagnosticsHandle,
         start_catalog: impl FnOnce() -> Result<OutputCatalogWatch, crate::domain::capture::AudioError>,
     ) -> Self {
@@ -1899,7 +1868,8 @@ impl CaptureRuntime {
                 partial,
                 ..ProductUi::default()
             },
-            sources,
+            #[cfg(test)]
+            sources: Vec::new(),
             dirty: true,
             last_state: None,
             last_logged_runtime: None,
@@ -1916,7 +1886,6 @@ impl CaptureRuntime {
             fed_plan_revision: None,
             last_catalog: None,
             last_rows: Vec::new(),
-            last_output: None,
             catalog_stopping: false,
             catalog_join_error: None,
         }
@@ -1995,10 +1964,8 @@ impl CaptureRuntime {
             );
         }
         self.ui.catalog.cancel_mode();
-        // The catalog worker must stop before the Qt loop exits: request the
-        // stop here, then let poll() drain its non-blocking try_join until
-        // the worker is actually complete. Drop only guarantees the final
-        // join fallback after Qt exit, never the quit barrier itself.
+        // Retire the catalog worker before the GUI loop exits. Drop is only
+        // the final join fallback, never the quit barrier.
         self.catalog_stopping = true;
         if let Some(worker) = &self.ui.catalog.worker {
             worker.stop();
@@ -2116,6 +2083,7 @@ impl CaptureRuntime {
         self.dirty = true;
         tracing::warn!(event_code = "qualification_command_rejected");
     }
+    #[cfg(test)]
     fn qualification_rejection(&mut self, line: &str, error: impl std::fmt::Display) {
         // This escaped value is user-facing UI state, never a log payload.
         self.rejection(serde_json::json!({"input": line, "error": error.to_string()}));
@@ -2355,7 +2323,7 @@ impl CaptureRuntime {
             None => "surface_loss_barrier: no capture engine".into(),
         }
     }
-    #[cfg(all(feature = "gpui-host", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn owner_ack_failed(&self) -> bool {
         self.engine
             .as_ref()
@@ -2621,10 +2589,7 @@ impl CaptureRuntime {
                 Some(reason) => output_silence_text(reason),
             },
         };
-        // Rows are serialized as a JSON array of objects: sink names and
-        // descriptions are external strings and must never ride as raw
-        // newline/pipe text. Keys are opaque and revision-scoped; the
-        // reserved Auto key can never collide with a catalogued sink.
+        // The reserved Auto key cannot collide with revision-scoped catalog keys.
         let mut rows = vec![OutputRow {
             key: AUTO_ROW_KEY.to_owned(),
             label: "Auto".to_owned(),
@@ -2649,11 +2614,9 @@ impl CaptureRuntime {
                 });
             }
         }
-        self.last_rows = rows.clone();
-        let serialized = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_owned());
+        self.last_rows = rows;
         OutputProjection {
             catalog_revision,
-            rows: serialized,
             selected,
             selected_key,
             effective,
@@ -2661,6 +2624,7 @@ impl CaptureRuntime {
             needs_action: matches!(plan.silence(), Some(OutputSilence::ManualRequiresAction)),
         }
     }
+    #[cfg(test)]
     fn checked_state(
         engine: &Engine,
         expected: ExpectedState,
@@ -2682,6 +2646,7 @@ impl CaptureRuntime {
             Ok(identity)
         }
     }
+    #[cfg(test)]
     pub(crate) fn qualification_command(&mut self, line: &str) -> UiUpdate {
         // Opt-in qualification calls the same production application decisions.
         if !control::is_structured_json_command(line) {
@@ -3162,25 +3127,8 @@ impl CaptureRuntime {
                 update.ui_snapshot = Some(Rc::clone(&snapshot));
                 self.ui.snapshot = Some(snapshot);
             }
-            self.last_output = Some(projection.clone());
-            update.output_rows = projection.rows;
-            update.output_catalog_revision = projection.catalog_revision;
-            update.output_selected = projection.selected;
-            update.output_selected_key = projection.selected_key;
-            update.output_effective = projection.effective;
-            update.output_status = projection.status;
-            update.output_needs_action = projection.needs_action;
             update.settings_status = self.persistence.status();
-            update.settings_path = self.persistence.path();
-            update.settings_refused = self.persistence.refused();
-            update.startup_reason = self.persistence.startup_reason().into();
-            update.saved_selection = self
-                .engine
-                .as_ref()
-                .map(|engine| selection_text(&engine.model().draft().settings))
-                .unwrap_or_default();
             update.close_dialog = self.persistence.close_dialog().into();
-            update.reset_token = self.persistence.reset_token();
             update.fullscreen = self.persistence.preferences().fullscreen;
             update.stats_hidden = self.persistence.preferences().stats_hidden;
             update.logging_enabled = self.persistence.preferences().logging_enabled;
@@ -3249,8 +3197,6 @@ impl CaptureRuntime {
                 } else {
                     String::new()
                 },
-                audio_source: String::new(),
-                audio_desired: String::new(),
                 audio_diagnostic: String::new(),
                 failed: false,
                 diagnostic: if changed {
@@ -3271,9 +3217,6 @@ impl CaptureRuntime {
                 } else {
                     String::new()
                 },
-                recovery_evidence: String::new(),
-                recovery_stage: String::new(),
-                candidates: Vec::new(),
                 paused: false,
                 prepared_paused: false,
                 volume_percent: i32::from(self.persistence.preferences().gain.volume_percent),
@@ -3290,23 +3233,11 @@ impl CaptureRuntime {
                 quit: self.quit_empty,
                 terminal_failure: false,
                 settings_status: String::new(),
-                settings_path: String::new(),
-                settings_refused: false,
-                saved_selection: String::new(),
-                startup_reason: String::new(),
                 close_dialog: String::new(),
-                reset_token: 0,
                 fullscreen: false,
                 stats_hidden: false,
                 logging_enabled: false,
                 closing: false,
-                output_rows: String::new(),
-                output_catalog_revision: 0,
-                output_selected: String::new(),
-                output_selected_key: String::new(),
-                output_effective: String::new(),
-                output_status: String::new(),
-                output_needs_action: false,
             };
         };
         let native = engine.runner_mut().take_native_update();
@@ -3328,12 +3259,6 @@ impl CaptureRuntime {
         // applied settings, then the last valid settings, then the draft.
         let model = engine.model();
         let desired_settings = stream_settings(model);
-        let desired_source = desired_settings
-            .audio
-            .source()
-            .filter(|_| changed)
-            .map(|source| source.name().to_owned())
-            .unwrap_or_default();
         let desired_audio_enabled = desired_settings.audio.enabled();
         let can_open = self.persistence.mutations_open()
             && self.ui.resolving.is_none()
@@ -3442,11 +3367,9 @@ impl CaptureRuntime {
         // desired draft: a draft edit or a desired request cannot masquerade
         // as a running route.
         let availability = engine.audio_availability().filter(|_| changed).cloned();
-        let (audio_status, audio_source, audio_diagnostic) = if changed {
+        let (audio_status, audio_diagnostic) = if changed {
             match &availability {
-                None | Some(AudioAvailability::Disabled) => {
-                    ("Disabled".to_owned(), String::new(), String::new())
-                }
+                None | Some(AudioAvailability::Disabled) => ("Disabled".to_owned(), String::new()),
                 Some(AudioAvailability::Silent { reason }) => {
                     let reason = match reason {
                         AudioSilence::WaitingForSource(error) => {
@@ -3457,60 +3380,31 @@ impl CaptureRuntime {
                         AudioSilence::Output(reason) => output_silence_text(reason),
                         AudioSilence::Failed(error) => format!("audio route failed: {error}"),
                     };
-                    ("Silent".to_owned(), String::new(), reason)
+                    ("Silent".to_owned(), reason)
                 }
                 Some(AudioAvailability::Opening { epoch }) => (
                     "Opening".to_owned(),
-                    String::new(),
                     format!("opening audio route (epoch {})", epoch.get()),
                 ),
                 Some(AudioAvailability::Switching { epoch, revision }) => (
                     "Switching".to_owned(),
-                    String::new(),
                     format!(
                         "switching output route (epoch {}, output revision {})",
                         epoch.get(),
                         revision.get()
                     ),
                 ),
-                Some(AudioAvailability::Active { route }) => (
-                    "Active".to_owned(),
-                    route.source().name().to_owned(),
-                    String::new(),
-                ),
+                Some(AudioAvailability::Active { .. }) => ("Active".to_owned(), String::new()),
                 Some(AudioAvailability::Detaching { epoch }) => (
                     "Detaching".to_owned(),
-                    String::new(),
                     format!("detaching audio route (epoch {})", epoch.get()),
                 ),
                 Some(AudioAvailability::Blocked { error, .. }) => {
-                    ("Blocked".to_owned(), String::new(), error.to_string())
+                    ("Blocked".to_owned(), error.to_string())
                 }
             }
         } else {
-            (String::new(), String::new(), String::new())
-        };
-        let (recovery_evidence, recovery_stage) = if changed {
-            model
-                .recovery()
-                .map(|loss| {
-                    (
-                        loss_evidence_text(&loss.evidence).to_owned(),
-                        loss.failure.to_string(),
-                    )
-                })
-                .unwrap_or_default()
-        } else {
             (String::new(), String::new())
-        };
-        let candidates: Vec<String> = if changed {
-            model
-                .recovery_candidates()
-                .iter()
-                .map(candidate_entry)
-                .collect()
-        } else {
-            Vec::new()
         };
         let product_phase = if changed {
             phase_name(model.phase()).into()
@@ -3578,21 +3472,12 @@ impl CaptureRuntime {
             can_restart,
             product_phase,
             audio_status,
-            audio_source,
-            audio_desired: if changed {
-                desired_source
-            } else {
-                String::new()
-            },
             audio_diagnostic,
             failed: phase == GatePhase::Failed
                 || runner.fatal_native_failure().is_some()
                 || treatment_failed,
             diagnostic,
             context_diagnostic,
-            recovery_evidence,
-            recovery_stage,
-            candidates,
             paused,
             prepared_paused,
             volume_percent,
@@ -3609,27 +3494,12 @@ impl CaptureRuntime {
             quit,
             terminal_failure: false,
             settings_status: String::new(),
-            settings_path: String::new(),
-            settings_refused: false,
-            saved_selection: String::new(),
-            startup_reason: String::new(),
             close_dialog: String::new(),
-            reset_token: 0,
             fullscreen: false,
             stats_hidden: false,
             logging_enabled: false,
             closing: false,
-            output_rows: String::new(),
-            output_catalog_revision: 0,
-            output_selected: String::new(),
-            output_selected_key: String::new(),
-            output_effective: String::new(),
-            output_status: String::new(),
-            output_needs_action: false,
         }
-    }
-    pub(crate) fn unchanged(&mut self) -> UiUpdate {
-        self.poll()
     }
 }
 
@@ -3771,34 +3641,6 @@ fn loss_evidence_text(evidence: &LossEvidence) -> String {
     }
 }
 
-/// Machine-parseable candidate entry for the selection surface. Fields are
-/// pipe-separated: "watch:epoch:candidate|description|vid:pid|controller|ports|serial".
-/// The technical identity (USB VID/PID, controller, port chain, serial) is
-/// always shown alongside the friendly description.
-fn candidate_entry(candidate: &RecoveryCandidate) -> String {
-    let identity = &candidate.identity;
-    let topology = identity.topology();
-    let ports = topology
-        .ports()
-        .iter()
-        .map(|port| port.get().to_string())
-        .collect::<Vec<_>>()
-        .join(".");
-    let serial = identity.serial().unwrap_or("-");
-    format!(
-        "{}:{}:{}|{}|{:04x}:{:04x}|{}|{}|{}",
-        candidate.token.stamp.watch.get(),
-        candidate.token.stamp.epoch.get(),
-        candidate.token.candidate.get(),
-        candidate.description,
-        identity.vendor_id(),
-        identity.product_id(),
-        topology.controller(),
-        ports,
-        serial
-    )
-}
-
 /// Product-authoritative qualification scalars. Zero represents an absent ID,
 /// exactly as checked_state does; no report/GUI snapshot is a command authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3871,6 +3713,7 @@ fn log_snapshot(snapshot: RuntimeLogSnapshot) {
     );
 }
 
+#[cfg(test)]
 fn qualification_intent(line: &str) -> &'static str {
     match line.split_ascii_whitespace().next() {
         Some("snapshot") => "Snapshot",
@@ -4066,7 +3909,6 @@ mod tests {
                 fed_plan_revision: None,
                 last_catalog: None,
                 last_rows: Vec::new(),
-                last_output: None,
                 catalog_stopping: false,
                 catalog_join_error: None,
                 ui: ProductUi::default(),
@@ -5030,11 +4872,10 @@ mod tests {
         let (mut runtime, drivers) = runtime();
         runtime.poll();
         let auto = runtime.qualification_command("draft-video 0 auto 1920x1080 60000/1001");
-        assert!(auto.saved_selection.contains("Input policy: Auto"));
-        assert!(
-            auto.saved_selection
-                .contains("Resolved input: not prepared")
-        );
+        let snapshot = auto.ui_snapshot.unwrap();
+        let selection = snapshot.selection.as_ref().unwrap();
+        assert_eq!(selection.requested_format_label, "Auto");
+        assert_eq!(selection.resolved_format_label, "Not prepared");
         let draft = &runtime.engine.as_ref().unwrap().model().draft().settings;
         assert_eq!(draft.video.mode.format_policy, InputFormatPolicy::Auto);
         assert!(draft.video.resolved_fourcc.is_none());
@@ -5559,9 +5400,8 @@ mod tests {
         assert_eq!(runtime.set_volume(80), SubmitStatus::Accepted);
         assert_eq!(runtime.set_muted(true), SubmitStatus::Accepted);
         let resuming = runtime.qualification_command("resume 1");
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
+        // Validation submission may wait for the committed watch observation.
+        await_update(&mut runtime, |_| started_rx.try_recv().is_ok());
         assert_eq!(
             runtime.engine.as_ref().unwrap().model().phase(),
             ProductPhase::ValidatingResume
@@ -5877,7 +5717,6 @@ mod tests {
             fed_plan_revision: None,
             last_catalog: None,
             last_rows: Vec::new(),
-            last_output: None,
             catalog_stopping: false,
             catalog_join_error: None,
             ui: ProductUi::default(),
@@ -6004,16 +5843,32 @@ mod tests {
         );
         assert_eq!(active.playback_status, "Live");
         assert!(active.can_set_gain);
-        assert_eq!(active.audio_source, "source-a");
+        let routed_source = |runtime: &CaptureRuntime| match runtime
+            .engine
+            .as_ref()
+            .unwrap()
+            .audio_availability()
+        {
+            Some(AudioAvailability::Active { route }) => Some(route.source().name().to_owned()),
+            _ => None,
+        };
+        let desired_source = |runtime: &CaptureRuntime| {
+            stream_settings(runtime.engine.as_ref().unwrap().model())
+                .audio
+                .source()
+                .map(|source| source.name().to_owned())
+        };
+        assert_eq!(routed_source(&runtime).as_deref(), Some("source-a"));
         assert_eq!(active.audio_status, "Active");
         let edited = runtime.qualification_command("draft-source 0 source-b");
-        assert_eq!(edited.audio_source, "source-a");
+        assert_eq!(routed_source(&runtime).as_deref(), Some("source-a"));
         assert_eq!(edited.audio_status, "Active");
         let disabled_draft = runtime.qualification_command("draft-audio 1 disable");
-        assert_eq!(disabled_draft.audio_desired, "source-a");
-        assert_eq!(disabled_draft.audio_source, "source-a");
+        assert_eq!(desired_source(&runtime).as_deref(), Some("source-a"));
+        assert_eq!(routed_source(&runtime).as_deref(), Some("source-a"));
         assert_eq!(disabled_draft.audio_status, "Active");
         confirm_explicit_pause(&mut runtime, &driver);
+        settle_committed_watch(&mut runtime);
         let paused = runtime.engine.as_ref().unwrap().model().state_identity();
         driver.send(BackendEvent::AudioAvailability(
             AudioAvailability::Detaching { epoch },
@@ -6035,8 +5890,8 @@ mod tests {
         // media owner itself stays healthy.
         assert!(silent.can_toggle_pause && silent.can_set_gain);
         assert_eq!(silent.playback_status, "Paused");
-        assert!(silent.audio_source.is_empty());
-        assert_eq!(silent.audio_desired, "source-a");
+        assert_eq!(routed_source(&runtime), None);
+        assert_eq!(desired_source(&runtime).as_deref(), Some("source-a"));
         assert_eq!(
             runtime.engine.as_ref().unwrap().audio_availability(),
             Some(&AudioAvailability::Silent {
@@ -6058,8 +5913,8 @@ mod tests {
             await_update(&mut runtime, |update| update.release_native)
         };
         assert_eq!(retired.audio_status, "Disabled");
-        assert!(retired.audio_source.is_empty());
-        assert_eq!(retired.audio_desired, "source-a");
+        assert_eq!(routed_source(&runtime), None);
+        assert_eq!(desired_source(&runtime).as_deref(), Some("source-a"));
         assert!(
             runtime
                 .engine
@@ -6207,7 +6062,6 @@ mod tests {
             fixture_treatment_capabilities(),
             startup,
             persistence,
-            vec![],
             writer.handle(),
         );
         let initial = runtime.poll();
@@ -6392,7 +6246,7 @@ mod tests {
     }
 
     #[test]
-    fn output_rows_are_json_objects_with_reserved_auto_key_and_scoped_sink_keys() {
+    fn typed_output_rows_have_reserved_auto_and_scoped_sink_keys() {
         let (mut runtime, _drivers) = runtime();
         runtime.last_catalog = Some(crate::domain::output::SinkCatalog {
             revision: 7,
@@ -6403,18 +6257,15 @@ mod tests {
             default_sink: None,
         });
         let projection = runtime.output_projection();
-        let parsed: serde_json::Value = serde_json::from_str(&projection.rows).unwrap();
-        let rows = parsed.as_array().expect("rows are a JSON array");
+        let update = runtime.poll();
+        let snapshot = runtime.product_snapshot(&update, &projection);
+        let rows = &snapshot.output.rows;
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0]["key"], "auto");
-        assert_eq!(rows[0]["label"], "Auto");
-        // Sink keys are revision-scoped and opaque: a sink literally named
-        // "auto" can never collide with the reserved Auto row.
-        assert_eq!(rows[1]["key"], "sink:7:0");
-        assert_eq!(rows[2]["key"], "sink:7:1");
-        assert_ne!(rows[1]["key"], "auto");
-        // The runtime-side identity is never serialized into the projection.
-        assert_eq!(rows[1].as_object().unwrap().len(), 4);
+        assert_eq!(rows[0].key, "auto");
+        assert_eq!(rows[0].label, "Auto");
+        assert_eq!(rows[1].name, "auto");
+        assert_eq!(rows[1].key, "sink:7:0");
+        assert_eq!(rows[2].key, "sink:7:1");
         // Selecting the reserved Auto key resolves to the Auto choice and
         // commits only through the accepted engine path. Every action must
         // echo the projected catalog revision: a stale revision is refused
@@ -6490,17 +6341,12 @@ mod tests {
         // No unique compatible row: the action key stays empty, which the UI
         // renders as selected-but-unavailable (index -1, never Auto).
         assert_eq!(projection.selected_key, "");
-        let parsed: serde_json::Value = serde_json::from_str(&projection.rows).unwrap();
+        let update = runtime.poll();
+        let snapshot = runtime.product_snapshot(&update, &projection);
         // The unavailable saved choice is absent from the rows, so the UI
         // keeps it selected-but-unavailable instead of silently mapping it
         // onto the Auto row.
-        assert!(
-            parsed
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|row| row["name"] != "ghost")
-        );
+        assert!(snapshot.output.rows.iter().all(|row| row.name != "ghost"));
         // A unique compatible observed row projects its revision-scoped key;
         // after a catalog change the key is re-scoped, never a shifted index.
         let speakers =
@@ -6704,29 +6550,6 @@ mod tests {
             serde_json::to_value(&*published).unwrap()["selectionRevision"],
             serde_json::json!(runtime.ui.public_revision.to_string())
         );
-        cleanup(&mut runtime);
-    }
-
-    #[test]
-    fn gpui_host_cxx_wire_maps_an_absent_snapshot_to_empty_and_a_change_to_schema_two() {
-        let (mut runtime, _) = product_runtime();
-        runtime.dirty = true;
-        let unchanged = runtime.poll();
-        assert!(unchanged.changed && unchanged.ui_snapshot.is_none());
-        let wire = crate::ui::bridge::test_wire_snapshot(unchanged);
-        assert!(
-            wire.is_empty(),
-            "an unchanged projection stays an empty wire string"
-        );
-
-        runtime.ui.public_revision += 1;
-        runtime.dirty = true;
-        let changed = runtime.poll();
-        assert!(changed.ui_snapshot.is_some());
-        let wire = crate::ui::bridge::test_wire_snapshot(changed);
-        let snapshot: serde_json::Value = serde_json::from_str(&wire).unwrap();
-        assert_eq!(snapshot["schema"], 2);
-        assert_eq!(snapshot["session_kind"], "capture");
         cleanup(&mut runtime);
     }
 
@@ -7469,7 +7292,7 @@ mod tests {
     }
     #[test]
     fn off_audio_retains_explicit_input_and_never_selects_the_first_input() {
-        let (mut runtime, _) = product_runtime();
+        let (mut runtime, _drivers) = product_runtime();
         let revision = runtime.ui.public_revision.to_string();
         runtime.set_audio_enabled(&revision, true);
         assert_eq!(runtime.ui.error.as_ref().unwrap().code, "audio_error");
@@ -7517,7 +7340,7 @@ mod tests {
         );
         cleanup(&mut runtime);
         for enabled in [false, true] {
-            let (mut runtime, _) = product_runtime();
+            let (mut runtime, _drivers) = product_runtime();
             let engine = runtime.engine.as_mut().unwrap();
             let mut candidate = engine.model().draft().settings.clone();
             candidate.audio = AudioSelection::Disabled {
@@ -8510,10 +8333,6 @@ mod tests {
             fixture_treatment_capabilities(),
             startup,
             persistence,
-            profile_audio_sources()
-                .into_iter()
-                .map(|source| source.identity)
-                .collect(),
             crate::diagnostics::DiagnosticsHandle::for_test(),
             || {
                 Err(AudioError::Control(
@@ -9647,46 +9466,45 @@ mod tests {
 
     #[test]
     fn native_environment_enriches_engine_free_reports_once_without_xwayland_inference() {
-        use crate::diagnostics::report::{Observation, UnavailableReason};
+        use crate::diagnostics::report::{
+            NativeEnvironmentReport, Observation, UnavailableReason, XServerReport,
+        };
         let (mut runtime, _) = runtime();
         runtime.engine = None;
         runtime.ui.partial = Some(PartialDraft::default());
         runtime.poll();
         let before = runtime.diagnostics_report().revision;
-        runtime.native_environment(
-            "6.11.2",
-            "xcb",
-            &"vendor".repeat(100),
-            12401000,
-            11,
-            0,
-            1,
-            1,
-        );
+        let native = NativeEnvironmentReport {
+            frontend: Observation::Observed {
+                value: "gpui".into(),
+            },
+            window_backend: Observation::Observed {
+                value: "x11".into(),
+            },
+            x_server: Observation::Observed {
+                value: XServerReport {
+                    vendor: "test X server".into(),
+                    release: 12401000,
+                    protocol_major: 11,
+                    protocol_minor: 0,
+                    shape_major: 1,
+                    shape_minor: 1,
+                },
+            },
+            xwayland_version: Observation::Unavailable {
+                reason: UnavailableReason::NotExposed,
+            },
+        };
+        runtime.native_environment(native.clone());
         let enriched = runtime.diagnostics_report();
         assert!(enriched.revision > before);
-        assert!(
-            matches!(enriched.environment.native.qt_runtime_version, Observation::Observed { value } if value == "6.11.2")
-        );
-        assert!(
-            matches!(enriched.environment.native.x_server, Observation::Observed { value } if value.vendor.len() == 256 && value.protocol_major == 11 && value.shape_major == 1)
-        );
-        assert!(matches!(
-            enriched.environment.native.xwayland_version,
-            Observation::Unavailable {
-                reason: UnavailableReason::NotExposed
-            }
-        ));
-        runtime.native_environment(
-            "6.11.2",
-            "xcb",
-            &"vendor".repeat(100),
-            12401000,
-            11,
-            0,
-            1,
-            1,
-        );
+        assert_eq!(enriched.environment.native, native);
+        let wire = serde_json::to_value(&enriched.environment.native).unwrap();
+        assert_eq!(wire["frontend"]["value"], "gpui");
+        assert_eq!(wire["window_backend"]["value"], "x11");
+        assert!(wire.get("qt_runtime_version").is_none());
+        assert!(wire.get("qt_platform").is_none());
+        runtime.native_environment(native);
         assert_eq!(runtime.diagnostics_report().revision, enriched.revision);
         cleanup(&mut runtime);
     }

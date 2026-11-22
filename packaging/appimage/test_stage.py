@@ -16,6 +16,70 @@ SPEC = importlib.util.spec_from_file_location("furami_stage", Path(__file__).wit
 stage = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(stage)
 
+REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+NOTICE_LOCK = "packaging/appimage/sources.lock.json"
+
+
+class CrateNoticeFixture:
+    """Real gzipped crate archives plus a minimal reviewed Cargo.lock/policy pair."""
+
+    def __init__(self, root):
+        self.repo = root / "repo"
+        self.app = root / "app"
+        self.snapshot = self.app / "source-snapshot"
+        self.appdir = root / "AppDir"
+        self.appdir.mkdir()
+        self.crates = []
+        self.policy = {"schema": 1, "cargo_notices": []}
+
+    @staticmethod
+    def write_archive(path, members):
+        slug = path.name.removesuffix(".crate")
+        with tarfile.open(path, "w:gz") as archive:
+            for relative, data in members.items():
+                member = tarfile.TarInfo(slug + "/" + relative)
+                if isinstance(data, bytes):
+                    member.size = len(data)
+                    archive.addfile(member, io.BytesIO(data))
+                else:
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = data
+                    archive.addfile(member)
+
+    def crate(self, name, members, *, role="shipped-code-candidate", declared=None):
+        slug = name + "-1.0.0"
+        path = self.app / "sources" / (slug + ".crate")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_archive(path, members)
+        row = {"name": name, "version": "1.0.0", "source": REGISTRY,
+               "checksum": stage.digest(path), "license_expression": "MIT",
+               "license_file": declared, "role": role,
+               "vendor_path": "first/vendor/" + slug}
+        self.crates.append(row)
+        return row, path
+
+    def publish(self):
+        for row in self.crates:
+            archive = self.app / "sources" / f"{row['name']}-{row['version']}.crate"
+            row["checksum"] = stage.digest(archive)
+        lock = self.repo / NOTICE_LOCK
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(json.dumps(self.policy))
+        (self.repo / "Cargo.lock").write_text("version = 4\n" + "".join(
+            "\n[[package]]\n" + "\n".join(
+                f"{key} = {json.dumps(row[key])}" for key in ("name", "version", "source", "checksum"))
+            for row in self.crates))
+        if self.snapshot.exists():
+            shutil.rmtree(self.snapshot)
+        shutil.copytree(self.repo, self.snapshot)
+        inputs = {path.relative_to(self.repo).as_posix(): stage.digest(path)
+                  for path in self.repo.rglob("*") if path.is_file()}
+        return {"inputs": inputs, "cargo_lock_sha256": inputs["Cargo.lock"], "crates": self.crates}
+
+    def stage(self, manifest, owners):
+        with patch.object(stage, "REPO", self.repo):
+            return stage.crate_notices(self.app, manifest, self.appdir, owners)
+
 
 class StageIntegrityTests(unittest.TestCase):
     def test_source_patch_bytes_are_inside_appdir_with_explicit_media_ownership(self):
@@ -101,26 +165,23 @@ class StageIntegrityTests(unittest.TestCase):
                          appdir / "usr/bin/furami", appdir / "furami"):
                 self.assertEqual(path.lstat().st_mtime_ns, epoch * 1_000_000_000)
 
-    def test_qt_xcb_context_requires_both_pinned_graphics_integrations(self):
+    def test_native_x11_loader_dependency_cannot_fall_back_when_missing(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             prefix, appdir = root / "prefix", root / "AppDir"
-            prefix.mkdir()
-            appdir.mkdir()
-            for relative in stage.XCB_PLUGINS[:2]:
-                target = prefix / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(("qualifying " + relative).encode())
-            artifacts = {name: value for name, value in stage.snapshot(prefix).items()
-                         if value["type"] == "file"}
-            with self.assertRaisesRegex(ValueError, "libqxcb-glx-integration.so"):
-                stage.stage_xcb_plugins(prefix, artifacts, appdir, {})
-            glx = prefix / stage.XCB_PLUGINS[2]
-            glx.write_bytes(b"pinned glx")
-            artifacts[stage.XCB_PLUGINS[2]] = {"type": "file", "sha256": stage.digest(glx)}
-            (prefix / stage.XCB_PLUGINS[1]).write_bytes(b"unrecorded replacement")
-            with self.assertRaisesRegex(ValueError, "libqxcb-egl-integration.so"):
-                stage.stage_xcb_plugins(prefix, artifacts, appdir, {})
+            (prefix / "lib").mkdir(parents=True)
+            relative = "usr/bin/furami"
+            executable = appdir / relative
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"\x7fELF Furami fixture")
+            library = "libxkbcommon-x11.so.0"
+            metadata = {"needed": [library], "paths": [], "soname": None}
+            owners = {relative: {"owner": "app"}}
+            with patch.object(stage, "elf_metadata", return_value=metadata), \
+                    patch.object(stage, "host_library", return_value=root / library):
+                with self.assertRaisesRegex(ValueError, r"missing Ubuntu loader library: .*libxkbcommon-x11\.so\.0"):
+                    stage.stage_libraries(prefix, {}, appdir, owners, {})
+            self.assertNotIn("usr/lib/" + library, owners)
 
     def test_source_symlinks_must_remain_inside_source_and_match_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -142,7 +203,7 @@ class StageIntegrityTests(unittest.TestCase):
                 stage.verify_artifacts(root, entries)
 
     def test_absolute_runpath_requires_known_prefix_and_room_for_rewrite(self):
-        replacement = stage.relocated_runpath("/out/prefix/lib", "usr/lib/qt6/plugins/platforms/libqxcb.so")
+        replacement = stage.relocated_runpath("/out/prefix/lib", "usr/lib/libmpv.so.2")
         self.assertEqual(replacement, "$ORIGIN")
         with self.assertRaisesRegex(ValueError, "foreign absolute"):
             stage.relocated_runpath("/home/user/build/lib", "usr/bin/furami")
@@ -214,93 +275,59 @@ class StageIntegrityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "section"):
                 stage.verify_runtime_header(image, runtime)
 
-    def test_crate_notices_copy_real_vendor_text_not_invented_metadata(self):
+    def test_crate_notices_copy_real_archive_text_not_invented_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            vendor = root / "app/first/vendor/example-1.0.0"
-            vendor.mkdir(parents=True)
-            (vendor / "LICENSE-MIT").write_text("original author permission\n")
-            staged = root / "AppDir"
-            staged.mkdir()
+            fixture = CrateNoticeFixture(Path(temporary))
+            fixture.crate("example", {"LICENSE-MIT": b"original author permission\n"}, role="build-only")
             owners = {}
-            records = stage.crate_notices(root / "app", {"crates": [
-                {"name": "example", "version": "1.0.0", "vendor_path": "first/vendor/example-1.0.0",
-                 "license_file": None, "role": "build-only", "license_expression": "MIT",
-                 "source": "registry+https://example.invalid", "checksum": "abc"}]}, staged, owners)
-            copied = staged / "usr/share/licenses/rust/example-1.0.0/LICENSE-MIT"
+            records = fixture.stage(fixture.publish(), owners)
+            relative = "usr/share/licenses/rust/example-1.0.0/LICENSE-MIT"
+            copied = fixture.appdir / relative
             self.assertEqual(copied.read_text(), "original author permission\n")
-            self.assertEqual(records[0]["notices"], [copied.relative_to(staged).as_posix()])
-            self.assertEqual(owners[copied.relative_to(staged).as_posix()]["source_sha256"], stage.digest(copied))
+            self.assertEqual(records[0]["notices"], [relative])
+            self.assertEqual(owners[relative]["source"], "sources/example-1.0.0.crate:example-1.0.0/LICENSE-MIT")
+            self.assertEqual(owners[relative]["source_sha256"], stage.digest(copied))
 
-    def test_linked_kdab_crate_without_top_level_license_preserves_source_attribution(self):
+    def test_linked_crate_with_declared_nested_notice_preserves_source_attribution(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            vendor = root / "app/first/vendor/cxx-qt-0.10.0"
-            (vendor / "src").mkdir(parents=True)
-            header = ("// SPDX-FileCopyrightText: 2023 Klarälvdalens Datakonsult AB, a KDAB Group company <info@kdab.com>\n"
-                      "// SPDX-FileContributor: Leon Matthes <leon.matthes@kdab.com>\n"
-                      "// SPDX-License-Identifier: MIT OR Apache-2.0\n")
-            (vendor / "src/lib.rs").write_text(header + "pub fn bridge() {}\n")
-            (vendor / "Cargo.toml").write_text('[package]\nname = "cxx-qt"\nversion = "0.10.0"\nlicense = "MIT OR Apache-2.0"\n')
-            source = vendor / "src/lib.rs"
-            (vendor / ".cargo-checksum.json").write_text(json.dumps({
-                "files": {"src/lib.rs": stage.digest(source)}, "package": None}))
-            licenses = root / "licenses"
-            licenses.mkdir()
-            for name in ("MIT.txt", "Apache-2.0.txt"):
-                (licenses / name).write_text("upstream " + name + "\n")
-            manifest = {"crates": [{
-                "name": "cxx-qt", "version": "0.10.0", "role": "shipped-code-candidate",
-                "vendor_path": "first/vendor/cxx-qt-0.10.0", "license_expression": "MIT OR Apache-2.0",
-                "source": "registry+https://github.com/rust-lang/crates.io-index",
-                "checksum": "a" * 64, "license_file": None}]}
-            archive = root / "app/sources/cxx-qt-0.10.0.crate"
-            archive.parent.mkdir(parents=True)
-            with tarfile.open(archive, "w:gz") as bundle:
-                bundle.add(vendor / "Cargo.toml", "cxx-qt-0.10.0/Cargo.toml")
-                bundle.add(source, "cxx-qt-0.10.0/src/lib.rs")
-            original_archive = archive.read_bytes()
-            manifest["crates"][0]["checksum"] = stage.digest(archive)
-            hashes = {name: stage.digest(licenses / name) for name in ("MIT.txt", "Apache-2.0.txt")}
-            staged = root / "AppDir"
-            staged.mkdir()
-            with patch.dict(stage.KDAB_LICENSE_SHA256, hashes):
-                owners = {}
-                record, = stage.crate_notices(root / "app", manifest, staged, owners, licenses)
-                self.assertEqual(record["license_expression"], "MIT OR Apache-2.0")
-                notice = staged / "usr/share/licenses/rust/cxx-qt-0.10.0/SPDX-NOTICES.txt"
-                self.assertIn(header.strip(), notice.read_text())
-                self.assertIn("src/lib.rs", notice.read_text())
-                self.assertEqual(owners[record["notices"][0]]["source_sha256"], stage.digest(notice))
-                self.assertEqual(len(record["notices"]), 3)
-                (licenses / "MIT.txt").write_text("replaced text\n")
-                with self.assertRaisesRegex(ValueError, "upstream KDAB license bytes unavailable/mismatched"):
-                    stage.crate_notices(root / "app", manifest, staged, {}, licenses)
-                (licenses / "MIT.txt").write_text("upstream MIT.txt\n")
-                archive.write_bytes(b"wrong crate")
-                with self.assertRaisesRegex(ValueError, "crate archive checksum mismatch"):
-                    stage.crate_notices(root / "app", manifest, staged, {}, licenses)
-                archive.unlink()
-                with self.assertRaisesRegex(ValueError, "crate source archive unavailable"):
-                    stage.crate_notices(root / "app", manifest, staged, {}, licenses)
-                archive.write_bytes(original_archive)
-                source.unlink()
-                with self.assertRaisesRegex(ValueError, "crate source unavailable"):
-                    stage.crate_notices(root / "app", manifest, staged, {}, licenses)
+            fixture = CrateNoticeFixture(Path(temporary))
+            license_file = "legal/permission.txt"
+            original = b"original upstream permission\n"
+            crate, archive = fixture.crate("frontend-example", {license_file: original},
+                                           declared=license_file)
+            owners = {}
+            record, = fixture.stage(fixture.publish(), owners)
+            destination = "usr/share/licenses/rust/frontend-example-1.0.0/" + license_file
+            self.assertEqual(record["license_expression"], "MIT")
+            self.assertEqual(record["notices"], [destination])
+            self.assertEqual((fixture.appdir / destination).read_bytes(), original)
+            self.assertEqual(owners[destination], {
+                "owner": "app-crate-source",
+                "source": "sources/frontend-example-1.0.0.crate:frontend-example-1.0.0/" + license_file,
+                "source_sha256": hashlib.sha256(original).hexdigest(),
+                "crate_member": license_file,
+                "crate": {key: crate[key] for key in ("name", "version", "source", "checksum")}})
+
+            fixture.write_archive(archive, {"README.md": b"no declared permission\n"})
+            with self.assertRaisesRegex(ValueError, "declared crate license missing/unsafe"):
+                fixture.stage(fixture.publish(), {})
+            fixture.write_archive(archive, {license_file: "elsewhere-license"})
+            with self.assertRaisesRegex(ValueError, "crate notice member must be unique and regular"):
+                fixture.stage(fixture.publish(), {})
+            fixture.write_archive(archive, {license_file: original})
+            manifest = fixture.publish()
+            archive.write_bytes(b"wrong crate archive")
+            with self.assertRaisesRegex(ValueError, "crate archive SHA256 mismatch"):
+                fixture.stage(manifest, {})
 
     def test_linked_crate_without_attribution_fails_but_build_only_macro_may_lack_notice(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            vendor = root / "app/first/vendor/other-1.0.0"
-            vendor.mkdir(parents=True)
-            appdir = root / "AppDir"
-            appdir.mkdir()
-            crate = {"name": "other", "version": "1.0.0", "vendor_path": "first/vendor/other-1.0.0",
-                     "role": "shipped-code-candidate", "license_file": None, "license_expression": "MIT",
-                     "source": "registry+https://example.invalid", "checksum": "a" * 64}
+            fixture = CrateNoticeFixture(Path(temporary))
+            fixture.crate("other", {"src/lib.rs": b"pub fn value() {}\n"})
             with self.assertRaisesRegex(ValueError, "linked crate attribution missing"):
-                stage.crate_notices(root / "app", {"crates": [crate]}, appdir, {})
-            records = stage.crate_notices(root / "app", {"crates": [{**crate, "role": "build-only"}]}, appdir, {})
+                fixture.stage(fixture.publish(), {})
+            fixture.crates[0]["role"] = "build-only"
+            records = fixture.stage(fixture.publish(), {})
             self.assertEqual(records[0]["notices"], [])
 
     def test_rust_std_notices_require_exact_linked_archive_and_distribution(self):
@@ -316,19 +343,27 @@ class StageIntegrityTests(unittest.TestCase):
             vendor_path = "first/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/libmemchr-def.rlib"
             vendor_binary = app / vendor_path
             vendor_binary.write_bytes(b"linked vendored Rust library")
+            proc_macro_path = "first/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/libproc_macro-1234.rlib"
+            proc_macro_binary = app / proc_macro_path
+            proc_macro_binary.write_bytes(b"linked toolchain proc_macro")
+            proc_macro_manifest = b'[package]\nname = "proc_macro"\nversion = "0.0.0"\n'
             source_file = app / "sources/rust-src-1.97.1.tar.xz"
             with tarfile.open(source_file, "w:xz") as archive:
-                content = b'[package]\nlicense = "MIT OR Apache-2.0"\n'
+                content = b'[package]\nname = "std"\nlicense = "MIT OR Apache-2.0"\n'
                 member = tarfile.TarInfo(
                     "rust-src-1.97.1/rust-src/lib/rustlib/src/rust/library/std/Cargo.toml")
                 member.size = len(content)
                 archive.addfile(member, io.BytesIO(content))
                 directory = "rust-src-1.97.1/rust-src/lib/rustlib/src/rust/library/vendor/memchr-2.7.6/"
-                for name, content in (("Cargo.toml", b'[package]\nlicense = "Unlicense OR MIT"\n'),
+                for name, content in (("Cargo.toml", b'[package]\nname = "memchr"\nlicense = "Unlicense OR MIT"\n'),
                                       ("LICENSE-MIT", b"vendored exact MIT permission\n")):
                     member = tarfile.TarInfo(directory + name)
                     member.size = len(content)
                     archive.addfile(member, io.BytesIO(content))
+                member = tarfile.TarInfo(
+                    "rust-src-1.97.1/rust-src/lib/rustlib/src/rust/library/proc_macro/Cargo.toml")
+                member.size = len(proc_macro_manifest)
+                archive.addfile(member, io.BytesIO(proc_macro_manifest))
             distribution = app / "sources/rust-std-1.97.1-x86_64-unknown-linux-gnu.tar.xz"
             prefix = distribution.name.removesuffix(".tar.xz")
             notices = []
@@ -343,7 +378,7 @@ class StageIntegrityTests(unittest.TestCase):
             manifest = {"toolchain": {
                 "rust-src": {"archive": source_file.name, "sha256": stage.digest(source_file)},
                 "rust-std": {"archive": distribution.name, "sha256": stage.digest(distribution)}},
-                "binary": {"linked_archives": [linked_path, vendor_path], "rust_standard_library": {
+                "binary": {"linked_archives": [linked_path, vendor_path, proc_macro_path], "rust_standard_library": {
                     "version": "1.97.1", "target": "x86_64-unknown-linux-gnu",
                     "license_expression": "MIT OR Apache-2.0",
                     "source": {"archive": source_file.name, "sha256": stage.digest(source_file),
@@ -353,10 +388,24 @@ class StageIntegrityTests(unittest.TestCase):
                                   "path": linked_path, "sha256": stage.digest(linked)},
                                  {"name": "memchr", "source_path": "vendor/memchr-2.7.6",
                                   "license_expression": "Unlicense OR MIT",
-                                  "path": vendor_path, "sha256": stage.digest(vendor_binary)}],
+                                  "path": vendor_path, "sha256": stage.digest(vendor_binary)},
+                                 {"name": "proc_macro", "source_path": "proc_macro",
+                                  "declared_license": None, "license_expression": "MIT OR Apache-2.0",
+                                  "path": proc_macro_path, "sha256": stage.digest(proc_macro_binary)}],
                     "notices": notices}}}
             owners = {}
-            staged = stage.rust_std_notices(app, manifest, appdir, owners)
+            lock = {"toolchain": manifest["toolchain"], "rust_version": "1.97.1",
+                    "target": "x86_64-unknown-linux-gnu", "rust_standard_library": {
+                        "license_expression": "MIT OR Apache-2.0",
+                        "proc_macro_manifest_sha256": hashlib.sha256(proc_macro_manifest).hexdigest(),
+                        "notices": [dict(notice) for notice in notices]}}
+            staged = stage.rust_std_notices(app, manifest, appdir, owners, app_lock=lock)
+            proc_macro = staged["linked_archives"][-1]
+            self.assertEqual(proc_macro["license_expression"], "MIT OR Apache-2.0")
+            proc_macro["declared_license"] = proc_macro["license_expression"]
+            with self.assertRaisesRegex(ValueError, "Rust std crate license differs from source: proc_macro"):
+                stage.rust_std_notices(app, manifest, appdir, {}, app_lock=lock)
+            proc_macro["declared_license"] = None
             self.assertEqual(len(staged["notices"]), 3)
             for destination in staged["notices"]:
                 self.assertEqual(stage.digest(appdir / destination), owners[destination]["source_sha256"])
@@ -364,12 +413,12 @@ class StageIntegrityTests(unittest.TestCase):
             self.assertEqual(len(vendor_notices), 1)
             self.assertEqual((appdir / vendor_notices[0]).read_bytes(), b"vendored exact MIT permission\n")
             manifest["binary"]["rust_standard_library"]["notices"][0]["sha256"] = "0" * 64
-            with self.assertRaisesRegex(ValueError, "Rust std notice hash mismatch"):
-                stage.rust_std_notices(app, manifest, appdir, {})
-            manifest["binary"]["rust_standard_library"]["notices"][0]["sha256"] = notices[0]["sha256"]
+            with self.assertRaisesRegex(ValueError, "Rust std notice manifest differs from app lock"):
+                stage.rust_std_notices(app, manifest, appdir, {}, app_lock=lock)
+            notices[0]["sha256"] = lock["rust_standard_library"]["notices"][0]["sha256"]
             linked.write_bytes(b"incorrect linked std")
             with self.assertRaisesRegex(ValueError, "Rust std linked archive bytes mismatch"):
-                stage.rust_std_notices(app, manifest, appdir, {})
+                stage.rust_std_notices(app, manifest, appdir, {}, app_lock=lock)
 
     def runtime_materials_fixture(self, root):
         runtime, staged = root / "runtime", root / "AppDir"

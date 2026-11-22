@@ -129,25 +129,13 @@ fi
 exec cc "$@" -fuse-ld=bfd
 EOF
 chmod +x /build/wrappers/cxx /build/wrappers/linker
-# QMAKE remains the actual frozen tool. Only rcc gets a read-only build-container
-# bind, logging its invocation and executing unchanged original provider bytes.
-# No host prefix, runtime library, qmake query, or vendored crate is modified.
-export QMAKE=/out/prefix/bin/qmake6 FURAMI_MEDIA_PREFIX=/out/prefix
+export FURAMI_MEDIA_PREFIX=/out/prefix
 export PKG_CONFIG_LIBDIR=/out/prefix/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig
 unset PKG_CONFIG_PATH PKG_CONFIG_SYSROOT_DIR
 export LD_LIBRARY_PATH=/out/prefix/lib
-[[ "$("$QMAKE" -query QT_VERSION)" == '6.11.2' ]]
-[[ "$("$QMAKE" -query QT_INSTALL_PREFIX)" == '/out/prefix' ]]
-[[ "$(pkg-config --modversion Qt6Core)" == '6.11.2' ]]
-[[ "$(pkg-config --variable=prefix Qt6Core)" == '/out/prefix' ]]
 [[ "$(pkg-config --modversion mpv)" == '2.5.0' ]]
 [[ "$(pkg-config --variable=prefix mpv)" == '/out/prefix' ]]
-pkg-config --exists x11 xcb xcb-shape
-pkg-config --cflags --libs Qt6Core > /build/evidence/qt-pkg-config.txt
-if grep -Eq '/home/qt/work/install|/usr/(local/)?(lib|include).*[Qq]t6' /build/evidence/qt-pkg-config.txt; then
-  echo 'Qt build flags escaped the frozen prefix' >&2
-  exit 1
-fi
+pkg-config --exists --print-errors x11 xcb xcb-shape fontconfig xkbcommon xkbcommon-x11
 export CARGO_HOME=/build/cargo-home CARGO_TARGET_DIR=/build/target CARGO_NET_OFFLINE=true
 export CARGO_BUILD_JOBS="${FURAMI_BUILD_JOBS:-2}"
 [[ "$CARGO_BUILD_JOBS" =~ ^[1-4]$ ]] || { echo 'build jobs must be 1..4' >&2; exit 1; }
@@ -157,7 +145,8 @@ export CXXFLAGS="$CFLAGS"
 export RUSTFLAGS='-C linker-features=-lld -C linker=/build/wrappers/linker --remap-path-prefix=/workspace=/usr/src/furami --remap-path-prefix=/build=/usr/src/furami-build'
 export SOURCE_DATE_EPOCH
 
-cargo metadata --offline --locked --format-version=1 --filter-platform x86_64-unknown-linux-gnu > /build/evidence/cargo-metadata.json
+cargo metadata --offline --locked --format-version=1 \
+  --filter-platform x86_64-unknown-linux-gnu > /build/evidence/cargo-metadata.json
 cargo build --release --offline --frozen --verbose > /build/evidence/cargo-build.log 2>&1 || {
   cat /build/evidence/cargo-build.log
   exit 1
@@ -168,10 +157,17 @@ readelf -h /build/bin/furami > /build/evidence/furami.elf-header.txt
 readelf -d /build/bin/furami > /build/evidence/furami.dynamic.txt
 readelf -Ws /build/bin/furami > /build/evidence/furami.symbols.txt
 ldd /build/bin/furami > /build/evidence/furami.ldd.txt
-! grep -q 'not found' /build/evidence/furami.ldd.txt
-if grep -E '^[[:space:]]*lib(Qt6|mpv)' /build/evidence/furami.ldd.txt |
+if grep -q 'not found' /build/evidence/furami.ldd.txt; then
+  echo 'Furami has unresolved build-container libraries' >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]*libQt[0-9]' /build/evidence/furami.ldd.txt; then
+  echo 'Furami resolved a Qt library' >&2
+  exit 1
+fi
+if grep -E '^[[:space:]]*libmpv' /build/evidence/furami.ldd.txt |
     grep -Ev '=> /out/prefix/lib/'; then
-  echo 'Furami resolved a Qt/libmpv library outside the verified media prefix' >&2
+  echo 'Furami resolved libmpv outside the verified media prefix' >&2
   exit 1
 fi
 # libmpv is loaded at runtime from FURAMI_MEDIA_PREFIX/lib/libmpv.so.

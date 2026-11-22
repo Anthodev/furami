@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Execute only in media lock's immutable Ubuntu 24.04 container, before stage.py.
 set -euo pipefail
+if [[ $# -gt 1 || ($# -eq 1 && $1 != --capture-ubuntu-only) ]]; then
+  printf 'Invalid Ubuntu staging arguments\n' >&2
+  exit 2
+fi
 export DEBIAN_FRONTEND=noninteractive TZ=UTC LC_ALL=C.UTF-8
 mkdir -p /tmp/furami-ca
 printf '%s  %s\n' "$CA_SHA256" /bootstrap-ca.deb | sha256sum --check --status
@@ -28,10 +32,11 @@ apt-get install --yes --no-install-recommends "${packages[@]}"
 dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' | sort > /tmp/stage-apt-installed.tsv
 printf '%s  %s\n' "$APT_INSTALLED_SHA256" /tmp/stage-apt-installed.tsv | sha256sum --check --status
 cmp /tmp/stage-apt-installed.tsv /media/apt-installed.tsv
-# Recreate only authenticated package/source metadata, never stage another image.
+# Inspect the identical ELF closure, but never start the image/tool/notice pipeline.
 if [[ ${1:-} == --capture-ubuntu-only ]]; then
-  exec python3 /workspace/packaging/appimage/sources.py --capture-ubuntu \
-    --stage /out --app /app --output /out
+  exec python3 /workspace/packaging/appimage/stage.py \
+    --media-output /media --app-build /app --runtime-build /runtime \
+    --output /out --version "$FURAMI_VERSION" --in-container --capture-ubuntu-only
 fi
 python3 /workspace/packaging/appimage/tool-closure.py --phase preflight
 # The media 408/317 closure above is finalized before adding three

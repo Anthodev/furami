@@ -2,7 +2,7 @@
   "schema": 1,
   "rust_version": "1.97.1",
   "target": "x86_64-unknown-linux-gnu",
-  "media_lock_sha256": "6ee70cabb2811fe00b4d942a45a74dd73ee7ea0be34062bf2638466b376a24c6",
+  "media_lock_sha256": "87d6286bfa66a22c0ba712e0ae4feabdebd28823a79f6b90a6de66dcbba02caf",
   "toolchain": {
     "rustc": {
       "url": "https://static.rust-lang.org/dist/rustc-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
@@ -27,6 +27,7 @@
   },
   "rust_standard_library": {
     "license_expression": "MIT OR Apache-2.0",
+    "proc_macro_manifest_sha256": "82563b1be3d575d02ce51535920361b804a836b5b4a2a712fd036a254c841d36",
     "notices": [
       {
         "archive": "rust-std-1.97.1-x86_64-unknown-linux-gnu.tar.xz",

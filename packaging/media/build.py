@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 
 LOCK_PATH = Path(__file__).with_name("stack.lock.json")
-REQUIRED = {"ca_certificates", "mpv", "libplacebo", "vulkan_headers", "ffmpeg", "qt", "cxx_qt"}
+REQUIRED = {"ca_certificates", "mpv", "libplacebo", "vulkan_headers", "ffmpeg"}
 PATCH_SPEC = importlib.util.spec_from_file_location("furami_media_source_patches", LOCK_PATH.with_name("source-patches.py"))
 source_patches = importlib.util.module_from_spec(PATCH_SPEC)
 PATCH_SPEC.loader.exec_module(source_patches)
@@ -29,7 +29,7 @@ def sha256(path):
 
 def check_lock(lock):
     if lock.get("schema") != 1 or set(lock.get("sources", {})) != REQUIRED:
-        raise ValueError("expected schema 1 and seven frozen sources")
+        raise ValueError("expected schema 1 and five frozen media sources")
     source_patches.entries(lock["sources"])
     if not re.fullmatch(r"docker.io/library/ubuntu@sha256:[0-9a-f]{64}", lock.get("container", "")):
         raise ValueError("Ubuntu container must use an immutable OCI digest")
@@ -44,33 +44,12 @@ def check_lock(lock):
     if not isinstance(lock.get("source_date_epoch"), int):
         raise ValueError("SOURCE_DATE_EPOCH must be frozen")
     for name, source in lock["sources"].items():
-        if name == "qt":
-            continue
         if not re.fullmatch(r"[0-9a-f]{64}", source.get("sha256", "")):
             raise ValueError(f"{name}: missing or invalid SHA256")
         if not source.get("url", "").startswith("https://") or not re.fullmatch(r"[a-z0-9-]+\.(tar\.(gz|xz)|deb)", source.get("archive", "")):
             raise ValueError(f"{name}: immutable HTTPS source URL and filename required")
         if not source.get("version"):
             raise ValueError(f"{name}: version required")
-    qt = lock["sources"]["qt"]
-    required_qt = {"qtbase", "qtdeclarative", "qtsvg", "icu", "qtshadertools"}
-    if qt.get("version") != "6.11.2" or qt.get("kit") != "linux_gcc_64":
-        raise ValueError("Qt official 6.11.2 linux_gcc_64 kit required")
-    archives = qt.get("archives", [])
-    if len(archives) != len(required_qt) or {item.get("component") for item in archives} != required_qt:
-        raise ValueError("Qt official kit archive closure incomplete")
-    repository = "https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_6112/qt6_6112/"
-    for item in archives:
-        if not re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", "")):
-            raise ValueError(f"Qt {item['component']} archive missing SHA256")
-        if not re.fullmatch(r"[0-9a-f]{40}", item.get("upstream_sha1", "")):
-            raise ValueError(f"Qt {item['component']} official SHA1 sidecar missing")
-        filename = item.get("archive", "")
-        package = ("qt.qt6.6112.addons.qtshadertools.linux_gcc_64"
-                   if item["component"] == "qtshadertools" else "qt.qt6.6112.linux_gcc_64")
-        expected = repository + package + "/" + filename
-        if not re.fullmatch(r"6\.11\.2-0-[A-Za-z0-9_.-]+\.7z", filename) or item.get("url") != expected:
-            raise ValueError(f"Qt {item['component']} archive must use official release URL")
     if not re.fullmatch(r"\d+\.\d+\.\d+", lock["sources"]["mpv"].get("client_api", "")):
         raise ValueError("mpv client API version must be pinned")
     if lock["sources"]["mpv"].get("build_flags") != ["-Djpeg=disabled"]:
@@ -83,28 +62,16 @@ def obtain_source(name, source, cache):
         actual = sha256(dest)
         if actual != source["sha256"]:
             raise ValueError(f"{name}: cached archive SHA256 {actual} differs from lock {source['sha256']}")
-        if "upstream_sha1" in source:
-            published = hashlib.sha1()
-            with dest.open("rb") as archive:
-                for chunk in iter(lambda: archive.read(1024 * 1024), b""):
-                    published.update(chunk)
-            if published.hexdigest() != source["upstream_sha1"]:
-                raise ValueError(f"{name}: cached archive SHA1 differs from published upstream sidecar")
         return dest
     tmp = dest.with_suffix(dest.suffix + ".partial")
     try:
         with urllib.request.urlopen(source["url"], timeout=120) as response, tmp.open("wb") as target:
             digest = hashlib.sha256()
-            published = hashlib.sha1() if "upstream_sha1" in source else None
             for chunk in iter(lambda: response.read(1024 * 1024), b""):
                 digest.update(chunk)
-                if published is not None:
-                    published.update(chunk)
                 target.write(chunk)
         if digest.hexdigest() != source["sha256"]:
             raise ValueError(f"{name}: downloaded archive SHA256 {digest.hexdigest()} differs from lock {source['sha256']}")
-        if published is not None and published.hexdigest() != source["upstream_sha1"]:
-            raise ValueError(f"{name}: downloaded archive SHA1 differs from published upstream sidecar")
         tmp.rename(dest)
     finally:
         tmp.unlink(missing_ok=True)
@@ -144,7 +111,7 @@ def build(output, cache):
     lock_sha256 = hashlib.sha256(lock_bytes).hexdigest()
     recipes = {name: sha256(LOCK_PATH.parent / name) for name in
                ("build.py", "container-build.sh", "build-device-check.sh",
-                "build-qt-kit.py", "build-apt-closure.json", "source-patches.py")}
+                "build-apt-closure.json", "source-patches.py")}
     closure = LOCK_PATH.parent / lock["apt_closure"]["file"]
     if sha256(closure) != lock["apt_closure"]["sha256"]:
         raise ValueError("APT closure file SHA256 differs from stack lock")
@@ -154,12 +121,6 @@ def build(output, cache):
     source_patches.snapshot(output / "source-inputs", lock_bytes, patch_inputs)
     cache.mkdir(parents=True, exist_ok=True)
     for name, source in lock["sources"].items():
-        if name == "qt":
-            for archive in source["archives"]:
-                component = archive["component"]
-                print(f"Verifying official Qt {source['version']} {component} ({archive['sha256']})", flush=True)
-                obtain_source(f"Qt {component}", archive, cache)
-            continue
         print(f"Verifying {name} {source['version']} ({source['sha256']})", flush=True)
         obtain_source(name, source, cache)
     repository = LOCK_PATH.parent.parent.parent.resolve()

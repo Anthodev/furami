@@ -745,15 +745,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clang-format"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "696283b40e1a39d208ee614b92e5f6521d16962edeb47c48372585ec92419943"
-dependencies = [
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "clap"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -811,23 +802,13 @@ dependencies = [
 
 [[package]]
 name = "codespan-reporting"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3538270d33cc669650c4b093848450d380def10c331d38c768e34cac80576e6e"
-dependencies = [
- "termcolor",
- "unicode-width 0.1.14",
-]
-
-[[package]]
-name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.2.2",
+ "unicode-width",
 ]
 
 [[package]]
@@ -873,15 +854,6 @@ dependencies = [
  "getrandom 0.2.17",
  "once_cell",
  "tiny-keccak",
-]
-
-[[package]]
-name = "convert_case"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
-dependencies = [
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -1122,95 +1094,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fde53ca86b9704a943fef0f1e1d836239a6aedca5de3c65fa9f97ec0bd46d39"
 dependencies = [
  "cc",
- "codespan-reporting 0.13.1",
+ "codespan-reporting",
  "indexmap",
  "proc-macro2",
  "quote",
  "scratch",
  "syn 3.0.6",
-]
-
-[[package]]
-name = "cxx-gen"
-version = "0.7.202"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5010d4044b4ac8b18aca2341f3a6227aaf332ec8f5e38fcb93cba53451f2dc92"
-dependencies = [
- "codespan-reporting 0.13.1",
- "indexmap",
- "proc-macro2",
- "quote",
- "syn 3.0.6",
-]
-
-[[package]]
-name = "cxx-qt"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af6a52cbe33f8a23c6cc7dafb628819b89af6536102c3976f5efc33a038d4a82"
-dependencies = [
- "cxx",
- "cxx-qt-build",
- "cxx-qt-macro",
- "qt-build-utils",
- "static_assertions",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "cxx-qt-build"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bb2bb9e19b427e79ec5db1d88cde2f44f2d4190e5a0177e2d599ceb9277b670"
-dependencies = [
- "cc",
- "codespan-reporting 0.11.1",
- "cxx-gen",
- "cxx-qt-gen",
- "proc-macro2",
- "qt-build-utils",
- "quote",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "cxx-qt-gen"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6de19cacc58672a9fb70fad66e3d62b6aeb4b2f323b6251aeb99b50c6b6aa0c"
-dependencies = [
- "clang-format",
- "convert_case 0.6.0",
- "cxx-gen",
- "indoc",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "cxx-qt-lib"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e3c9fea8106d4bbe438d15c1242acd38f4869ca4f6d2a0b19e1f0dbbf23a50e"
-dependencies = [
- "cxx",
- "cxx-qt",
- "cxx-qt-build",
- "qt-build-utils",
-]
-
-[[package]]
-name = "cxx-qt-macro"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb794f10a4d27bfbd810eb8bf7fd7d9a0b0b5cefcd86a4c7b13ae3f8d4fa0169"
-dependencies = [
- "cxx-qt-gen",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -1220,7 +1109,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07bae89236c811fd4d08ed3441759ac4ac98d752cbfd3de341315ba16ad20ec3"
 dependencies = [
  "clap",
- "codespan-reporting 0.13.1",
+ "codespan-reporting",
  "indexmap",
  "proc-macro2",
  "quote",
@@ -1272,7 +1161,7 @@ version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
 dependencies = [
- "convert_case 0.10.0",
+ "convert_case",
  "proc-macro2",
  "quote",
  "rustc_version",
@@ -1716,9 +1605,6 @@ version = "1.1.0"
 dependencies = [
  "cxx",
  "cxx-build",
- "cxx-qt",
- "cxx-qt-build",
- "cxx-qt-lib",
  "gpui-pre",
  "gpui-pre-platform",
  "image",
@@ -2759,15 +2645,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "indoc"
-version = "2.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3216,7 +3093,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cfg-if",
  "cfg_aliases",
- "codespan-reporting 0.13.1",
+ "codespan-reporting",
  "half",
  "hashbrown 0.17.1",
  "indexmap",
@@ -4143,20 +4020,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "qt-build-utils"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c97911f105c362cbc035f631be7b43e44d9bca3a3aed2434260ba896f23d6b4"
-dependencies = [
- "anyhow",
- "cc",
- "semver",
- "serde",
- "thiserror 1.0.69",
- "which",
 ]
 
 [[package]]
@@ -5517,12 +5380,6 @@ name = "unicode-vo"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1d386ff53b415b7fe27b50bb44679e2cc4660272694b7b6f3326d8480823a94"
-
-[[package]]
-name = "unicode-width"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"

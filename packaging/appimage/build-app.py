@@ -108,7 +108,7 @@ def verify_media(media, stack):
         if relative.startswith("/") or ".." in Path(relative).parts:
             raise ValueError(f"invalid media artifact path: {relative}")
         verify_artifact(prefix, manifest, relative)
-    for required in ("bin/qmake6", "include/mpv/client.h", "lib/libmpv.so"):
+    for required in ("include/mpv/client.h", "lib/libmpv.so", "lib/pkgconfig/mpv.pc"):
         if required not in manifest["artifacts"]:
             raise ValueError(f"missing frozen media build input: {required}")
     return manifest
@@ -137,14 +137,6 @@ def obtain(source, cache):
 
 
 
-def generated_files(build):
-    target = build / "target"
-    return {p.relative_to(target).as_posix(): sha256(p) for p in sorted(target.rglob("*"))
-            if p.is_file() and p.suffix in (".h", ".hpp", ".hxx", ".cc", ".cpp", ".cxx")
-            and "/out/" in p.as_posix()}
-
-
-
 def dependency_roles(metadata):
     packages = {package["id"]: package for package in metadata["packages"]}
     nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
@@ -168,6 +160,17 @@ def dependency_roles(metadata):
     return {package: ("shipped-code-candidate" if package in runtime else
                       "build-only" if package in selected else "not-selected")
             for package in packages}
+
+
+def verify_candidate_graph(packages, roles):
+    selected = {package["name"] for package in packages if roles[package["id"]] != "not-selected"}
+    if not any(package["name"] == "gpui-pre" and roles[package["id"]] == "shipped-code-candidate"
+               for package in packages):
+        raise ValueError("application Cargo graph is missing the GPUI runtime dependency")
+    qt = sorted(name for name in selected
+                if name == "qt-build-utils" or name == "cxx-qt" or name.startswith("cxx-qt-"))
+    if qt:
+        raise ValueError(f"selected Qt crates in application Cargo graph: {', '.join(qt)}")
 
 
 def retained_direct_objects(linker_map, app_lock, apt_closure):
@@ -220,7 +223,7 @@ def retained_direct_objects(linker_map, app_lock, apt_closure):
             continue
         size, map_path = int(match[2], 16), match[3]
         if map_path.startswith("/build/target/"):
-            continue  # Furami/CXX-Qt output, not distribution CRT.
+            continue  # Application and Cargo build output, not distribution CRT.
         path = posixpath.normpath(map_path)
         if path not in known:
             raise ValueError(f"unattributed linker object {map_path}")
@@ -243,17 +246,62 @@ def retained_direct_objects(linker_map, app_lock, apt_closure):
     return [matched[path] for path in sorted(matched)]
 
 
+def rust_std_crate_license(name, source_path, manifest, app_lock):
+    package = tomllib.loads(manifest.decode()).get("package", {})
+    declared = package.get("license")
+    if package.get("name", "").replace("-", "_") != name:
+        raise ValueError(f"{name}: Rust std manifest package differs from linked crate")
+    if isinstance(declared, str) and declared.strip():
+        return declared, ("MIT OR Apache-2.0" if name == "rustc_demangle"
+                          and declared == "MIT/Apache-2.0" else declared)
+    # Only this exact in-tree manifest lacks terms. The pinned distribution's
+    # verified COPYRIGHT and accompanying license texts supply Rust's default.
+    if (name == source_path == package.get("name") == "proc_macro"
+            and "license" not in package and "license-file" not in package
+            and app_lock["rust_version"] == "1.97.1"
+            and app_lock["target"] == "x86_64-unknown-linux-gnu"
+            and hashlib.sha256(manifest).hexdigest() ==
+            app_lock["rust_standard_library"].get("proc_macro_manifest_sha256")):
+        return None, app_lock["rust_standard_library"]["license_expression"]
+    raise ValueError(f"{name}: missing or invalid Rust std manifest license")
+
+
+def verified_rust_std_notices(directory, app_lock):
+    standard = app_lock["toolchain"]["rust-std"]
+    notices = app_lock["rust_standard_library"]["notices"]
+    prefix = standard["archive"].removesuffix(".tar.xz")
+    if (len(notices) != 3 or {item["path"] for item in notices} !=
+            {f"{prefix}/{name}" for name in ("COPYRIGHT", "LICENSE-MIT", "LICENSE-APACHE")}
+            or any(item["archive"] != standard["archive"] or not HEX.fullmatch(item["sha256"])
+                   for item in notices)):
+        raise ValueError("invalid pinned Rust standard-library notices")
+    archive = directory / standard["archive"]
+    if archive.is_symlink() or not archive.is_file() or sha256(archive) != standard["sha256"]:
+        raise ValueError("Rust std distribution archive missing/mismatched")
+    verified = []
+    with tarfile.open(archive, "r:xz") as tar:
+        for item in sorted(notices, key=lambda row: row["path"]):
+            member = tar.getmember(item["path"])
+            if not member.isfile():
+                raise ValueError(f"Rust std notice member not a regular file: {item['path']}")
+            content = tar.extractfile(member).read()
+            if hashlib.sha256(content).hexdigest() != item["sha256"]:
+                raise ValueError(f"Rust std notice hash mismatch: {item['path']}")
+            verified.append((item, content))
+    return verified
+
+
 def rust_std_closure(output, linked_archives, app_lock, cache=None):
     """Map linked toolchain rlibs to source crates, without labeling vendor code MIT-only."""
     source = app_lock["toolchain"]["rust-src"]
-    standard = app_lock["toolchain"]["rust-std"]
     root = output / "first/rust/lib/rustlib/src/rust/library"
     sources = {}
     for manifest in root.rglob("Cargo.toml"):
-        package = tomllib.loads(manifest.read_text()).get("package", {})
+        content = manifest.read_bytes()
+        package = tomllib.loads(content.decode()).get("package", {})
         name = package.get("name", "").replace("-", "_")
-        if name and package.get("license"):
-            sources.setdefault(name, []).append((manifest, package["license"]))
+        if name:
+            sources.setdefault(name, []).append((manifest, content))
     prefix = f"first/rust/lib/rustlib/{app_lock['target']}/lib/"
     archives = []
     for path in linked_archives:
@@ -265,58 +313,55 @@ def rust_std_closure(output, linked_archives, app_lock, cache=None):
         name = name_match.group(1)
         choices = sources.get(name, [])
         if name == "compiler_builtins":
-            choices = [(file, license_name) for file, license_name in choices
+            choices = [(file, content) for file, content in choices
                        if file.parent.name == "compiler-builtins"]
         if len(choices) != 1:
             raise ValueError(f"{name}: expected one pinned Rust source manifest, got {len(choices)}")
-        source_file, license_name = choices[0]
+        source_file, content = choices[0]
+        source_path = source_file.relative_to(root).parent.as_posix()
+        declared, license_expression = rust_std_crate_license(name, source_path, content, app_lock)
         artifact = output / path
         if not artifact.is_file():
             raise ValueError(f"missing linked Rust toolchain archive {path}")
         archives.append({"name": name, "path": path, "sha256": sha256(artifact),
-                         "license_expression": ("MIT OR Apache-2.0" if license_name == "MIT/Apache-2.0"
-                                                else license_name),
-                         "declared_license": license_name,
-                         "source_path": source_file.relative_to(root).parent.as_posix()})
+                         "license_expression": license_expression,
+                         "declared_license": declared, "source_path": source_path})
     required = {"std", "core", "alloc", "panic_unwind", "compiler_builtins"}
     if not required.issubset({archive["name"] for archive in archives}):
         raise ValueError(f"missing linked Rust runtime components: {sorted(required - {a['name'] for a in archives})}")
     license_info = app_lock["rust_standard_library"]
-    notices = license_info["notices"]
-    for notice in notices:
-        if notice["archive"] != standard["archive"] or not HEX.fullmatch(notice["sha256"]):
-            raise ValueError("invalid pinned Rust standard-library notice")
-    with tarfile.open((cache or output / "sources") / standard["archive"]) as tar:
-        for notice in notices:
-            member = tar.getmember(notice["path"])
-            if not member.isfile() or hashlib.sha256(tar.extractfile(member).read()).hexdigest() != notice["sha256"]:
-                raise ValueError(f"Rust standard-library notice differs from pinned archive: {notice['path']}")
+    verified_rust_std_notices(cache or output / "sources", app_lock)
     return {"version": app_lock["rust_version"], "target": app_lock["target"],
             "license_expression": license_info["license_expression"],
             "source": {"archive": source["archive"], "sha256": source["sha256"],
                        "path": f"rust-src-{app_lock['rust_version']}/rust-src/lib/rustlib/src/rust/library"},
-            "notices": notices, "archives": archives}
+            "notices": license_info["notices"], "archives": archives}
 
 
 def input_hashes():
+    from sources import cargo_notice_input_files, cargo_notice_lock
+
+    _, _, notice_inputs = cargo_notice_lock(REPOSITORY)
+    cargo_notice_input_files(REPOSITORY, notice_inputs)
     stack = json.loads(STACK_LOCK.read_text())
     patches = source_patches.inputs(STACK_LOCK.parent, stack["sources"])
     inputs = [APP_LOCK, STACK_LOCK, STACK_LOCK.parent / "build-apt-closure.json",
-              REPOSITORY / "Cargo.lock", REPOSITORY / "Cargo.toml",
+              REPOSITORY / "Cargo.toml",
+              REPOSITORY / "Cargo.lock",
+              HERE / "sources.lock.json",
+              *sorted((HERE / "notices").rglob("*")),
               REPOSITORY / "build.rs", REPOSITORY / "rust-toolchain.toml",
               REPOSITORY / "LICENSE", REPOSITORY / "assets/logo.ico", REPOSITORY / "assets/logo.png",
               REPOSITORY / "assets/logo.svg",
               *sorted((REPOSITORY / "assets/icons").rglob("*")),
               HERE / "build-app.py", HERE / "app-container-build.sh",
-              HERE / "rcc-wrapper.sh",
               STACK_LOCK.with_name("source-patches.py"),
               *(STACK_LOCK.parent / relative for relative in patches),
-              *sorted((REPOSITORY / "src").rglob("*")),
-              *sorted((REPOSITORY / "qml").rglob("*"))]
+              *sorted((REPOSITORY / "src").rglob("*"))]
     if any(path.is_symlink() for path in inputs):
         raise ValueError("source snapshot cannot contain symlinks")
-    return {path.relative_to(REPOSITORY).as_posix(): sha256(path)
-            for path in inputs if path.is_file()}
+    return {**{path.relative_to(REPOSITORY).as_posix(): sha256(path)
+               for path in inputs if path.is_file()}, **notice_inputs}
 
 
 def snapshot_inputs(output, inputs):
@@ -347,7 +392,7 @@ def verify_workspace_inputs(root: Path, inputs: dict[str, str]) -> None:
 
 
 def prepare_build_workspace(snapshot: Path, workspace: Path, inputs: dict[str, str]) -> None:
-    """Materialize only recorded source inputs in a fresh private writable tree."""
+    """Materialize only recorded source inputs for the read-only container mount."""
     if workspace.exists() or any(path.is_symlink() for path in (workspace, *workspace.parents)):
         raise ValueError(f"build workspace must be fresh without symlinks: {workspace}")
     if (workspace.resolve().is_relative_to(snapshot.resolve())
@@ -361,7 +406,6 @@ def prepare_build_workspace(snapshot: Path, workspace: Path, inputs: dict[str, s
         shutil.copy2(snapshot / relative, target)
         if target.is_symlink() or not target.is_file():
             raise ValueError(f"workspace copy is not a regular nonsymlink file: {relative}")
-        target.chmod(target.stat().st_mode | 0o200)
     verify_workspace_inputs(workspace, inputs)
 
 
@@ -394,34 +438,20 @@ def emit_failed_build_log(log_path):
 def run_build(media, output, cache, stack, label, inputs):
     build = output / label
     build.mkdir()
-    workspace = build / "workspace"
+    workspace = output / f"{label}-workspace"
     prepare_build_workspace(output / "source-snapshot", workspace, inputs)
-    wrapper = build / "wrappers/rcc"
-    wrapper.parent.mkdir(exist_ok=True)
     epoch = stack["source_date_epoch"]
     if not isinstance(epoch, int) or epoch <= 0:
-        raise ValueError("RCC reproducibility requires a positive pinned epoch")
-    wrapper.write_text((HERE / "rcc-wrapper.sh").read_text().replace("@SOURCE_DATE_EPOCH@", str(epoch)))
-    wrapper.chmod(0o755)
+        raise ValueError("application reproducibility requires a positive pinned epoch")
     evidence = build / "evidence"
     evidence.mkdir(exist_ok=True)
-    tools = {"schema": 1, "qmake": {"invocation": "/out/prefix/bin/qmake6",
-              "sha256": sha256(media / "prefix/bin/qmake6")},
-             "rcc": {"discovery_path": "/out/prefix/libexec/rcc",
-                     "original_invocation": "/frozen-provider/prefix/libexec/rcc",
-                     "original_sha256": sha256(media / "prefix/libexec/rcc"),
-                     "wrapper_sha256": sha256(wrapper), "source_date_epoch": epoch,
-                     "binding": "single read-only container file bind; host provider unchanged"}}
-    (evidence / "qt-build-tools.json").write_text(json.dumps(tools, indent=2, sort_keys=True) + "\n")
     command = ["podman", "run", "--rm", "--pull=always", "--platform", stack["platform"],
-               "--security-opt", "label=disable", "--volume", f"{workspace.resolve()}:/workspace:rw",
+               "--security-opt", "label=disable", "--volume", f"{workspace.resolve()}:/workspace:ro",
                "--volume", f"{media}:/out:ro", "--volume", f"{cache}:/sources:ro",
-               "--volume", f"{media}:/frozen-provider:ro",
-               "--volume", f"{wrapper}:/out/prefix/libexec/rcc:ro",
                "--volume", f"{build}:/build", "--workdir", "/workspace",
                "--env", f"APT_SNAPSHOT={stack['apt_snapshot']}",
                "--env", f"CA_CERT_SHA256={stack['sources']['ca_certificates']['sha256']}",
-               "--env", f"SOURCE_DATE_EPOCH={stack['source_date_epoch']}",
+               "--env", f"SOURCE_DATE_EPOCH={epoch}",
                "--env", f"APT_CLOSURE_SHA256={stack['apt_closure']['sha256']}",
                "--env", f"APT_INSTALLED_SHA256={stack['apt_closure']['installed_sha256']}",
                "--env", f"APT_DEBS_SHA256={stack['apt_closure']['downloaded_debs_sha256']}",
@@ -460,6 +490,7 @@ def build_app(media, output, cache):
         raise ValueError("Rust toolchain archives require pinned upstream SHA256")
     verify_media(media, stack)
     crates = crate_sources(REPOSITORY / "Cargo.lock")
+    before = input_hashes()
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"output must be empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -474,7 +505,6 @@ def build_app(media, output, cache):
         local_sources.mkdir(exist_ok=True)
         for entry in all_sources:
             shutil.copy2(cache / entry["archive"], local_sources / entry["archive"])
-    before = input_hashes()
     media_before = sha256(media / "manifest.json")
     receipt_path = output / "build-inputs.json"
     receipt = {"schema": 1, "inputs": before, "media_path": str(media),
@@ -491,11 +521,7 @@ def build_app(media, output, cache):
         check_sha(cache / entry["archive"], entry["sha256"], entry["archive"])
         check_sha(output / "sources" / entry["archive"], entry["sha256"], entry["archive"])
     verify_media(media, stack)
-    generated_first = generated_files(output / "first")
-    if not generated_first:
-        raise ValueError("CXX-Qt generated C++/headers missing from app build")
     comparison = {"status": "single-build", "sha256_first": sha256(first),
-                  "generated_cpp_first": generated_first,
                   "reproducibility": "not measured; compare independent builds in CI"}
     binary = output / "bin/furami"
     binary.parent.mkdir()
@@ -503,6 +529,8 @@ def build_app(media, output, cache):
     evidence = output / "first/evidence"
     metadata = json.loads((evidence / "cargo-metadata.json").read_text())
     roles = dependency_roles(metadata)
+    verify_candidate_graph(metadata["packages"], roles)
+
     def crate_record(package):
         name, version = package["name"], package["version"]
         vendor = f"first/vendor/{name}-{version}" if package.get("source") else None
@@ -537,8 +565,7 @@ def build_app(media, output, cache):
                 "apt_closure": stack["apt_closure"],
                 "media": {"lock_sha256": sha256(STACK_LOCK), "manifest_sha256": media_before},
                 "compilation": {"mode": "fresh",
-                                "input_receipt_sha256": sha256(receipt_path),
-                                "qt_tools_evidence": "first/evidence/qt-build-tools.json"},
+                                "input_receipt_sha256": sha256(receipt_path)},
                 "inputs": before, "toolchain": sources, "source_archives": [
                     {"archive": entry["archive"], "sha256": entry["sha256"]} for entry in all_sources],
                 "crates": crate_inventory,

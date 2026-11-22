@@ -485,6 +485,10 @@ mod startup_option_tests {
             known_code("qualification_state"),
             Some("qualification_state")
         );
+        assert_eq!(known_code("gpui_x11_preflight"), Some("gpui_x11_preflight"));
+        assert!(SafeField::token("reason", "display-unreachable").permitted());
+        assert!(SafeField::token("failure_code", "mpv_library").permitted());
+        assert!(!SafeField::token("failure_code", "/private/libmpv.so").permitted());
         for phase in [
             "Idle",
             "WaitingSurface",
@@ -527,6 +531,7 @@ fn token_name(name: &str) -> bool {
             | "format"
             | "format_policy"
             | "fourcc"
+            | "failure_code"
     )
 }
 fn token_allowed(name: &str, value: &str) -> bool {
@@ -783,6 +788,7 @@ fn token_allowed(name: &str, value: &str) -> bool {
                 | "gpui_owner_barrier_failed"
                 | "qualification"
         ),
+        "failure_code" => value == "mpv_library",
         "format_policy" => matches!(value, "Auto" | "Manual"),
         "fourcc" | "format" => matches!(value, "YUYV" | "NV12" | "MJPG" | "BGR3" | "RGB3" | "UYVY"),
         "target" => matches!(
@@ -977,6 +983,7 @@ fn known_code(code: &str) -> Option<&'static str> {
         "native_environment",
         "native_surface",
         "native_release",
+        "gpui_x11_preflight",
         "gpui_publish",
         "gpui_wm_close",
         "gpui_surface_loss",
@@ -1001,6 +1008,11 @@ fn known_code(code: &str) -> Option<&'static str> {
         "qualification_command_rejected",
         "qualification_request_received",
         "qualification_request_parsed",
+        "qualification_stdin_enabled",
+        "qualification_stdin_read_failed",
+        "qualification_stdin_eof",
+        "qualification_invalid_utf8",
+        "qualification_line_oversized",
         "qualification_state",
         "qualification_backend",
         "qualification_volume",
@@ -1867,13 +1879,6 @@ impl DiagnosticsRuntime {
         self.handle.clone()
     }
     pub fn install_tracing(&self) {
-        if CALLBACK_HANDLE.set(self.handle()).is_err() {
-            self.handle.shared.error(DiagnosticsError::new(
-                DiagnosticsOperation::Subscribe,
-                DiagnosticsCode::SubscriberUnavailable,
-            ));
-            return;
-        }
         let filter = log_filter(std::env::var_os("RUST_LOG"), &self.handle);
         let subscriber = tracing_subscriber::registry()
             .with(filter)
@@ -1896,7 +1901,7 @@ impl DiagnosticsRuntime {
             .as_ref()
             .is_none_or(JoinHandle::is_finished)
     }
-    /// Call only after Qt returns and media-owner shutdown has been acknowledged.
+    /// Call after the GUI returns and the media-owner shutdown is acknowledged.
     /// Never joins a live worker, including on Drop.
     pub fn finish_shutdown(&self, allowance: Duration) {
         self.begin_shutdown();
@@ -1929,7 +1934,6 @@ impl Drop for DiagnosticsRuntime {
         self.begin_shutdown();
     }
 }
-static CALLBACK_HANDLE: OnceLock<DiagnosticsHandle> = OnceLock::new();
 
 fn build(config: DiagnosticsConfig) -> (DiagnosticsHandle, Receiver<Message>) {
     let mut health = DiagnosticsHealth::starting(config.limits);
@@ -2233,31 +2237,6 @@ impl<S: Subscriber> Layer<S> for SafeLayer {
     }
 }
 
-pub fn diagnostics_qt_message(severity: i32) {
-    if let Some(handle) = CALLBACK_HANDLE.get() {
-        qt_message(handle, severity);
-    }
-}
-fn qt_message(handle: &DiagnosticsHandle, severity: i32) {
-    let epoch = handle.shared.recording_epoch.load(Ordering::Acquire);
-    if epoch == 0 {
-        return;
-    }
-    let (level, token) = match severity {
-        0 => (EventLevel::Debug, "Debug"),
-        1 => (EventLevel::Warn, "Warning"),
-        2 => (EventLevel::Error, "Critical"),
-        3 => (EventLevel::Error, "Fatal"),
-        4 => (EventLevel::Info, "Info"),
-        _ => (EventLevel::Warn, "Unknown"),
-    };
-    handle.submit(
-        epoch,
-        level,
-        "qt_message",
-        &[SafeField::token("severity", token)],
-    );
-}
 fn known_control(value: &str) -> bool {
     const CONTROLS: &[&str] = &[
         "UnknownControl",
@@ -2461,11 +2440,6 @@ const NATIVE_SCHEMAS: &[(&str, &[&str])] = &[
         "native_root_destroyed_uncontrolled",
         &["root", "generation"],
     ),
-    ("qualification_stdin_enabled", &[]),
-    ("qualification_stdin_read_failed", &["errno"]),
-    ("qualification_stdin_eof", &[]),
-    ("qualification_invalid_utf8", &[]),
-    ("qualification_line_oversized", &[]),
     ("intent_open_capture", &[]),
     (
         "intent_restart_capture",
@@ -2585,12 +2559,14 @@ const NATIVE_SCHEMAS: &[(&str, &[&str])] = &[
         &["exit_code", "owner_cleanup_authorized"],
     ),
 ];
+#[cfg(test)]
 fn native_schema(code: &str) -> Option<(&'static str, &'static [&'static str])> {
     NATIVE_SCHEMAS
         .iter()
         .copied()
         .find(|(candidate, _)| *candidate == code)
 }
+#[cfg(test)]
 fn native_bool(name: &str) -> bool {
     matches!(
         name,
@@ -2626,17 +2602,13 @@ fn native_bool(name: &str) -> bool {
             | "owner_cleanup_authorized"
     )
 }
+#[cfg(test)]
 fn reject_native_record(handle: &DiagnosticsHandle, epoch: u64) {
     if handle.reject_oversized_record(epoch) {
         handle.submit(epoch, EventLevel::Warn, "record_rejected", &[]);
     }
 }
-pub fn diagnostics_native_event(code: &str, severity: i32, fields_json: &str) {
-    let Some(handle) = CALLBACK_HANDLE.get() else {
-        return;
-    };
-    native_event(handle, code, severity, fields_json);
-}
+#[cfg(test)]
 pub(super) fn native_event(
     handle: &DiagnosticsHandle,
     code: &str,

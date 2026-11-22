@@ -107,8 +107,8 @@ impl DesktopSessionReport {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct NativeEnvironmentReport {
-    pub qt_runtime_version: Observation<String>,
-    pub qt_platform: Observation<String>,
+    pub frontend: Observation<String>,
+    pub window_backend: Observation<String>,
     pub x_server: Observation<XServerReport>,
     pub xwayland_version: Observation<String>,
 }

@@ -63,7 +63,7 @@ impl Section {
     }
 
     pub(super) const fn width(self) -> f32 {
-        // MenuView applies this factor to the ordinary Brume widths.
+        // Menu surfaces are 20 % wider than the ordinary Brume widths.
         1.2 * match self {
             Self::Root | Self::Index => brume::MENU_WIDTH,
             _ => brume::SETTINGS_WIDTH,

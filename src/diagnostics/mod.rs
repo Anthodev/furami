@@ -8,7 +8,6 @@ pub use logging::{
     DiagnosticsCode, DiagnosticsConfig, DiagnosticsError, DiagnosticsHandle, DiagnosticsHealth,
     DiagnosticsOperation, DiagnosticsRuntime, EventLevel, FolderHealth, FolderPreparation,
     FolderRequestId, FolderState, IoKind, LogLimits, LogLocation, LogOrigin, SafeField, SinkStatus,
-    diagnostics_native_event, diagnostics_qt_message,
 };
 
 #[cfg(test)]

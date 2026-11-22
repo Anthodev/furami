@@ -26,8 +26,13 @@ ORIGINAL_REPO = publisher.REPO
 
 def source_members():
     root = publisher.REPO / 'public-fixture'
-    return {path.relative_to(root).as_posix(): path.read_bytes()
-            for path in root.rglob('*') if path.is_file()}
+    members = {path.relative_to(root).as_posix(): path.read_bytes()
+               for path in root.rglob('*') if path.is_file()}
+    # Assembly distributes these current repository bytes as reviewed Cargo
+    # notice inputs, not the private snapshot copy.
+    for relative in ('Cargo.lock', 'packaging/appimage/sources.lock.json'):
+        members['furami/' + relative] = (publisher.REPO / relative).read_bytes()
+    return members
 
 
 def write_materials(root, members):
@@ -61,7 +66,7 @@ def fixture(root, variance=False, *, version='0.1.0-rc.1'):
              'material_policy': dict(POLICY)}
     (root / 'release-ready.json').write_text(json.dumps(ready))
     criteria = dict.fromkeys(('image_bytes', 'payload_files_modes_symlinks', 'source_runtime_bytes',
-                             'source_assets_content', 'source_archive_bytes_except_proven_metadata', 'generated_CPP_headers'), True)
+                             'source_assets_content', 'source_archive_bytes_except_proven_metadata'), True)
     if variance:
         criteria.update(image_bytes=False, image_known_metadata_only=True)
     sources = {'source-materials-001.tar': hashes['source-materials-001.tar']}
@@ -127,8 +132,10 @@ class CandidateTests(unittest.TestCase):
         shutil.copytree(ORIGINAL_REPO / 'scripts', repo / 'scripts',
                         ignore=shutil.ignore_patterns('__pycache__'))
         (repo / 'Cargo.toml').write_text('[package]\nname="furami"\nversion="0.1.0-rc.1"\n')
-        (repo / 'Cargo.lock').write_text('[[package]]\nname="furami"\nversion="0.1.0-rc.1"\n')
         _, _, members = support.runtime_source_fixture(repo, root / 'private-cache')
+        # runtime_source_fixture installs a dependency-free Cargo.lock, which
+        # has no furami package identity for the publication CLI.
+        (repo / 'Cargo.lock').write_text('[[package]]\nname="furami"\nversion="0.1.0-rc.1"\n')
         # Synthetic publication assets contain no media code. Declare that
         # explicitly and distribute the same canonical lock with their sources.
         media_lock = repo / 'packaging/media/stack.lock.json'
@@ -298,7 +305,7 @@ class CandidateTests(unittest.TestCase):
                         elif mutation == 'receipt-status':
                             value['status'] = 'mismatch'
                         else:
-                            value['criteria']['generated_CPP_headers'] = False
+                            value['criteria']['source_assets_content'] = False
                         (root / name).write_text(json.dumps(value))
                         sums(root)
                     result = self.run_cli(root, notes, env, tag=tag, event=event)

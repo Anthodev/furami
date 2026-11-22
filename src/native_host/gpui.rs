@@ -20,8 +20,10 @@ mod x11;
 use std::{
     cell::RefCell,
     ffi::{CStr, c_char, c_int},
+    io::{self, BufRead},
     panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
+    sync::mpsc::{Receiver, TryRecvError, sync_channel},
     time::{Duration, Instant},
 };
 
@@ -39,7 +41,9 @@ use crate::{
     media::controller::{Generation, SurfaceToken, X11WindowId},
     ui::{
         projection::{SessionKind, Snapshot},
-        runtime::{RuntimeCoordinator, UiUpdate},
+        runtime::{
+            QualificationCommand, RuntimeCoordinator, UiUpdate, log_qualification_rejection,
+        },
     },
 };
 
@@ -227,6 +231,7 @@ struct HostState {
     top_refresh_due: Option<Instant>,
     settings_refresh_due: Option<Instant>,
     log_folder_pending: Option<(u64, String)>,
+    qualification_input: Option<Receiver<QualificationCommand>>,
     overlay_opacity: f32,
     overlay_epoch: u64,
     focus_intent: bool,
@@ -318,6 +323,7 @@ impl HostState {
             uncontrolled_exit: false,
             failure: None,
             qualification_failure: false,
+            qualification_input: None,
         }
     }
 
@@ -341,8 +347,8 @@ impl HostState {
             authorized = false,
         );
         eprintln!("furami: {code}");
-        // Dropping the X11 connection would itself destroy its windows. Like
-        // Qt's fatal barrier, do not unwind or claim a successful release.
+        // Dropping the X11 connection destroys its windows. Never unwind
+        // past an unacknowledged owner barrier or claim a successful release.
         std::process::abort();
     }
 
@@ -398,6 +404,9 @@ impl HostState {
             self.redraw = true;
         }
         if changed {
+            if self.view.phase != phase || self.view.paused != paused {
+                self.volume.reset_wheel();
+            }
             self.view.phase = phase;
             self.view.generation = generation;
             self.view.restart_generation = restart_generation;
@@ -684,6 +693,7 @@ impl HostState {
                     tracing::error!(event_code = "gpui_companion_quarantine_failed", %error);
                 }
                 self.companion_mode = CompanionMode::Lost;
+                self.volume.reset();
                 self.set_overlay_opacity(0.);
             }
         }
@@ -759,6 +769,7 @@ impl HostState {
         }
         tracing::error!(event_code = "gpui_companion_loss", reason, root = self.root);
         self.companion_mode = CompanionMode::Lost;
+        self.volume.reset();
         self.overlay_opacity = 0.;
         self.failure.get_or_insert(GpuiLaunchError::NativeLoss);
         // The managed root can still display save/durability decisions. The
@@ -786,6 +797,8 @@ impl HostState {
             self.companion_input_popup = None;
             self.set_overlay_opacity(0.);
             self.volume.reset();
+            // Unmapping can end the pointer grab before a release reaches chrome.
+            self.chrome.press(false, Instant::now());
             tracing::info!(
                 event_code = "gpui_companion_hidden",
                 epoch = self.overlay_epoch
@@ -807,11 +820,7 @@ impl HostState {
         if native_changed || self.companion_facts.is_none() {
             self.companion_facts = Some(self.x11().companion_facts()?);
         }
-        let available = self.accepts_input()
-            && self
-                .companion_facts
-                .as_ref()
-                .is_some_and(|facts| facts.root_viewable && facts.focus.is_some());
+        let available = self.accepts_input() && self.owned_family_viewable();
         let now = Instant::now();
         self.chrome
             .reconcile(available, self.view.snapshot.as_deref(), now);
@@ -836,6 +845,12 @@ impl HostState {
             self.chrome.dismiss(popup, now);
             self.return_focus_intent = true;
             self.redraw = true;
+        }
+        if !available {
+            self.volume.reset();
+        } else if !self.volume_pointer_available() {
+            self.volume.cancel_drag();
+            self.volume.reset_wheel();
         }
         if self.keyboard_popup_focus != self.chrome.popup() {
             self.keyboard_popup_focus = None;
@@ -1040,6 +1055,25 @@ impl HostState {
             && !self.quit_authorized
     }
 
+    fn owned_family_viewable(&self) -> bool {
+        self.companion_facts
+            .is_some_and(|facts| facts.root_viewable && facts.focus.is_some())
+    }
+
+    fn wheel_family_viewable(&self, companion: bool) -> bool {
+        // X11 delivers wheel events under the pointer even after keyboard focus
+        // leaves Furami. The last render poll cannot authorize this event.
+        self.volume_pointer_available()
+            && (!companion || self.companion_mode == CompanionMode::Visible)
+            && self.x11.as_ref().is_some_and(|x11| {
+                x11.companion_facts().is_ok_and(|facts| {
+                    facts.root_viewable
+                        && facts.focus.is_some()
+                        && (!companion || facts.companion_viewable)
+                })
+            })
+    }
+
     fn video_mapped(&self) -> bool {
         self.lease.as_ref().is_some_and(|lease| lease.mapped)
     }
@@ -1157,6 +1191,40 @@ impl HostState {
 
     fn request_fullscreen(&mut self) {
         self.fullscreen_intent |= self.f11_press(self.native_fullscreen);
+    }
+
+    fn poll_qualification_input(&mut self) {
+        let Some(input) = &self.qualification_input else {
+            return;
+        };
+        // Native observation runs before this poll and never waits for stdin.
+        // Until startup restoration or an in-flight toggle settles, keep the
+        // FIFO intact. WM close bypasses stdin and cancels the transition.
+        if self.accepts_input() && (!self.fullscreen_restored || self.fullscreen_pending.is_some())
+        {
+            return;
+        }
+        match input.try_recv() {
+            Ok(QualificationCommand::Fullscreen) => {
+                if self.accepts_input() {
+                    self.fullscreen_pending = Some(PendingFullscreen::new(
+                        !self.native_fullscreen,
+                        true,
+                        Instant::now(),
+                    ));
+                    self.fullscreen_intent = true;
+                }
+            }
+            Ok(command) => {
+                let update = self.runtime.qualification_command(command);
+                if command == QualificationCommand::Snapshot {
+                    self.log_layout();
+                }
+                self.consume(update);
+            }
+            Err(TryRecvError::Disconnected) => self.qualification_input = None,
+            Err(TryRecvError::Empty) => {}
+        }
     }
 
     /// Drain native events first, and return whether to issue the saved-mode
@@ -1345,6 +1413,7 @@ impl HostView {
                             let mut state = view.state.borrow_mut();
                             let (toggle, focus) =
                                 state.tick(window.scale_factor(), window.is_fullscreen());
+                            state.poll_qualification_input();
                             let quit = state.quit_authorized && !state.quit_requested;
                             state.quit_requested |= quit;
                             (
@@ -1583,17 +1652,11 @@ impl Render for HostView {
                 }
             }))
             .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
-                let (companion_mode, popup) = {
-                    let state = this.state.borrow();
-                    (state.companion_mode, state.chrome.popup())
-                };
-                // The video/empty viewport routes the wheel whenever the app
-                // family owns input, even if chrome is hidden: the event both
-                // adjusts the gain and reveals the chrome.
                 let outcome = {
                     let mut state = this.state.borrow_mut();
-                    let active = companion_mode == CompanionMode::Visible || popup.is_some();
-                    state.volume_wheel(event, active)
+                    // The owned viewport still receives wheel input when the
+                    // chrome is unmapped; the event adjusts gain and reveals it.
+                    state.volume_wheel(event, false)
                 };
                 if outcome != volume::WheelOutcome::Ignore {
                     this.state.borrow_mut().chrome.wheel(Instant::now());
@@ -1705,8 +1768,12 @@ impl Render for HostView {
     }
 }
 
+#[link(name = "X11")]
 unsafe extern "C" {
     fn XInitThreads() -> c_int;
+}
+
+unsafe extern "C" {
     fn setlocale(category: c_int, locale: *const c_char) -> *mut c_char;
 }
 
@@ -1740,7 +1807,11 @@ fn preflight_x11(display: &str) -> Result<X11, &'static str> {
     })
 }
 
-pub(super) fn run(display: &str, runtime: RuntimeCoordinator) -> Result<(), GpuiLaunchError> {
+pub(super) fn run(
+    display: &str,
+    runtime: RuntimeCoordinator,
+    qualification_stdin: bool,
+) -> Result<(), GpuiLaunchError> {
     let x11 = match preflight_x11(display) {
         Ok(x11) => Some(x11),
         Err(reason) => {
@@ -1770,7 +1841,7 @@ pub(super) fn run(display: &str, runtime: RuntimeCoordinator) -> Result<(), Gpui
             .with_windowing(gpui::WindowingRequest::Windowed(environment))
             .run(move |cx| {
                 text_field::register_keys(cx);
-                launch(cx, launcher);
+                launch(cx, launcher, qualification_stdin);
             });
     }));
     let mut state = state.borrow_mut();
@@ -1797,7 +1868,74 @@ pub(super) fn run(display: &str, runtime: RuntimeCoordinator) -> Result<(), Gpui
     failure.map_or(Ok(()), Err)
 }
 
-fn launch(cx: &mut App, state: Rc<RefCell<HostState>>) {
+fn start_qualification_input(state: &Rc<RefCell<HostState>>) -> bool {
+    let (send, receive) = sync_channel(8);
+    let worker = std::thread::Builder::new()
+        .name("qualification-stdin".into())
+        .spawn(move || {
+            let mut input = io::stdin().lock();
+            let mut line = Vec::new();
+            let mut oversized = false;
+            loop {
+                let chunk = match input.fill_buf() {
+                    Ok([]) => {
+                        tracing::info!(event_code = "qualification_stdin_eof");
+                        return;
+                    }
+                    Ok(chunk) => chunk,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            event_code = "qualification_stdin_read_failed",
+                            errno = error.raw_os_error().unwrap_or_default()
+                        );
+                        return;
+                    }
+                };
+                let newline = chunk.iter().position(|byte| *byte == b'\n');
+                let len = newline.unwrap_or(chunk.len());
+                if !oversized {
+                    if line.len() + len > 65_536 {
+                        oversized = true;
+                        tracing::warn!(event_code = "qualification_line_oversized");
+                    } else {
+                        line.extend_from_slice(&chunk[..len]);
+                    }
+                }
+                input.consume(len + usize::from(newline.is_some()));
+                if newline.is_none() {
+                    continue;
+                }
+                if !oversized {
+                    match std::str::from_utf8(&line) {
+                        Ok(line) => match QualificationCommand::parse(line) {
+                            Some(command) => {
+                                if send.send(command).is_err() {
+                                    return;
+                                }
+                            }
+                            None => log_qualification_rejection(),
+                        },
+                        Err(_) => tracing::warn!(event_code = "qualification_invalid_utf8"),
+                    }
+                }
+                oversized = false;
+                line.clear();
+            }
+        });
+    if let Err(error) = worker {
+        tracing::warn!(
+            event_code = "qualification_stdin_read_failed",
+            errno = error.raw_os_error().unwrap_or_default()
+        );
+        return false;
+    }
+    state.borrow_mut().qualification_input = Some(receive);
+    tracing::info!(event_code = "qualification_stdin_enabled");
+    true
+}
+
+fn launch(cx: &mut App, state: Rc<RefCell<HostState>>, qualification_stdin: bool) {
     let on_quit = Rc::clone(&state);
     cx.on_app_quit(move |_| {
         // The observer must run synchronously, before GPUI clears the windows.
@@ -1808,7 +1946,7 @@ fn launch(cx: &mut App, state: Rc<RefCell<HostState>>) {
         std::future::ready(())
     })
     .detach();
-    if start_windows(cx, &state) {
+    if start_windows(cx, &state) && (!qualification_stdin || start_qualification_input(&state)) {
         cx.activate(true);
     } else {
         state.borrow_mut().drain_without_gui("setup-failed");
@@ -1907,11 +2045,14 @@ fn start_windows(cx: &mut App, state: &Rc<RefCell<HostState>>) -> bool {
         tracing::error!(event_code = "gpui_companion_setup_failed", %error);
         return false;
     }
+    let environment = x11.environment_report();
     state.companion = Some(companion);
     if state.resize(true, scale).is_err() {
         return false;
     }
     state.started = true;
+    let update = state.runtime.native_environment(environment);
+    state.consume(update);
     let update = state.runtime.ui_ready();
     state.consume(update);
     true

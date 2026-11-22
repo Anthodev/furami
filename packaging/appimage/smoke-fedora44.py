@@ -13,11 +13,10 @@ copied flags):
 * the candidate renders the deterministic qualification fixture in the real
   Furami window: the moving-rectangle index and the eight-cell bit code both
   advance, freeze after a confirmed pause, and advance again after resume;
-* the running candidate maps its own Qt/media libraries from the extracted
-  tree and uses the hardware Vulkan ICD (no lavapipe/llvmpipe);
-* a missing or invalid Qt platform/xcb-graphics/SVG plugin, a missing DISPLAY
-  and a missing required QML import all refuse readably before any window,
-  without a crash/abort;
+* the GPUI candidate maps all eight bundled media libraries, no Qt, and
+  uses the hardware Vulkan ICD (no lavapipe/llvmpipe);
+* missing or unreachable X11 displays and missing bundled libmpv refuse
+  readably without a crash or decoded video;
 * `reset-confirm`, `open-close-during-opening` and `force-surface-loss` sent
   while qualification is healthy are refused without changing the owner
   generation, the pause state or the window, and a fresh snapshot plus an
@@ -43,11 +42,10 @@ session, and ``qualification_fixture.py``. Extracted trees are mutated in place
 one case at a time (renamed away, then restored) rather than copied, which keeps
 each refusal case isolated without duplicating a multi-hundred-megabyte tree.
 Spectacle can only capture non-interactively fullscreen, so each capture is the
-whole virtual screen; the fixture placement is not assumed — the app's observed
-``qt_geometry`` gives the native video host rect (the container rect, not the
-letterboxed content), and the 16:9 fixture is located inside it by decode
-evidence (the placement whose eight-cell bit code equals its own rectangle
-index). The raw PNGs are retained for the parent's own image inspection before
+whole virtual screen. Independent X11 queries identify the mapped video
+child and its device-pixel rectangle. The 16:9 fixture is located inside it
+by matching the eight-cell bit code to the moving rectangle index. The raw
+PNGs are retained for the parent's own image inspection before
 any PASS is accepted.
 
 Usage:
@@ -78,17 +76,6 @@ HERE = Path(__file__).resolve().parent
 # Pinned hardware identity of the single accepted render node (plan step 4).
 EXPECTED_PCI_ID = "1002:744C"
 EXPECTED_PCI_SLOT = "0000:03:00.0"
-
-# Qt XCB plugins the candidate must ship; each is mutated in one refusal case.
-XCB_PLUGINS = (
-    "usr/lib/qt6/plugins/platforms/libqxcb.so",
-    "usr/lib/qt6/plugins/xcbglintegrations/libqxcb-egl-integration.so",
-    "usr/lib/qt6/plugins/xcbglintegrations/libqxcb-glx-integration.so",
-    "usr/lib/qt6/plugins/imageformats/libqsvg.so",
-    "usr/lib/qt6/plugins/iconengines/libqsvgicon.so",
-)
-# A QML module a real launch always needs; removing it must refuse cleanly.
-REQUIRED_QML_MODULE = "usr/qml/QtQuick"
 
 
 class Blocker(Exception):
@@ -195,7 +182,7 @@ def write_harness(harness: Path) -> None:
         "mkdir -p /tmp/.X11-unix\n"
         "chmod 1777 /tmp/.X11-unix\n"
         "# Private D-Bus session; the compositor owns the XWayland display and\n"
-        "# runs the session as its own child. AppRun's Qt/LD paths stay inside\n"
+        "# runs the session as its own child. AppRun's loader paths stay inside\n"
         "# the launched app and never reach kwin/spectacle.\n"
         "exec dbus-run-session -- /usr/bin/kwin_wayland \\\n"
         "    --virtual --xwayland --width 1280 --height 900 \\\n"
@@ -217,9 +204,6 @@ def container_command(image: str, device: Path, candidate: Path, fixture: Path,
         "--mount", f"type=bind,src={fixture},dst=/input/fixture.y4m,ro",
         "--mount", f"type=bind,src={harness},dst=/harness,ro",
         "--mount", f"type=bind,src={evidence},dst=/evidence,rw",
-        "--env", "QT_FORCE_STDERR_LOGGING=1",
-        "--env", "FURAMI_SMOKE_XCB_PLUGINS=" + json.dumps(list(XCB_PLUGINS)),
-        "--env", "FURAMI_SMOKE_REQUIRED_QML=" + REQUIRED_QML_MODULE,
         "--env", "HOME=/tmp/furami-compositor-home",
         "--env", "XDG_RUNTIME_DIR=/tmp/furami-compositor-runtime",
         "--workdir", "/tmp",
@@ -393,11 +377,8 @@ import hashlib, json, os, re, select, shutil, stat, subprocess, sys, time
 from pathlib import Path
 
 EVIDENCE = Path("/evidence")
-XCB_PLUGINS = tuple(json.loads(os.environ["FURAMI_SMOKE_XCB_PLUGINS"]))
-REQUIRED_QML = os.environ["FURAMI_SMOKE_REQUIRED_QML"]
 # Mandatory qualification teardown milestones, in the order they must appear.
-MANDATORY_TEARDOWN = ("owner_destroy_complete", "ui_stop_ack", "native_destroy_begin",
-                      "native_destroy", "qt_quit_authorized", "qt_event_loop_exit code=0")
+MANDATORY_TEARDOWN = ("owner_destroy_complete", "gpui_release", "gpui_exit")
 # The recorded Radeon ICD pins the isolated app so a software device cannot answer.
 RADEON_ICD = None
 FAILURES = []
@@ -597,39 +578,30 @@ def survivors_of(root, app_pid, app_session):
 def teardown_chain(app):
     """Validate the mandatory teardown milestones as structured events in order."""
     chain = {}
-    for code in ("owner_destroy_complete", "ui_stop_ack", "native_destroy_begin",
-                 "native_destroy", "qt_quit_authorized", "qt_event_loop_exit"):
-        values = event_records(app, code)
-        chain[code] = values[-1][1] if values else None
     indices = []
-    for marker in MANDATORY_TEARDOWN:
-        code = marker.split(" ")[0]
+    for code in MANDATORY_TEARDOWN:
         values = event_records(app, code)
-        indices.append(values[-1][0] if values else None)
+        index, fields = values[0] if len(values) == 1 else (None, {})
+        chain[code] = fields
+        indices.append(index)
     ordered = all(i is not None for i in indices) and indices == sorted(indices)
-    required = {
-        "generation": ("owner_destroy_complete", "ui_stop_ack", "native_destroy_begin",
-                       "native_destroy", "qt_quit_authorized"),
-        "root": ("ui_stop_ack", "native_destroy_begin", "native_destroy", "qt_quit_authorized"),
-        "host": ("ui_stop_ack", "native_destroy_begin", "native_destroy"),
-    }
     expected = app.get("teardown_identity", {})
-    identities = {field: {code: (chain[code] or {}).get(field) for code in codes}
-                  for field, codes in required.items()}
     correlated = all(
         type(expected.get(field)) is int and expected[field] > 0
-        and all(type(value) is int and value == expected[field]
-                for value in values.values())
-        for field, values in identities.items())
-    field_ok = (chain["native_destroy_begin"] or {}).get("parent_preserved") is True \
-        and (chain["native_destroy"] or {}).get("authorized") is True \
-        and (chain["qt_event_loop_exit"] or {}).get("exit_code") == 0 \
-        and (chain["qt_event_loop_exit"] or {}).get("owner_cleanup_authorized") is True
-    return {"events": chain, "present": [m for m, i in zip(MANDATORY_TEARDOWN, indices)
-                                         if i is not None],
-            "ordered": ordered, "correlated": correlated, "fields_ok": field_ok,
-            "identities": identities, "expected_identity": expected,
-            "complete": ordered and correlated and field_ok}
+        and all(chain[code].get(field) == expected[field] for code in codes)
+        for field, codes in {
+            "generation": MANDATORY_TEARDOWN,
+            "root": ("gpui_release", "gpui_exit"),
+            "host": ("gpui_release", "gpui_exit"),
+        }.items())
+    release, exit_event = chain["gpui_release"], chain["gpui_exit"]
+    field_ok = (release.get("phase") == "Releasing" and release.get("status") == "Destroyed"
+                and release.get("authorized") is True and release.get("poisoned") is False
+                and exit_event.get("exit_code") == 0 and exit_event.get("authorized") is True
+                and exit_event.get("controlled") is True)
+    return {"events": chain, "indices": indices, "ordered": ordered,
+            "correlated": correlated, "fields_ok": field_ok,
+            "expected_identity": expected, "complete": ordered and correlated and field_ok}
 
 
 def extract_candidate(home):
@@ -839,25 +811,54 @@ def last_event(app, code):
     return values[-1][1] if values else None
 
 
-def wait_for_event(app, code, predicate, label, timeout=60.0):
+def x11_query(*argv):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=5)
+
+
+def native_geometry(root, host):
+    """Independent X11 readback; geometry is already in device pixels."""
+    if not all(type(xid) is int and xid > 0 for xid in (root, host)):
+        return None
+    windows = {}
+    for role, xid in (("root", root), ("host", host)):
+        result = x11_query("xwininfo", "-id", hex(xid), "-stats", "-tree")
+        if result.returncode:
+            return None
+        text = result.stdout
+        fields = {}
+        for key, field in (("x", "Absolute upper-left X"), ("y", "Absolute upper-left Y"),
+                           ("width", "Width"), ("height", "Height")):
+            match = re.search(r"^[ \t]*" + field + r":[ \t]*(-?\d+)[ \t]*$", text, re.MULTILINE)
+            if not match:
+                return None
+            fields[key] = int(match[1])
+        parent = re.search(r"Parent window id:\s+(0x[0-9a-fA-F]+)", text)
+        if not parent or not re.search(r"^[ \t]*Map State:[ \t]*IsViewable[ \t]*$", text, re.MULTILINE):
+            return None
+        windows[role] = {"xid": xid, "parent": int(parent[1], 16), **fields}
+    state = x11_query("xprop", "-id", hex(root), "_NET_WM_STATE")
+    if state.returncode:
+        return None
+    return {**windows, "fullscreen": "_NET_WM_STATE_FULLSCREEN" in state.stdout}
+
+
+def wait_geometry(app, root, host, fullscreen, timeout=60):
     deadline = time.monotonic() + timeout
-    last = None
-    while time.monotonic() < deadline:
+    geometry = None
+    while time.monotonic() < deadline and app["proc"].poll() is None:
         pump(app, 0.2)
-        values = event_records(app, code)
-        if values:
-            last = values[-1][1]
-            if predicate(last):
-                return last
-        if app["proc"].poll() is not None:
-            break
-    fail("{}: no {} event satisfied the condition within {}s (last={})".format(
-        label, code, timeout, last))
+        geometry = native_geometry(root, host)
+        if geometry is None:
+            continue
+        client, video = geometry["root"], geometry["host"]
+        extent = (client["x"], client["y"], client["width"], client["height"])
+        if (video["parent"] == root and geometry["fullscreen"] is fullscreen
+                and tuple(video[key] for key in ("x", "y", "width", "height")) == extent
+                and (not fullscreen or extent == (0, 0, 1280, 900))):
+            return geometry
+    fail("native X11 geometry did not settle (fullscreen={}, last={})".format(
+        fullscreen, geometry))
     return None
-
-
-def wait_geometry(app, predicate, label, timeout=60.0):
-    return wait_for_event(app, "qt_geometry", predicate, label, timeout)
 
 
 def proc_maps(pid):
@@ -874,9 +875,10 @@ def proc_maps(pid):
 
 # Library families that must come from the extracted candidate; anything from
 # the host filesystem in these families means a mixed system fallback.
-CANDIDATE_ONLY_FAMILIES = ("libQt6", "libQt5", "libmpv", "libplacebo", "libass",
-                           "libavcodec", "libavformat", "libavutil", "libavfilter",
-                           "libswscale", "libswresample", "libavdevice", "libx264", "libx265",
+REQUIRED_MEDIA_FAMILIES = ("libmpv", "libplacebo", "libavcodec", "libavformat",
+                           "libavutil", "libavfilter", "libswscale", "libswresample")
+CANDIDATE_ONLY_FAMILIES = REQUIRED_MEDIA_FAMILIES + (
+                           "libass", "libavdevice", "libx264", "libx265",
                            "libvpx", "libdav1d", "libSvtAv1", "libaom", "libmp3lame",
                            "libvorbis", "libopus", "libFLAC")
 
@@ -893,17 +895,17 @@ def analyse_maps(maps, extract_root):
 
     def family(path):
         name = path.rsplit("/", 1)[-1]
-        return [f for f in CANDIDATE_ONLY_FAMILIES if f in name]
+        return [f for f in CANDIDATE_ONLY_FAMILIES if name.startswith(f + ".so")]
 
     candidate_only = {p for p in paths if family(p)}
+    bundled = {p for p in candidate_only
+               if p.startswith(prefix + "usr/lib/") and not p.endswith(" (deleted)")}
     return {
-        "qt_from_candidate": sorted({p for p in candidate_only if p.startswith(prefix)
-                                     and "libQt" in p}),
-        "media_from_candidate": sorted({p for p in candidate_only if p.startswith(prefix)
-                                        and "libQt" not in p}),
-        # External Qt/media/provider mappings: a mixed system fallback.
-        "external_candidate_families": sorted({p for p in candidate_only
-                                               if not p.startswith(prefix)}),
+        "qt_mapped": sorted({p for p in paths if re.match(r"libQt[56]", Path(p).name)}),
+        "media_from_candidate": sorted(bundled),
+        "missing_bundled_media": sorted(set(REQUIRED_MEDIA_FAMILIES)
+                                        - {f for p in bundled for f in family(p)}),
+        "external_candidate_families": sorted(candidate_only - bundled),
         "hardware_icd_mapped": sorted({p for p in paths if "libvulkan_radeon" in p}),
         "software_icd_mapped": sorted({p for p in paths
                                        if "libvulkan_lvp" in p or "llvmpipe" in p
@@ -949,22 +951,10 @@ def run_vulkan_facts():
 
 # --- Screenshot decoding (Pillow inside the container) -----------------------
 def host_rect(geometry, image_size):
-    """Physical-pixel rect of the native video host from observed geometry.
-
-    ``qt_geometry`` reports the videoContainer rect in logical pixels; the
-    capture is in physical pixels, so it is scaled by the observed dpr. The host
-    itself is NOT assumed 16:9: Main.qml anchors the container to the whole
-    window, and mpv letterboxes the 16:9 fixture inside it.
-    """
-    try:
-        dpr = float(geometry.get("dpr") or 1.0)
-        x = float(geometry["video_x"]) * dpr
-        y = float(geometry["video_y"]) * dpr
-        width = float(geometry["video_width"]) * dpr
-        height = float(geometry["video_height"]) * dpr
-    except (KeyError, TypeError, ValueError):
-        return None
-    if width <= 0 or height <= 0 or dpr <= 0:
+    """Physical-pixel rectangle of the observed video child, before letterboxing."""
+    video = geometry["host"]
+    x, y, width, height = (video[key] for key in ("x", "y", "width", "height"))
+    if width <= 0 or height <= 0:
         return None
     image_width, image_height = image_size
     x0, y0 = max(0, int(x)), max(0, int(y))
@@ -1150,39 +1140,31 @@ def scenario_main_run(app, root, notes, captured):
 
     maps = analyse_maps(proc_maps(app["proc"].pid), root)
     notes["maps"] = maps
-    if not maps["qt_from_candidate"] or not maps["media_from_candidate"]:
-        fail("running candidate does not map its own Qt/media libraries from the extracted tree: "
-             "{}".format(maps))
-    if maps["external_candidate_families"]:
-        fail("running candidate maps Qt/media/provider libraries from outside the extracted tree "
-             "(mixed system fallback): {}".format(maps["external_candidate_families"]))
+    if maps["qt_mapped"] or maps["missing_bundled_media"] or maps["external_candidate_families"]:
+        fail("candidate mapped Qt or did not use exclusively bundled media: {}".format(maps))
+    children = survivors_of(root, app["proc"].pid, app["proc"].pid)
+    notes["candidate_processes_during_playback"] = children
+    if children:
+        fail("qualification spawned processes instead of using its in-process owner: {}".format(
+            children))
     if maps["software_icd_mapped"]:
         fail("running candidate mapped a software Vulkan ICD even though only the recorded Radeon "
              "ICD was offered: {}".format(maps["software_icd_mapped"]))
     if not maps["hardware_icd_mapped"]:
         fail("candidate hardware Vulkan ICD mapping unproven; no cause inferred: {}".format(maps))
 
-    # Real fullscreen evidence from native readback, plus the observed geometry
-    # of the video host (never assumed).
-    send(app, "fullscreen")
-    readback = wait_for_event(app, "fullscreen_preference_readback",
-                              lambda f: f.get("effective") is True,
-                              "fullscreen native readback", timeout=30)
-    native_state = last_event(app, "fullscreen_native_state_observed")
-    geometry = wait_geometry(app, lambda g: g.get("root_width") == 1280
-                             and g.get("root_height") == 900, "fullscreen geometry", timeout=60)
-    notes["fullscreen_readback"] = readback
-    notes["fullscreen_native_state"] = native_state
-    notes["geometry"] = geometry
+    published = last_event(app, "gpui_publish") or {}
+    client_xid, video_xid = published.get("root"), published.get("host")
     app["teardown_identity"] = {
-        "generation": ready.get("generation"),
-        "root": (geometry or {}).get("root"),
-        "host": (last_event(app, "native_publish") or {}).get("host"),
+        "generation": ready.get("generation"), "root": client_xid, "host": video_xid,
     }
-    if geometry is None:
-        fail("fullscreen root geometry 1280x900 was never observed")
-    if readback is None:
-        fail("fullscreen native readback never reported effective fullscreen")
+    if published.get("generation") != ready.get("generation"):
+        fail("native media child was not published for the ready generation: {}".format(published))
+    notes["geometry_windowed"] = wait_geometry(app, client_xid, video_xid, False)
+    if not send(app, "fullscreen"):
+        fail("fullscreen command could not be submitted")
+    geometry = wait_geometry(app, client_xid, video_xid, True)
+    notes["geometry"] = geometry
 
 
     def capture(label, box):
@@ -1263,8 +1245,8 @@ def scenario_main_run(app, root, notes, captured):
     # needs its own fresh rejection, and generation/pause/phase stay unchanged.
     baseline = refresh_state(app) or ready
     refusals = {}
-    window_events_before = sum(1 for row in app["rows"] if "native_root" in row)
-    for command in ("reset-confirm", "open-close-during-opening", "force-surface-loss"):
+    for command in ("reset-confirm", "open-close-during-opening", "force-surface-loss",
+                    "pause not-a-generation", "fullscreen unexpected"):
         offset = len(app["rows"])
         send(app, command)
         rejection = None
@@ -1287,7 +1269,9 @@ def scenario_main_run(app, root, notes, captured):
             "failed": current.get("failed"),
             "generation_unchanged": current.get("generation") == baseline.get("generation"),
             "paused_unchanged": current.get("paused") == baseline.get("paused"),
-            "window_events": sum(1 for row in app["rows"] if "native_root" in row),
+            "geometry_unchanged": geometry is not None
+                                  and native_geometry(client_xid, video_xid) == geometry,
+            "native_publications": len(event_records(app, "gpui_publish")),
         }
         refusals[command] = entry
         if not entry["alive"]:
@@ -1305,9 +1289,8 @@ def scenario_main_run(app, root, notes, captured):
             fail("{!r} restarted the qualification owner (generation changed)".format(command))
         if not entry["paused_unchanged"]:
             fail("{!r} changed the pause state".format(command))
-        if entry["window_events"] != window_events_before:
-            fail("{!r} changed window events ({} -> {})".format(
-                command, window_events_before, entry["window_events"]))
+        if not entry["geometry_unchanged"] or entry["native_publications"] != 1:
+            fail("{!r} changed the managed window or its video child: {}".format(command, entry))
     notes["shortcut_refusals"] = refusals
     notes["baseline_state"] = baseline
     notes["post_refusal_state"] = refresh_state(app)
@@ -1337,35 +1320,8 @@ def scenario_main_run(app, root, notes, captured):
         fail("mandatory teardown chain incomplete/out of order: {}".format(teardown))
 
 
-def sanitization_findings(text, root, plugin_class):
-    """Bounds the refusal output must respect (no raw path, no controls, bounded detail).
 
-    The native startup prints the plugin safe detail as its own ``furami:`` line;
-    that payload is bounded to 512 characters. Constant detail text legitimately
-    contains no ``<media-prefix>``, so no substitution claim is asserted.
-    """
-    findings = {}
-    if str(root) in text:
-        findings["raw_path"] = "absolute extraction path appears in output"
-    controls = sorted({repr(ch) for ch in text if not ch.isprintable() and ch != "\n"})
-    if controls:
-        findings["controls"] = controls
-    if "\r" in text:
-        findings["carriage_return"] = "CR present in refusal output"
-    details = [line[len("furami: "):] for line in text.split("\n")
-               if line.startswith("furami: ") and "startup failed" not in line]
-    class_prefix = plugin_class + ": "
-    if len(details) != 1 or not details[0].startswith(class_prefix) \
-            or not details[0][len(class_prefix):].strip():
-        findings["safe_detail_class"] = "expected one nonempty {} detail".format(plugin_class)
-    invalid = [repr(payload) for payload in details
-               if not payload.strip() or len(payload) > 512 or not payload.isprintable()]
-    if invalid:
-        findings["safe_detail_invalid"] = invalid
-    return findings
-
-
-def run_refusal(root, env, label, expect, receipt, timeout=60):
+def run_refusal(root, env, label, expect, receipt, *, evidence=None, timeout=60):
     app = None
     try:
         app = spawn_app(root, env)
@@ -1382,72 +1338,71 @@ def run_refusal(root, env, label, expect, receipt, timeout=60):
             receipt["cleanup"] = finish_app(app, root, label)
             text = "\n".join(app["rows"])
             exit_code = receipt["cleanup"].get("exit_code")
-            window_created = bool(event_records(app, "native_root"))
+            publication = last_event(app, "gpui_publish")
+            states = event_records(app, "qualification_state")
+            rendered = bool(event_records(app, "qualification_backend")) or any(
+                fields.get("configured") is True or fields.get("phase") == "Ready"
+                for _, fields in states)
             # Require the typed startup refusal, not a matching word in another log.
             codes = re.findall(r"^furami: startup failed \(([^ ()]+)(?: at [^()\n]+)?\)$",
                                text, re.MULTILINE)
-            receipt.update({"exit_code": exit_code, "window_created": window_created,
-                            "expected": list(expect), "codes": codes,
-                            "tail": app["rows"][-30:]})
-            if type(exit_code) is not int or exit_code <= 0:
-                fail("{}: expected a reaped nonzero refusal without signal, got {}".format(
-                    label, exit_code))
-            if window_created:
-                fail("{}: a window was created before the refusal".format(label))
-            if not set(codes) & set(expect):
-                fail("{}: typed refusal named none of {} (found {})".format(
-                    label, list(expect), codes))
-            if any(code.startswith("qt_plugin_") for code in expect):
-                findings = sanitization_findings(text, root, receipt["plugin_class"])
-                receipt["sanitization"] = findings
-                if findings:
-                    fail("{}: refusal detail violates sanitization bounds: {}".format(
-                        label, findings))
+            observed = [fields for _, fields in event_records(app, evidence[0])] if evidence else []
+            receipt.update({"exit_code": exit_code, "publication": publication,
+                            "rendered": rendered, "expected": expect, "codes": codes,
+                            "evidence": observed, "tail": app["rows"][-30:]})
+            if exit_code != 1:
+                fail("{}: expected controlled refusal exit 1, got {}".format(label, exit_code))
+            if rendered or (label != "missing-libmpv" and publication):
+                fail("{}: refusal rendered video or published a surface: {}".format(label, receipt))
+            if codes != [expect]:
+                fail("{}: expected typed refusal {}, got {}".format(label, expect, codes))
+            if evidence and not any(fields.get(evidence[1]) == evidence[2] for fields in observed):
+                fail("{}: missing refusal evidence {}".format(label, evidence))
             store_text("refusal-{}.log".format(label), text)
         store("refusal-{}.json".format(label), receipt)
 
 
-def scenario_refusal(root, home, label, relative, mode, expect):
-    """Mutate one path, prove refusal/cleanup, and restore the exact original."""
-    target = root / relative
-    backup = target.with_name(target.name + ".smoke-bak")
-    if not target.exists():
-        fail("{}: mutation target absent: {}".format(label, relative))
-        store("refusal-{}.json".format(label), {"error": "mutation target absent",
-                                              "relative": relative})
+def scenario_missing_libmpv(root, home):
+    """Remove the real payload temporarily, leaving its soname links dangling."""
+    library = root / "usr/lib/libmpv.so"
+    libdir = library.parent
+    if not library.is_file():
+        fail("missing-libmpv: required packaged libmpv entry absent")
         return
+    target = library.resolve()
+    if target.parent != libdir:
+        fail("missing-libmpv: packaged libmpv resolves outside usr/lib")
+        return
+    backup = target.with_name(target.name + ".smoke-bak")
     before = target_fingerprint(target)
-    case_home = make_private_root(home / "failure-{}".format(label))
+    case_home = make_private_root(home / "failure-missing-libmpv")
     target.rename(backup)
     try:
-        if mode == "invalid":
-            target.write_bytes(b"not-an-elf-qt-plugin\n")
-        run_refusal(root, private_environment(case_home), label, expect,
-                    {"mutation": mode, "relative": relative, "home": str(case_home),
-                     "plugin_class": {
-                         "libqxcb.so": "platform",
-                         "libqxcb-egl-integration.so": "xcb-egl",
-                         "libqxcb-glx-integration.so": "xcb-glx",
-                         "libqsvg.so": "svg-image",
-                         "libqsvgicon.so": "svg-icon",
-                     }.get(target.name)})
+        run_refusal(root, private_environment(case_home), "missing-libmpv", "qualification",
+                    {"removed": str(target.relative_to(root)), "home": str(case_home)},
+                    evidence=("qualification_state", "failure_code", "mpv_library"))
     finally:
-        if target.exists() and mode == "invalid":
-            target.unlink()
         backup.rename(target)
         after = target_fingerprint(target)
         if after != before:
-            fail("{}: mutated path was not restored exactly: {} -> {}".format(
-                label, before, after))
+            fail("missing-libmpv: mutated path was not restored exactly: {} -> {}".format(
+                before, after))
 
 
-def scenario_no_display(root, home):
-    case_home = make_private_root(home / "failure-no-display")
+def scenario_display_refusal(root, home, unreachable):
+    label = "unreachable-display" if unreachable else "no-display"
+    case_home = make_private_root(home / ("failure-" + label))
     env = private_environment(case_home)
-    env.pop("DISPLAY", None)
-    env.pop("WAYLAND_DISPLAY", None)
-    run_refusal(root, env, "no-display", ("NoDisplay", "InvalidDisplayEnvironment"),
-                {"home": str(case_home)}, timeout=30)
+    if unreachable:
+        # Local Unix transport, no TCP and no server at this private endpoint.
+        env["DISPLAY"] = "unix/:65535"
+    else:
+        env.pop("DISPLAY", None)
+    # Retain the valid private Wayland session: GPUI must not fall back to it.
+    run_refusal(root, env, label, "gpui_native_startup" if unreachable else "NoDisplay",
+                {"home": str(case_home), "display": env.get("DISPLAY")},
+                evidence=("gpui_x11_preflight", "reason", "display-unreachable")
+                if unreachable else None, timeout=30)
 
 
 def main():
@@ -1485,12 +1440,9 @@ def main():
     root = extract_candidate(home)
     tree_before = tree_fingerprint(root)
     scenario_main(home, root)
-    for relative in XCB_PLUGINS:
-        leaf = relative.rsplit("/", 1)[-1]
-        scenario_refusal(root, home, "missing-" + leaf, relative, "missing", ("qt_plugin_missing",))
-        scenario_refusal(root, home, "invalid-" + leaf, relative, "invalid", ("qt_plugin_invalid",))
-    scenario_no_display(root, home)
-    scenario_refusal(root, home, "missing-qml", REQUIRED_QML, "missing", ("NativeLaunch",))
+    scenario_display_refusal(root, home, unreachable=False)
+    scenario_display_refusal(root, home, unreachable=True)
+    scenario_missing_libmpv(root, home)
     final_survivors = []
     for child in APP_SESSIONS:
         identity = child["identity"]

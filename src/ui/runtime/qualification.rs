@@ -7,6 +7,39 @@ use crate::media::{
 };
 use std::rc::Rc;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QualificationCommand {
+    Snapshot,
+    Fullscreen,
+    ApplicationClose,
+    Pause(AttemptId),
+}
+
+impl QualificationCommand {
+    pub(crate) fn parse(line: &str) -> Option<Self> {
+        match line {
+            "snapshot" => Some(Self::Snapshot),
+            "fullscreen" => Some(Self::Fullscreen),
+            "application-close" => Some(Self::ApplicationClose),
+            _ => {
+                let value = line.strip_prefix("pause ")?;
+                if value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                AttemptId::new(value.parse().ok()?).map(Self::Pause)
+            }
+        }
+    }
+}
+
+pub(crate) fn log_qualification_rejection() {
+    tracing::warn!(
+        event_code = "qualification_command_rejected",
+        kind = "CommandRejected",
+        accepted = false
+    );
+}
+
 pub(crate) struct QualificationRuntime {
     gate: QualificationGate,
     pending: Option<(String, QualificationVideo, CompiledRendererSettings)>,
@@ -38,11 +71,7 @@ impl QualificationRuntime {
         }
     }
     pub(super) fn reject(&mut self, action: &'static str) -> UiUpdate {
-        tracing::warn!(
-            event_code = "qualification_command_rejected",
-            kind = "CommandRejected",
-            accepted = false
-        );
+        log_qualification_rejection();
         self.error = Some(projection::IntentError {
             code: "unavailable",
             action,
@@ -60,42 +89,15 @@ impl QualificationRuntime {
         }
         self.poll()
     }
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Mirrors the CXX native environment boundary."
-    )]
     pub(super) fn native_environment(
         &mut self,
-        qt: &str,
-        platform: &str,
-        vendor: &str,
-        release: u32,
-        protocol_major: u32,
-        protocol_minor: u32,
-        shape_major: u32,
-        shape_minor: u32,
+        report: crate::diagnostics::report::NativeEnvironmentReport,
     ) -> UiUpdate {
-        use crate::diagnostics::report::{NativeEnvironmentReport, Observation, XServerReport};
-        self.native_environment = NativeEnvironmentReport {
-            qt_runtime_version: Observation::Observed {
-                value: crate::diagnostics::report::bounded_text(qt, 128),
-            },
-            qt_platform: Observation::Observed {
-                value: crate::diagnostics::report::bounded_text(platform, 128),
-            },
-            x_server: Observation::Observed {
-                value: XServerReport {
-                    vendor: crate::diagnostics::report::bounded_text(vendor, 256),
-                    release,
-                    protocol_major,
-                    protocol_minor,
-                    shape_major,
-                    shape_minor,
-                },
-            },
-            ..Default::default()
-        };
-        self.poll()
+        let changed = self.native_environment != report;
+        if changed {
+            self.native_environment = report;
+        }
+        self.poll_with_native_change(changed)
     }
     pub(super) fn request_application_close(&mut self) -> UiUpdate {
         self.pending = None;
@@ -130,7 +132,7 @@ impl QualificationRuntime {
             .map(|error| error.code.to_owned())
             .unwrap_or_default()
     }
-    #[cfg(all(feature = "gpui-host", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(super) fn owner_ack_failed(&self) -> bool {
         self.gate.owner_ack_failed()
     }
@@ -151,34 +153,29 @@ impl QualificationRuntime {
             }
         }
     }
-    pub(super) fn qualification_command(&mut self, line: &str) -> UiUpdate {
-        // No trim: the finite command grammar does not admit hidden trailing input.
-        tracing::info!(
-            event_code = "qualification_request_parsed",
-            kind = qualification_intent(line)
-        );
-        match line {
-            "snapshot" => {
+    pub(super) fn qualification_command(&mut self, command: QualificationCommand) -> UiUpdate {
+        let kind = match command {
+            QualificationCommand::Snapshot => "Snapshot",
+            QualificationCommand::ApplicationClose => "ApplicationClose",
+            QualificationCommand::Pause(_) => "Pause",
+            // Fullscreen requests must be handled by the native host. The
+            // runtime only receives the observed state via set_fullscreen.
+            QualificationCommand::Fullscreen => return self.reject("qualification_command"),
+        };
+        tracing::info!(event_code = "qualification_request_parsed", kind);
+        match command {
+            QualificationCommand::Snapshot => {
                 self.last_snapshot = None;
                 self.poll()
             }
-            "fullscreen" => self.set_fullscreen(!self.fullscreen),
-            "application-close" => self.request_application_close(),
-            _ => {
-                if let Some(value) = line.strip_prefix("pause ")
-                    && let Ok(generation) = value.parse::<u64>()
-                    && generation.to_string() == value
-                    && let Some(attempt) = AttemptId::new(generation)
-                    && self.pause(attempt) == SubmitStatus::Accepted
-                {
-                    return self.poll();
-                }
-                self.reject("qualification_command")
+            QualificationCommand::ApplicationClose => self.request_application_close(),
+            QualificationCommand::Pause(attempt)
+                if self.pause(attempt) == SubmitStatus::Accepted =>
+            {
+                self.poll()
             }
+            _ => self.reject("qualification_command"),
         }
-    }
-    pub(super) fn unchanged(&mut self) -> UiUpdate {
-        self.poll()
     }
     fn snapshot(&self, update: &QualificationUpdate) -> projection::Snapshot {
         let health = self.diagnostics.health();
@@ -259,6 +256,9 @@ impl QualificationRuntime {
         }
     }
     pub(super) fn poll(&mut self) -> UiUpdate {
+        self.poll_with_native_change(false)
+    }
+    fn poll_with_native_change(&mut self, native_changed: bool) -> UiUpdate {
         let update = self.gate.poll();
         let failure = update
             .terminal_failure
@@ -266,19 +266,19 @@ impl QualificationRuntime {
             .or(self.startup_failure.as_ref());
         let snapshot = self.snapshot(&update);
         let changed = self.last_snapshot.as_deref() != Some(&snapshot);
+        let phase = match update.phase {
+            GatePhase::Idle => "Idle",
+            GatePhase::WaitingSurface => "WaitingSurface",
+            GatePhase::Opening => "Opening",
+            GatePhase::Ready => "Ready",
+            GatePhase::Stopping => "Stopping",
+            GatePhase::Releasing => "Releasing",
+            GatePhase::Failed => "Failed",
+            GatePhase::QuitReady => "QuitReady",
+        };
         let ui_snapshot = if changed {
             let snapshot = Rc::new(snapshot);
             self.last_snapshot = Some(Rc::clone(&snapshot));
-            let phase = match update.phase {
-                GatePhase::Idle => "Idle",
-                GatePhase::WaitingSurface => "WaitingSurface",
-                GatePhase::Opening => "Opening",
-                GatePhase::Ready => "Ready",
-                GatePhase::Stopping => "Stopping",
-                GatePhase::Releasing => "Releasing",
-                GatePhase::Failed => "Failed",
-                GatePhase::QuitReady => "QuitReady",
-            };
             let size = update
                 .observations
                 .as_ref()
@@ -293,28 +293,31 @@ impl QualificationRuntime {
                 width = size.map_or(0, |size| size.value.width()),
                 height = size.map_or(0, |size| size.value.height()),
                 failed = failure.is_some(),
+                failure_code = failure.map(|error| error.code),
                 quit = update.quit
             );
-            if let Some(revision) = self.diagnostics.reserve_report_revision() {
-                let mut report = crate::diagnostics::report::ReportSnapshot::initial();
-                report.revision = revision;
-                report.environment.os = self.diagnostics.os_report();
-                report.environment.log_location = self.diagnostics.health();
-                report.environment.native = self.native_environment.clone();
-                report.environment.runtime_media = update
-                    .diagnostics
-                    .as_ref()
-                    .map(crate::diagnostics::report::RuntimeMediaReport::from)
-                    .unwrap_or_default();
-                report.session.phase = "QualificationVideo".into();
-                report.session.gate_phase = phase;
-                report.session.identity.generation = Some(1);
-                self.diagnostics.publish_report(report);
-            }
             Some(snapshot)
         } else {
             None
         };
+        if (changed || native_changed)
+            && let Some(revision) = self.diagnostics.reserve_report_revision()
+        {
+            let mut report = crate::diagnostics::report::ReportSnapshot::initial();
+            report.revision = revision;
+            report.environment.os = self.diagnostics.os_report();
+            report.environment.log_location = self.diagnostics.health();
+            report.environment.native = self.native_environment.clone();
+            report.environment.runtime_media = update
+                .diagnostics
+                .as_ref()
+                .map(crate::diagnostics::report::RuntimeMediaReport::from)
+                .unwrap_or_default();
+            report.session.phase = "QualificationVideo".into();
+            report.session.gate_phase = phase;
+            report.session.identity.generation = Some(1);
+            self.diagnostics.publish_report(report);
+        }
         if self.last_backend != update.diagnostics {
             self.last_backend.clone_from(&update.diagnostics);
             if let Some(observed) = &update.diagnostics {
@@ -345,8 +348,6 @@ impl QualificationRuntime {
             can_restart: false,
             product_phase: if update.quit { "Stopped" } else { "Active" }.into(),
             audio_status: "Disabled".into(),
-            audio_source: String::new(),
-            audio_desired: String::new(),
             audio_diagnostic: String::new(),
             failed: failure.is_some(),
             diagnostic: failure
@@ -355,9 +356,6 @@ impl QualificationRuntime {
             context_diagnostic: failure
                 .map(|error| error.code.to_owned())
                 .unwrap_or_default(),
-            recovery_evidence: String::new(),
-            recovery_stage: String::new(),
-            candidates: Vec::new(),
             paused: update.paused,
             prepared_paused: false,
             volume_percent: 0,
@@ -377,12 +375,7 @@ impl QualificationRuntime {
             quit: update.quit,
             terminal_failure: failure.is_some(),
             settings_status: String::new(),
-            settings_path: String::new(),
-            settings_refused: false,
-            saved_selection: String::new(),
-            startup_reason: String::new(),
             close_dialog: String::new(),
-            reset_token: 0,
             fullscreen: self.fullscreen,
             stats_hidden: true,
             logging_enabled: true,
@@ -390,13 +383,6 @@ impl QualificationRuntime {
                 update.phase,
                 GatePhase::Stopping | GatePhase::Releasing | GatePhase::QuitReady
             ),
-            output_rows: "[]".into(),
-            output_catalog_revision: 0,
-            output_selected: String::new(),
-            output_selected_key: String::new(),
-            output_effective: String::new(),
-            output_status: "Disabled".into(),
-            output_needs_action: false,
         }
     }
 }
@@ -445,7 +431,12 @@ mod tests {
         }
         assert_eq!(initial["catalog"]["sourceRows"], serde_json::json!([]));
         assert_eq!(initial["output"]["rows"], serde_json::json!([]));
+        assert_eq!(
+            QualificationCommand::parse("fullscreen"),
+            Some(QualificationCommand::Fullscreen)
+        );
         for command in [
+            "",
             "force-surface-loss",
             "reset-confirm",
             "open-close-during-opening",
@@ -455,25 +446,61 @@ mod tests {
             "pause 01",
             "pause 1 trailing",
             "snapshot ",
+            "fullscreen unexpected",
+            "pause +1",
+            "pause 0",
+            "pause 18446744073709551616",
         ] {
-            let update = runtime.qualification_command(command);
-            let published = update
-                .ui_snapshot
-                .as_deref()
-                .or(runtime.last_snapshot.as_deref())
-                .unwrap();
-            let snapshot: serde_json::Value = serde_json::to_value(published).unwrap();
-            assert_eq!(snapshot["intentError"]["code"], "unavailable", "{command}");
-            assert_eq!(snapshot["gatePhase"], "Idle", "{command}");
-            assert!(runtime.pending.is_some());
-            assert!(!update.create_native && !update.release_native && !update.quit);
+            assert_eq!(QualificationCommand::parse(command), None, "{command}");
         }
-        let snapshot = runtime.qualification_command("snapshot");
+        let pause = QualificationCommand::parse("pause 18446744073709551615").unwrap();
+        assert_eq!(
+            pause,
+            QualificationCommand::Pause(AttemptId::new(u64::MAX).unwrap())
+        );
+        let update = runtime.qualification_command(pause);
+        let snapshot = update.ui_snapshot.as_deref().unwrap();
+        assert_eq!(snapshot.intent_error.as_ref().unwrap().code, "unavailable");
+        assert_eq!(snapshot.gate_phase, "Idle");
+        assert!(runtime.pending.is_some());
+        assert!(!update.create_native && !update.release_native && !update.quit);
+        let snapshot = runtime.qualification_command(QualificationCommand::Snapshot);
         assert!(snapshot.ui_snapshot.is_some());
         assert!(!snapshot.create_native);
-        let closed = runtime.request_application_close();
+        let closed = runtime.qualification_command(QualificationCommand::ApplicationClose);
         assert!(closed.quit && !closed.terminal_failure);
         assert!(runtime.pending.is_none());
+    }
+
+    #[test]
+    fn qualification_native_environment_publishes_without_replaying_the_ui() {
+        use crate::diagnostics::report::{NativeEnvironmentReport, Observation, UnavailableReason};
+
+        let mut runtime = runtime();
+        assert!(runtime.poll().ui_snapshot.is_some());
+        assert!(runtime.poll().ui_snapshot.is_none());
+        let before = runtime.diagnostics.reserve_report_revision().unwrap();
+        let report = NativeEnvironmentReport {
+            frontend: Observation::Observed {
+                value: "gpui".into(),
+            },
+            window_backend: Observation::Observed {
+                value: "x11".into(),
+            },
+            xwayland_version: Observation::Unavailable {
+                reason: UnavailableReason::NotExposed,
+            },
+            ..Default::default()
+        };
+        let update = runtime.native_environment(report.clone());
+        assert!(update.ui_snapshot.is_none());
+        assert!(!update.create_native && !update.release_native && !update.quit);
+        assert_eq!(runtime.native_environment, report);
+        let published = before.next().unwrap();
+        let after = published.next().unwrap();
+        assert_eq!(runtime.diagnostics.reserve_report_revision(), Some(after));
+        assert!(runtime.native_environment(report).ui_snapshot.is_none());
+        assert_eq!(runtime.diagnostics.reserve_report_revision(), after.next());
     }
 
     #[test]
@@ -493,7 +520,7 @@ mod tests {
             runtime.last_snapshot.as_ref().expect("retained snapshot")
         ));
 
-        let forced = runtime.qualification_command("snapshot");
+        let forced = runtime.qualification_command(QualificationCommand::Snapshot);
         assert!(
             forced.ui_snapshot.is_some(),
             "explicit snapshot republishes"

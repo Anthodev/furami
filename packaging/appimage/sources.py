@@ -18,9 +18,16 @@ import tarfile
 import urllib.parse
 import urllib.request
 import tempfile
+import tomllib
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+APT_LISTS = Path('/var/lib/apt/lists')
+UBUNTU_DOC = Path('/usr/share/doc')
+CARGO_NOTICE_LOCK = 'packaging/appimage/sources.lock.json'
+CARGO_NOTICE_DIR = 'packaging/appimage/notices/'
+CARGO_REGISTRY = 'registry+https://github.com/rust-lang/crates.io-index'
+HEX_SHA = re.compile(r'[0-9a-f]{64}\Z')
 
 PUBLIC_MATERIAL_POLICY = {'schema': 1, 'alpine_bootstrap': 'private',
                           'public_offline_bootstrap_complete': False}
@@ -36,6 +43,138 @@ def sha(path):
 
 def dump(path, value):
     Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+
+def notice_relative(path):
+    return (isinstance(path, str) and path and '\\' not in path and '\0' not in path
+            and all(part not in ('', '.', '..') for part in path.split('/')))
+
+
+def notice_file(root, relative):
+    if not notice_relative(relative):
+        raise ValueError(f'unsafe notice path: {relative!r}')
+    path = root / relative
+    if any(parent.is_symlink() for parent in (path, *path.parents)) or not path.is_file():
+        raise ValueError(f'notice input must be a regular nonsymlink file: {relative}')
+    return path
+
+
+def crate_identity(row):
+    return tuple(row.get(key) for key in ('name', 'version', 'source', 'checksum'))
+
+
+def registry_crate(identity):
+    name, version, source, checksum = identity
+    return (isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_-]*', name)
+            and isinstance(version, str) and re.fullmatch(r'[0-9][A-Za-z0-9.+-]*', version)
+            and source == CARGO_REGISTRY and isinstance(checksum, str) and HEX_SHA.fullmatch(checksum))
+
+
+def _notice_origin(origin):
+    if not isinstance(origin, dict) or not notice_relative(origin.get('path')):
+        return False
+    kind = origin.get('kind')
+    if kind == 'upstream':
+        if (origin.keys() != {'kind', 'path', 'revision', 'repository'}
+                or not isinstance(origin['revision'], str)
+                or not re.fullmatch(r'[0-9a-f]{40}', origin['revision'])):
+            return False
+        url = origin['repository']
+    elif kind == 'distribution':
+        if (origin.keys() != {'kind', 'path', 'url', 'archive_sha256', 'descriptor_sha256'}
+                or any(not isinstance(origin[key], str) or not HEX_SHA.fullmatch(origin[key])
+                       for key in ('archive_sha256', 'descriptor_sha256'))):
+            return False
+        url = origin['url']
+    else:
+        return False
+    if not isinstance(url, str) or any(character.isspace() for character in url):
+        return False
+    parsed = urllib.parse.urlsplit(url)
+    return (parsed.scheme == 'https' and parsed.hostname and parsed.path
+            and parsed.username is None and not parsed.query and not parsed.fragment)
+
+
+def cargo_notice_lock(root):
+    """Read the reviewed crate identities and exact source-snapshot input hashes."""
+    cargo = notice_file(root, 'Cargo.lock').read_bytes()
+    policy = notice_file(root, CARGO_NOTICE_LOCK).read_bytes()
+    locked = set()
+    for row in tomllib.loads(cargo.decode()).get('package', []):
+        identity = crate_identity(row)
+        if row.get('source') is not None:
+            if not registry_crate(identity) or identity in locked:
+                raise ValueError(f'invalid Cargo.lock registry identity: {identity}')
+            locked.add(identity)
+    rows = json.loads(policy).get('cargo_notices')
+    if not isinstance(rows, list):
+        raise ValueError('reviewed Cargo notice list missing from sources.lock.json')
+    inputs = {'Cargo.lock': hashlib.sha256(cargo).hexdigest(),
+              CARGO_NOTICE_LOCK: hashlib.sha256(policy).hexdigest()}
+    supplemental = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError('invalid supplemental Cargo notice row')
+        identity = crate_identity(row)
+        if not registry_crate(identity) or identity not in locked or identity in supplemental:
+            raise ValueError(f'Cargo.lock does not uniquely match supplemental notice: {identity}')
+        unresolved = row.get('unresolved')
+        notices = row.get('notices')
+        if (row.keys() - {'name', 'version', 'source', 'checksum', 'notices', 'unresolved'}
+                or ('unresolved' in row and (not isinstance(unresolved, str) or not unresolved.strip()))
+                or not isinstance(notices, list) or (not notices and not unresolved)):
+            raise ValueError(f'invalid supplemental Cargo notice row: {identity}')
+        names = set()
+        for notice in notices:
+            if not isinstance(notice, dict):
+                raise ValueError(f'invalid supplemental Cargo notice: {identity}')
+            path, expected = notice.get('file'), notice.get('sha256')
+            if (notice.keys() - {'file', 'sha256', 'origin', 'crate_member'}
+                    or not notice_relative(path) or not path.startswith(CARGO_NOTICE_DIR)
+                    or not path[len(CARGO_NOTICE_DIR):]
+                    or not isinstance(expected, str) or not HEX_SHA.fullmatch(expected)
+                    or not _notice_origin(notice.get('origin'))
+                    or ('crate_member' in notice and not notice_relative(notice['crate_member']))):
+                raise ValueError(f'invalid supplemental Cargo notice: {identity}: {path!r}')
+            name = Path(path).name
+            if name in names or inputs.setdefault(path, expected) != expected:
+                raise ValueError(f'supplemental Cargo notice collision: {identity}: {path}')
+            names.add(name)
+        supplemental[identity] = row
+    return locked, supplemental, inputs
+
+
+def cargo_notice_input_files(root, inputs):
+    for relative, expected in inputs.items():
+        path = notice_file(root, relative)
+        if sha(path) != expected:
+            raise ValueError(f'Cargo notice input SHA256 mismatch: {relative}')
+
+
+def cargo_notice_snapshot(app_root, app_manifest, repository):
+    locked, supplemental, expected = cargo_notice_lock(repository)
+    recorded = app_manifest.get('inputs', {})
+    if (app_manifest.get('cargo_lock_sha256') != expected['Cargo.lock']
+            or any(recorded.get(path) != digest for path, digest in expected.items())
+            or any(path.startswith(CARGO_NOTICE_DIR) and path not in expected for path in recorded)):
+        raise ValueError('application notice snapshot inputs differ from reviewed locks')
+    cargo_notice_input_files(app_root / 'source-snapshot', expected)
+    return locked, supplemental, expected
+
+
+def verify_public_cargo_notices(inventory, repository):
+    """Use reviewed identities, not the recipient index, to require these bytes."""
+    _, supplemental, inputs = cargo_notice_lock(repository)
+    required = {'furami/' + path: digest for path, digest in inputs.items()}
+    required.update({f'app-inputs/{name}-{version}.crate': checksum
+                     for name, version, _, checksum in supplemental})
+    for path, expected in required.items():
+        if inventory.get(path, {}).get('sha256') != expected:
+            raise ValueError(f'public Cargo notice input absent or changed: {path}')
+    unexpected = sorted(path for path in inventory
+                        if path.startswith('furami/' + CARGO_NOTICE_DIR) and path not in required)
+    if unexpected:
+        raise ValueError(f'unreviewed public Cargo notice inputs: {unexpected}')
 
 
 def paragraphs(text):
@@ -111,30 +250,28 @@ def resolve_ubuntu_terms(lock: dict, *, binary_package: str, binary_version: str
             'terms_selection_resolved': True}
 
 
-def capture_ubuntu(stage, app, output):
-    """Run only in staging container after authenticated snapshot apt update."""
-    receipt = json.loads((stage / 'evidence.json').read_text())
-    app_manifest = json.loads((app / 'manifest.json').read_text())
-    packages = {item['owner'].split(':', 1)[1].split('=', 1)[0]
-                for item in receipt['component_sources'].values()
-                if item['owner'].startswith('ubuntu:')}
+def _collect_ubuntu(appdir, owners, app_manifest, apt_snapshot, evidence):
+    """Read the frozen dpkg/APT state, independent of release terms selection."""
+    package_objects = {}
+    for relative, item in owners.items():
+        if not item['owner'].startswith('ubuntu:'):
+            continue
+        package = item['owner'].split(':', 1)[1].split('=', 1)[0]
+        package_objects.setdefault(package, []).append((relative, item))
+    packages = set(package_objects)
     packages.update(('glslang-dev', 'spirv-tools'))
     packages.update(item['binary_package']['name'] for item in app_manifest['binary']['direct_objects'])
-    terms_path = HERE / 'ubuntu-terms.lock.json'
-    terms_lock = load_ubuntu_terms(terms_path)
-    observed = set()
     # Source identities and checksums come from authenticated apt source lists,
     # not from an unverified descriptor URL or guessed binary package name.
     records = []
-    evidence = output / 'ubuntu-source-evidence'
     evidence.mkdir(exist_ok=True)
-    apt_lists = Path('/var/lib/apt/lists')
     index_files = {}
-    for path in sorted(apt_lists.iterdir()):
+    for path in sorted(APT_LISTS.iterdir()):
         if path.is_file() and ('_InRelease' in path.name or '_source_Sources' in path.name):
             shutil.copy2(path, evidence / path.name)
             index_files[path.name] = sha(path)
-    if not index_files or not any('_source_Sources' in name for name in index_files):
+    if not any('_InRelease' in name for name in index_files) or not any(
+            '_source_Sources' in name for name in index_files):
         raise ValueError('authenticated Ubuntu source indexes unavailable')
     for package in sorted(packages):
         identity = command(['dpkg-query', '-W', '-f=${source:Package}\t${source:Version}\t${Version}', package]).strip().split('\t')
@@ -156,39 +293,65 @@ def capture_ubuntu(stage, app, output):
             if not re.fullmatch(r'[0-9a-f]{64}', digest) or Path(filename).name != filename:
                 raise ValueError(f'{package}: invalid signed source checksum')
             files.append({'archive': filename, 'sha256': digest, 'size': int(size),
-                          'url': f'https://snapshot.ubuntu.com/ubuntu/{receipt["ubuntu_base_image"]["apt_snapshot"]}/{directory}/{filename}'})
+                          'url': f'https://snapshot.ubuntu.com/ubuntu/{apt_snapshot}/{directory}/{filename}'})
         if not files or not any(item['archive'].endswith('.dsc') for item in files):
             raise ValueError(f'{package}: source record lacks descriptor')
-        notice = Path('/usr/share/doc') / package / 'copyright'
+        notice = UBUNTU_DOC / package / 'copyright'
         if not notice.is_file():
             raise ValueError(f'{package}: source notice unavailable')
         target = evidence / f'{package}.copyright'
         shutil.copy2(notice, target)
-        sections = [row for row in paragraphs(notice.read_text()) if 'License' in row]
-        objects = []
-        for relative, item in receipt['component_sources'].items():
-            if item['owner'].split('=', 1)[0] == 'ubuntu:' + package:
-                staged = stage / 'AppDir' / relative
-                if item['owner'] != 'ubuntu:' + package + '=' + binary_version:
-                    raise ValueError(f'Ubuntu staged owner version mismatch: {package}')
-                if staged.is_symlink() or not staged.is_file():
-                    continue
-                with staged.open('rb') as stream:
-                    if stream.read(4) == b'\x7fELF':
-                        objects.append(relative)
-        terms = resolve_ubuntu_terms(terms_lock, binary_package=package, binary_version=binary_version,
-                                     source_package=source, source_version=version, notice=target,
-                                     shipped_objects=objects)
-        observed.add(package + '@' + binary_version)
+        sections = [row for row in paragraphs(target.read_text()) if 'License' in row]
+        objects = {}
+        for relative, item in sorted(package_objects.get(package, ())):
+            if item['owner'] != 'ubuntu:' + package + '=' + binary_version:
+                raise ValueError(f'Ubuntu staged owner version mismatch: {package}')
+            staged = appdir / relative
+            if staged.is_symlink() or not staged.is_file():
+                continue
+            with staged.open('rb') as stream:
+                if stream.read(4) == b'\x7fELF':
+                    objects[relative] = item
         records.append({'binary_package': package, 'binary_version': binary_version,
                         'source_package': source, 'source_version': version,
-                        **{key: value for key, value in terms.items() if key != 'source_package'},
+                        'shipped_objects': list(objects), 'object_owners': objects,
+                        'notice': {'path': target.name, 'sha256': sha(target)},
                         'files': files, 'license_sections': sections,
                         'license_fields': sorted({row['License'] for row in sections})})
+    return {'authenticated_by': 'apt snapshot Signed-By ubuntu-archive-keyring.gpg',
+            'indexes_sha256': index_files, 'packages': records}
+
+
+def observe_ubuntu(appdir, owners, app_manifest, apt_snapshot, output):
+    """Write facts for manual terms review; never create a release capture."""
+    observation = _collect_ubuntu(appdir, owners, app_manifest, apt_snapshot,
+                                  output / 'ubuntu-observation-evidence')
+    dump(output / 'ubuntu-observation.json', {'schema': 1, 'release_eligible': False,
+                                             'apt_snapshot': apt_snapshot, **observation})
+
+
+def capture_ubuntu(stage, app, output):
+    """Run only in staging container after authenticated snapshot apt update."""
+    receipt = json.loads((stage / 'evidence.json').read_text())
+    app_manifest = json.loads((app / 'manifest.json').read_text())
+    terms_path = HERE / 'ubuntu-terms.lock.json'
+    terms_lock = load_ubuntu_terms(terms_path)
+    evidence = output / 'ubuntu-source-evidence'
+    captured = _collect_ubuntu(stage / 'AppDir', receipt['component_sources'], app_manifest,
+                               receipt['ubuntu_base_image']['apt_snapshot'], evidence)
+    observed = set()
+    for record in captured['packages']:
+        package, binary_version = record['binary_package'], record['binary_version']
+        terms = resolve_ubuntu_terms(terms_lock, binary_package=package, binary_version=binary_version,
+                                     source_package=record['source_package'],
+                                     source_version=record['source_version'],
+                                     notice=evidence / record['notice']['path'],
+                                     shipped_objects=record['shipped_objects'])
+        observed.add(package + '@' + binary_version)
+        del record['object_owners']
+        record.update((key, value) for key, value in terms.items() if key != 'source_package')
     _require_ubuntu_package_set(terms_lock, observed)
-    dump(output / 'ubuntu-sources.json', {'schema': 1, 'authenticated_by': 'apt snapshot Signed-By ubuntu-archive-keyring.gpg',
-                                         'terms_lock_sha256': sha(terms_path),
-                                         'indexes_sha256': index_files, 'packages': records})
+    dump(output / 'ubuntu-sources.json', {'schema': 1, 'terms_lock_sha256': sha(terms_path), **captured})
 
 
 def obtain(entry, cache, acquire):
@@ -219,12 +382,6 @@ def obtain(entry, cache, acquire):
 
 LOADER_REPORTS = {'mpv.ldd.txt': 'mpv.loader-resolution.txt',
                   'libmpv.so.ldd.txt': 'libmpv.so.loader-resolution.txt'}
-QT_METADATA_PATHS = frozenset((
-    'src/3rdparty/.gitattributes', 'src/3rdparty/tinycbor/.gitignore',
-    'src/3rdparty/tinycbor/tests/.gitignore', 'src/android/jar/.gitignore',
-    'src/android/templates/.gitignore', 'src/corelib/serialization/.gitignore',
-    'src/network/android/jar/.gitignore',
-    'src/plugins/networkinformation/android/jar/.gitignore'))
 
 
 def loader_resolution_report(raw):
@@ -240,87 +397,6 @@ def loader_resolution_report(raw):
     return (b'Derived loader-resolution report; terminal per-process addresses omitted.\n'
             b'Transform: glibc-terminal-address-v1. Recorded build environment only.\n'
             + b'\n'.join(result) + b'\n')
-
-
-def supplemental_dossier(entry, sbom):
-    dossier = entry.get('supplemental_metadata')
-    if dossier is None:
-        return None
-    if (dossier.get('commit') != entry.get('kit_source_commit')
-            or dossier.get('archive_sha256') != entry['sha256']
-            or dossier.get('spdx_sha256') != sha(sbom)
-            or set(dossier.get('files', {})) != QT_METADATA_PATHS
-            or set(dossier.get('license_evidence', {})) != {
-                'REUSE.toml', 'src/3rdparty/tinycbor/REUSE.toml',
-                'LICENSES/BSD-3-Clause.txt', 'src/3rdparty/tinycbor/LICENSE'}):
-        raise ValueError('Qt supplemental identity/path/evidence mismatch')
-    names = set()
-    for relative, row in {**dossier['files'], **dossier['license_evidence']}.items():
-        if (row.get('recipient') != 'qt-inputs/qtbase-git-metadata/' + relative
-                or row.get('url') != 'https://raw.githubusercontent.com/qt/qtbase/' + dossier['commit'] + '/' + relative
-                or Path(row.get('archive', '')).name != row.get('archive')
-                or row['archive'] in names
-                or not re.fullmatch('[0-9a-f]{64}', row.get('sha256', ''))
-                or not re.fullmatch('[0-9a-f]{40}', row.get('sha1', ''))):
-            raise ValueError('invalid Qt supplemental record')
-        names.add(row['archive'])
-    return dossier
-
-
-def qt_correspondence(archive, sbom, *, supplements=None):
-    """Reconcile source/code/license bytes, not require bit-identical Qt rebuild."""
-    if supplements and not set(supplements).issubset(QT_METADATA_PATHS):
-        raise ValueError('unexpected Qt supplemental path')
-    text = sbom.read_text()
-    records = {}
-    for block in text.split("\n\n"):
-        filename = re.search(r"^FileName: (.+)$", block, re.MULTILINE)
-        checksum = re.search(r"^FileChecksum: SHA1: ([0-9a-f]{40})$", block, re.MULTILINE)
-        if not filename or not checksum:
-            continue
-        relative = filename.group(1).removeprefix("./")
-        if relative.startswith(("src/", "LICENSES/", "cmake/", "mkspecs/")) or relative in ("CMakeLists.txt", ".cmake.conf", "configure", "configure.bat"):
-            if relative in records:
-                raise ValueError('duplicate Qt source SPDX record: ' + relative)
-            records[relative] = checksum.group(1)
-    if not records:
-        raise ValueError(f"source SPDX has no build/source/license checksums: {sbom.name}")
-    checked = {}
-    differences = []
-    supplemental_checked = {}
-    seen = set()
-    with tarfile.open(archive) as tar:
-        for member in tar:
-            parts = Path(member.name).parts
-            relative = "/".join(parts[1:])
-            if relative not in records:
-                continue
-            if relative in seen:
-                raise ValueError('duplicate Qt source archive member: ' + relative)
-            seen.add(relative)
-            if not member.isfile():
-                differences.append(relative + ": not regular source")
-                continue
-            content = tar.extractfile(member).read()
-            digest = hashlib.sha1(content).hexdigest()
-            checked[relative] = digest
-            if digest != records[relative]:
-                differences.append(relative + ": differs from vendor source SPDX")
-    for relative in records.keys() - seen:
-        supplied = (supplements or {}).get(relative)
-        if supplied:
-            path, row = supplied
-            if (path.is_symlink() or not path.is_file() or sha(path) != row['sha256']
-                    or hashlib.sha1(path.read_bytes()).hexdigest() != row['sha1']
-                    or row['sha1'] != records[relative]):
-                raise ValueError('Qt supplemental content mismatch: ' + relative)
-            supplemental_checked[relative] = row
-        else:
-            differences.append(relative + ': absent from checked source archive')
-    return {"source_archive_sha256": sha(archive), "vendor_source_SPDX_sha256": sha(sbom),
-            "archive_checked_files": len(checked), "supplemental_checked_files": len(supplemental_checked),
-            "supplemental_files": supplemental_checked,
-            "checked_files": len(checked) + len(supplemental_checked), "differences": sorted(differences)}
 
 
 def verify_tar_footer(archive, name):
@@ -489,6 +565,7 @@ def verify_public_materials(release, index, *, require_complete=True):
     if linked_sources != alpine.get('linked_sources'):
         raise ValueError('public linked source closure differs from reviewed canonical pairs')
     source_policy = read_lock('sources.lock.json', 'appimage')
+    verify_public_cargo_notices(inventory, REPO)
     base = source_policy.get('alpine_private_bootstrap')
     if (type(source_policy.get('schema')) is not int or source_policy['schema'] != 1
             or not isinstance(base, dict) or base.get('image') != runtime['container']
@@ -507,7 +584,7 @@ def verify_public_materials(release, index, *, require_complete=True):
                 for entry in runtime['sources'].values()}
     required.update(public_indexes)
     for name, source in media_lock['sources'].items():
-        if name not in ('qt', 'ca_certificates'):
+        if name != 'ca_certificates':
             required['media-inputs/' + source['archive']] = source['sha256']
     required.update({'furami/packaging/media/' + row['file']: row['sha256']
                      for row in media_patches})
@@ -516,12 +593,11 @@ def verify_public_materials(release, index, *, require_complete=True):
         required[prefix + 'APKBUILD'] = source['apkbuild']['sha256']
         for entry in (source['upstream_source'], *source['aports_inputs']):
             required[prefix + entry['file']] = entry['sha256']
-    # Re-evaluate delivered Qt bytes, not a claimed successful correspondence.
-    with tempfile.TemporaryDirectory(prefix='furami-offline-qt-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='furami-offline-media-') as temporary:
         def delivered(name):
             row = inventory.get(name)
             if row is None:
-                raise ValueError('Qt recipient material missing: ' + name)
+                raise ValueError('media recipient material missing: ' + name)
             target = Path(temporary) / hashlib.sha256(name.encode()).hexdigest()
             with tarfile.open(release / row['archive']) as archive:
                 with archive.extractfile(name) as stream, target.open('wb') as output:
@@ -551,41 +627,6 @@ def verify_public_materials(release, index, *, require_complete=True):
                 recorded = b'\n'.join(line + b' (0x0)' for line in lines[2:]) + b'\n'
                 if loader_resolution_report(recorded) != report:
                     raise ValueError('invalid derived loader-resolution report')
-        required_modules = source_policy.get('required_qt_modules')
-        if (not isinstance(required_modules, list) or len(set(required_modules)) != len(required_modules)
-                or any(module not in source_policy['qt_sources'] for module in required_modules)):
-            raise ValueError('canonical required Qt module set malformed')
-        receipts = index.get('qt_correspondence', {})
-        if not isinstance(receipts, dict) or any(module not in source_policy['qt_sources'] for module in receipts):
-            raise ValueError('Qt correspondence receipt set malformed')
-        if require_complete and not set(required_modules).issubset(receipts):
-            raise ValueError('required Qt correspondence receipt omitted')
-        for module in set(required_modules) | set(receipts):
-            entry = source_policy['qt_sources'][module]
-            source_name = 'qt-inputs/' + entry['archive']
-            sbom_name = 'qt-evidence/sbom/' + module + '-' + entry['version'] + '.source.spdx'
-            if not require_complete and (source_name not in inventory or sbom_name not in inventory):
-                continue
-            source = delivered(source_name)
-            sbom = delivered(sbom_name)
-            if sha(source) != entry['sha256']:
-                raise ValueError('Qt official archive differs from lock')
-            dossier = supplemental_dossier(entry, sbom)
-            supplements = {}
-            if dossier:
-                for relative, row in {**dossier['files'], **dossier['license_evidence']}.items():
-                    if not require_complete and row['recipient'] not in inventory:
-                        continue
-                    supplied = delivered(row['recipient'])
-                    if (sha(supplied) != row['sha256']
-                            or hashlib.sha1(supplied.read_bytes()).hexdigest() != row['sha1']):
-                        raise ValueError('Qt delivered supplemental evidence mismatch')
-                    if relative in dossier['files']:
-                        supplements[relative] = (supplied, row)
-            actual = qt_correspondence(source, sbom, supplements=supplements)
-            receipt = receipts.get(module)
-            if (receipt is not None and actual != receipt) or (require_complete and (receipt is None or actual['differences'])):
-                raise ValueError('Qt actual recipient correspondence differs from receipt')
     if require_complete:
         for name, checksum in required.items():
             if inventory.get(name, {}).get('sha256') != checksum:
@@ -618,13 +659,13 @@ def assemble(provenance, audit, output, caches, acquire):
     artifacts = []
     missing = []
     optional_unavailable = []
-    qt_receipts = {}
     inputs = {}
     app = Path(provenance['app'])
     runtime = Path(provenance['runtime'])
     stage = Path(provenance['stage'])
     media = Path(provenance['media'])
     app_manifest = json.loads((app / 'manifest.json').read_text())
+    _, _, notice_inputs = cargo_notice_snapshot(app, app_manifest, REPO)
     media_manifest = json.loads((media / 'manifest.json').read_text())
     runtime_manifest = json.loads((runtime / 'manifest.json').read_text())
     stack = json.loads((REPO / 'packaging/media/stack.lock.json').read_text())
@@ -666,6 +707,10 @@ def assemble(provenance, audit, output, caches, acquire):
     patch_owners = {'packaging/media/' + row['file']: row['source']
                     for row in source_patches.entries(media_manifest['sources'])}
     for relative, digest in app_manifest['inputs'].items():
+        if relative.startswith(CARGO_NOTICE_DIR):
+            add(app / 'source-snapshot' / relative, 'furami/' + relative,
+                notice_inputs[relative], role='license-evidence')
+            continue
         add(app / 'source-snapshot' / relative, 'furami/' + relative, digest,
             component=patch_owners.get(relative, 'furami'))
     # Full controlling scripts and locks, not developer-specific output paths.
@@ -673,6 +718,9 @@ def assemble(provenance, audit, output, caches, acquire):
         for path in sorted((REPO / 'packaging' / folder).iterdir()):
             if path.is_file() and not path.is_symlink() and (path.name == 'AppRun' or path.suffix in ('.py', '.sh', '.json', '.md', '.conf', '.svg', '.png', '.desktop')):
                 add(path, 'furami/packaging/' + folder + '/' + path.name, role='build-recipe')
+    for relative in notice_inputs:
+        if relative != 'Cargo.lock':
+            add(REPO / relative, 'furami/' + relative, notice_inputs[relative], role='license-evidence')
     for row in source_patches.entries(media_manifest['sources']):
         add(media / 'source-inputs' / row['file'], 'furami/packaging/media/' + row['file'],
             row['sha256'], component=row['source'])
@@ -688,37 +736,9 @@ def assemble(provenance, audit, output, caches, acquire):
     for entry in app_manifest['source_archives']:
         add(app / 'sources' / entry['archive'], 'app-inputs/' + entry['archive'], entry['sha256'], 'build-input')
     for name, entry in media_manifest['sources'].items():
-        if name in ('qt', 'ca_certificates'):
+        if name == 'ca_certificates':
             continue
         locked(entry, caches['media'], 'media-inputs/' + entry['archive'], name)
-    for entry in media_manifest['sources']['qt']['archives']:
-        locked(entry, caches['media'], 'media-inputs/' + entry['archive'], 'qt-kit:' + entry['component'], 'build-input', required=False)
-    qt_lock = json.loads((HERE / 'sources.lock.json').read_text())
-    required_qt = {item.get('source_component_id', item['component_id']).removeprefix('qt:')
-                   for relative, owner in audit['component_files'].items()
-                   if not relative.startswith('usr/share/')
-                   for item in owner.get('components', []) if item.get('source_component_id', item['component_id']).startswith('qt:')}
-    for module, entry in qt_lock['qt_sources'].items():
-        source = locked(entry, caches['compliance'], 'qt-inputs/' + entry['archive'], 'qt:' + module,
-                        required=module in required_qt)
-        if source and module in required_qt:
-            sbom = media / 'prefix/sbom' / f'{module}-6.11.2.source.spdx'
-            dossier = supplemental_dossier(entry, sbom)
-            supplements = {}
-            if dossier:
-                for relative, row in {**dossier['files'], **dossier['license_evidence']}.items():
-                    supplied = locked(row, caches['compliance'], row['recipient'], 'qt:' + module,
-                                      role='corresponding-source' if relative in dossier['files'] else 'license-evidence')
-                    if supplied and relative in dossier['files']:
-                        supplements[relative] = (supplied, row)
-            proof = qt_correspondence(source, sbom, supplements=supplements)
-            qt_receipts[module] = proof
-            missing.extend(f'Qt {module}: {path}' for path in proof['differences'])
-    for path in sorted((media / 'prefix/sbom').iterdir()):
-        add(path, 'qt-evidence/sbom/' + path.name, media_manifest['artifacts'][path.relative_to(media / 'prefix').as_posix()]['sha256'], 'license-evidence')
-    for path in sorted((media / 'prefix').glob('config_*')):
-        if path.is_file():
-            add(path, 'qt-evidence/' + path.name, role='build-configuration')
     derived = tempfile.TemporaryDirectory(prefix='furami-loader-reports-')
     loader_receipts = []
     for raw_name, report_name in LOADER_REPORTS.items():
@@ -810,7 +830,7 @@ def assemble(provenance, audit, output, caches, acquire):
     derived.cleanup()
     index = {'schema': 1, 'complete': not missing, 'missing': sorted(set(missing)), 'files': artifacts,
              'material_policy': dict(PUBLIC_MATERIAL_POLICY),
-             'optional_unavailable': sorted(set(optional_unavailable)), 'qt_correspondence': qt_receipts,
+             'optional_unavailable': sorted(set(optional_unavailable)),
              'archives': [{'path': name, 'sha256': sha(output / name)} for name in archives],
              'scope': 'public corresponding sources and distributed materials; excludes private Alpine binary bootstrap'}
     dump(output / 'sources-index.json', index)

@@ -35,62 +35,6 @@ class DerivedLoaderTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 sources.loader_resolution_report(raw)
 
-    def test_canonical_supplemental_dossier_is_identity_and_path_bound(self):
-        entry = copy.deepcopy(json.loads((Path(__file__).with_name('sources.lock.json')).read_text())['qt_sources']['qtbase'])
-        with tempfile.TemporaryDirectory() as directory:
-            sbom = Path(directory) / 'vendor.spdx'
-            sbom.write_bytes(b'vendor fixture')
-            entry['supplemental_metadata']['spdx_sha256'] = sources.sha(sbom)
-            self.assertIsNotNone(sources.supplemental_dossier(entry, sbom))
-            for mutation in ('commit', 'archive', 'spdx', 'extra', 'missing', 'evidence', 'target', 'duplicate-cache', 'url'):
-                changed = copy.deepcopy(entry)
-                dossier = changed['supplemental_metadata']
-                first = next(iter(dossier['files']))
-                if mutation == 'commit':
-                    dossier['commit'] = '0' * 40
-                elif mutation == 'archive':
-                    dossier['archive_sha256'] = '0' * 64
-                elif mutation == 'spdx':
-                    dossier['spdx_sha256'] = '0' * 64
-                elif mutation == 'extra':
-                    dossier['files']['src/unrelated/.gitignore'] = dossier['files'][first]
-                elif mutation == 'missing':
-                    del dossier['files'][first]
-                elif mutation == 'evidence':
-                    dossier['license_evidence'].clear()
-                elif mutation == 'target':
-                    dossier['files'][first]['recipient'] = '../unsafe'
-                elif mutation == 'duplicate-cache':
-                    keys = list(dossier['files'])
-                    dossier['files'][keys[1]]['archive'] = dossier['files'][first]['archive']
-                else:
-                    dossier['files'][first]['url'] = dossier['files'][first]['url'].replace(dossier['commit'], 'dev')
-                with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                    sources.supplemental_dossier(changed, sbom)
-
-    def test_supplement_cannot_shadow_archive_member(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            sbom, archive, supplied = root / 'source.spdx', root / 'source.tar', root / 'supplement'
-            supplied.write_bytes(b'expected')
-            row = {'sha1': hashlib.sha1(b'expected').hexdigest(),
-                   'sha256': sources.sha(supplied), 'recipient': 'overlay/src/android/jar/.gitignore'}
-            sbom.write_text('FileName: ./src/android/jar/.gitignore\nFileChecksum: SHA1: ' + row['sha1'] + '\n')
-            with tarfile.open(archive, 'w') as tar:
-                info = tarfile.TarInfo('qtbase/src/android/jar/.gitignore')
-                info.size = len(b'wrong')
-                tar.addfile(info, io.BytesIO(b'wrong'))
-            proof = sources.qt_correspondence(archive, sbom, supplements={'src/android/jar/.gitignore': (supplied, row)})
-            self.assertTrue(proof['differences'])
-            self.assertEqual(proof['supplemental_checked_files'], 0)
-            with tarfile.open(archive, 'w'):
-                pass
-            self.assertEqual(sources.qt_correspondence(
-                archive, sbom, supplements={'src/android/jar/.gitignore': (supplied, row)})['differences'], [])
-            supplied.write_bytes(b'tampered')
-            with self.assertRaises(ValueError):
-                sources.qt_correspondence(archive, sbom, supplements={'src/android/jar/.gitignore': (supplied, row)})
-
 
 class SourceMetadataTests(unittest.TestCase):
     def test_empty_checksum_headers_keep_exact_descriptor_and_separate_tables(self):
@@ -198,17 +142,19 @@ class UbuntuTermsTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 sources.load_ubuntu_terms(path)
 
-    def test_normative_lock_covers_all_pinned_packages_including_library_and_crt_sources(self):
+    def test_normative_lock_covers_representative_libraries_and_crt_sources(self):
         lock = sources.load_ubuntu_terms(Path(__file__).with_name('ubuntu-terms.lock.json'))
-        self.assertEqual(len(lock['packages']), 76)
-        self.assertEqual(len({(row['source_package']['name'], row['source_package']['version'])
-                              for row in lock['packages'].values()}), 60)
-        for package in ('libgcrypt20', 'libasound2t64', 'libkeyutils1', 'libc6-dev', 'libgcc-13-dev'):
+        for package in ('libgcrypt20', 'libasound2t64', 'libglib2.0-0t64', 'libfontconfig1',
+                        'libxkbcommon0', 'libxkbcommon-x11-0', 'libc6-dev', 'libgcc-13-dev'):
             record, = [row for identity, row in lock['packages'].items() if identity.startswith(package + '@')]
             self.assertIs(record['source_required'], True)
         for package in ('libc6-dev', 'libgcc-13-dev'):
             record, = [row for identity, row in lock['packages'].items() if identity.startswith(package + '@')]
             self.assertTrue(record['license_exception'])
+        # The authenticated Qt-free observation no longer ships these krb5/xcb
+        # owners; absent identities must never be carried by the normative lock.
+        for package in ('libkeyutils1', 'libkrb5-3', 'libcom-err2', 'libxcb-shape0', 'libxcb-cursor0'):
+            self.assertFalse(any(identity.startswith(package + '@') for identity in lock['packages']))
 
 
 def runtime_source_fixture(repo, cache):
@@ -263,8 +209,8 @@ def runtime_source_fixture(repo, cache):
     for path in (target / 'runtime.lock.json', target / 'alpine-source.lock.json'):
         members['furami/packaging/appimage-runtime/' + path.name] = path.read_bytes()
     policy = json.loads((sources.HERE / 'sources.lock.json').read_text())
-    policy['qt_sources'] = {}
-    policy['required_qt_modules'] = []
+    # The fixture exercises delivery mechanics, not the reviewed crate notices.
+    policy['cargo_notices'] = []
     policy['alpine_private_bootstrap'] = {
         'image': runtime['container'], 'manifest_sha256': runtime['container'].split('@sha256:')[1],
         'config_sha256': hashlib.sha256(b'private base config').hexdigest(),
@@ -273,6 +219,8 @@ def runtime_source_fixture(repo, cache):
     policy_path.parent.mkdir(parents=True, exist_ok=True)
     policy_path.write_text(json.dumps(policy))
     members['furami/packaging/appimage/sources.lock.json'] = policy_path.read_bytes()
+    # A minimal legitimate Cargo.lock: no registry crates, so no notices are due.
+    (repo / 'Cargo.lock').write_text('version = 4\n')
     for report_name in sources.LOADER_REPORTS.values():
         members['media-evidence/' + report_name] = sources.loader_resolution_report(
             b'\tlinux-vdso.so.1 (0x1234)\n\tlibmpv.so => /prefix/lib/libmpv.so (0x5678)\n')
@@ -287,7 +235,7 @@ class PublicMaterialTests(unittest.TestCase):
         self.repo = self.root / 'repo'
         self.cache = self.root / 'private-bootstrap'
         self.provenance = {name: str(self.root / name) for name in ('app', 'media', 'runtime', 'stage')}
-        for relative in ('app/first/vendor', 'app/source-snapshot', 'media/prefix/sbom',
+        for relative in ('app/first/vendor', 'app/source-snapshot', 'media',
                          'runtime/licenses', 'runtime/relink', 'stage/ubuntu-source-evidence'):
             (self.root / relative).mkdir(parents=True)
         for folder in ('appimage', 'media', 'appimage-runtime'):
@@ -300,9 +248,18 @@ class PublicMaterialTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.write_json(self.repo / 'packaging/media/stack.lock.json',
-                        {'source_date_epoch': 1, 'sources': {'qt': {'archives': []}}})
-        self.write_json(self.root / 'app/manifest.json', {'inputs': {}, 'source_archives': []})
-        self.write_json(self.root / 'media/manifest.json', {'sources': {'qt': {'archives': []}}, 'artifacts': {}})
+                        {'source_date_epoch': 1, 'sources': {}})
+        self.notice_inputs = {}
+        for relative in ('Cargo.lock', 'packaging/appimage/sources.lock.json'):
+            target = self.root / 'app/source-snapshot' / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.repo / relative, target)
+            self.notice_inputs[relative] = sources.sha(target)
+        self.write_json(self.root / 'app/manifest.json',
+                        {'inputs': self.notice_inputs,
+                         'cargo_lock_sha256': self.notice_inputs['Cargo.lock'],
+                         'source_archives': []})
+        self.write_json(self.root / 'media/manifest.json', {'sources': {}, 'artifacts': {}})
         for name in sources.LOADER_REPORTS:
             (self.root / 'media' / name).write_bytes(
                 b'\tlinux-vdso.so.1 (0x1234)\n\tlibmpv.so => /prefix/lib/libmpv.so (0x5678)\n')
@@ -479,61 +436,48 @@ class PublicMaterialTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'recipient material missing'):
             sources.verify_public_materials(output, index)
 
-    def configure_qt_fixture(self):
-        policy_path = self.recipe / 'sources.lock.json'
-        policy = json.loads(policy_path.read_text())
-        entry = copy.deepcopy(json.loads((Path(__file__).with_name('sources.lock.json')).read_text())['qt_sources']['qtbase'])
-        archive = self.cache / entry['archive']
-        with tarfile.open(archive, 'w') as tar:
-            member = tarfile.TarInfo('qtbase/src/ordinary.cpp')
-            member.size = 4
-            tar.addfile(member, io.BytesIO(b'code'))
-        sbom = self.root / 'media/prefix/sbom/qtbase-6.11.2.source.spdx'
-        dossier = entry['supplemental_metadata']
-        sbom.write_text('\n\n'.join(
-            ['FileName: ./src/ordinary.cpp\nFileChecksum: SHA1: ' + hashlib.sha1(b'code').hexdigest()]
-            + ['FileName: ./' + name + '\nFileChecksum: SHA1: ' + row['sha1']
-               for name, row in dossier['files'].items()]))
-        entry['sha256'] = sources.sha(archive)
-        dossier['archive_sha256'] = entry['sha256']
-        dossier['spdx_sha256'] = sources.sha(sbom)
-        policy['qt_sources'] = {'qtbase': entry}
-        policy['required_qt_modules'] = ['qtbase']
-        policy_path.write_text(json.dumps(policy))
-        manifest = self.root / 'media/manifest.json'
-        value = json.loads(manifest.read_text())
-        value['artifacts']['sbom/' + sbom.name] = {'sha256': sources.sha(sbom)}
-        manifest.write_text(json.dumps(value))
-        return entry
+    def test_rehashed_media_lock_cannot_replace_the_reviewed_source_identity(self):
+        self.configure_media_patch()
+        output, index = self.assemble()
+        members = self.delivered_members(output)
+        relative = 'furami/packaging/media/stack.lock.json'
+        lock = json.loads(members[relative])
+        lock['sources']['ffmpeg']['sha256'] = '0' * 64
+        members[relative] = json.dumps(lock).encode()
+        self.rewrite_materials(output, index, members)
+        with self.assertRaisesRegex(ValueError, 'lock differs from reviewed canonical recipe: stack.lock.json'):
+            sources.verify_public_materials(output, index)
 
-    def test_cached_qt_archive_without_supplements_remains_incomplete(self):
-        self.configure_qt_fixture()
-        output = self.root / 'public'
-        audit = {'component_files': {'usr/lib/libQt6Core.so': {
-            'components': [{'component_id': 'qt:qtbase'}]}}}
-        with patch.object(sources, 'REPO', self.repo), patch.object(sources, 'HERE', self.recipe), \
-                patch.object(sources, 'load_ubuntu_terms', return_value={'packages': {}}):
-            index = sources.assemble(self.provenance, audit, output,
-                                     dict.fromkeys(('runtime', 'media', 'compliance'), self.cache), False)
-        self.assertFalse(index['complete'])
-        self.assertTrue(index['missing'])
-        sources.verify_public_materials(output, index, require_complete=False)
+    def test_app_crate_source_delivery_requires_the_recorded_archive(self):
+        app = self.root / 'app'
+        app_sources = app / 'sources'
+        app_sources.mkdir()
+        archive = app_sources / 'accesskit-fixture.crate'
+        with tarfile.open(archive, 'w:gz') as bundle:
+            code = b'pub struct Node;\n'
+            member = tarfile.TarInfo('accesskit-fixture/src/lib.rs')
+            member.size = len(code)
+            bundle.addfile(member, io.BytesIO(code))
+        self.write_json(app / 'manifest.json', {
+            'inputs': self.notice_inputs, 'cargo_lock_sha256': self.notice_inputs['Cargo.lock'],
+            'source_archives': [{'archive': archive.name, 'sha256': sources.sha(archive)}]})
+
+        output, index = self.assemble()
+        self.assertIs(index['complete'], True)
+        self.assertEqual(self.delivered_members(output)['app-inputs/' + archive.name], archive.read_bytes())
+        shutil.rmtree(output)
+
+        archive.unlink()
+        output, index = self.assemble()
+        self.assertIs(index['complete'], False)
+        self.assertIn('missing regular input: app-inputs/' + archive.name, index['missing'])
         with self.assertRaisesRegex(ValueError, 'incomplete'):
             sources.verify_public_materials(output, index)
+        shutil.rmtree(output)
 
-    def test_removing_qt_receipt_spdx_overlay_and_rehashing_still_refuses(self):
-        self.configure_qt_fixture()
-        output, index = self.assemble()
-        members = {}
-        for archive_path in output.glob('source-materials-*.tar'):
-            with tarfile.open(archive_path) as archive:
-                members.update({member.name: archive.extractfile(member).read() for member in archive
-                                if not member.name.startswith(('qt-inputs/', 'qt-evidence/'))})
-        index['qt_correspondence'] = {}
-        index['complete'], index['missing'] = True, []
-        self.rewrite_materials(output, index, members)
-        with self.assertRaisesRegex(ValueError, 'required Qt correspondence'):
-            sources.verify_public_materials(output, index)
+        archive.write_bytes(b'wrong crate archive')
+        with self.assertRaisesRegex(ValueError, 'corresponding source hash mismatch'):
+            self.assemble()
 
     def test_policy_and_actual_membership_cannot_be_self_declared(self):
         output, index = self.assemble()

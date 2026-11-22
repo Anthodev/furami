@@ -2,6 +2,7 @@
 //! Allowed dependencies: `domain`, narrow media/capture/persistence interfaces.
 
 pub mod apply;
+#[cfg(test)]
 pub(crate) mod control;
 pub(crate) mod diagnostic;
 pub(crate) mod gate;

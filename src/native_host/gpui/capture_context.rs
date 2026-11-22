@@ -1,22 +1,20 @@
 //! Lower-left capture session context and stream statistics for the GPUI
 //! frontend.
 //!
-//! `qml/ContextStatus.qml` and the left half of `qml/BottomChromeContent.qml`
-//! are the parity contract: the operational truth block (intent error, context
-//! diagnostic, diagnostics fault, settings refusal, output reselection,
-//! recovery evidence/stage/candidates) and, below it, the structured stream
-//! statistics label. Both anchor to the bottom-left window margin; the bottom
-//! right is left to the Options trigger.
+//! The block carries the operational truth (intent error, context diagnostic,
+//! diagnostics fault, settings refusal, output reselection, recovery
+//! evidence/stage/candidates) and, below it, the structured stream statistics
+//! label. Both anchor to the bottom-left window margin; the bottom right is
+//! left to the Options trigger.
 //!
-//! Independence rules carried over from QML:
+//! Independence rules:
 //!
 //! - The persisted statistics preference hides only the statistics label, not
-//!   the context block: `ContextStatus` never reads `statsHiddenPreference`.
+//!   the context block: this block never reads the statistics preference.
 //! - A logging/diagnostics fault is its own error line, not a capture error,
 //!   and does not depend on the statistics preference.
 //! - While a chrome popup is open, or a mandatory decision (reset/save/close
-//!   confirmation) owns the bottom surface, the whole block is hidden exactly
-//!   like the QML `BottomChromeContent` stack.
+//!   confirmation) owns the bottom surface, the whole block is hidden.
 //!
 //! The recovery rows are the only focusable elements here. Each one binds the
 //! rendered candidate key and the rendered generation; an activation re-checks
@@ -55,9 +53,9 @@ use super::{
 };
 
 /// Width reserved on the right for the bottom Options trigger: one 48 px hit
-/// target plus the shared gap, matching the QML `stack` row.
+/// target plus the shared gap.
 const RIGHT_RESERVE: f32 = brume::HIT_TARGET + brume::GAP;
-/// QML `ContextStatus` recovery button label and accessible name.
+/// Recovery button label and accessible name.
 const RECONNECT_LABEL: &str = "Reconnect";
 const RECONNECT_ACCESSIBLE: &str = "Reconnect this source";
 const SETTINGS_REFUSED: &str = "Settings file refused: changes remain valid for this session.";
@@ -309,8 +307,7 @@ pub(super) fn paint(
 }
 
 /// Hidden while a popup or a mandatory decision owns the bottom surface, or
-/// while the host itself refuses input (`BottomChromeContent` `stack.visible`
-/// and `contextVisible`).
+/// while the host itself refuses input.
 fn suppressed(state: &HostState, snapshot: Option<&Snapshot>) -> bool {
     !accepts_chrome(state)
         || state.chrome.popup().is_some()
@@ -498,7 +495,7 @@ enum Tone {
     Error,
 }
 
-/// Plain-text Brume label (`qml/BrumeLabel.qml` variants). GPUI text is never
+/// Plain-text Brume label in the secondary, note or error variant. GPUI text is never
 /// interpreted as markup, so device names, diagnostics and recovery text paint
 /// directly.
 fn label(text: impl Into<SharedString>, tone: Tone, enabled: bool) -> Div {
@@ -515,7 +512,7 @@ fn label(text: impl Into<SharedString>, tone: Tone, enabled: bool) -> Div {
         .child(text)
 }
 
-/// The exact QML `statsText` block. The human FPS label is the only decimal
+/// The structured statistics block. The human FPS label is the only decimal
 /// conversion here; it is derived from the projected rational and never feeds a
 /// dispatch.
 fn stats_text(stats: &crate::ui::projection::StreamStats) -> String {

@@ -184,7 +184,6 @@ impl GateRunner {
     pub(crate) fn fatal_native_failure(&self) -> Option<&ApplyFailure> {
         self.fatal_native.as_ref()
     }
-    #[cfg(any(test, all(feature = "gpui-host", target_os = "linux")))]
     pub(crate) fn owner_ack_failed(&self) -> bool {
         self.owner_ack_failed
     }
@@ -334,7 +333,7 @@ impl GateRunner {
         self.emit_failure(failure.clone());
         self.emit_blocked(failure);
     }
-    /// Only historical Qt pre-destruction barrier blocks; normal port calls do not.
+    /// Wait only at the native surface-loss barrier; ordinary updates never block here.
     pub(crate) fn wait_for_owner_ack(&mut self, attempt: AttemptId) -> Result<(), MediaError> {
         if self.state.attempt() != Some(attempt)
             || !self.state.blocked()

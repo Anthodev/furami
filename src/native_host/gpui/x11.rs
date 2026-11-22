@@ -1,5 +1,5 @@
 //! Responsibility: Checked X11 requests for the GPUI native host.
-//! Allowed dependencies: x11rb only.
+//! Allowed dependencies: x11rb and the native diagnostic report DTO.
 //!
 //! The adapter owns a second connection to the same X server as GPUI. It
 //! validates the GPUI client and its chrome companion separately from the
@@ -9,6 +9,10 @@
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
+};
+
+use crate::diagnostics::report::{
+    NativeEnvironmentReport, Observation, UnavailableReason, XServerReport, bounded_text,
 };
 
 use x11rb::{
@@ -274,6 +278,7 @@ pub(super) struct X11 {
     destroyed: Cell<Option<u32>>,
     min_keycode: u8,
     max_keycode: u8,
+    shape_version: (u16, u16),
 }
 
 impl X11 {
@@ -318,7 +323,33 @@ impl X11 {
             destroyed: Cell::new(None),
             min_keycode,
             max_keycode,
+            shape_version: (reply.major_version, reply.minor_version),
         })
+    }
+
+    pub(super) fn environment_report(&self) -> NativeEnvironmentReport {
+        let setup = self.connection.setup();
+        NativeEnvironmentReport {
+            frontend: Observation::Observed {
+                value: "gpui".into(),
+            },
+            window_backend: Observation::Observed {
+                value: "x11".into(),
+            },
+            x_server: Observation::Observed {
+                value: XServerReport {
+                    vendor: bounded_text(&String::from_utf8_lossy(&setup.vendor), 256),
+                    release: setup.release_number,
+                    protocol_major: u32::from(setup.protocol_major_version),
+                    protocol_minor: u32::from(setup.protocol_minor_version),
+                    shape_major: u32::from(self.shape_version.0),
+                    shape_minor: u32::from(self.shape_version.1),
+                },
+            },
+            xwayland_version: Observation::Unavailable {
+                reason: UnavailableReason::NotExposed,
+            },
+        }
     }
 
     /// Validate a GPUI client window and subscribe to its structure events.

@@ -1,12 +1,11 @@
 //! Capture-format and audio settings bodies for the GPUI frontend.
 //!
-//! `qml/CaptureSettingsView.qml` and `qml/AudioSettingsView.qml` are the parity
-//! contract. This module owns only those two page bodies: the shared Back/
-//! title/version header, the settings index, the surrounding popup shell, its
-//! placement and its two-second catalog refresh cadence belong to the parent.
+//! This module owns only those two page bodies: the shared Back/title/version
+//! header, the settings index, the surrounding popup shell, its placement and
+//! its two-second catalog refresh cadence belong to the parent.
 //!
 //! Both pages apply their complete selections immediately; there is no local
-//! draft and no Apply button. Identity rules carried over from the QML views:
+//! draft and no Apply button. Identity rules:
 //!
 //! - A choice row binds the opaque projected key and the revisions *as
 //!   rendered*. A valid stale pair still reaches the checked
@@ -20,10 +19,9 @@
 //! - Audio capture (input) stays distinct from the playback output route and
 //!   mute. Mute never changes the selected route.
 //!
-//! The dropdowns are page-local disclosures, not new native/GPUI windows: the
-//! QML `BrumeChoice` popup is a `Popup.Item` bounded to its owner tool, so the
-//! opened list grows inside the settings body and the companion keeps its one
-//! overlay surface.
+//! The dropdowns are page-local disclosures, not new native windows: the
+//! opened list is bounded to its owner tool, so it grows inside the settings
+//! body and the companion keeps its one overlay surface.
 //!
 //! Host integration surface: [`paint`] renders one page body, [`focus_targets`]
 //! feeds the popup Tab chain (including the opened list's enabled rows), and
@@ -51,7 +49,7 @@ use super::{
     top_chrome::FocusTarget,
 };
 
-/// Stable element identities matching the QML `objectName`s.
+/// Stable element identities.
 pub(super) const CAPTURE_REFRESH_ID: &str = "captureRefresh";
 pub(super) const CAPTURE_FORMAT_ERROR_ID: &str = "captureFormatError";
 pub(super) const CAPTURE_FORMAT_ID: &str = "captureFormatSelector";
@@ -191,14 +189,12 @@ fn decimal_token(value: &str) -> Option<u64> {
     }
 }
 
-/// `CaptureSettingsView` editable gate: the selection can be edited and one is
-/// actually projected.
+/// Editable gate: the selection can be edited and one is actually projected.
 fn capture_editable(snapshot: &Snapshot) -> bool {
     snapshot.can_edit_selection && snapshot.selection.is_some()
 }
 
-/// `CaptureSettingsView` selected format key: an explicit manual format, else
-/// the `auto` policy row.
+/// Selected format key: an explicit manual format, else the `auto` policy row.
 fn selected_format_key(selection: &Selection) -> &str {
     if selection.format_policy == "manual" {
         &selection.manual_format_key
@@ -231,7 +227,7 @@ fn choice_display<'a>(
     }
 }
 
-/// `CaptureSettingsView` Requested/Resolved line.
+/// Requested/Resolved line.
 fn format_state_text(selection: &Selection) -> String {
     let requested = if selection.requested_format_label.is_empty() {
         "—"
@@ -246,18 +242,19 @@ fn format_state_text(selection: &Selection) -> String {
     format!("Requested: {requested}   Resolved: {resolved}")
 }
 
-/// QML `visible: !selection.audioEnabled && selection.audioInputKey.length === 0`.
+/// Show the missing-input note when capture is disabled and no input is
+/// retained.
 fn missing_input_note(selection: &Selection) -> bool {
     !selection.audio_enabled && selection.audio_input_key.is_empty()
 }
 
-/// QML `visible: selection.audioInputLabel.length > 0`.
+/// Show the retained-input note only while an input label is retained.
 fn retained_input_note(selection: &Selection) -> Option<String> {
     (!selection.audio_input_label.is_empty())
         .then(|| format!("{RETAINED_PREFIX}{}", selection.audio_input_label))
 }
 
-/// QML audio capture status: `Status: <live.audioStatus|—>` plus an optional
+/// Audio capture status: `Status: <live.audioStatus|—>` plus an optional
 /// diagnostic line. Painted as separate text lines.
 fn audio_status_lines(live: &Live) -> Vec<String> {
     let status = if live.audio_status.is_empty() {
@@ -272,7 +269,7 @@ fn audio_status_lines(live: &Live) -> Vec<String> {
     lines
 }
 
-/// QML output status: the route status and, independently, the effective sink.
+/// Output status: the route status and, independently, the effective sink.
 fn output_status_lines(output: &Output) -> Vec<String> {
     let mut lines = Vec::new();
     if !output.status.is_empty() {
@@ -303,7 +300,7 @@ impl HostState {
         }
         match intent {
             Intent::Refresh => {
-                // qml/Chrome.qml `refreshCatalogs` refuses while closing.
+                // Catalog refresh refuses while the runtime is closing.
                 if self
                     .view
                     .snapshot
@@ -460,7 +457,7 @@ fn audio_enabled_intent(snapshot: &Snapshot, enabled: bool) -> Option<Intent> {
 
 // ── Focus targets ───────────────────────────────────────────────────────────
 
-/// The page's contribution to the popup Tab chain, in QML creation order and
+/// The page's contribution to the popup Tab chain, in paint order and
 /// skipping hidden/disabled controls. Opened lists contribute their enabled
 /// rows directly after the trigger.
 pub(super) fn focus_targets(
@@ -1178,7 +1175,7 @@ fn icon_button(
 }
 
 /// Collapsed dropdown trigger: the projected choice label, a chevron and the
-/// same 36 px control geometry as `BrumeChoice`.
+/// shared 36 px control geometry.
 #[allow(clippy::too_many_arguments)]
 fn choice_trigger(
     id: &'static str,

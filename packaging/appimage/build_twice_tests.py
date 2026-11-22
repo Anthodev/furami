@@ -22,10 +22,8 @@ class ComparisonTests(unittest.TestCase):
             tree = root / label
             (tree / 'release').mkdir(parents=True)
             (tree / 'runtime').mkdir()
-            (tree / 'app').mkdir()
             (tree / 'release/candidate.AppImage').write_bytes(b'exact-image')
             (tree / 'release/manifest.json').write_text(json.dumps({'payload': {'.': {'type': 'directory', 'mode': '0o755'}, 'app': {'sha256': 'a'}}}))
-            (tree / 'app/manifest.json').write_text(json.dumps({'builds': {'generated_cpp_first': {'header.h': 'a'}}}))
             for name in ('runtime-x86_64', 'link.map', 'apk-installed.txt'):
                 (tree / 'runtime' / name).write_bytes(b'constant')
             (tree / 'runtime/manifest.json').write_text('{}')
@@ -39,7 +37,7 @@ class ComparisonTests(unittest.TestCase):
             tar.addfile(entry, io.BytesIO(content))
 
     def test_real_output_trees_detect_each_material_mismatch(self):
-        for mutation in ('none', 'payload', 'root-mode', 'runtime', 'generated', 'source'):
+        for mutation in ('none', 'payload', 'root-mode', 'runtime', 'source'):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 self.trees(root)
@@ -54,8 +52,6 @@ class ComparisonTests(unittest.TestCase):
                     path.write_text(json.dumps(value))
                 elif mutation == 'runtime':
                     (second / 'runtime/runtime-x86_64').write_bytes(b'changed')
-                elif mutation == 'generated':
-                    (second / 'app/manifest.json').write_text(json.dumps({'builds': {'generated_cpp_first': {'header.h': 'b'}}}))
                 elif mutation == 'source':
                     self.source_tar(second / 'release/source-materials-001.tar', b'changed!')
                 verdict = comparison.compare_outputs(root)
@@ -71,6 +67,9 @@ class ComparisonTests(unittest.TestCase):
             shutil.copytree(comparison.HERE.parent, canonical / 'packaging',
                             ignore=shutil.ignore_patterns('__pycache__'))
             _, _, public_members = support.runtime_source_fixture(canonical, root / 'private-inputs')
+            # The recipient verifies the current reviewed Cargo.lock bytes even
+            # when the fixture carries no registry crates.
+            public_members['furami/Cargo.lock'] = (canonical / 'Cargo.lock').read_bytes()
             # These synthetic images contain no media code; their canonical
             # source lock must say so instead of claiming the real provider.
             media_lock = canonical / 'packaging/media/stack.lock.json'
@@ -138,7 +137,7 @@ class ComparisonTests(unittest.TestCase):
 
     def criteria(self):
         return dict.fromkeys(('image_bytes', 'payload_files_modes_symlinks', 'source_runtime_bytes',
-                              'source_assets_content', 'source_archive_bytes_except_proven_metadata', 'generated_CPP_headers'), True)
+                              'source_assets_content', 'source_archive_bytes_except_proven_metadata'), True)
 
     def test_exact_predicate_accepts_only_proven_variance(self):
         criteria = self.criteria()

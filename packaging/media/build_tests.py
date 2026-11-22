@@ -13,9 +13,6 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location("media_build", Path(__file__).with_name("build.py"))
 media_build = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(media_build)
-QT_SPEC = importlib.util.spec_from_file_location("official_qt_kit", Path(__file__).with_name("build-qt-kit.py"))
-qt_kit = importlib.util.module_from_spec(QT_SPEC)
-QT_SPEC.loader.exec_module(qt_kit)
 PATCH_SPEC = importlib.util.spec_from_file_location("media_source_patches", Path(__file__).with_name("source-patches.py"))
 source_patches = importlib.util.module_from_spec(PATCH_SPEC)
 PATCH_SPEC.loader.exec_module(source_patches)
@@ -32,18 +29,20 @@ class SourceTests(unittest.TestCase):
                             "archive": "mpv.tar.gz"}, cache
                 )
 
-    def test_rejects_cached_qt_archive_when_published_sha1_disagrees(self):
-        import hashlib
-        with tempfile.TemporaryDirectory() as directory:
-            cache = Path(directory)
-            payload = b"qt archive bytes"
-            (cache / "qtbase.7z").write_bytes(payload)
-            with self.assertRaisesRegex(ValueError, "qtbase.*SHA1"):
-                media_build.obtain_source(
-                    "qtbase", {"url": "https://example.invalid/qtbase.7z",
-                               "sha256": hashlib.sha256(payload).hexdigest(),
-                               "upstream_sha1": "0" * 40, "archive": "qtbase.7z"}, cache
-                )
+    def test_lock_contains_only_media_producer_inputs(self):
+        lock = json.loads(media_build.LOCK_PATH.read_text())
+        self.assertEqual(set(lock["sources"]), {
+            "ca_certificates", "mpv", "libplacebo", "vulkan_headers", "ffmpeg",
+        })
+        media_build.check_lock(lock)
+
+    def test_rejects_legacy_frontend_inputs(self):
+        for name in ("qt", "cxx_qt"):
+            with self.subTest(name=name):
+                lock = json.loads(media_build.LOCK_PATH.read_text())
+                lock["sources"][name] = {}
+                with self.assertRaisesRegex(ValueError, "five frozen media sources"):
+                    media_build.check_lock(lock)
 
     def test_missing_or_unverified_source_lock_is_rejected(self):
         lock = json.loads(media_build.LOCK_PATH.read_text())
@@ -67,18 +66,6 @@ class SourceTests(unittest.TestCase):
         lock = json.loads(media_build.LOCK_PATH.read_text())
         lock["sources"]["mpv"]["build_flags"] = ["-Djpeg=enabled"]
         with self.assertRaisesRegex(ValueError, "libjpeg image writer"):
-            media_build.check_lock(lock)
-
-    def test_rejects_unpinned_official_qt_archive(self):
-        lock = json.loads(media_build.LOCK_PATH.read_text())
-        lock["sources"]["qt"]["archives"][0]["sha256"] = ""
-        with self.assertRaisesRegex(ValueError, "Qt.*SHA256"):
-            media_build.check_lock(lock)
-
-    def test_rejects_non_official_qt_archive_url(self):
-        lock = json.loads(media_build.LOCK_PATH.read_text())
-        lock["sources"]["qt"]["archives"][0]["url"] = "https://example.invalid/qtbase.7z"
-        with self.assertRaisesRegex(ValueError, "Qt.*official"):
             media_build.check_lock(lock)
 
 
@@ -208,43 +195,6 @@ class SourcePatchTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "SHA256"):
                     media_build.build(root / "output", root / "cache")
             self.assertFalse((root / "output").exists())
-
-
-class QtMetadataTests(unittest.TestCase):
-    def test_relocates_official_pkgconfig_prl_and_libtool_metadata(self):
-        with tempfile.TemporaryDirectory() as directory:
-            prefix = Path(directory)
-            pc_dir = prefix / "lib/pkgconfig"
-            pc_dir.mkdir(parents=True)
-            (prefix / "bin").mkdir()
-            pc = pc_dir / "Qt6Core.pc"
-            pc.write_text("prefix=/home/qt/work/install\nVersion: 6.11.2\n")
-            prl = prefix / "lib/libQt6Core.prl"
-            prl.write_text("QMAKE_PRL_LIBS = -L/home/qt/work/install/lib -lfoo\n")
-            la = prefix / "lib/libQt6Core.la"
-            la.write_text("libdir='/home/qt/work/install/lib'\n")
-
-            changes = qt_kit.relocate_metadata(prefix)
-
-            self.assertIn(f"prefix={prefix}\n", pc.read_text())
-            self.assertIn("$$[QT_INSTALL_LIBS]", prl.read_text())
-            self.assertIn(f"libdir='{prefix}/lib'", la.read_text())
-            self.assertEqual((prefix / "bin/qt.conf").read_text(), "[Paths]\nPrefix=..\n")
-            self.assertEqual({row["path"] for row in changes}, {
-                "lib/pkgconfig/Qt6Core.pc", "lib/libQt6Core.prl",
-                "lib/libQt6Core.la", "bin/qt.conf"
-            })
-            self.assertNotEqual(changes[0]["original_sha256"], changes[0]["installed_sha256"])
-
-    def test_rejects_unknown_qt_pkgconfig_prefix(self):
-        with tempfile.TemporaryDirectory() as directory:
-            prefix = Path(directory)
-            pc_dir = prefix / "lib/pkgconfig"
-            pc_dir.mkdir(parents=True)
-            (prefix / "bin").mkdir()
-            (pc_dir / "Qt6Core.pc").write_text("prefix=/usr/lib\nVersion: 6.11.2\n")
-            with self.assertRaisesRegex(ValueError, "Qt pkg-config prefix"):
-                qt_kit.relocate_metadata(prefix)
 
 
 class DeviceListingTests(unittest.TestCase):

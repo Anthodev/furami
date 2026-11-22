@@ -67,18 +67,14 @@ class BuildWorkspaceTests(unittest.TestCase):
                 checkout = root / "checkout"
                 checkout.mkdir()
                 if dirty:
-                    for relative in (".qmlls.ini", ".cargo/config.toml", "unrelated"):
+                    for relative in (".cargo/config.toml", "unrelated"):
                         path = checkout / relative
                         path.parent.mkdir(parents=True, exist_ok=True)
                         path.write_text("private developer artifact")
                 (snapshot / "unrecorded").write_text("not an input either")
                 media = root / "media"
-                for relative in ("bin/qmake6", "libexec/rcc"):
-                    path = media / "prefix" / relative
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(b"tool")
                 stack = json.loads(app_build.STACK_LOCK.read_text())
-                workspace = root / "app/first/workspace"
+                workspace = root / "app/first-workspace"
                 checkout_before = {str(p.relative_to(checkout)): p.read_bytes()
                                    for p in checkout.rglob("*") if p.is_file()}
 
@@ -86,17 +82,13 @@ class BuildWorkspaceTests(unittest.TestCase):
                     files = {p.relative_to(workspace).as_posix()
                              for p in workspace.rglob("*") if p.is_file()}
                     self.assertEqual(files, set(inputs))
-                    self.assertIn(f"{workspace}:/workspace:rw", command)
                     self.assertNotIn(f"{checkout}:/workspace:ro", command)
                     self.assertNotIn(f"{checkout}:/workspace:rw", command)
-                    for mount in (f"{media}:/out:ro", f"{media}:/frozen-provider:ro",
-                                  f"{root / 'sources'}:/sources:ro",
-                                  f"{root / 'app/first'}:/build",
-                                  f"{root / 'app/first/wrappers/rcc'}:/out/prefix/libexec/rcc:ro"):
-                        self.assertIn(mount, command)
+                    mounts = [command[i + 1] for i, arg in enumerate(command) if arg == "--volume"]
+                    self.assertCountEqual(mounts, [f"{workspace}:/workspace:ro", f"{media}:/out:ro",
+                                                  f"{root / 'sources'}:/sources:ro",
+                                                  f"{root / 'app/first'}:/build"])
                     self.assertEqual(command[command.index("--workdir") + 1], "/workspace")
-                    (workspace / ".qmlls.ini").write_text(
-                        '[General]\nbuildDir="/build/target/qml_modules"\nno-cmake-calls=true\n')
                     binary = root / "app/first/bin/furami"
                     binary.parent.mkdir()
                     binary.write_bytes(b"fixture executable")
@@ -108,8 +100,6 @@ class BuildWorkspaceTests(unittest.TestCase):
                     binary = app_build.run_build(
                         media, root / "app", root / "sources", stack, "first", inputs)
                 self.assertEqual(binary.read_bytes(), b"fixture executable")
-                self.assertTrue((workspace / ".qmlls.ini").read_text())
-                self.assertFalse((snapshot / ".qmlls.ini").exists())
                 self.assertEqual(checkout_before, {
                     str(p.relative_to(checkout)): p.read_bytes()
                     for p in checkout.rglob("*") if p.is_file()})
@@ -171,13 +161,9 @@ class BuildWorkspaceTests(unittest.TestCase):
             root = Path(temporary)
             snapshot, inputs = self.fixture(root)
             media = root / "media"
-            for relative in ("bin/qmake6", "libexec/rcc"):
-                path = media / "prefix" / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(b"tool")
 
             def mutate(command, **kwargs):
-                (root / "app/first/workspace/src/main.rs").write_bytes(b"changed by child")
+                (root / "app/first-workspace/src/main.rs").write_bytes(b"changed by child")
                 return SimpleNamespace(returncode=0)
 
             with patch.object(app_build.subprocess, "run", side_effect=mutate), \
@@ -189,6 +175,16 @@ class BuildWorkspaceTests(unittest.TestCase):
         inputs = app_build.input_hashes()
         self.assertEqual(inputs["packaging/media/build-apt-closure.json"],
                          app_build.sha256(app_build.STACK_LOCK.parent / "build-apt-closure.json"))
+
+    def test_candidate_snapshot_hashes_every_source_and_embedded_resource(self):
+        inputs = app_build.input_hashes()
+        for relative in ("assets/logo.png", "assets/icons/play.svg", "assets/icons/LICENSE-tabler.txt",
+                         "src/capture/linux/v4l2.cpp"):
+            self.assertEqual(inputs[relative], app_build.sha256(app_build.REPOSITORY / relative))
+        sources = {path.relative_to(app_build.REPOSITORY).as_posix()
+                   for path in (app_build.REPOSITORY / "src").rglob("*") if path.is_file()}
+        self.assertEqual({relative for relative in inputs if relative.startswith("src/")}, sources)
+        self.assertFalse(any(relative.startswith("qml/") for relative in inputs))
 
 
 class AppBuildContractTests(unittest.TestCase):
@@ -239,10 +235,6 @@ class AppBuildContractTests(unittest.TestCase):
             (output / "source-snapshot").mkdir()
             (output / "source-snapshot/Cargo.toml").write_bytes(b"fixture")
             inputs = {"Cargo.toml": hashlib.sha256(b"fixture").hexdigest()}
-            for name in ("bin/qmake6", "libexec/rcc"):
-                tool = media / "prefix" / name
-                tool.parent.mkdir(parents=True, exist_ok=True)
-                tool.write_bytes(b"fixture")
             stack = json.loads(app_build.STACK_LOCK.read_text())
 
             def fail(command, **kwargs):
@@ -261,20 +253,20 @@ class AppBuildContractTests(unittest.TestCase):
     def test_changed_prefix_artifact_is_rejected_before_build(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "prefix/bin").mkdir(parents=True)
-            (root / "prefix/bin/qmake6").write_bytes(b"tampered Qt")
-            media = {"artifacts": {"bin/qmake6": {"type": "file", "sha256": "0" * 64}}}
-            with self.assertRaisesRegex(ValueError, "bin/qmake6.*SHA256"):
-                app_build.verify_artifact(root / "prefix", media, "bin/qmake6")
+            (root / "prefix/include/mpv").mkdir(parents=True)
+            (root / "prefix/include/mpv/client.h").write_bytes(b"tampered header")
+            media = {"artifacts": {"include/mpv/client.h": {"type": "file", "sha256": "0" * 64}}}
+            with self.assertRaisesRegex(ValueError, "include/mpv/client.h.*SHA256"):
+                app_build.verify_artifact(root / "prefix", media, "include/mpv/client.h")
 
     def test_symlink_escape_cannot_load_unverified_build_input(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "prefix/bin").mkdir(parents=True)
-            (root / "prefix/bin/qmake6").symlink_to("/usr/bin/qmake6")
-            media = {"artifacts": {"bin/qmake6": {"type": "symlink", "target": "/usr/bin/qmake6"}}}
+            (root / "prefix/lib").mkdir(parents=True)
+            (root / "prefix/lib/libmpv.so").symlink_to("/usr/lib/libmpv.so")
+            media = {"artifacts": {"lib/libmpv.so": {"type": "symlink", "target": "/usr/lib/libmpv.so"}}}
             with self.assertRaisesRegex(ValueError, "outside prefix"):
-                app_build.verify_artifact(root / "prefix", media, "bin/qmake6")
+                app_build.verify_artifact(root / "prefix", media, "lib/libmpv.so")
 
 
 
@@ -308,6 +300,16 @@ class AppBuildContractTests(unittest.TestCase):
         self.assertEqual(roles["macro-dep"], "build-only")
         self.assertEqual(roles["build-dep"], "build-only")
         self.assertEqual(roles["windows-only"], "not-selected")
+
+    def test_selected_candidate_graph_requires_gpui_and_refuses_qt_build_crates(self):
+        packages = [{"id": name, "name": name} for name in ("furami", "gpui-pre", "cxx-qt-build", "cxx-build")]
+        roles = {"furami": "shipped-code-candidate", "gpui-pre": "shipped-code-candidate",
+                 "cxx-qt-build": "not-selected", "cxx-build": "build-only"}
+        app_build.verify_candidate_graph(packages, roles)
+        with self.assertRaisesRegex(ValueError, "selected Qt crates.*cxx-qt-build"):
+            app_build.verify_candidate_graph(packages, {**roles, "cxx-qt-build": "build-only"})
+        with self.assertRaisesRegex(ValueError, "GPUI"):
+            app_build.verify_candidate_graph(packages, {**roles, "gpui-pre": "not-selected"})
 
     def test_retained_crt_objects_are_attributed_to_pinned_binary_packages(self):
         lock = json.loads(app_build.APP_LOCK.read_text())
@@ -387,13 +389,14 @@ LOAD /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a
             "first/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/libcompiler_builtins-9999.rlib",
             "first/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/libmemchr-cccc.rlib",
             "first/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/librustc_demangle-7777.rlib",
-            "first/target/release/deps/libcxx_qt_macro-dddd.so",
+            "first/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/libproc_macro-1234.rlib",
+            "first/target/release/deps/libserde_derive-dddd.so",
         ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in ("libstd-aaaa.rlib", "libcore-bbbb.rlib", "liballoc-eeee.rlib",
                          "libpanic_unwind-ffff.rlib", "libcompiler_builtins-9999.rlib",
-                         "libmemchr-cccc.rlib", "librustc_demangle-7777.rlib"):
+                         "libmemchr-cccc.rlib", "librustc_demangle-7777.rlib", "libproc_macro-1234.rlib"):
                 archive = root / "first/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib" / name
                 archive.parent.mkdir(parents=True, exist_ok=True)
                 archive.write_bytes(name.encode())
@@ -409,6 +412,11 @@ LOAD /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a
                 package_name = ("compiler_builtins" if "compiler-builtins" in name else
                                 name.rsplit("/", 1)[-1].split("-2.7")[0].split("-0.1")[0])
                 manifest.write_text(f'[package]\nname = "{package_name}"\nlicense = "{license_name}"\n')
+            manifest = root / "first/rust/lib/rustlib/src/rust/library/proc_macro/Cargo.toml"
+            manifest.parent.mkdir()
+            proc_macro_manifest = b'[package]\nname = "proc_macro"\nversion = "0.0.0"\n'
+            manifest.write_bytes(proc_macro_manifest)
+            lock["rust_standard_library"]["proc_macro_manifest_sha256"] = hashlib.sha256(proc_macro_manifest).hexdigest()
             source = root / "sources" / lock["toolchain"]["rust-std"]["archive"]
             source.parent.mkdir()
             with tarfile.open(source, "w:xz") as archive:
@@ -418,12 +426,22 @@ LOAD /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a
                     item = tarfile.TarInfo(notice["path"])
                     item.size = len(content)
                     archive.addfile(item, io.BytesIO(content))
+            lock["toolchain"]["rust-std"]["sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
             result = app_build.rust_std_closure(root, linked, lock)
+            manifest.write_bytes(proc_macro_manifest + b'license-file = "OTHER"\n')
+            with self.assertRaisesRegex(ValueError, "proc_macro.*license"):
+                app_build.rust_std_closure(root, linked, lock)
+            manifest.write_bytes(proc_macro_manifest)
+            (manifest.parent.parent / "core/Cargo.toml").write_text('[package]\nname = "core"\n')
+            with self.assertRaisesRegex(ValueError, "core.*license"):
+                app_build.rust_std_closure(root, linked, lock)
         self.assertEqual([entry["name"] for entry in result["archives"]],
                          ["std", "core", "alloc", "panic_unwind", "compiler_builtins", "memchr",
-                          "rustc_demangle"])
-        self.assertEqual(result["archives"][-2]["license_expression"], "Unlicense OR MIT")
-        self.assertEqual(result["archives"][-1]["declared_license"], "MIT/Apache-2.0")
+                          "rustc_demangle", "proc_macro"])
+        self.assertEqual(result["archives"][-3]["license_expression"], "Unlicense OR MIT")
+        self.assertEqual(result["archives"][-2]["declared_license"], "MIT/Apache-2.0")
+        self.assertEqual(result["archives"][-2]["license_expression"], "MIT OR Apache-2.0")
+        self.assertIsNone(result["archives"][-1]["declared_license"])
         self.assertEqual(result["archives"][-1]["license_expression"], "MIT OR Apache-2.0")
         self.assertEqual(result["source"]["sha256"], lock["toolchain"]["rust-src"]["sha256"])
         self.assertEqual(result["license_expression"], "MIT OR Apache-2.0")

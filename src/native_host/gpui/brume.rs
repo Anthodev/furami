@@ -1,27 +1,21 @@
 //! Brume design tokens for the GPUI frontend.
 //!
-//! This is the single translation of `qml/Brume.qml` into Rust. The palette
-//! swatches are Catppuccin Macchiato (MIT, © Catppuccin) and are the only
-//! source of colour truth: every role and derived surface below comes from
-//! them so the two frontends cannot drift into a second theme. Prune and Craie
-//! remain future preferences only and are deliberately not implemented here.
+//! The palette swatches are Catppuccin Macchiato (MIT, © Catppuccin) and are
+//! the only source of colour truth: every role and derived surface below comes
+//! from them, so no view can drift into a second theme. Prune and Craie remain
+//! future preferences only and are deliberately not implemented here.
 //!
-//! GPUI's default system font is the equivalent of QML's `"Sans Serif"`
-//! family; text sizes are the shared 13/11/15 scale, so no family string is
-//! forced on the platform text system.
+//! GPUI's default system font is the platform `"Sans Serif"` family; text
+//! sizes are the shared 13/11/15 scale, so no family string is forced on the
+//! platform text system.
 //!
-//! The bundled SVG icons live in `assets/icons/` and are included here as the
-//! same bytes the QML resource module ships, attribution file included.
+//! The bundled SVG icons live in `assets/icons/`, together with the Tabler
+//! attribution file.
 
-// Design tokens are the shared visual contract for every GPUI view. The
-// native-composition gate consumes a subset today; the selector, playback and
-// settings views consume the rest as they land, and one dictionary is what
-// keeps the two frontends from growing a second theme. The allowance is scoped
-// to this token module only.
-#![allow(
-    dead_code,
-    reason = "shared Brume token contract; the gate uses a subset"
-)]
+// Design tokens are the shared visual contract for every GPUI view. Views
+// consume subsets as they land, and one dictionary is what keeps them from
+// growing separate themes. The allowance is scoped to this token module only.
+#![allow(dead_code, reason = "shared Brume token contract; views use subsets")]
 
 use std::time::Duration;
 
@@ -75,7 +69,7 @@ pub(super) const ERROR: Rgba = RED;
 pub(super) const WINDOW: Rgba = MATTE;
 pub(super) const CONTROL: Rgba = SURFACE0;
 pub(super) const CONTROL_HOVER: Rgba = SURFACE1;
-/// `Qt.darker(surface0, 1.12)`: HSV value divided by 1.12, rounded per channel.
+/// Pressed surface: HSV value divided by 1.12, rounded per channel.
 pub(super) const CONTROL_PRESSED: Rgba = color(0x303447);
 pub(super) const MENU_SURFACE: Rgba = BASE;
 /// `matte` at 78 % opacity.
@@ -125,16 +119,16 @@ pub(super) const FADE_DURATION: Duration = Duration::from_millis(200);
 /// Hover colour transition.
 pub(super) const HOVER_DURATION: Duration = Duration::from_millis(110);
 
-/// QML `Easing.OutCubic`.
+/// Cubic ease-out: `1 - (1 - t)³`.
 pub(super) fn fade_out_cubic(delta: f32) -> f32 {
     1.0 - (1.0 - delta).powi(3)
 }
 
 // ── Bundled icons ──────────────────────────────────────────────────────────
-// Same bytes as the QML resource module (`build.rs` registers the directory),
-// including the Tabler attribution. Names are the SVG file stems; `path` is a
-// stable identity keying the GPUI SVG sprite atlas, so an icon is parsed and
-// rasterized once per (path, size) instead of per frame.
+// Embedded from `assets/icons/`, including the Tabler attribution. Names are
+// the SVG file stems; `path` is a stable identity keying the GPUI SVG sprite
+// atlas, so an icon is parsed and rasterized once per (path, size) instead of
+// per frame.
 
 /// One bundled glyph: its stable asset path and embedded bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
