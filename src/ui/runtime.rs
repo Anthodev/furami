@@ -5868,6 +5868,7 @@ mod tests {
         assert_eq!(routed_source(&runtime).as_deref(), Some("source-a"));
         assert_eq!(disabled_draft.audio_status, "Active");
         confirm_explicit_pause(&mut runtime, &driver);
+        settle_committed_watch(&mut runtime);
         let paused = runtime.engine.as_ref().unwrap().model().state_identity();
         driver.send(BackendEvent::AudioAvailability(
             AudioAvailability::Detaching { epoch },
