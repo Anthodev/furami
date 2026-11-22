@@ -6,7 +6,7 @@
 
 ### Fixes
 
-- fix(ui): preserve sharp video and window dragging under Hyprland ([a0d297ae](https://github.com/Anthodev/furami/commit/a0d297ae)). Keep the video sharp while the controls are visible, let Hyprland move the main window using the user's configured binding, and route close requests from either Furami window through the same shutdown path.
+- fix(ui): preserve sharp video and window dragging under Hyprland ([a0d297ae](https://github.com/Anthodev/furami/commit/a0d297ae)). The video stays sharp while the controls are visible, without changing Hyprland's blur settings. The configured window-move shortcut still works, and `Super+Q` closes Furami whether the video window or the controls have focus.
 
 Full changelog: [v2.0.0...v2.0.1](https://github.com/Anthodev/furami/compare/v2.0.0...v2.0.1)
 
