@@ -2,15 +2,12 @@
 
 ## [Unreleased]
 
-### Fixes
-
-- Verify the AppImage runtime's exact Alpine packages instead of requiring live repository indexes to match historical snapshots. Package signatures, metadata, checksums and the offline installed package set are still checked.
-
 ## [2.0.1] - 2026-11-22
 
 ### Fixes
 
 - fix(ui): preserve sharp video and window dragging under Hyprland ([a0d297ae](https://github.com/Anthodev/furami/commit/a0d297ae)). The video stays sharp while the controls are visible, without changing Hyprland's blur settings. The configured window-move shortcut still works, and `Super+Q` closes Furami whether the video window or the controls have focus.
+- fix(packaging): verify pinned Alpine APKs without live indexes ([e9aa10d8](https://github.com/Anthodev/furami/commit/e9aa10d8)). The AppImage runtime build no longer requires live Alpine indexes to match historical snapshots. It still checks each locked package's signature, metadata and checksum, and verifies the exact package set after offline installation.
 
 Full changelog: [v2.0.0...v2.0.1](https://github.com/Anthodev/furami/compare/v2.0.0...v2.0.1)
 
