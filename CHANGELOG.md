@@ -2,9 +2,13 @@
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-23
+
 ### Interface
 
-- Remove the standalone Rendering page. Settings now groups Capture, Audio and Preferences; existing capture profiles still load.
+- refactor(ui): remove the advanced rendering menu ([d2d91b49](https://github.com/Anthodev/furami/commit/d2d91b49)). Settings now groups Capture, Audio and Preferences. The capture profile format is unchanged.
+
+Full changelog: [v2.0.1...v2.1.0](https://github.com/Anthodev/furami/compare/v2.0.1...v2.1.0)
 
 ## [2.0.1] - 2026-11-22
 
