@@ -1,7 +1,7 @@
 //! Read-only product values. Action tokens are opaque decimal strings, never JS numbers.
 use crate::domain::{
     capture::{FrameRate, FrameSize},
-    render::{DitherMode, RendererSettings, RendererValues, ScalerChoice, ScalerKernel},
+    render::{DitherMode, RendererSettings, ScalerChoice, ScalerKernel},
 };
 use crate::media::render_catalog::{self, RendererCapabilities, RendererCatalogError};
 use serde::Serialize;
@@ -416,9 +416,6 @@ pub(super) fn treatments(
                 .into(),
     }
 }
-pub(super) fn mutate_renderer(values: RendererValues) -> Result<RendererSettings, String> {
-    RendererSettings::new(values).map_err(|error| error.to_string())
-}
 
 #[cfg(test)]
 mod tests {
@@ -429,7 +426,7 @@ mod tests {
         for value in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
             let mut values = RendererSettings::default().values();
             values.scale_antiring = value;
-            assert!(mutate_renderer(values).is_err());
+            assert!(RendererSettings::new(values).is_err());
         }
     }
 }

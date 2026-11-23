@@ -3,7 +3,7 @@
 use super::{catalog as capture_catalog, projection};
 use crate::domain::{
     capture::{CaptureModeRequest, FrameRate, FrameSize, InputFormatPolicy},
-    render::{DitherMode, RendererSettings, ScalerChoice, ScalerKernel},
+    render::RendererSettings,
 };
 use std::rc::Rc;
 
@@ -966,133 +966,6 @@ impl CaptureRuntime {
                 Ok(())
             },
         )
-    }
-    fn edit_renderer(
-        &mut self,
-        revision: &str,
-        action: &'static str,
-        field: &'static str,
-        change: impl FnOnce(&mut crate::domain::render::RendererValues) -> Result<(), String>,
-    ) -> UiUpdate {
-        let available = self.ui.renderer.available;
-        self.edit_ui(revision, action, field, |draft, _| {
-            if !available {
-                return Err((
-                    "unavailable",
-                    "The qualified render catalog is unavailable.".into(),
-                ));
-            }
-            let mut values = draft.renderer.values();
-            change(&mut values).map_err(|error| ("invalid_value", error))?;
-            draft.renderer =
-                projection::mutate_renderer(values).map_err(|error| ("renderer_error", error))?;
-            Ok(())
-        })
-    }
-    fn scaler_allowed(&self, field: &str, token: &str) -> bool {
-        self.ui
-            .renderer
-            .fields
-            .iter()
-            .find(|row| row.key == field)
-            .is_some_and(|row| {
-                row.choices
-                    .iter()
-                    .any(|choice| choice.key == token && choice.eligible)
-            })
-    }
-    pub(crate) fn set_scale(&mut self, revision: &str, kernel: &str) -> UiUpdate {
-        let allowed = self.scaler_allowed("scale", kernel);
-        self.edit_renderer(revision, "setScale", "scale", |values| {
-            let kernel = ScalerKernel::from_token(kernel)
-                .ok_or("Unknown kernel (scale does not accept auto).")?;
-            if !allowed {
-                return Err(
-                    "Kernel advertised but ineffective or unavailable on the qualified renderer."
-                        .into(),
-                );
-            }
-            values.scale = kernel;
-            Ok(())
-        })
-    }
-    pub(crate) fn set_cscale(&mut self, revision: &str, kernel: &str) -> UiUpdate {
-        self.set_scaler_choice(revision, kernel, true)
-    }
-    pub(crate) fn set_dscale(&mut self, revision: &str, kernel: &str) -> UiUpdate {
-        self.set_scaler_choice(revision, kernel, false)
-    }
-    fn set_scaler_choice(&mut self, revision: &str, kernel: &str, chroma: bool) -> UiUpdate {
-        let allowed = self.scaler_allowed(if chroma { "cscale" } else { "dscale" }, kernel);
-        self.edit_renderer(
-            revision,
-            if chroma { "setCscale" } else { "setDscale" },
-            if chroma { "cscale" } else { "dscale" },
-            |values| {
-                let choice = if kernel == "auto" {
-                    ScalerChoice::Inherit
-                } else {
-                    ScalerChoice::Kernel(ScalerKernel::from_token(kernel).ok_or("Unknown kernel.")?)
-                };
-                if !allowed {
-                    return Err(
-                        "Kernel advertised but ineffective or unavailable on the qualified renderer."
-                            .into(),
-                    );
-                }
-                if chroma {
-                    values.cscale = choice;
-                } else {
-                    values.dscale = choice;
-                }
-                Ok(())
-            },
-        )
-    }
-    pub(crate) fn set_scale_antiring(&mut self, revision: &str, value: f64) -> UiUpdate {
-        self.edit_renderer(revision, "setScaleAntiring", "scale_antiring", |values| {
-            values.scale_antiring = value;
-            Ok(())
-        })
-    }
-    pub(crate) fn set_dither(&mut self, revision: &str, mode: &str) -> UiUpdate {
-        self.edit_renderer(revision, "setDither", "dither", |values| {
-            values.dither = *DitherMode::ALL
-                .iter()
-                .find(|value| value.as_str() == mode)
-                .ok_or("Unknown dithering mode.")?;
-            Ok(())
-        })
-    }
-    pub(crate) fn set_deband_enabled(&mut self, revision: &str, enabled: bool) -> UiUpdate {
-        self.edit_renderer(revision, "setDebandEnabled", "deband", |values| {
-            values.deband.enabled = enabled;
-            Ok(())
-        })
-    }
-    pub(crate) fn set_deband_iterations(&mut self, revision: &str, value: i32) -> UiUpdate {
-        self.edit_renderer(
-            revision,
-            "setDebandIterations",
-            "deband_iterations",
-            |values| {
-                values.deband.iterations = u8::try_from(value)
-                    .map_err(|_| "The iteration count must be an integer between 0 and 16.")?;
-                Ok(())
-            },
-        )
-    }
-    pub(crate) fn set_deband_grain(&mut self, revision: &str, value: f64) -> UiUpdate {
-        self.edit_renderer(revision, "setDebandGrain", "deband_grain", |values| {
-            values.deband.grain = value;
-            Ok(())
-        })
-    }
-    pub(crate) fn set_interpolation(&mut self, revision: &str, enabled: bool) -> UiUpdate {
-        self.edit_renderer(revision, "setInterpolation", "interpolation", |values| {
-            values.interpolation = enabled;
-            Ok(())
-        })
     }
     fn admitted_settings(&self) -> Option<&crate::domain::state::AppliedSettings> {
         let model = self.engine.as_ref()?.model();
@@ -4174,7 +4047,11 @@ mod tests {
         );
         for wrong in [
             ExpectedState {
-                phase: ProductPhase::Stopped,
+                phase: if expected.phase == ProductPhase::Stopped {
+                    ProductPhase::Active
+                } else {
+                    ProductPhase::Stopped
+                },
                 ..expected
             },
             ExpectedState {
@@ -4305,13 +4182,7 @@ mod tests {
             serde_json::to_string(renderer).unwrap(),
         ))
     }
-    fn begin_live_treatments(
-        runtime: &mut CaptureRuntime,
-        driver: &Driver,
-    ) -> (
-        crate::media::controller::RequestId,
-        crate::domain::state::TreatmentAttemptKey,
-    ) {
+    fn apply_staged_draft(runtime: &mut CaptureRuntime) -> UiUpdate {
         let expected = snapshot_expected(runtime);
         let revision = runtime
             .engine
@@ -4321,10 +4192,19 @@ mod tests {
             .draft()
             .revision
             .get();
-        let pending = runtime.qualification_command(&format!(
+        runtime.qualification_command(&format!(
             "apply {:?} {} {} Complete {revision}",
             expected.phase, expected.apply, expected.attempt,
-        ));
+        ))
+    }
+    fn begin_live_treatments(
+        runtime: &mut CaptureRuntime,
+        driver: &Driver,
+    ) -> (
+        crate::media::controller::RequestId,
+        crate::domain::state::TreatmentAttemptKey,
+    ) {
+        let pending = apply_staged_draft(runtime);
         assert_eq!(pending.product_phase, "ApplyingTreatments");
         assert_eq!(pending.playback_status, "Applying treatments");
         assert!(
@@ -4710,8 +4590,7 @@ mod tests {
             let driver = start_live(&mut runtime, &drivers);
             runtime.set_stats_hidden(true);
             let original = std::fs::read(store.path()).unwrap();
-            let revision = runtime.ui.public_revision.to_string();
-            runtime.set_interpolation(&revision, true);
+            edit_renderer_settings(&mut runtime, &treatment_renderer(true));
             let candidate = runtime
                 .engine
                 .as_ref()
@@ -4721,7 +4600,7 @@ mod tests {
                 .settings
                 .renderer
                 .clone();
-            let (id, key) = receive_renderer_edit(&driver);
+            let (id, key) = begin_live_treatments(&mut runtime, &driver);
             let stale_close = format!(
                 "close ApplyingTreatments {} {} Complete",
                 key.apply.get(),
@@ -6672,7 +6551,7 @@ mod tests {
         );
         runtime.ui.public_revision = u64::MAX;
         let before = runtime.engine.as_ref().unwrap().model().draft().clone();
-        runtime.set_interpolation(&u64::MAX.to_string(), true);
+        runtime.set_audio_enabled(&u64::MAX.to_string(), false);
         assert_eq!(runtime.ui.public_revision, u64::MAX);
         assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &before);
         assert_eq!(runtime.ui.error.as_ref().unwrap().code, "unavailable");
@@ -6728,8 +6607,6 @@ mod tests {
             assert!(runtime.ui.catalog.projection.source_rows[0].eligible);
             let revision = runtime.ui.public_revision;
             runtime.set_audio_enabled(&revision.to_string(), false);
-            assert_eq!(runtime.ui.error.as_ref().unwrap().code, "invalid_value");
-            runtime.set_interpolation(&revision.to_string(), true);
             assert_eq!(runtime.ui.error.as_ref().unwrap().code, "invalid_value");
             assert_eq!(runtime.ui.public_revision, revision);
             assert_eq!(runtime.ui.partial.as_ref(), Some(&partial));
@@ -6787,31 +6664,24 @@ mod tests {
         cleanup(&mut runtime);
     }
     #[test]
-    fn immediate_renderer_commits_once_without_reopening_and_busy_inputs_cannot_stage() {
+    fn renderer_apply_commits_once_without_reopening_and_busy_inputs_cannot_stage() {
         let (mut runtime, drivers) = product_runtime();
         let store = WritableSettings::new();
         store.bind(&mut runtime);
         let driver = start_live(&mut runtime, &drivers);
-        let revision = runtime.ui.public_revision;
-        runtime.set_interpolation(&revision.to_string(), true);
+        edit_renderer_settings(&mut runtime, &treatment_renderer(true));
         let requested = runtime.engine.as_ref().unwrap().model().draft().clone();
         assert!(requested.settings.renderer.values().interpolation);
-        assert_eq!(runtime.ui.public_revision, revision + 1);
-        let (id, command) = driver
-            .submitted
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
-            panic!("same-source renderer edit must use the existing treatment owner");
-        };
+        let (id, key) = begin_live_treatments(&mut runtime, &driver);
+        let revision = runtime.ui.public_revision;
         let selected = runtime.ui.selected.clone();
         let policy = runtime.ui.audio_policy;
-        runtime.set_audio_enabled(&runtime.ui.public_revision.to_string(), false);
+        runtime.set_audio_enabled(&revision.to_string(), false);
         assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
         assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &requested);
         assert_eq!(runtime.ui.selected, selected);
         assert_eq!(runtime.ui.audio_policy, policy);
-        assert_eq!(runtime.ui.public_revision, revision + 1);
+        assert_eq!(runtime.ui.public_revision, revision);
         assert!(!runtime.ui.snapshot.as_ref().unwrap().can_edit_selection);
         // The submitted prepared treatments are compiled from the accepted
         // candidate, so the proof carries that exact renderer without reading
@@ -6831,20 +6701,14 @@ mod tests {
         driver.destroyed.recv().unwrap();
     }
     #[test]
-    fn immediate_renderer_confirmation_preserves_requested_values_and_preferences() {
+    fn renderer_apply_confirmation_preserves_requested_values_and_preferences() {
         let (mut runtime, drivers) = product_runtime();
         let driver = start_live(&mut runtime, &drivers);
-        runtime.set_interpolation(&runtime.ui.public_revision.to_string(), true);
+        edit_renderer_settings(&mut runtime, &treatment_renderer(true));
         let requested = runtime.engine.as_ref().unwrap().model().draft().clone();
+        let (id, key) = begin_live_treatments(&mut runtime, &driver);
         let revision = runtime.ui.public_revision;
-        let (id, command) = driver
-            .submitted
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
-            panic!("real immediate treatment admission required");
-        };
-        runtime.set_interpolation(&revision.to_string(), false);
+        runtime.set_audio_enabled(&revision.to_string(), false);
         assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
         assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &requested);
         runtime.set_volume(21);
@@ -6891,37 +6755,6 @@ mod tests {
         runtime.poll();
     }
 
-    fn receive_renderer_edit(
-        driver: &Driver,
-    ) -> (
-        crate::media::controller::RequestId,
-        crate::domain::state::TreatmentAttemptKey,
-    ) {
-        let (id, command) = driver
-            .submitted
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
-            panic!("renderer editor must submit a real treatment command: {command:?}");
-        };
-        (id, key)
-    }
-
-    fn confirm_renderer_edit(runtime: &mut CaptureRuntime, driver: &Driver) {
-        let (id, key) = receive_renderer_edit(driver);
-        let renderer = runtime
-            .engine
-            .as_ref()
-            .unwrap()
-            .model()
-            .draft()
-            .settings
-            .renderer
-            .clone();
-        confirm_treatments(driver, id, key, renderer);
-        await_update(runtime, |update| update.product_phase == "Active");
-    }
-
     #[test]
     fn prevalidation_refusal_keeps_renderer_request_and_saved_profile_untouched() {
         fn refuse(
@@ -6946,8 +6779,7 @@ mod tests {
         remember_profile(&mut runtime.persistence, saved.clone());
         seed_renderer(&mut runtime, saved.renderer.clone());
         let bytes = std::fs::read(store.path()).unwrap();
-        let revision = runtime.ui.public_revision.to_string();
-        runtime.set_interpolation(&revision, true);
+        edit_renderer_settings(&mut runtime, &treatment_renderer(true));
         let requested = runtime
             .engine
             .as_ref()
@@ -6957,6 +6789,7 @@ mod tests {
             .settings
             .clone();
         assert_ne!(requested.renderer, saved.renderer);
+        apply_staged_draft(&mut runtime);
         // A prevalidation rejection with no incumbent returns to Stopped;
         // it is recorded separately from terminal owner/treatment failures.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -7020,7 +6853,7 @@ mod tests {
         let last_valid = model.last_valid().unwrap().clone();
         let expected_renderer = treatment_renderer(true);
         let bytes = std::fs::read(store.path()).unwrap();
-        let revision = runtime.ui.public_revision.to_string();
+        edit_renderer_settings(&mut runtime, &expected_renderer);
         // Replace only the preparation/admission port. As in the existing
         // unavailable-pause-port probe, the actual confirmed owner remains
         // alive in `original` and is restored before observation or cleanup.
@@ -7035,7 +6868,7 @@ mod tests {
         );
         let original =
             std::mem::replace(runtime.engine.as_mut().unwrap().runner_mut(), refused_port);
-        runtime.set_interpolation(&revision, true);
+        apply_staged_draft(&mut runtime);
         *runtime.engine.as_mut().unwrap().runner_mut() = original;
         runtime.dirty = true;
         let refused = runtime.poll();
@@ -7125,22 +6958,24 @@ mod tests {
         let driver = complete_profile_source(&mut runtime, &drivers, update, None);
         for action in 0..4 {
             let bytes = std::fs::read(store.path()).unwrap();
-            let revision = runtime.ui.public_revision.to_string();
+            let mut values = a.renderer.values();
             match action {
                 0 => {
-                    runtime.set_scale_antiring(&revision, 0.75);
+                    values.scale_antiring = 0.75;
                 }
                 1 => {
-                    runtime.set_dither(&revision, "ordered");
+                    values.dither = crate::domain::render::DitherMode::Ordered;
                 }
                 2 => {
-                    runtime.set_deband_enabled(&revision, true);
+                    values.deband.enabled = true;
                 }
                 3 => {
-                    runtime.set_interpolation(&revision, false);
+                    values.interpolation = false;
                 }
                 _ => unreachable!(),
             }
+            let target = RendererSettings::new(values).unwrap();
+            edit_renderer_settings(&mut runtime, &target);
             let candidate = runtime
                 .engine
                 .as_ref()
@@ -7157,7 +6992,9 @@ mod tests {
                 bytes,
                 "pending is never saved"
             );
-            confirm_renderer_edit(&mut runtime, &driver);
+            let (id, key) = begin_live_treatments(&mut runtime, &driver);
+            confirm_treatments(&driver, id, key, candidate.renderer.clone());
+            await_update(&mut runtime, |update| update.product_phase == "Active");
             a.renderer = candidate.renderer;
             let reloaded = PersistenceSession::load(Ok(store.path()));
             assert!(
@@ -7229,14 +7066,8 @@ mod tests {
             bootstrap_audio: Default::default(),
         });
         let driver = start_live(&mut runtime, &drivers);
-        runtime.set_interpolation(&runtime.ui.public_revision.to_string(), true);
-        let (id, command) = driver
-            .submitted
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        let crate::media::controller::BackendCommand::ApplyTreatments { key, .. } = command else {
-            panic!("real treatment admission required")
-        };
+        edit_renderer_settings(&mut runtime, &treatment_renderer(true));
+        let (id, key) = begin_live_treatments(&mut runtime, &driver);
         runtime.set_volume(29);
         confirm_treatments(&driver, id, key, treatment_renderer(true));
         await_update(&mut runtime, |update| update.product_phase == "Active");
@@ -7380,7 +7211,7 @@ mod tests {
         }
     }
     #[test]
-    fn renderer_qualified_unsupported_and_inactive_values_remain_honest() {
+    fn renderer_qualified_unsupported_choice_and_inactive_notice_remain_honest() {
         let (mut runtime, _drivers) = product_runtime();
         let unavailable = runtime
             .ui
@@ -7394,64 +7225,7 @@ mod tests {
             .find(|choice| choice.key == "ewa_lanczossoft")
             .unwrap();
         assert!(!unavailable.eligible && !unavailable.reason.is_empty());
-        let before = runtime
-            .engine
-            .as_ref()
-            .unwrap()
-            .model()
-            .draft()
-            .settings
-            .renderer
-            .clone();
-        runtime.set_scale(&runtime.ui.public_revision.to_string(), "ewa_lanczossoft");
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .renderer,
-            before
-        );
-        runtime.set_deband_iterations(&runtime.ui.public_revision.to_string(), -1);
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .renderer,
-            before
-        );
-        runtime.set_scale_antiring(&runtime.ui.public_revision.to_string(), f64::NAN);
-        assert_eq!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .renderer,
-            before
-        );
-        runtime.set_interpolation(&runtime.ui.public_revision.to_string(), true);
-        let after = runtime
-            .engine
-            .as_ref()
-            .unwrap()
-            .model()
-            .draft()
-            .settings
-            .renderer
-            .values();
-        let mut expected = before.values();
-        expected.interpolation = true;
-        assert_eq!(after, expected);
+        product_values(&mut runtime);
         assert!(
             !runtime
                 .ui
@@ -7461,10 +7235,6 @@ mod tests {
                 .renderer
                 .notice
                 .is_empty()
-        );
-        assert!(
-            runtime.ui.submitted.is_some(),
-            "valid completion immediately submits the requested renderer"
         );
         cleanup(&mut runtime);
     }
@@ -7490,7 +7260,7 @@ mod tests {
             Vec::new(),
         );
         product_values(&mut runtime);
-        runtime.set_interpolation(&runtime.ui.public_revision.to_string(), true);
+        runtime.set_audio_enabled(&runtime.ui.public_revision.to_string(), false);
         assert!(matches!(
             runtime.ui.error.as_ref().unwrap().code,
             "busy" | "stale_catalog"
@@ -7669,7 +7439,7 @@ mod tests {
             }
             let before = runtime.engine.as_ref().unwrap().model().draft().clone();
             let revision = runtime.ui.public_revision;
-            runtime.set_interpolation(&revision.to_string(), true);
+            runtime.set_audio_enabled(&revision.to_string(), false);
             assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
             assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &before);
             assert_eq!(runtime.ui.public_revision, revision);
@@ -7751,7 +7521,7 @@ mod tests {
         let revision = runtime.ui.public_revision;
         let before = runtime.engine.as_ref().unwrap().model().draft().clone();
         let physical = pending_source_fixture(&mut runtime, 71);
-        runtime.set_interpolation(&revision.to_string(), true);
+        runtime.set_audio_enabled(&revision.to_string(), false);
         assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
         assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &before);
         assert_eq!(runtime.ui.public_revision, revision);
@@ -8028,7 +7798,7 @@ mod tests {
         let before = runtime.engine.as_ref().unwrap().model().draft().clone();
         let revision = runtime.ui.public_revision;
         let selected = runtime.ui.selected.clone();
-        let refused = runtime.set_interpolation(&revision.to_string(), true);
+        let refused = runtime.set_audio_enabled(&revision.to_string(), false);
         assert_eq!(runtime.ui.error.as_ref().unwrap().code, "busy");
         assert_eq!(runtime.engine.as_ref().unwrap().model().draft(), &before);
         assert_eq!(runtime.ui.public_revision, revision);
@@ -9024,20 +8794,8 @@ mod tests {
         runtime.ui.resolving.as_mut().unwrap().origin = SelectionOrigin::Startup { original };
         let catalog = runtime.ui.catalog.revision;
         let revision = runtime.ui.public_revision;
-        runtime.set_interpolation(&revision.to_string(), true);
+        runtime.set_audio_enabled(&revision.to_string(), false);
         assert!(runtime.ui.resolving.is_none());
-        assert!(
-            runtime
-                .engine
-                .as_ref()
-                .unwrap()
-                .model()
-                .draft()
-                .settings
-                .renderer
-                .values()
-                .interpolation
-        );
         let newer = runtime.engine.as_ref().unwrap().model().draft().clone();
         runtime
             .ui

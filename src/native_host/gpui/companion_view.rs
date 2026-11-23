@@ -230,9 +230,6 @@ impl CompanionView {
             return;
         }
         self.finish_mode_editor_for_popup(rendered, cx);
-        if Section::from_popup(rendered) == Some(Section::Rendering) {
-            self.finish_renderer(window, cx);
-        }
         let restore = {
             let mut state = self.state.borrow_mut();
             if !state.chrome.dismiss(rendered, Instant::now()) {
@@ -405,27 +402,6 @@ impl CompanionView {
             cx.stop_propagation();
             return;
         }
-        if self
-            .menu
-            .as_ref()
-            .and_then(|menu| menu.active_edit(window))
-            .is_some()
-        {
-            match event.keystroke.key.as_str() {
-                "f11" | "escape" => {
-                    cx.stop_propagation();
-                    return;
-                }
-                "enter" if !modifiers.modified() => {
-                    if !event.is_held {
-                        self.finish_renderer(window, cx);
-                    }
-                    cx.stop_propagation();
-                    return;
-                }
-                _ => {}
-            }
-        }
         if let Some(group) = self
             .top
             .as_ref()
@@ -501,14 +477,6 @@ impl CompanionView {
         cx.notify();
     }
 
-    fn finish_renderer(&self, window: &Window, cx: &mut Context<Self>) {
-        if let Some(menu) = &self.menu
-            && let Some(expected) = menu.active_edit(window)
-        {
-            menu.finish_edit(expected, &mut self.state.borrow_mut(), cx);
-        }
-    }
-
     fn menu_navigation(popup: Popup, cx: &Context<Self>) -> Navigate {
         let weak = cx.weak_entity();
         Rc::new(move |section, source, window, cx| {
@@ -521,9 +489,6 @@ impl CompanionView {
                     if state.chrome.popup() != Some(popup) || !accepts_chrome(&state) {
                         return;
                     }
-                }
-                if Section::from_popup(popup) == Some(Section::Rendering) {
-                    this.finish_renderer(window, cx);
                 }
                 {
                     let mut state = this.state.borrow_mut();
@@ -792,7 +757,6 @@ impl Render for CompanionView {
                     (popup, section),
                     &Self::menu_navigation(popup, cx),
                     &regions,
-                    window,
                     cx,
                 );
                 chrome = chrome.child(

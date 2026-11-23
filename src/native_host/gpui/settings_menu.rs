@@ -7,7 +7,7 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::{domain::render::ScalerChoice, ui::projection::Snapshot};
+use crate::ui::projection::Snapshot;
 
 use super::{
     HostState, brume,
@@ -17,7 +17,6 @@ use super::{
     device_settings::{self, DeviceSettings, Page as DevicePage},
     playback_menu::{self, MenuInputs, PlaybackMenu},
     preferences_page::{self, PreferencesPage},
-    renderer_page::RendererPage,
     top_chrome::FocusTarget,
 };
 
@@ -27,7 +26,6 @@ pub(super) enum Section {
     Index,
     Capture,
     Audio,
-    Rendering,
     Preferences,
 }
 
@@ -38,7 +36,6 @@ impl Section {
             Self::Index => "menu-settings",
             Self::Capture => "menu-capture",
             Self::Audio => "menu-audio",
-            Self::Rendering => "menu-rendering",
             Self::Preferences => "menu-preferences",
         }
     }
@@ -49,7 +46,6 @@ impl Section {
             "menu-settings" => Self::Index,
             "menu-capture" => Self::Capture,
             "menu-audio" => Self::Audio,
-            "menu-rendering" => Self::Rendering,
             "menu-preferences" => Self::Preferences,
             _ => return None,
         })
@@ -76,7 +72,6 @@ impl Section {
             Self::Index => "Settings",
             Self::Capture => "Capture — format",
             Self::Audio => "Audio",
-            Self::Rendering => "Rendering",
             Self::Preferences => "Preferences",
         }
     }
@@ -87,10 +82,9 @@ pub(super) type Navigate = Rc<dyn Fn(Section, Activation, &mut Window, &mut App)
 pub(super) struct SettingsMenu {
     popup: Option<Popup>,
     back: FocusHandle,
-    entries: [FocusHandle; 4],
+    entries: [FocusHandle; 3],
     playback: PlaybackMenu,
     devices: DeviceSettings,
-    renderer: RendererPage,
     preferences: PreferencesPage,
 }
 
@@ -102,7 +96,6 @@ impl SettingsMenu {
             entries: std::array::from_fn(|_| cx.focus_handle()),
             playback: PlaybackMenu::new(cx),
             devices: DeviceSettings::new(cx),
-            renderer: RendererPage::default(),
             preferences: PreferencesPage::new(cx),
         }
     }
@@ -125,28 +118,16 @@ impl SettingsMenu {
                 device_page(section),
                 cx,
             )),
-            Section::Rendering => {
-                targets.extend(self.renderer.focus_handles().iter().map(FocusTarget::plain))
-            }
             Section::Preferences => targets.extend(self.preferences.focus_targets(state)),
             Section::Root => unreachable!(),
         }
         targets
     }
 
-    pub(super) fn active_edit(&self, window: &Window) -> Option<&FocusHandle> {
-        self.renderer.active_edit(window)
-    }
-
-    pub(super) fn finish_edit(&self, expected: &FocusHandle, state: &mut HostState, cx: &mut App) {
-        self.renderer.finish_edit(expected, state, cx);
-    }
-
     pub(super) fn reconcile(&mut self, popup: Option<Popup>) {
         if self.popup != popup {
             self.popup = popup;
             self.devices.close_open_choice();
-            self.renderer.clear();
             self.preferences.reset_disclosure();
         }
     }
@@ -157,7 +138,6 @@ impl SettingsMenu {
         (popup, section): (Popup, Section),
         navigate: &Navigate,
         regions: &HitRegions,
-        window: &mut Window,
         cx: &mut Context<CompanionView>,
     ) -> AnyElement {
         if section == Section::Root {
@@ -185,14 +165,6 @@ impl SettingsMenu {
                 regions,
                 cx,
             ),
-            Section::Rendering => {
-                if let Some(snapshot) = snapshot.as_deref() {
-                    self.renderer
-                        .paint(popup, snapshot, state, regions, window, cx)
-                } else {
-                    div()
-                }
-            }
             Section::Preferences => div().child(preferences_page::paint(
                 &self.preferences,
                 state,
@@ -246,17 +218,6 @@ impl SettingsMenu {
             .map_or("Disabled", |selection| {
                 nonempty(&selection.audio_input_label, "Input to choose")
             });
-        let rendering = selection.map_or_else(
-            || "—".to_owned(),
-            |selection| {
-                let values = selection.renderer.values();
-                let downscale = match values.dscale {
-                    ScalerChoice::Inherit => "auto",
-                    ScalerChoice::Kernel(kernel) => kernel.as_str(),
-                };
-                format!("{} / {downscale}", values.scale.as_str())
-            },
-        );
         let preferences =
             snapshot.map_or("—", |snapshot| nonempty(&snapshot.settings.status, "—"));
         let rows = [
@@ -275,14 +236,6 @@ impl SettingsMenu {
                 "Audio settings",
                 "headphones",
                 audio,
-            ),
-            (
-                Section::Rendering,
-                "settingsRendererEntry",
-                "Rendering",
-                "Rendering settings",
-                "palette",
-                rendering.as_str(),
             ),
             (
                 Section::Preferences,

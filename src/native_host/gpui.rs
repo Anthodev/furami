@@ -11,7 +11,6 @@ mod idle_inhibitor;
 mod log_folder;
 mod playback_menu;
 mod preferences_page;
-mod renderer_page;
 mod settings_menu;
 mod text_field;
 mod top_chrome;

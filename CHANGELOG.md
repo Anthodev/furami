@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Interface
+
+- Remove the standalone Rendering page. Settings now groups Capture, Audio and Preferences; existing capture profiles still load.
+
 ## [2.0.1] - 2026-11-22
 
 ### Fixes

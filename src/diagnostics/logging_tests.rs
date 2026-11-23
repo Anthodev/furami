@@ -547,13 +547,13 @@ fn native_boundary_keeps_exact_ids_and_geometry_but_never_arbitrary_tokens() {
         &harness.handle,
         "ui_control",
         4,
-        r#"{"object_name":"renderChoice_scale_PRIVATE_ASCII","ordinal":3,"width":42}"#,
+        r#"{"object_name":"audioInputSelector_PRIVATE_ASCII","ordinal":3,"width":42}"#,
     );
     logging::native_event(
         &harness.handle,
         "ui_control",
         4,
-        r#"{"object_name":"renderChoice_scale","ordinal":4,"width":43}"#,
+        r#"{"object_name":"audioInputSelector","ordinal":4,"width":43}"#,
     );
     harness.handle.event(
         EventLevel::Info,
@@ -609,7 +609,7 @@ fn native_boundary_keeps_exact_ids_and_geometry_but_never_arbitrary_tokens() {
         assert!(
             events
                 .iter()
-                .any(|line| line["fields"]["object_name"] == "renderChoice_scale"
+                .any(|line| line["fields"]["object_name"] == "audioInputSelector"
                     && line["fields"]["ordinal"] == 4
                     && line["fields"]["width"] == 43)
         );

@@ -73,15 +73,6 @@ impl RuntimeCoordinator {
         select_format(revision: &str, catalog: &str, row: &str);
         set_audio_enabled(revision: &str, enabled: bool);
         select_audio_input(revision: &str, catalog: &str, row: &str);
-        set_scale(revision: &str, kernel: &str);
-        set_cscale(revision: &str, kernel: &str);
-        set_dscale(revision: &str, kernel: &str);
-        set_scale_antiring(revision: &str, value: f64);
-        set_dither(revision: &str, mode: &str);
-        set_deband_enabled(revision: &str, enabled: bool);
-        set_deband_iterations(revision: &str, value: i32);
-        set_deband_grain(revision: &str, value: f64);
-        set_interpolation(revision: &str, enabled: bool);
         retry_save(); close_without_save(); request_reset();
         decide_reset(token: u64, confirmed: bool);
         set_stats_hidden(hidden: bool); set_logging_enabled(enabled: bool);
